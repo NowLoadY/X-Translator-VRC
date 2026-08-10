@@ -1,0 +1,35 @@
+# Project specific runtime/build folders
+.env
+runtime/
+models/
+target/
+**/target/
+*-target/
+dist/
+
+# Rust build artifacts
+*.pdb
+*.dll
+*.exe
+*.d
+
+# IDE and OS files
+.vscode/
+.idea/
+.DS_Store
+*.swp
+*.swo
+
+# Logs and databases
+*.log
+*.sqlite3
+
+# Audio cache / Temporary files
+*.wav
+*.mp3
+*.flac
+*.ogg
+.temp/
+tmp/
+*.tmp
+*.bak

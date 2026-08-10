@@ -1,0 +1,47 @@
+[package]
+name = "rust-client"
+version.workspace = true
+edition.workspace = true
+
+[dependencies]
+cpal = "0.18.1"
+crossbeam-channel = "0.5.16"
+eframe = "0.36.1"
+egui_extras = { version = "0.36.1", features = ["svg", "image"] }
+env_logger = "0.11.11"
+futures = "0.3.33"
+log = "0.4.33"
+parking_lot = "0.12.5"
+reqwest = { version = "0.13.4", features = ["json"] }
+rfd = "0.17.2"
+rubato = "4.0.0"
+audioadapter-buffers = "4.0.0"
+rosc = "0.11.4"
+serde = { version = "1.0.229", features = ["derive"] }
+serde_json = "1.0.151"
+tokio = { version = "1.53.1", features = ["full"] }
+tokio-tungstenite = "0.30.0"
+tungstenite = "0.30.0"
+zip = { version = "2.4.2", default-features = false, features = ["deflate"] }
+xrtranslate-assets = { path = "../crates/xrtranslate-assets" }
+xrtranslate-config = { path = "../crates/xrtranslate-config" }
+
+[target.'cfg(windows)'.dependencies]
+wasapi = "0.23.0"
+windows-sys = { version = "0.61.2", features = ["Win32_Foundation", "Win32_Security", "Win32_System_JobObjects", "Win32_System_Threading"] }
+windows = { version = "0.60.0", features = [
+    "Win32_Foundation",
+    "Win32_UI_WindowsAndMessaging",
+    "Win32_Graphics_Direct2D",
+    "Win32_Graphics_Direct2D_Common",
+    "Win32_Graphics_DirectWrite",
+    "Win32_Graphics_Dxgi_Common",
+    "Win32_Graphics_Dwm",
+    "Win32_Graphics_Gdi",
+    "Win32_System_LibraryLoader",
+    "Win32_UI_Input_KeyboardAndMouse",
+    "Win32_UI_Controls",
+] }
+
+[build-dependencies]
+winres = "0.1.12"

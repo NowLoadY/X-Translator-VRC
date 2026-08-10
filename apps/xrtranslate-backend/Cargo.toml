@@ -1,0 +1,26 @@
+[package]
+name = "xrtranslate-backend"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+description = "Native high-performance backend for XRTranslate."
+
+[dependencies]
+axum = { version = "0.8.8", features = ["ws"] }
+clap = { version = "4.5.58", features = ["derive"] }
+futures-util = "0.3.31"
+serde = { version = "1.0.229", features = ["derive"] }
+serde_json = "1.0.151"
+tokio = { version = "1.47.1", features = ["macros", "rt-multi-thread", "net", "signal", "sync", "time"] }
+tracing = "0.1.41"
+tracing-subscriber = { version = "0.3.20", features = ["env-filter"] }
+url = "2.5.8"
+xrtranslate-assets = { path = "../../crates/xrtranslate-assets" }
+xrtranslate-config = { path = "../../crates/xrtranslate-config" }
+xrtranslate-engine = { path = "../../crates/xrtranslate-engine" }
+xrtranslate-inference = { path = "../../crates/xrtranslate-inference" }
+xrtranslate-protocol = { path = "../../crates/xrtranslate-protocol" }
+xrtranslate-speaker = { path = "../../crates/xrtranslate-speaker" }
+xrtranslate-supervisor = { path = "../../crates/xrtranslate-supervisor" }
+xrtranslate-vad = { path = "../../crates/xrtranslate-vad" }

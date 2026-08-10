@@ -1,0 +1,11 @@
+[package]
+name = "xrtranslate-vad"
+version.workspace = true
+edition = "2024"
+license = "MIT"
+repository = "https://github.com/NowLoadY/XRTranslate"
+description = "Stateful Silero VAD inference and deterministic PCM endpointing"
+
+[dependencies]
+ndarray = "0.16"
+ort = { version = "=2.0.0-rc.10", features = ["ndarray"] }

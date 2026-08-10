@@ -1,0 +1,354 @@
+//! WebSocket wire contract shared by the desktop client and the native backend.
+//!
+//! JSON control messages use a stable `action` or `event` discriminator. Audio
+//! frames are sent as raw binary WebSocket messages; see [`PcmFormat`] and
+//! [`PcmFrame`] for their deliberately header-free representation.
+
+#![forbid(unsafe_code)]
+
+use std::{error::Error, fmt};
+
+use serde::{Deserialize, Serialize};
+
+/// The current WebSocket contract version.
+///
+/// The legacy Python backend does not exchange this number on the wire yet.
+/// It is exported so the Rust client and backend can reject incompatible peers
+/// once a handshake is added without changing the individual DTOs.
+pub const PROTOCOL_VERSION: u16 = 2;
+
+/// The encoded sample format of every binary audio WebSocket frame.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum PcmSampleFormat {
+    /// A signed, little-endian 16-bit PCM sample.
+    S16Le,
+}
+
+/// Metadata negotiated out-of-band for a stream of raw PCM frames.
+///
+/// Client-to-server frames use the sample rate in [`EventControl::ConfigAudio`]
+/// (normally 16 kHz). Server-to-client TTS frames use `audio.tts_sample_rate`
+/// (normally 48 kHz). Both directions are mono signed 16-bit little-endian
+/// PCM. No binary frame has a custom header or length prefix: one WebSocket
+/// binary message is exactly one [`PcmFrame`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub struct PcmFormat {
+    pub sample_rate: u32,
+    pub channels: u8,
+    pub sample_format: PcmSampleFormat,
+}
+
+impl PcmFormat {
+    /// Mono signed-16-bit little-endian PCM at `sample_rate` Hz.
+    pub const fn mono_s16le(sample_rate: u32) -> Self {
+        Self {
+            sample_rate,
+            channels: 1,
+            sample_format: PcmSampleFormat::S16Le,
+        }
+    }
+
+    /// Number of bytes in one interleaved sample frame.
+    pub const fn bytes_per_sample_frame(self) -> usize {
+        self.channels as usize * 2
+    }
+}
+
+/// A raw WebSocket binary payload whose bytes are PCM16LE samples.
+///
+/// This wrapper has no `Serialize` implementation on purpose. Serializing it
+/// as JSON would hide the protocol's binary-frame requirement (and commonly
+/// turn PCM into base64 by accident).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct PcmFrame(Vec<u8>);
+
+impl PcmFrame {
+    /// Validates and owns a raw PCM frame for `format`.
+    pub fn new(bytes: Vec<u8>, format: PcmFormat) -> Result<Self, PcmFrameError> {
+        let frame_width = format.bytes_per_sample_frame();
+        if format.sample_rate == 0 {
+            return Err(PcmFrameError::ZeroSampleRate);
+        }
+        if format.channels == 0 {
+            return Err(PcmFrameError::ZeroChannels);
+        }
+        if bytes.len() % frame_width != 0 {
+            return Err(PcmFrameError::PartialSampleFrame {
+                bytes: bytes.len(),
+                frame_width,
+            });
+        }
+        Ok(Self(bytes))
+    }
+
+    /// Borrows the raw binary WebSocket payload.
+    pub fn as_bytes(&self) -> &[u8] {
+        &self.0
+    }
+
+    /// Consumes the wrapper and returns the binary WebSocket payload.
+    pub fn into_bytes(self) -> Vec<u8> {
+        self.0
+    }
+
+    /// Number of PCM sample frames contained in this message.
+    pub fn sample_frames(&self, format: PcmFormat) -> usize {
+        self.0.len() / format.bytes_per_sample_frame()
+    }
+}
+
+/// A malformed raw binary PCM frame.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum PcmFrameError {
+    ZeroSampleRate,
+    ZeroChannels,
+    PartialSampleFrame { bytes: usize, frame_width: usize },
+}
+
+impl fmt::Display for PcmFrameError {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::ZeroSampleRate => {
+                formatter.write_str("PCM sample rate must be greater than zero")
+            }
+            Self::ZeroChannels => {
+                formatter.write_str("PCM channel count must be greater than zero")
+            }
+            Self::PartialSampleFrame { bytes, frame_width } => write!(
+                formatter,
+                "PCM payload has {bytes} bytes, which is not divisible by its {frame_width}-byte sample frame"
+            ),
+        }
+    }
+}
+
+impl Error for PcmFrameError {}
+
+/// All JSON controls sent from a WebSocket client to the backend.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(untagged)]
+pub enum ClientControl {
+    Action(ActionControl),
+    Event(EventControl),
+}
+
+/// Action-discriminated client controls.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(tag = "action", rename_all = "snake_case")]
+pub enum ActionControl {
+    /// Updates the active translation route. It is also the initial route
+    /// supplied immediately after a WebSocket connection opens.
+    SessionConfig {
+        source_lang: String,
+        target_lang: String,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        sample_rate: Option<u32>,
+    },
+    /// Enables or disables a session feature.
+    ToggleFeature { feature: Feature, enabled: bool },
+}
+
+/// Event-discriminated client controls.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(tag = "event", rename_all = "snake_case")]
+pub enum EventControl {
+    /// Sets the microphone PCM sample rate and, optionally, the route before
+    /// binary audio is sent.
+    ConfigAudio {
+        sample_rate: u32,
+        source_lang: String,
+        target_lang: String,
+    },
+    /// Flushes the active turn and stops session work.
+    Stop,
+    /// Marks the beginning of microphone audio for a logical turn.
+    TurnStarted { turn_id: String },
+}
+
+/// Session features that can be changed while connected.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum Feature {
+    Tts,
+}
+
+/// JSON events sent from the backend to a WebSocket client.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(tag = "action", content = "data", rename_all = "snake_case")]
+pub enum ServerEvent {
+    SessionReady(SessionReady),
+    AsrResult(AsrResult),
+    SourceSegmentReady(SourceSegmentReady),
+    TranslationReady(TranslationReady),
+    TtsFinished(TtsFinished),
+    Error(ErrorEvent),
+}
+
+/// Identifies a newly-created backend session and its initial language route.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct SessionReady {
+    pub session_id: String,
+    pub source_lang: String,
+    pub target_lang: String,
+}
+
+/// An incremental or completed ASR result.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct AsrResult {
+    #[serde(rename = "type")]
+    pub kind: AsrResultKind,
+    pub text: String,
+    pub delta: String,
+    /// Unix timestamp in seconds, as emitted by the existing backend.
+    pub ts: Option<f64>,
+}
+
+/// The stability of an ASR result.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum AsrResultKind {
+    Partial,
+    Stable,
+    Final,
+    Blank,
+}
+
+/// A source-language segment placed on the translation queue.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct SourceSegmentReady {
+    pub source_text: String,
+    pub turn_id: String,
+    pub segment_index: u32,
+    pub segment_count: u32,
+    pub speaker_id: String,
+    pub source_start_ms: f64,
+    pub source_end_ms: f64,
+}
+
+/// A completed translation and its latency information.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct TranslationReady {
+    pub source_text: String,
+    pub translated_text: String,
+    pub turn_id: String,
+    pub segment_index: u32,
+    pub segment_count: u32,
+    pub speaker_id: String,
+    /// Absolute position inside the current audio epoch.
+    #[serde(default)]
+    pub source_start_ms: f64,
+    /// Exclusive end position inside the current audio epoch.
+    #[serde(default)]
+    pub source_end_ms: f64,
+    pub clone_audio_path: String,
+    pub tts_audio_path: String,
+    pub metrics: LatencyMetrics,
+}
+
+/// Latency values reported to the client in milliseconds.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub struct LatencyMetrics {
+    pub asr_ms: u64,
+    pub mt_ms: u64,
+    pub tts_ms: u64,
+}
+
+/// Signals that the preceding binary TTS audio has been fully sent.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct TtsFinished {
+    pub text: String,
+}
+
+/// A recoverable backend error for the current session.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ErrorEvent {
+    pub message: String,
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn session_config_serializes_to_the_legacy_json_shape() {
+        let control = ClientControl::Action(ActionControl::SessionConfig {
+            source_lang: "auto".into(),
+            target_lang: "zh,en".into(),
+            sample_rate: None,
+        });
+
+        assert_eq!(
+            serde_json::to_string(&control).unwrap(),
+            r#"{"action":"session_config","source_lang":"auto","target_lang":"zh,en"}"#
+        );
+    }
+
+    #[test]
+    fn config_audio_round_trips_as_an_event_control() {
+        let json = r#"{"event":"config_audio","sample_rate":16000,"source_lang":"auto","target_lang":"zh,en"}"#;
+        let control: ClientControl = serde_json::from_str(json).unwrap();
+
+        assert_eq!(
+            control,
+            ClientControl::Event(EventControl::ConfigAudio {
+                sample_rate: 16_000,
+                source_lang: "auto".into(),
+                target_lang: "zh,en".into(),
+            })
+        );
+        assert_eq!(serde_json::to_string(&control).unwrap(), json);
+    }
+
+    #[test]
+    fn translation_event_matches_the_existing_backend_shape() {
+        let json = r#"{
+            "action":"translation_ready",
+            "data":{
+                "source_text":"hello",
+                "translated_text":"你好",
+                "turn_id":"native-1",
+                "segment_index":1,
+                "segment_count":1,
+                "speaker_id":"",
+                "clone_audio_path":"",
+                "tts_audio_path":"",
+                "metrics":{"asr_ms":12,"mt_ms":34,"tts_ms":0}
+            }
+        }"#;
+
+        let event: ServerEvent = serde_json::from_str(json).unwrap();
+        assert_eq!(
+            event,
+            ServerEvent::TranslationReady(TranslationReady {
+                source_text: "hello".into(),
+                translated_text: "你好".into(),
+                turn_id: "native-1".into(),
+                segment_index: 1,
+                segment_count: 1,
+                speaker_id: String::new(),
+                source_start_ms: 0.0,
+                source_end_ms: 0.0,
+                clone_audio_path: String::new(),
+                tts_audio_path: String::new(),
+                metrics: LatencyMetrics {
+                    asr_ms: 12,
+                    mt_ms: 34,
+                    tts_ms: 0,
+                },
+            })
+        );
+    }
+
+    #[test]
+    fn pcm_frames_are_header_free_and_require_full_samples() {
+        let format = PcmFormat::mono_s16le(16_000);
+        let frame = PcmFrame::new(vec![0, 1, 2, 3], format).unwrap();
+        assert_eq!(frame.as_bytes(), &[0, 1, 2, 3]);
+        assert_eq!(frame.sample_frames(format), 2);
+        assert!(matches!(
+            PcmFrame::new(vec![0, 1, 2], format),
+            Err(PcmFrameError::PartialSampleFrame { .. })
+        ));
+    }
+}

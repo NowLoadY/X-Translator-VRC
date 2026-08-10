@@ -1,0 +1,22 @@
+[workspace]
+resolver = "3"
+members = [
+    "rust-client",
+    "crates/xrtranslate-protocol",
+    "crates/xrtranslate-config",
+    "crates/xrtranslate-engine",
+    "crates/xrtranslate-inference",
+    "crates/xrtranslate-assets",
+    "crates/xrtranslate-speaker",
+    "crates/xrtranslate-vad",
+    "crates/xrtranslate-supervisor",
+    "apps/xrtranslate-backend",
+    "apps/xrtranslate-installer",
+    "apps/xrtranslate-packager",
+]
+
+[workspace.package]
+version = "0.1.0"
+edition = "2024"
+license = "AGPL-3.0-only"
+repository = "https://github.com/NowLoadY/XRTranslate"

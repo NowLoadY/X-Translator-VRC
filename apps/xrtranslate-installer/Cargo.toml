@@ -1,0 +1,13 @@
+[package]
+name = "xrtranslate-installer"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+description = "Native model installer and verifier for XRTranslate."
+
+[dependencies]
+clap = { version = "4.5.58", features = ["derive"] }
+tokio = { version = "1.53.1", features = ["macros", "rt-multi-thread"] }
+xrtranslate-assets = { path = "../../crates/xrtranslate-assets" }
+xrtranslate-config = { path = "../../crates/xrtranslate-config" }

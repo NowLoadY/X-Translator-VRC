@@ -1,0 +1,11 @@
+[package]
+name = "xrtranslate-speaker"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+description = "Native ERes2NetV2 speaker embeddings and bounded online speaker tracking."
+
+[dependencies]
+ndarray = "0.16"
+ort = { version = "=2.0.0-rc.10", features = ["ndarray"] }

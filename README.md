@@ -1,96 +1,92 @@
-# X-Translator
+<p align="center">
+  <img src="rust-client/resources/branding/xrtranslate-logo.png" alt="XRTranslate" width="120" />
+</p>
 
-English | [Chinese version](README_zh.md)
+<h1 align="center">XRTranslate</h1>
 
-X-Translator is a real-time speaker-aware speech-to-speech translation system. It connects streaming ASR, machine translation, and prompt-conditioned TTS through a lightweight runtime controller, so the browser can display source text, translated text, and synthesized target speech during a live session. Try the online demo at [https://translate.sjtuxlance.com/](https://translate.sjtuxlance.com/).
+<p align="center">
+  <strong>为 VRChat 提供实时字幕与双向语音翻译</strong>
+</p>
 
-The current release includes the local demo and backend service adapters. Evaluation code will be released later.
+<p align="center">
+  <b>中文</b> • <a href="README_EN.md">English</a>
+</p>
 
-## Architecture
+<p align="center">
+  <a href="#使用指南">使用指南</a> •
+  <a href="#常用位置">常用位置</a> •
+  <a href="#citation">Citation</a> •
+  <a href="#acknowledgements">致谢</a>
+</p>
 
-![X-Translator system architecture](assets/overview.png)
+---
 
-## Runtime Design
+## 使用指南
 
-![ASR pipeline and segment commitment](assets/asr_pipeline.png)
+### 1. 下载并解压
 
-![Speaker prompt manager](assets/speaker_prompt_manager.png)
+从 [Releases](../../releases) 下载 XRTranslate 发布包并解压到固定位置。请保持解压后的目录完整，切勿随意移动 `config.json`、`resources/` 或 `models/` 目录。
 
-## Repository Layout
+### 2. 按首次启动引导完成配置
 
-- `backend/`: FastAPI backend, runtime controller, ASR/MT/TTS clients, and session logic.
-- `frontend/`: Static browser demo UI.
-- `server/`: ASR, MT, and TTS service adapters, setup notes, and tmux launchers.
-- `main.py`: Local application entry point.
-- `config.json`: Default runtime configuration.
-- `start.sh`: Convenience script for launching the demo.
+首次启动时，应用会开启极简引导：
+* **运行时引擎**：可一键自动检测并下载适合当前电脑的 `llama.cpp`，或指定已有 `llama-server.exe`。
+* **模型自动校验**：极简完成模型下载与准备，无需手动分拣解压。
 
-## Environment Setup
+### 3. 开始翻译
 
-```bash
-cd xtranslate
-python -m venv .venv
-source .venv/bin/activate
-pip install -e .
-```
+回到 **翻译** 页面，选择麦克风或系统声音，点击 **开始翻译** 即可。客户端会在需要时自动托管本地后台服务，并在退出时自动关闭。
 
-If you use CUDA 12.4, install the matching PyTorch build:
+---
 
-```bash
-pip install torch==2.6.0+cu124 torchaudio==2.6.0+cu124 torch-complex==0.4.4 --extra-index-url https://download.pytorch.org/whl/cu124
-```
+## 常用位置
 
-## Basic Configuration
+| 项目 | 默认路径 | 说明 |
+| :--- | :--- | :--- |
+| **模型文件** | `models/` | 放置语音识别模型与翻译模型等模型包 |
+| **运行日志** | `runtime/logs/` | 查看后台服务与客户端日志 |
+| **本地服务设置** | `config.json` | 端口、模型及渲染参数配置 |
 
-Edit `config.json` before running the demo. In most cases, only these fields need to be changed:
+### 默认模型的资源占用
 
-- `server.host` and `server.port`: local web server address.
-- `asr.provider`: ASR backend, such as `qwen3`, `sensevoice`, `paraformer`, or `zipformer`.
-- `translation.provider`: MT backend, such as `lmt` or `hunyuan`.
-- `tts.provider`: TTS backend, such as `xvoice` or `index`.
-- Backend service URLs, for example `asr.qwen3_asr_url`, `translation.lmt_url`, and `tts.xvoice_tts_url`.
-- `translation.source_lang` and `translation.target_lang`: source and target language codes.
+以下为默认设置、两个模型均使用显卡运行时的参考值；不同显卡、llama.cpp 版本和设置会有少量差异。
 
-The default configuration assumes local backend services. Start the ASR, MT, and TTS services you select in `config.json` before launching the browser demo.
+| 模型 | 用途 | 文件大小 | 预计显存占用 |
+| :--- | :--- | :--- | :--- |
+| **语音识别模型** | 语音识别 | 约 1.8 GB | 约 2.7 GB |
+| **翻译模型** | 翻译 | 约 1.1 GB | 约 1.4 GB |
 
-See [`server/README.md`](server/README.md) for backend installation and multi-service startup instructions.
+两个模型同时运行时，预计占用约 **4.1 GB** 显存。建议使用 8 GB 或以上显存的显卡，以留出系统和其他程序所需空间。
 
-## Run the Demo
-
-```bash
-bash start.sh
-```
-
-The default local demo URL is:
-
-```text
-http://0.0.0.0:7654
-```
-
-## TODO
-
-- [x] Release demo code.
-- [x] Release server adapters and launchers.
-- [ ] Release evaluation code.
-- [x] Release paper.
+---
 
 ## Citation
 
-
 ```bibtex
 @misc{zhao2026xtranslatorrealtimemultilingualspeakeraware,
-      title={X-Translator: A Real-Time Multilingual Speaker-Aware Speech-to-Speech Translation System}, 
+      title={X-Translator: A Real-Time Multilingual Speaker-Aware Speech-to-Speech Translation System},
       author={Yuxiang Zhao and Yichi Zhang and Yanjie An and Yanqiao Zhu and Zhanxun Liu and Yushen Chen and Qixi Zheng and Haina Zhu and Yunchong Xiao and Keqi Deng and Shuai Fan and Kai Yu and Xie Chen},
       year={2026},
       eprint={2607.17544},
       archivePrefix={arXiv},
       primaryClass={eess.AS},
-      url={https://arxiv.org/abs/2607.17544}, 
+      url={https://arxiv.org/abs/2607.17544},
 }
 ```
 
+---
+
 ## Acknowledgements
 
-We thank [XTalk](https://github.com/xcc-zach/xtalk), [X-ASR](https://github.com/Gilgamesh-J/X-ASR), [Qwen3-ASR](https://github.com/QwenLM/Qwen3-ASR), [Paraformer](https://github.com/modelscope/FunASR), [SenseVoice](https://github.com/FunAudioLLM/SenseVoice), [NiuTrans LMT](https://github.com/NiuTrans/LMT), [Hunyuan-MT](https://github.com/Tencent-Hunyuan/Hunyuan-MT), [X-Voice](https://github.com/sunnyxrxrx/X-Voice), [IndexTTS](https://github.com/index-tts/index-tts), and [OpenSTBench](https://github.com/sjtuayj/OpenSTBench) for their contributions to the broader speech translation ecosystem.
+特别感谢原始项目 [X-Translator](https://github.com/zhaoyx239/X-Translator) 及其作者团队的卓越贡献。
 
-X-Translator code is released under the MIT License. Third-party modules, models, and services used with this project remain governed by their original licenses.
+同时感谢 [XTalk](https://github.com/xcc-zach/xtalk)、[X-ASR](https://github.com/Gilgamesh-J/X-ASR)、[Paraformer](https://github.com/modelscope/FunASR)、[SenseVoice](https://github.com/FunAudioLLM/SenseVoice)、[NiuTrans LMT](https://github.com/NiuTrans/LMT)、[Hunyuan-MT](https://github.com/Tencent-Hunyuan/Hunyuan-MT)、[X-Voice](https://github.com/sunnyxrxrx/X-Voice)、[IndexTTS](https://github.com/index-tts/index-tts) 与 [OpenSTBench](https://github.com/sjtuayj/OpenSTBench)。
+
+## License
+
+本项目包含采用不同开源许可证发布的代码：
+
+- 原项目 X-Translator 相关代码沿用 [MIT License](LICENSE-MIT)。
+- Rust 原生客户端及新增代码采用 [GNU Affero General Public License v3.0 (AGPL-3.0)](LICENSE)。
+
+具体许可范围以仓库中的许可证文件及对应源码为准。

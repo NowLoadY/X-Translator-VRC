@@ -1,0 +1,106 @@
+use std::{error::Error, fmt};
+
+/// A transport failure before an HTTP response was received.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct TransportError {
+    /// Short machine-readable classification such as `timeout` or `connect`.
+    pub kind: String,
+    /// Human-readable diagnostic suitable for a backend error event.
+    pub message: String,
+}
+
+impl TransportError {
+    pub fn new(kind: impl Into<String>, message: impl Into<String>) -> Self {
+        Self {
+            kind: kind.into(),
+            message: message.into(),
+        }
+    }
+}
+
+impl fmt::Display for TransportError {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(formatter, "{}: {}", self.kind, self.message)
+    }
+}
+
+impl Error for TransportError {}
+
+/// A structured, user-readable failure returned by an inference adapter.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum InferenceError {
+    /// An adapter was constructed with an unusable value.
+    InvalidConfiguration {
+        field: &'static str,
+        message: String,
+    },
+    /// PCM16 input cannot be represented in a WAV container.
+    InvalidAudio { message: String },
+    /// The HTTP client did not receive a response.
+    Transport {
+        endpoint: String,
+        source: TransportError,
+    },
+    /// The service returned a non-success status.
+    HttpStatus {
+        endpoint: String,
+        status: u16,
+        body_preview: String,
+    },
+    /// The service response was not an OpenAI chat-completions document.
+    InvalidResponse {
+        endpoint: String,
+        message: String,
+        body_preview: String,
+    },
+    /// The model completed the request but produced no usable text.
+    EmptyOutput { operation: &'static str },
+}
+
+impl fmt::Display for InferenceError {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::InvalidConfiguration { field, message } => {
+                write!(formatter, "invalid {field}: {message}")
+            }
+            Self::InvalidAudio { message } => write!(formatter, "invalid PCM16 audio: {message}"),
+            Self::Transport { endpoint, source } => {
+                write!(
+                    formatter,
+                    "inference request to {endpoint} failed: {source}"
+                )
+            }
+            Self::HttpStatus {
+                endpoint,
+                status,
+                body_preview,
+            } => write!(
+                formatter,
+                "inference request to {endpoint} returned HTTP {status}: {body_preview}"
+            ),
+            Self::InvalidResponse {
+                endpoint,
+                message,
+                body_preview,
+            } => write!(
+                formatter,
+                "invalid inference response from {endpoint}: {message} ({body_preview})"
+            ),
+            Self::EmptyOutput { operation } => {
+                write!(formatter, "{operation} completed without usable text")
+            }
+        }
+    }
+}
+
+impl Error for InferenceError {}
+
+pub(crate) fn preview(body: &str) -> String {
+    const LIMIT: usize = 512;
+    let normalized = body.split_whitespace().collect::<Vec<_>>().join(" ");
+    if normalized.chars().count() <= LIMIT {
+        return normalized;
+    }
+    let prefix = normalized.chars().take(LIMIT).collect::<String>();
+    format!("{prefix}…")
+}

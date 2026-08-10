@@ -1,0 +1,16 @@
+[package]
+name = "xrtranslate-inference"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+description = "llama.cpp and OpenAI-compatible inference adapters for XRTranslate."
+
+[dependencies]
+base64 = "0.22.1"
+reqwest = { version = "0.13.4", features = ["json"] }
+serde = { version = "1.0.229", features = ["derive"] }
+serde_json = "1.0.151"
+
+[dev-dependencies]
+tokio = { version = "1.47.1", features = ["macros", "rt-multi-thread"] }

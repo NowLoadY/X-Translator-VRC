@@ -1,65 +1,107 @@
 {
+  "asr": {
+    "provider": "qwen3-gguf",
+    "providers": {
+      "qwen3-gguf": {
+        "model_asset": "qwen3-asr-gguf",
+        "prompt_field": "prompt",
+        "supports_language": true,
+        "supports_prompt": true,
+        "url": "http://127.0.0.1:8001/v1/chat/completions"
+      }
+    },
+    "vad_adaptive_after_ms": 4000,
+    "vad_adaptive_silence_ms": 128,
+    "vad_max_utterance_ms": 8000,
+    "vad_overlap_ms": 256,
+    "vad_silence_ms": 320,
+    "vad_threshold": 0.6
+  },
+  "audio": {
+    "pre_buffer_frames": 20,
+    "sample_rate": 16000,
+    "tts_sample_rate": 48000
+  },
+  "frontend": {
+    "show_speaker": false
+  },
+  "model_manager": {
+    "hunyuan_gguf_repo": "tencent/Hy-MT2-1.8B-GGUF",
+    "llama_cpp": {
+      "downloads": [
+        {
+          "name": "llama-b10333-bin-win-cpu-x64.zip",
+          "url": "https://github.com/ggml-org/llama.cpp/releases/download/b10333/llama-b10333-bin-win-cpu-x64.zip"
+        },
+        {
+          "name": "llama-b10333-bin-win-cuda-12.4-x64.zip",
+          "url": "https://github.com/ggml-org/llama.cpp/releases/download/b10333/llama-b10333-bin-win-cuda-12.4-x64.zip"
+        },
+        {
+          "name": "cudart-llama-bin-win-cuda-12.4-x64.zip",
+          "url": "https://github.com/ggml-org/llama.cpp/releases/download/b10333/cudart-llama-bin-win-cuda-12.4-x64.zip"
+        },
+        {
+          "name": "llama-b10333-bin-win-cuda-13.3-x64.zip",
+          "url": "https://github.com/ggml-org/llama.cpp/releases/download/b10333/llama-b10333-bin-win-cuda-13.3-x64.zip"
+        },
+        {
+          "name": "cudart-llama-bin-win-cuda-13.3-x64.zip",
+          "url": "https://github.com/ggml-org/llama.cpp/releases/download/b10333/cudart-llama-bin-win-cuda-13.3-x64.zip"
+        }
+      ],
+      "release": "b10333",
+      "release_page": "https://github.com/ggml-org/llama.cpp/releases/tag/b10333"
+    },
+    "llama_server_path": "D:\\app_install_path\\AI\\llama.cpp\\llama-server.exe"
+  },
+  "osc": {
+    "enabled": true,
+    "history_ttl_seconds": 15.0,
+    "ip": "127.0.0.1",
+    "listen_port": 9001,
+    "max_text_length": 144,
+    "send_port": 9000
+  },
+  "prompt_context": {
+    "enabled": true,
+    "max_entries": 6,
+    "translation_max_chars": 600
+  },
   "server": {
     "host": "0.0.0.0",
     "port": 7654
   },
-  "audio": {
-    "sample_rate": 16000,
-    "tts_sample_rate": 48000,
-    "pre_buffer_frames": 20
-  },
-  "asr": {
-    "provider": "qwen3",
-    "qwen3_asr_url": "http://localhost:8001/v1/recognize",
-    "zipformer_server_uri": "ws://127.0.0.1:8765",
-    "zipformer_chunk_size": 7680,
-    "zipformer_window_seconds": 3.2,
-    "zipformer_init_turn_seconds": 1.6,
-    "zipformer_use_ctpunc": false,
-    "paraformer_model": "iic/speech_paraformer-large-vad-punc_asr_nat-zh-cn-16k-common-vocab8404-pytorch",
-    "paraformer_hub": "ms",
-    "sensevoice_language": "zh",
-    "sensevoice_device": "cuda",
-    "chunk_seconds": 1.6,
-    "paraformer_chunk_size": 2560,
-    "paraformer_window_seconds": 3.2,
-    "paraformer_init_turn_seconds": 1.6,
-    "paraformer_device": "cuda"
-  },
-  "translation": {
-    "provider": "lmt",
-    "hunyuan_url": "http://localhost:8000/v1/chat/completions",
-    "lmt_url": "http://localhost:8002/v1/chat/completions",
-    "model": "",
-    "max_tokens": 256,
-    "source_lang": "zh",
-    "target_lang": "en",
-    "emit_min_chars": 6,
-    "emit_interval_seconds": 0.8
-  },
-  "tts": {
-    "index_tts_url": "http://localhost:11996/tts_url",
-    "omni_tts_url": "http://localhost:11997/synthesize",
-    "xvoice_tts_url": "http://localhost:11998/synthesize",
-    "provider": "xvoice",
-    "clone_window_seconds": 6.0,
-    "speaker_prompt_enabled": true,
-    "speaker_embedding_provider": "modelscope_campplus",
-    "speaker_embedding_model": "iic/speech_campplus_sv_zh-cn_16k-common",
-    "speaker_embedding_window_seconds": 1.0,
-    "speaker_embedding_hop_seconds": 0.5,
-    "speaker_prompt_min_seconds": 1.0,
-    "speaker_prompt_max_seconds": 6.0,
-    "speaker_vad_frame_ms": 40,
-    "speaker_silence_dbfs": -42.0,
-    "speaker_vad_margin_db": 10.0,
-    "speaker_change_threshold": 0.45
+  "speaker": {
+    "enabled": true,
+    "intra_threads": 2,
+    "max_speakers": 8,
+    "min_utterance_ms": 500,
+    "model_path": "models/3D-Speaker-ERes2NetV2/speaker_embedding.onnx",
+    "same_speaker_hysteresis": 0.04,
+    "similarity_threshold": 0.62
   },
   "storage": {
-    "session_audio_dir": "xtranslate/runtime/session_audio",
-    "log_dir": "xtranslate/runtime/logs"
+    "log_dir": "runtime/logs"
   },
-  "frontend": {
-    "show_speaker": false
+  "translation": {
+    "emit_interval_seconds": 0.8,
+    "emit_min_chars": 6,
+    "provider": "hunyuan",
+    "providers": {
+      "hunyuan": {
+        "max_tokens": 256,
+        "model": "Hy-MT2",
+        "model_asset": "hy-mt2",
+        "supports_prompt_context": true,
+        "url": "http://127.0.0.1:8002/v1/chat/completions"
+      }
+    },
+    "source_lang": "auto",
+    "target_lang": "zh,en"
+  },
+  "tts": {
+    "provider": "none",
+    "providers": {}
   }
 }

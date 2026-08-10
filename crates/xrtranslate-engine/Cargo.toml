@@ -1,0 +1,8 @@
+[package]
+name = "xrtranslate-engine"
+version.workspace = true
+edition = "2024"
+license.workspace = true
+repository.workspace = true
+
+[dependencies]
