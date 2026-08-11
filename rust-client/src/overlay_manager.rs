@@ -3,8 +3,8 @@ use std::process::{Child, ChildStdin, Command, Stdio};
 use std::thread;
 
 use crate::overlay_ipc::{OverlayEvent, OverlayState};
-use std::sync::mpsc::{channel, Receiver};
 use log::{error, info, warn};
+use std::sync::mpsc::{Receiver, channel};
 
 pub struct OverlayManager {
     child: Option<Child>,
@@ -49,8 +49,14 @@ impl OverlayManager {
             }
         };
 
-        let stdin = child.stdin.take().expect("Failed to open stdin for overlay");
-        let stdout = child.stdout.take().expect("Failed to open stdout for overlay");
+        let stdin = child
+            .stdin
+            .take()
+            .expect("Failed to open stdin for overlay");
+        let stdout = child
+            .stdout
+            .take()
+            .expect("Failed to open stdout for overlay");
 
         self.child = Some(child);
         self.stdin = Some(stdin);

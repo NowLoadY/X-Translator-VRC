@@ -4,6 +4,7 @@ members = [
     "rust-client",
     "crates/xrtranslate-protocol",
     "crates/xrtranslate-config",
+    "crates/xrtranslate-download",
     "crates/xrtranslate-engine",
     "crates/xrtranslate-inference",
     "crates/xrtranslate-assets",
@@ -16,7 +17,7 @@ members = [
 ]
 
 [workspace.package]
-version = "0.1.0"
+version = "0.2.0"
 edition = "2024"
 license = "AGPL-3.0-only"
 repository = "https://github.com/NowLoadY/XRTranslate"

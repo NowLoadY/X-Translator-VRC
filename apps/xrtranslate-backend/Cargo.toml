@@ -17,6 +17,8 @@ tracing = "0.1.41"
 tracing-subscriber = { version = "0.3.20", features = ["env-filter"] }
 url = "2.5.8"
 xrtranslate-assets = { path = "../../crates/xrtranslate-assets" }
+xr-corpus-client = { path = "../../XR-Corpus/crates/client" }
+xr-corpus-protocol = { path = "../../XR-Corpus/crates/protocol" }
 xrtranslate-config = { path = "../../crates/xrtranslate-config" }
 xrtranslate-engine = { path = "../../crates/xrtranslate-engine" }
 xrtranslate-inference = { path = "../../crates/xrtranslate-inference" }

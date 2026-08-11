@@ -251,7 +251,7 @@ pub fn format_chatbox_history_preview(
             source: s.trim().into(),
             translated: t.trim().into(),
             speaker_id: String::new(),
-            timestamp: now,
+            expires_at: now + Duration::from_secs_f64(settings.history_ttl_seconds),
         })
         .collect::<Vec<_>>();
     build_chatbox_text(&history, None, settings, metrics)
@@ -262,7 +262,7 @@ struct HistoryMessage {
     source: String,
     translated: String,
     speaker_id: String,
-    timestamp: Instant,
+    expires_at: Instant,
 }
 struct QueuedMessage {
     text: String,
@@ -277,6 +277,8 @@ enum Command {
         translated: String,
         speaker_id: String,
         ongoing: bool,
+        /// Optional lifetime for this message.
+        ttl: Option<Duration>,
     },
     Clear,
     Update(OscSettings),
@@ -301,6 +303,24 @@ impl OscHandle {
             translated: translated.trim().into(),
             speaker_id: speaker_id.trim().into(),
             ongoing,
+            ttl: None,
+        });
+    }
+    #[allow(dead_code)]
+    pub fn add_message_with_ttl(
+        &self,
+        source: &str,
+        translated: &str,
+        speaker_id: &str,
+        ongoing: bool,
+        ttl: Duration,
+    ) {
+        let _ = self.tx.send(Command::Message {
+            source: source.trim().into(),
+            translated: translated.trim().into(),
+            speaker_id: speaker_id.trim().into(),
+            ongoing,
+            ttl: Some(ttl),
         });
     }
     pub fn clear_chatbox(&self) {
@@ -314,14 +334,14 @@ struct RuntimeStatus {
     last_error: Option<String>,
     chatbox_text: String,
     chatbox_typing: bool,
-    chatbox_expires_at: Option<Instant>,
+    next_message_expires_at: Option<Instant>,
 }
 
 #[derive(Clone, Debug, Default)]
 pub struct ChatboxPreview {
     pub text: String,
     pub typing: bool,
-    pub expires_in: Option<Duration>,
+    pub next_message_expires_in: Option<Duration>,
 }
 
 /// Owns the VRChat OSC UDP listener and a single coalescing chatbox writer.
@@ -379,8 +399,8 @@ impl OscManager {
         ChatboxPreview {
             text: status.chatbox_text.clone(),
             typing: status.chatbox_typing,
-            expires_in: status
-                .chatbox_expires_at
+            next_message_expires_in: status
+                .next_message_expires_at
                 .map(|expires_at| expires_at.saturating_duration_since(Instant::now())),
         }
     }
@@ -395,9 +415,14 @@ impl OscManager {
     }
     pub fn update_settings(&mut self, settings: OscSettings) -> Result<(), String> {
         settings.validate()?;
+        let listener_changed = listener_config_changed(&self.settings, &settings);
         self.settings = settings.clone();
         let _ = self.tx.send(Command::Update(settings));
-        self.restart_listener()
+        if listener_changed {
+            self.restart_listener()
+        } else {
+            Ok(())
+        }
     }
     pub fn shutdown(&mut self) {
         self.clear_chatbox();
@@ -525,7 +550,7 @@ fn dispatch_loop(
         let wait = dispatch_wait(
             pending.as_ref(),
             last_send,
-            next_content_expiry(&history, live.as_ref(), settings.history_ttl_seconds),
+            next_content_expiry(&history, live.as_ref()),
         );
         match rx.recv_timeout(wait) {
             Ok(Command::Message {
@@ -533,14 +558,18 @@ fn dispatch_loop(
                 translated,
                 speaker_id,
                 ongoing,
+                ttl,
             }) if settings.enabled => {
                 let now = Instant::now();
-                expire_chatbox_entries(&mut history, &mut live, now, settings.history_ttl_seconds);
+                expire_chatbox_entries(&mut history, &mut live, now);
                 let entry = HistoryMessage {
                     source,
                     translated,
                     speaker_id,
-                    timestamp: now,
+                    expires_at: now
+                        + ttl.unwrap_or_else(|| {
+                            Duration::from_secs_f64(settings.history_ttl_seconds)
+                        }),
                 };
                 if render_entry(&entry, &settings).is_empty() {
                     continue;
@@ -582,12 +611,7 @@ fn dispatch_loop(
                     last_send = Instant::now();
                 }
                 settings = updated;
-                expire_chatbox_entries(
-                    &mut history,
-                    &mut live,
-                    Instant::now(),
-                    settings.history_ttl_seconds,
-                );
+                expire_chatbox_entries(&mut history, &mut live, Instant::now());
                 if settings.enabled {
                     let metrics = monitor.snapshot();
                     queue_message(
@@ -614,12 +638,7 @@ fn dispatch_loop(
             }
             Err(crossbeam_channel::RecvTimeoutError::Timeout) => {
                 let now = Instant::now();
-                if expire_chatbox_entries(
-                    &mut history,
-                    &mut live,
-                    now,
-                    settings.history_ttl_seconds,
-                ) {
+                if expire_chatbox_entries(&mut history, &mut live, now) {
                     let metrics = monitor.snapshot();
                     queue_message(
                         &mut pending,
@@ -702,7 +721,7 @@ fn send_message(settings: &OscSettings, message: &QueuedMessage, status: &Mutex<
     let mut runtime = status.lock();
     runtime.chatbox_text.clone_from(&message.text);
     runtime.chatbox_typing = message.typing;
-    runtime.chatbox_expires_at = message.expires_at;
+    runtime.next_message_expires_at = message.expires_at;
 }
 
 fn build_queued_message(
@@ -719,7 +738,7 @@ fn build_queued_message(
         typing,
         notify,
         final_priority,
-        expires_at: next_content_expiry(history, live, settings.history_ttl_seconds),
+        expires_at: next_content_expiry(history, live),
     }
 }
 
@@ -742,29 +761,29 @@ fn dispatch_wait(
 fn next_content_expiry(
     history: &[HistoryMessage],
     live: Option<&HistoryMessage>,
-    ttl_seconds: f64,
 ) -> Option<Instant> {
-    let ttl = Duration::from_secs_f64(ttl_seconds);
     history
         .iter()
         .chain(live)
-        .filter_map(|entry| entry.timestamp.checked_add(ttl))
+        .map(|entry| entry.expires_at)
         .min()
+}
+
+fn listener_config_changed(previous: &OscSettings, updated: &OscSettings) -> bool {
+    previous.enabled != updated.enabled
+        || previous.ip != updated.ip
+        || previous.listen_port != updated.listen_port
 }
 
 fn expire_chatbox_entries(
     history: &mut Vec<HistoryMessage>,
     live: &mut Option<HistoryMessage>,
     now: Instant,
-    ttl_seconds: f64,
 ) -> bool {
-    let ttl = Duration::from_secs_f64(ttl_seconds);
     let previous_len = history.len();
-    history.retain(|entry| now.saturating_duration_since(entry.timestamp) < ttl);
+    history.retain(|entry| now < entry.expires_at);
     let history_changed = history.len() != previous_len;
-    let live_expired = live
-        .as_ref()
-        .is_some_and(|entry| now.saturating_duration_since(entry.timestamp) >= ttl);
+    let live_expired = live.as_ref().is_some_and(|entry| now >= entry.expires_at);
     if live_expired {
         *live = None;
     }
@@ -775,7 +794,7 @@ fn clear_runtime_preview(status: &Mutex<RuntimeStatus>) {
     let mut runtime = status.lock();
     runtime.chatbox_text.clear();
     runtime.chatbox_typing = false;
-    runtime.chatbox_expires_at = None;
+    runtime.next_message_expires_at = None;
 }
 
 fn build_chatbox_text(
@@ -789,6 +808,11 @@ fn build_chatbox_text(
         entries.pop_front();
     }
 
+    // Header and footer exist only while live messages remain.
+    if entries.is_empty() {
+        return String::new();
+    }
+
     let prefix = settings.header_config.render_text(metrics);
     let suffix = settings.footer_config.render_text(metrics);
 
@@ -799,22 +823,7 @@ fn build_chatbox_text(
             .filter(|s| !s.is_empty())
             .collect::<Vec<_>>();
 
-        let mut combined = rendered_entries.join("\n");
-
-        if !prefix.is_empty() {
-            combined = if combined.is_empty() {
-                prefix.clone()
-            } else {
-                format!("{}\n{}", prefix, combined)
-            };
-        }
-        if !suffix.is_empty() {
-            combined = if combined.is_empty() {
-                suffix.clone()
-            } else {
-                format!("{}\n{}", combined, suffix)
-            };
-        }
+        let combined = compose_chatbox(&prefix, &rendered_entries.join("\n"), &suffix);
 
         if combined.chars().count() <= settings.max_text_length {
             return combined;
@@ -822,21 +831,19 @@ fn build_chatbox_text(
         if entries.len() > 1 {
             entries.pop_front();
         } else {
-            return trim_entry(first, settings);
+            return fit_single_entry(first, &prefix, &suffix, settings);
         }
     }
 
-    let mut result = String::new();
-    if !prefix.is_empty() {
-        result.push_str(&prefix);
-    }
-    if !suffix.is_empty() {
-        if !result.is_empty() {
-            result.push('\n');
-        }
-        result.push_str(&suffix);
-    }
-    result
+    String::new()
+}
+
+fn compose_chatbox(prefix: &str, content: &str, suffix: &str) -> String {
+    [prefix, content, suffix]
+        .into_iter()
+        .filter(|part| !part.is_empty())
+        .collect::<Vec<_>>()
+        .join("\n")
 }
 
 fn render_entry(entry: &HistoryMessage, settings: &OscSettings) -> String {
@@ -893,13 +900,36 @@ fn render_entry(entry: &HistoryMessage, settings: &OscSettings) -> String {
     }
 }
 
-fn trim_entry(entry: &HistoryMessage, settings: &OscSettings) -> String {
+fn fit_single_entry(
+    entry: &HistoryMessage,
+    prefix: &str,
+    suffix: &str,
+    settings: &OscSettings,
+) -> String {
     let rendered = render_entry(entry, settings);
     let limit = settings.max_text_length;
-    if rendered.chars().count() <= limit {
-        return rendered;
+    let mut prefix = prefix;
+    let mut suffix = suffix;
+
+    // Preserve speech before decorations when space is limited.
+    while decoration_length(prefix, suffix) >= limit {
+        if !suffix.is_empty() {
+            suffix = "";
+        } else if !prefix.is_empty() {
+            prefix = "";
+        } else {
+            break;
+        }
     }
-    trim_text(&rendered, limit)
+    let content_limit = limit.saturating_sub(decoration_length(prefix, suffix));
+    let content = trim_text(&rendered, content_limit);
+    compose_chatbox(prefix, &content, suffix)
+}
+
+fn decoration_length(prefix: &str, suffix: &str) -> usize {
+    let text = prefix.chars().count() + suffix.chars().count();
+    let separators = usize::from(!prefix.is_empty()) + usize::from(!suffix.is_empty());
+    text + separators
 }
 
 fn trim_text(text: &str, limit: usize) -> String {
@@ -929,12 +959,25 @@ fn trim_text(text: &str, limit: usize) -> String {
 mod tests {
     use super::*;
 
-    fn history_message(timestamp: Instant, text: &str) -> HistoryMessage {
+    #[test]
+    fn display_only_updates_do_not_restart_the_osc_listener() {
+        let previous = OscSettings::default();
+        let mut display_update = previous.clone();
+        display_update.show_speaker_number = true;
+        display_update.history_ttl_seconds = 20.0;
+        assert!(!listener_config_changed(&previous, &display_update));
+
+        let mut network_update = previous.clone();
+        network_update.listen_port += 1;
+        assert!(listener_config_changed(&previous, &network_update));
+    }
+
+    fn history_message(expires_at: Instant, text: &str) -> HistoryMessage {
         HistoryMessage {
             source: text.into(),
             translated: String::new(),
             speaker_id: String::new(),
-            timestamp,
+            expires_at,
         }
     }
 
@@ -973,20 +1016,19 @@ mod tests {
     #[test]
     fn ttl_expiration_removes_final_history_and_abandoned_live_text() {
         let started = Instant::now();
-        let mut history = vec![history_message(started, "final")];
-        let mut live = Some(history_message(started, "partial"));
+        let expires_at = started + Duration::from_secs(1);
+        let mut history = vec![history_message(expires_at, "final")];
+        let mut live = Some(history_message(expires_at, "partial"));
 
         assert!(!expire_chatbox_entries(
             &mut history,
             &mut live,
             started + Duration::from_millis(999),
-            1.0,
         ));
         assert!(expire_chatbox_entries(
             &mut history,
             &mut live,
             started + Duration::from_secs(1),
-            1.0,
         ));
         assert!(history.is_empty());
         assert!(live.is_none());
@@ -996,15 +1038,74 @@ mod tests {
     fn next_expiry_tracks_the_oldest_visible_entry() {
         let started = Instant::now();
         let history = vec![
-            history_message(started, "oldest"),
-            history_message(started + Duration::from_secs(2), "newer"),
+            history_message(started + Duration::from_secs(10), "oldest"),
+            history_message(started + Duration::from_secs(12), "newer"),
         ];
-        let live = history_message(started + Duration::from_secs(3), "live");
+        let live = history_message(started + Duration::from_secs(13), "live");
 
         assert_eq!(
-            next_content_expiry(&history, Some(&live), 10.0),
+            next_content_expiry(&history, Some(&live)),
             Some(started + Duration::from_secs(10)),
         );
+    }
+
+    #[test]
+    fn entries_expire_independently_and_banners_clear_with_the_last_message() {
+        let started = Instant::now();
+        let mut history = vec![
+            history_message(started + Duration::from_secs(1), "old"),
+            history_message(started + Duration::from_secs(3), "new"),
+        ];
+        let mut live = None;
+        let mut settings = OscSettings::default();
+        settings.header_config = BannerConfig {
+            content_type: BannerContentType::CustomText,
+            custom_text: "header".into(),
+            show_device_name: false,
+        };
+        let metrics = crate::sys_info::SystemMetrics::default();
+
+        assert!(expire_chatbox_entries(
+            &mut history,
+            &mut live,
+            started + Duration::from_secs(1),
+        ));
+        assert_eq!(history.len(), 1);
+        assert!(build_chatbox_text(&history, None, &settings, &metrics).contains("new"));
+
+        assert!(expire_chatbox_entries(
+            &mut history,
+            &mut live,
+            started + Duration::from_secs(3),
+        ));
+        assert!(build_chatbox_text(&history, None, &settings, &metrics).is_empty());
+    }
+
+    #[test]
+    fn long_single_message_is_trimmed_without_silently_dropping_banners() {
+        let now = Instant::now();
+        let history = vec![history_message(now + Duration::from_secs(10), "0123456789")];
+        let mut settings = OscSettings::default();
+        settings.max_text_length = 12;
+        settings.header_config = BannerConfig {
+            content_type: BannerContentType::CustomText,
+            custom_text: "H".into(),
+            show_device_name: false,
+        };
+        settings.footer_config = BannerConfig {
+            content_type: BannerContentType::CustomText,
+            custom_text: "F".into(),
+            show_device_name: false,
+        };
+
+        let text = build_chatbox_text(
+            &history,
+            None,
+            &settings,
+            &crate::sys_info::SystemMetrics::default(),
+        );
+        assert_eq!(text, "H\n23456789\nF");
+        assert_eq!(text.chars().count(), settings.max_text_length);
     }
 
     #[test]
@@ -1050,6 +1151,7 @@ mod tests {
             translated: "你好".into(),
             speaker_id: "speaker-01".into(),
             ongoing: false,
+            ttl: None,
         })
         .unwrap();
         assert_eq!(

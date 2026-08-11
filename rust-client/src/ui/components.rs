@@ -31,27 +31,52 @@ pub fn section<R>(ui: &mut Ui, title: &str, add_contents: impl FnOnce(&mut Ui) -
 }
 
 pub fn animated_button(ui: &mut Ui, text: &str) -> egui::Response {
+    animated_button_enabled(ui, text, true)
+}
+
+/// Formats a byte count for display.
+pub fn format_file_size(bytes: u64) -> String {
+    const UNITS: [&str; 4] = ["B", "KiB", "MiB", "GiB"];
+    let mut value = bytes as f64;
+    let mut unit = 0;
+    while value >= 1024.0 && unit + 1 < UNITS.len() {
+        value /= 1024.0;
+        unit += 1;
+    }
+    if unit == 0 {
+        format!("{bytes} {}", UNITS[unit])
+    } else {
+        format!("{value:.1} {}", UNITS[unit])
+    }
+}
+
+pub fn animated_button_enabled(ui: &mut Ui, text: &str, enabled: bool) -> egui::Response {
     let id = ui.make_persistent_id(text);
     let is_hovered = ui.memory(|m| m.data.get_temp::<bool>(id).unwrap_or(false));
-    
+
     let hover_factor = crate::ui::animation::AnimationSystem::animate_bool(
         ui.ctx(),
         id.with("anim"),
-        is_hovered,
+        is_hovered && enabled,
         0.15,
     );
-    let fill = crate::ui::animation::AnimationSystem::lerp_color(
-        Color32::from_rgb(241, 245, 249),
-        Color32::from_rgb(226, 232, 240),
-        hover_factor,
-    );
-    
-    let button = egui::Button::new(egui::RichText::new(text).color(crate::ui::theme::text_normal()))
-        .fill(fill)
-        .min_size(Vec2::new(80.0, 30.0))
-        .corner_radius(CornerRadius::same(8));
-        
-    let response = ui.add(button);
+    let fill = if enabled {
+        crate::ui::animation::AnimationSystem::lerp_color(
+            Color32::from_rgb(241, 245, 249),
+            Color32::from_rgb(226, 232, 240),
+            hover_factor,
+        )
+    } else {
+        Color32::from_rgb(241, 245, 249)
+    };
+
+    let button =
+        egui::Button::new(egui::RichText::new(text).color(crate::ui::theme::text_normal()))
+            .fill(fill)
+            .min_size(Vec2::new(80.0, 30.0))
+            .corner_radius(CornerRadius::same(8));
+
+    let response = ui.add_enabled(enabled, button);
     ui.memory_mut(|m| m.data.insert_temp(id, response.hovered()));
     response
 }
@@ -63,7 +88,7 @@ pub fn primary_button(ui: &mut Ui, text: &str) -> egui::Response {
 pub fn primary_button_enabled(ui: &mut Ui, text: &str, enabled: bool) -> egui::Response {
     let id = ui.make_persistent_id(text);
     let is_hovered = ui.memory(|m| m.data.get_temp::<bool>(id).unwrap_or(false));
-    
+
     let hover_factor = crate::ui::animation::AnimationSystem::animate_bool(
         ui.ctx(),
         id.with("anim"),
@@ -84,7 +109,7 @@ pub fn primary_button_enabled(ui: &mut Ui, text: &str, enabled: bool) -> egui::R
         .fill(fill)
         .min_size(Vec2::new(100.0, 32.0))
         .corner_radius(CornerRadius::same(8));
-        
+
     let response = ui.add_enabled(enabled, button);
     ui.memory_mut(|m| m.data.insert_temp(id, response.hovered()));
     response
@@ -110,11 +135,67 @@ pub fn language_selector(
 }
 
 pub fn danger_button(ui: &mut Ui, text: &str) -> egui::Response {
+    danger_button_enabled(ui, text, true)
+}
+
+pub fn danger_button_enabled(ui: &mut Ui, text: &str, enabled: bool) -> egui::Response {
     let button = egui::Button::new(egui::RichText::new(text).color(Color32::WHITE).strong())
-        .fill(Color32::from_rgb(220, 38, 38)) // Red
+        .fill(if enabled {
+            Color32::from_rgb(220, 38, 38)
+        } else {
+            Color32::from_rgb(254, 202, 202)
+        })
         .min_size(Vec2::new(90.0, 32.0))
         .corner_radius(CornerRadius::same(8));
-    ui.add(button)
+    ui.add_enabled(enabled, button)
+}
+
+/// Adds a widget controlled by feature availability.
+pub fn feature_widget<W: egui::Widget>(
+    ui: &mut Ui,
+    feature: crate::feature_access::Feature,
+    language: crate::i18n::UiLanguage,
+    widget: W,
+) -> egui::Response {
+    let access = crate::feature_access::access(feature);
+    decorate_unavailable(ui.add_enabled(access.available, widget), access, language)
+}
+
+/// Adds a feature-aware checkbox.
+pub fn feature_checkbox(
+    ui: &mut Ui,
+    feature: crate::feature_access::Feature,
+    language: crate::i18n::UiLanguage,
+    checked: &mut bool,
+    text: &str,
+) -> egui::Response {
+    feature_widget(ui, feature, language, egui::Checkbox::new(checked, text))
+}
+
+/// Adds controls governed by one feature.
+pub fn feature_ui<R>(
+    ui: &mut Ui,
+    feature: crate::feature_access::Feature,
+    language: crate::i18n::UiLanguage,
+    add_contents: impl FnOnce(&mut Ui) -> R,
+) -> egui::InnerResponse<R> {
+    let access = crate::feature_access::access(feature);
+    let mut response = ui.add_enabled_ui(access.available, add_contents);
+    response.response = decorate_unavailable(response.response, access, language);
+    response
+}
+
+fn decorate_unavailable(
+    response: egui::Response,
+    access: crate::feature_access::FeatureAccess,
+    language: crate::i18n::UiLanguage,
+) -> egui::Response {
+    match access.unavailable_reason {
+        Some(reason) if !access.available => {
+            response.on_disabled_hover_text(crate::i18n::tr(language, reason))
+        }
+        _ => response,
+    }
 }
 
 /// Rounded file-picker input used wherever a local executable or model path
@@ -216,10 +297,10 @@ pub fn sub_sidebar<T: Copy + PartialEq>(
 ) {
     let width = 175.0;
     let card_id = ui.make_persistent_id("sub_sidebar_layout_measurement");
-    
+
     // Read actual measured header height from memory (defaults to 32.0 on frame 1)
     let header_h = ui.memory(|m| m.data.get_temp::<f32>(card_id).unwrap_or(32.0));
-    
+
     let card_height = ui.available_height().max(240.0);
     let inner_height = card_height - 24.0; // Frame top & bottom inner_margin (12 + 12)
     let count = items.len();
@@ -255,7 +336,10 @@ pub fn sub_sidebar<T: Copy + PartialEq>(
                 ui.add_space(8.0);
 
                 let header_end_y = ui.cursor().top();
-                ui.memory_mut(|m| m.data.insert_temp(card_id, (header_end_y - start_y).max(20.0)));
+                ui.memory_mut(|m| {
+                    m.data
+                        .insert_temp(card_id, (header_end_y - start_y).max(20.0))
+                });
 
                 for (idx, item) in items.iter().enumerate() {
                     if idx > 0 {
@@ -264,16 +348,16 @@ pub fn sub_sidebar<T: Copy + PartialEq>(
 
                     let is_selected = *selected == item.id;
                     let id = ui.make_persistent_id(item.label);
-                    
+
                     let is_hovered = ui.memory(|m| m.data.get_temp::<bool>(id).unwrap_or(false));
-                    
+
                     let select_factor = crate::ui::animation::AnimationSystem::animate_bool(
                         ui.ctx(),
                         id.with("select"),
                         is_selected,
                         0.20,
                     );
-                    
+
                     let hover_factor = crate::ui::animation::AnimationSystem::animate_bool(
                         ui.ctx(),
                         id.with("hover"),
@@ -296,13 +380,13 @@ pub fn sub_sidebar<T: Copy + PartialEq>(
                     } else {
                         Color32::TRANSPARENT
                     };
-                    
+
                     let text_color = crate::ui::animation::AnimationSystem::lerp_color(
                         crate::ui::theme::text_normal(),
                         Color32::from_rgb(37, 99, 235), // Accent Blue
                         select_factor,
                     );
-                    
+
                     let stroke = Stroke::new(
                         1.0,
                         crate::ui::animation::AnimationSystem::lerp_color(
@@ -329,7 +413,8 @@ pub fn sub_sidebar<T: Copy + PartialEq>(
                         .show(ui, |ui| {
                             ui.set_width(ui.available_width());
                             ui.horizontal(|ui| {
-                                let mut rt = egui::RichText::new(&text).size(13.5).color(text_color);
+                                let mut rt =
+                                    egui::RichText::new(&text).size(13.5).color(text_color);
                                 if is_selected {
                                     rt = rt.strong();
                                 }

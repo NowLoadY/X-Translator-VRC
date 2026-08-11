@@ -12,19 +12,20 @@ use std::sync::{
 mod audio;
 mod backend;
 mod client_settings;
+mod feature_access;
 mod i18n;
 mod model_install;
 mod network;
 mod osc;
-mod runtime_install;
-mod service_config;
-mod sys_info;
-pub mod version;
-mod ui;
 mod overlay_ipc;
 mod overlay_manager;
 #[cfg(windows)]
 mod overlay_native;
+mod runtime_install;
+mod service_config;
+mod sys_info;
+mod ui;
+pub mod version;
 
 use audio::{AudioSystem, InputConfigInfo, InputDevice};
 use client_settings::{CaptureSource, ClientSettings};
@@ -36,9 +37,18 @@ use ui::{NavigationState, Page};
 #[derive(Clone, Debug, PartialEq)]
 struct RecognitionHistoryEntry {
     text: String,
+    turn_id: String,
     speaker_id: String,
     source_start_ms: f64,
     source_end_ms: f64,
+    activation_matches: Vec<xrtranslate_protocol::CorpusTermMatch>,
+    context_matches: Vec<xrtranslate_protocol::CorpusTermMatch>,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+struct PendingFinalAsr {
+    text: String,
+    turn_id: String,
 }
 
 #[derive(Clone, Debug, PartialEq)]
@@ -48,9 +58,8 @@ struct TranslationHistoryEntry {
     speaker_id: String,
     source_start_ms: f64,
     source_end_ms: f64,
+    term_matches: Vec<xrtranslate_protocol::CorpusTermMatch>,
 }
-
-
 
 const LANGUAGE_OPTIONS: &[(&str, &str)] = &[
     ("zh", "Chinese"),
@@ -86,8 +95,6 @@ fn route_label(ui_language: UiLanguage, _source: &str, target: &str) -> &'static
     language_label(ui_language, target)
 }
 
-
-
 struct XRTranslateApp {
     audio_system: AudioSystem,
     devices: Vec<InputDevice>,
@@ -103,7 +110,6 @@ struct XRTranslateApp {
     event_tx: Sender<SessionEvent>,
     connection_status: String,
     partial_text: String,
-    pending_final_asr: Option<String>,
     recognition_history: Vec<RecognitionHistoryEntry>,
     translations: Vec<TranslationHistoryEntry>,
     last_error: Option<String>,
@@ -111,6 +117,7 @@ struct XRTranslateApp {
     source_lang: String,
     target_lang: String,
     tts_enabled: bool,
+    speaker_recognition_enabled: bool,
     osc_manager: OscManager,
     osc_draft: OscSettings,
     service_config: service_config::ServiceConfigEditor,
@@ -139,7 +146,7 @@ struct XRTranslateApp {
 struct SharedSessionState {
     connection_status: String,
     partial_text: String,
-    pending_final_asr: Option<String>,
+    pending_final_asr: Vec<PendingFinalAsr>,
     recognition_history: Vec<RecognitionHistoryEntry>,
     translations: Vec<TranslationHistoryEntry>,
     last_error: Option<String>,
@@ -160,8 +167,12 @@ impl Default for XRTranslateApp {
         let osc_manager = OscManager::new(osc_draft.clone());
 
         let selected_input_config = match settings.capture_source {
-            CaptureSource::Microphone => audio_system.input_config(&settings.selected_device_id).ok(),
-            CaptureSource::SystemAudio => audio_system.loopback_config(&settings.selected_loopback_device_id).ok(),
+            CaptureSource::Microphone => {
+                audio_system.input_config(&settings.selected_device_id).ok()
+            }
+            CaptureSource::SystemAudio => audio_system
+                .loopback_config(&settings.selected_loopback_device_id)
+                .ok(),
         };
 
         let shared_session_state = Arc::new(Mutex::new(SharedSessionState {
@@ -170,8 +181,10 @@ impl Default for XRTranslateApp {
         }));
         let overlay_manager = Arc::new(Mutex::new(overlay_manager::OverlayManager::new()));
         let overlay_enabled_atomic = Arc::new(AtomicBool::new(settings.floating_subtitles_enabled));
-        let overlay_max_count_atomic = Arc::new(AtomicUsize::new(settings.floating_subtitles_max_count));
-        let overlay_font_size_atomic = Arc::new(AtomicU32::new(settings.floating_subtitles_font_size as u32));
+        let overlay_max_count_atomic =
+            Arc::new(AtomicUsize::new(settings.floating_subtitles_max_count));
+        let overlay_font_size_atomic =
+            Arc::new(AtomicU32::new(settings.floating_subtitles_font_size as u32));
 
         // Background session event pump thread
         let shared_state_clone = Arc::clone(&shared_session_state);
@@ -187,25 +200,42 @@ impl Default for XRTranslateApp {
                 while let Ok(event) = rx.recv() {
                     let mut state = shared_state_clone.lock().unwrap();
                     match event {
-                        SessionEvent::Connected => state.connection_status = "Connected - listening".into(),
+                        SessionEvent::Connected => {
+                            state.connection_status = "Connected - listening".into()
+                        }
                         SessionEvent::Disconnected(reason) => {
                             state.connection_status = reason;
                             state.is_translating = false;
                         }
                         SessionEvent::Status(status) => state.connection_status = status,
-                        SessionEvent::Asr { kind, text } => {
+                        SessionEvent::Asr {
+                            kind,
+                            text,
+                            turn_id,
+                        } => {
                             if kind == "final" && !text.is_empty() {
-                                state.pending_final_asr = Some(text.clone());
-                                let is_duplicate = state
-                                    .recognition_history
-                                    .last()
-                                    .is_some_and(|entry| entry.text == text && entry.speaker_id.is_empty());
+                                state.pending_final_asr.push(PendingFinalAsr {
+                                    text: text.clone(),
+                                    turn_id: turn_id.clone(),
+                                });
+                                if state.pending_final_asr.len() > 100 {
+                                    state.pending_final_asr.remove(0);
+                                }
+                                let is_duplicate =
+                                    state.recognition_history.last().is_some_and(|entry| {
+                                        entry.text == text
+                                            && entry.turn_id == turn_id
+                                            && entry.speaker_id.is_empty()
+                                    });
                                 if !is_duplicate {
                                     state.recognition_history.push(RecognitionHistoryEntry {
                                         text: text.clone(),
+                                        turn_id,
                                         speaker_id: String::new(),
                                         source_start_ms: 0.0,
                                         source_end_ms: 0.0,
+                                        activation_matches: Vec::new(),
+                                        context_matches: Vec::new(),
                                     });
                                     if state.recognition_history.len() > 100 {
                                         state.recognition_history.remove(0);
@@ -220,6 +250,9 @@ impl Default for XRTranslateApp {
                         }
                         SessionEvent::SourceSegment {
                             text,
+                            activation_matches,
+                            context_matches,
+                            turn_id,
                             speaker_id,
                             source_start_ms,
                             source_end_ms,
@@ -229,19 +262,44 @@ impl Default for XRTranslateApp {
                                 continue;
                             }
                             if segment_index == 1 {
-                                if let Some(pending) = state.pending_final_asr.take()
-                                    && state.recognition_history.last().is_some_and(|entry| {
-                                        entry.speaker_id.is_empty() && entry.text == pending
+                                let pending_index = state
+                                    .pending_final_asr
+                                    .iter()
+                                    .position(|pending| {
+                                        (!turn_id.is_empty() && pending.turn_id == turn_id)
+                                            || (turn_id.is_empty() && pending.turn_id.is_empty())
                                     })
-                                {
-                                    state.recognition_history.pop();
+                                    .or_else(|| {
+                                        state
+                                            .pending_final_asr
+                                            .iter()
+                                            .position(|pending| pending.turn_id.is_empty())
+                                    });
+                                if let Some(pending_index) = pending_index {
+                                    let pending = state.pending_final_asr.remove(pending_index);
+                                    let temporary_index =
+                                        state.recognition_history.iter().rposition(|entry| {
+                                            entry.speaker_id.is_empty()
+                                                && if pending.turn_id.is_empty() {
+                                                    entry.turn_id.is_empty()
+                                                        && entry.text == pending.text
+                                                } else {
+                                                    entry.turn_id == pending.turn_id
+                                                }
+                                        });
+                                    if let Some(temporary_index) = temporary_index {
+                                        state.recognition_history.remove(temporary_index);
+                                    }
                                 }
                             }
                             let entry = RecognitionHistoryEntry {
                                 text,
+                                turn_id,
                                 speaker_id,
                                 source_start_ms,
                                 source_end_ms,
+                                activation_matches,
+                                context_matches,
                             };
                             if state.recognition_history.last() != Some(&entry) {
                                 state.recognition_history.push(entry);
@@ -256,6 +314,7 @@ impl Default for XRTranslateApp {
                             speaker_id,
                             source_start_ms,
                             source_end_ms,
+                            term_matches,
                         } => {
                             state.translations.push(TranslationHistoryEntry {
                                 source,
@@ -263,12 +322,16 @@ impl Default for XRTranslateApp {
                                 speaker_id,
                                 source_start_ms,
                                 source_end_ms,
+                                term_matches,
                             });
                             if state.translations.len() > 100 {
                                 state.translations.remove(0);
                             }
                         }
                         SessionEvent::TtsAudio(_audio) => {}
+                        SessionEvent::BackendError(error) => {
+                            state.last_error = Some(error);
+                        }
                         SessionEvent::Error(error) => {
                             state.last_error = Some(error);
                             state.connection_status = "Connection error".into();
@@ -321,7 +384,6 @@ impl Default for XRTranslateApp {
             event_tx,
             connection_status: "Ready".into(),
             partial_text: String::new(),
-            pending_final_asr: None,
             recognition_history: Vec::new(),
             translations: Vec::new(),
             last_error: None,
@@ -329,6 +391,7 @@ impl Default for XRTranslateApp {
             source_lang: settings.source_lang,
             target_lang: settings.target_lang,
             tts_enabled: settings.tts_enabled,
+            speaker_recognition_enabled: settings.speaker_recognition_enabled,
             osc_manager,
             osc_draft,
             service_config: service_config::ServiceConfigEditor::load(),
@@ -345,7 +408,9 @@ impl Default for XRTranslateApp {
                 collapsed: settings.sidebar_collapsed,
                 page: settings.active_page,
             },
-            mute_self_pauses_translation: Arc::new(AtomicBool::new(settings.mute_self_pauses_translation)),
+            mute_self_pauses_translation: Arc::new(AtomicBool::new(
+                settings.mute_self_pauses_translation,
+            )),
             floating_subtitles_enabled: settings.floating_subtitles_enabled,
             floating_subtitles_max_count: settings.floating_subtitles_max_count,
             floating_subtitles_font_size: settings.floating_subtitles_font_size,
@@ -371,6 +436,7 @@ impl XRTranslateApp {
             source_lang: self.source_lang.clone(),
             target_lang: self.target_lang.clone(),
             tts_enabled: self.tts_enabled,
+            speaker_recognition_enabled: self.speaker_recognition_enabled,
             mute_self_pauses_translation: self.mute_self_pauses_translation.load(Ordering::Relaxed),
             ui_language: self.ui_language,
             first_run: self.first_run,
@@ -397,19 +463,39 @@ impl XRTranslateApp {
         self.save_settings();
     }
 
+    fn set_connection_status(&mut self, status: impl Into<String>) {
+        let status = status.into();
+        self.connection_status.clone_from(&status);
+        if let Ok(mut state) = self.shared_session_state.lock() {
+            state.connection_status = status;
+        }
+    }
+
+    fn set_startup_error(&mut self, status: &str, error: String) {
+        self.set_connection_status(status);
+        self.last_error = Some(error.clone());
+        if let Ok(mut state) = self.shared_session_state.lock() {
+            state.last_error = Some(error);
+            state.is_translating = false;
+        }
+    }
+
     pub fn start(&mut self, ctx: Option<eframe::egui::Context>) {
         if self.backend_start_deadline.is_some() {
             return;
         }
         match self.backend_manager.prepare(&self.server_url) {
             Ok(backend::BackendStart::Ready) => self.start_session(ctx),
-            Ok(backend::BackendStart::Starting) => {
+            Ok(backend::BackendStart::Starting(stage)) => {
                 self.backend_start_deadline =
                     Some(std::time::Instant::now() + std::time::Duration::from_secs(180));
-                self.connection_status = "Starting local backend...".into();
+                self.set_connection_status(stage.message());
                 self.last_error = None;
+                if let Ok(mut state) = self.shared_session_state.lock() {
+                    state.last_error = None;
+                }
             }
-            Err(error) => self.last_error = Some(error),
+            Err(error) => self.set_startup_error("Startup failed", error),
         }
     }
 
@@ -417,40 +503,48 @@ impl XRTranslateApp {
         let (audio_tx, audio_rx) = unbounded();
         match self.start_selected_capture(audio_tx.clone()) {
             Ok(()) => {
+                let tts_handle = crate::feature_access::is_available(
+                    crate::feature_access::Feature::TtsPlayback,
+                )
+                .then(|| self.audio_system.tts_handle())
+                .flatten();
                 let session = start_session(
                     audio_rx,
                     self.event_tx.clone(),
                     self.server_url.clone(),
                     self.source_lang.clone(),
                     self.target_lang.clone(),
+                    self.speaker_recognition_enabled,
                     self.osc_manager.muted_state(),
                     Arc::clone(&self.mute_self_pauses_translation),
                     self.osc_manager.handle(),
-                    self.audio_system.tts_handle(),
+                    tts_handle,
                     ctx,
                 );
-                session.set_tts_enabled(self.tts_enabled);
+                if crate::feature_access::is_available(crate::feature_access::Feature::TtsPlayback)
+                {
+                    session.set_tts_enabled(self.tts_enabled);
+                }
                 self.session = Some(session);
                 self.audio_tx = Some(audio_tx);
                 self.is_translating = true;
                 self.connection_status = "Connecting...".into();
                 self.last_error = None;
                 self.partial_text.clear();
-                self.pending_final_asr = None;
                 self.recognition_history.clear();
                 self.translations.clear();
 
                 if let Ok(mut state) = self.shared_session_state.lock() {
                     state.connection_status = "Connecting...".into();
                     state.partial_text.clear();
-                    state.pending_final_asr = None;
+                    state.pending_final_asr.clear();
                     state.recognition_history.clear();
                     state.translations.clear();
                     state.last_error = None;
                     state.is_translating = true;
                 }
             }
-            Err(error) => self.last_error = Some(error),
+            Err(error) => self.set_startup_error("Audio input failed", error),
         }
     }
 
@@ -463,17 +557,20 @@ impl XRTranslateApp {
                 self.backend_start_deadline = None;
                 self.start_session(ctx);
             }
-            backend::BackendStatus::Starting if std::time::Instant::now() < deadline => {}
-            backend::BackendStatus::Starting => {
+            backend::BackendStatus::Starting(stage) if std::time::Instant::now() < deadline => {
+                self.set_connection_status(stage.message());
+            }
+            backend::BackendStatus::Starting(_) => {
                 self.backend_start_deadline = None;
                 self.backend_manager.shutdown();
-                self.last_error = Some("Backend did not become ready within 180 seconds".into());
-                self.connection_status = "Backend startup timed out".into();
+                self.set_startup_error(
+                    "Startup timed out",
+                    "Local services did not become ready within 180 seconds".into(),
+                );
             }
             backend::BackendStatus::Failed(error) => {
                 self.backend_start_deadline = None;
-                self.last_error = Some(error.clone());
-                self.connection_status = "Backend startup failed".into();
+                self.set_startup_error("Startup failed", error.clone());
                 self.modal_dialog = ui::modal::ModalDialog::error(
                     "Backend Startup Failure",
                     "The native backend process failed to initialize or exited prematurely.",
@@ -593,14 +690,60 @@ impl XRTranslateApp {
     }
 
     fn set_tts_enabled(&mut self, enabled: bool) {
-        self.tts_enabled = enabled;
+        self.tts_enabled = enabled
+            && crate::feature_access::is_available(crate::feature_access::Feature::TtsPlayback);
         self.save_settings();
-        if !enabled {
+        if !self.tts_enabled {
             self.audio_system.clear_tts_playback();
         }
         if let Some(session) = &self.session {
-            session.set_tts_enabled(enabled);
+            session.set_tts_enabled(self.tts_enabled);
         }
+    }
+
+    /// Updates the unified speaker-recognition setting.
+    fn set_osc_speaker_number_enabled(&mut self, enabled: bool) {
+        let enabled = enabled
+            && crate::feature_access::is_available(crate::feature_access::Feature::SpeakerNumbers);
+        self.speaker_recognition_enabled = enabled;
+        self.osc_draft.show_speaker_number = enabled;
+        if let Some(session) = &self.session {
+            session.set_speaker_recognition_enabled(enabled);
+        }
+        match self.osc_manager.update_settings(self.osc_draft.clone()) {
+            Ok(()) => self.last_error = None,
+            Err(error) => self.last_error = Some(error),
+        }
+        self.save_settings();
+    }
+
+    fn set_mute_self_pauses_translation(&mut self, enabled: bool) {
+        let enabled = enabled
+            && crate::feature_access::is_available(crate::feature_access::Feature::MuteSync);
+        self.mute_self_pauses_translation
+            .store(enabled, Ordering::Release);
+        self.save_settings();
+    }
+
+    fn set_floating_subtitles_enabled(&mut self, enabled: bool) {
+        self.floating_subtitles_enabled = enabled
+            && crate::feature_access::is_available(
+                crate::feature_access::Feature::FloatingSubtitles,
+            );
+        self.save_settings();
+    }
+
+    pub(crate) fn clear_history(&mut self) {
+        self.translations.clear();
+        self.recognition_history.clear();
+        self.partial_text.clear();
+        if let Ok(mut state) = self.shared_session_state.lock() {
+            state.translations.clear();
+            state.recognition_history.clear();
+            state.partial_text.clear();
+            state.pending_final_asr.clear();
+        }
+        self.osc_manager.clear_chatbox();
     }
 
     fn stop(&mut self) {
@@ -627,9 +770,12 @@ impl XRTranslateApp {
         }
 
         // Sync atomic settings to background pump thread
-        self.overlay_enabled_atomic.store(self.floating_subtitles_enabled, Ordering::Relaxed);
-        self.overlay_max_count_atomic.store(self.floating_subtitles_max_count, Ordering::Relaxed);
-        self.overlay_font_size_atomic.store(self.floating_subtitles_font_size as u32, Ordering::Relaxed);
+        self.overlay_enabled_atomic
+            .store(self.floating_subtitles_enabled, Ordering::Relaxed);
+        self.overlay_max_count_atomic
+            .store(self.floating_subtitles_max_count, Ordering::Relaxed);
+        self.overlay_font_size_atomic
+            .store(self.floating_subtitles_font_size as u32, Ordering::Relaxed);
 
         if self.floating_subtitles_enabled {
             if let Ok(mut mgr) = self.overlay_manager.lock() {
@@ -644,7 +790,8 @@ impl XRTranslateApp {
                         overlay_ipc::OverlayEvent::MaxCountChanged(new_max) => {
                             let clamped = new_max.clamp(1, 10);
                             self.floating_subtitles_max_count = clamped;
-                            self.overlay_max_count_atomic.store(clamped, Ordering::Relaxed);
+                            self.overlay_max_count_atomic
+                                .store(clamped, Ordering::Relaxed);
                         }
                     }
                 }
@@ -728,7 +875,10 @@ impl eframe::App for XRTranslateApp {
             .frame(
                 egui::Frame::new()
                     .fill(egui::Color32::WHITE)
-                    .stroke(egui::Stroke::new(1.0, egui::Color32::from_rgb(226, 232, 240)))
+                    .stroke(egui::Stroke::new(
+                        1.0,
+                        egui::Color32::from_rgb(226, 232, 240),
+                    ))
                     .inner_margin(egui::Margin::symmetric(margin_x.round() as i8, 14)),
             )
             .show(ui, |ui| {

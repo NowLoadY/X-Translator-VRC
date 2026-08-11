@@ -136,7 +136,7 @@ mod tests {
         assert!(
             arguments
                 .windows(2)
-                .any(|pair| pair == ["--ctx-size", "1024"])
+                .any(|pair| pair == ["--ctx-size", "4096"])
         );
         assert!(
             arguments

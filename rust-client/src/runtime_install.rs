@@ -6,16 +6,15 @@
 //! CPU build.
 
 use crossbeam_channel::{Receiver, TryRecvError, unbounded};
-use futures::StreamExt;
 use std::{
     collections::HashSet,
     fs,
-    io::Write,
     path::{Path, PathBuf},
     process::Command,
     thread,
 };
 use xrtranslate_config::{AppConfig, LlamaCppRuntimeConfig};
+use xrtranslate_download::{DownloadClient, DownloadSpec};
 
 const MIN_CUDA_COMPUTE_CAPABILITY: (u16, u16) = (6, 0);
 const BLACKWELL_MINIMUM_CUDA: (u16, u16) = (12, 8);
@@ -26,9 +25,25 @@ enum RuntimeBackend {
     Cuda,
 }
 
+#[derive(Clone, Debug)]
 struct RuntimeSelection {
     assets: Vec<ReleaseAsset>,
     backend: RuntimeBackend,
+}
+
+impl RuntimeSelection {
+    fn total_bytes(&self) -> u64 {
+        self.assets.iter().map(|asset| asset.size).sum()
+    }
+}
+
+impl RuntimeBackend {
+    const fn label(self) -> &'static str {
+        match self {
+            Self::Cpu => "CPU",
+            Self::Cuda => "CUDA",
+        }
+    }
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -42,6 +57,7 @@ struct NvidiaCuda {
 pub enum RuntimeInstallState {
     Idle,
     Detecting,
+    Ready,
     Downloading {
         asset: String,
         downloaded: u64,
@@ -64,6 +80,7 @@ impl RuntimeInstallState {
 
 #[derive(Debug)]
 enum Event {
+    Prepared(Result<RuntimeSelection, String>),
     Downloading {
         asset: String,
         downloaded: u64,
@@ -77,6 +94,7 @@ enum Event {
 pub struct RuntimeInstaller {
     state: RuntimeInstallState,
     events: Option<Receiver<Event>>,
+    selection: Option<RuntimeSelection>,
 }
 
 impl Default for RuntimeInstaller {
@@ -84,6 +102,7 @@ impl Default for RuntimeInstaller {
         Self {
             state: RuntimeInstallState::Idle,
             events: None,
+            selection: None,
         }
     }
 }
@@ -99,10 +118,44 @@ impl RuntimeInstaller {
         self.state.is_busy()
     }
 
+    #[must_use]
+    pub fn download_size_bytes(&self) -> Option<u64> {
+        self.selection.as_ref().map(RuntimeSelection::total_bytes)
+    }
+
+    #[must_use]
+    pub fn backend_label(&self) -> Option<&'static str> {
+        self.selection
+            .as_ref()
+            .map(|selection| selection.backend.label())
+    }
+
+    pub fn prepare_recommended(&mut self, project_root: PathBuf) -> Result<(), String> {
+        if !matches!(self.state, RuntimeInstallState::Idle) {
+            return Ok(());
+        }
+        let (sender, receiver) = unbounded();
+        thread::Builder::new()
+            .name("llama-cpp-planner".into())
+            .spawn(move || {
+                let result = configured_release_assets(&project_root)
+                    .and_then(|assets| select_assets(&assets));
+                let _ = sender.send(Event::Prepared(result));
+            })
+            .map_err(|error| format!("Cannot start llama.cpp planner: {error}"))?;
+        self.state = RuntimeInstallState::Detecting;
+        self.events = Some(receiver);
+        Ok(())
+    }
+
     pub fn install_recommended(&mut self, project_root: PathBuf) -> Result<(), String> {
         if self.is_busy() {
             return Err("A llama.cpp installation is already running.".into());
         }
+        let selection = self.selection.clone().ok_or_else(|| {
+            "The llama.cpp download plan is not ready. Wait for hardware detection to finish."
+                .to_owned()
+        })?;
         let (sender, receiver) = unbounded();
         thread::Builder::new()
             .name("llama-cpp-installer".into())
@@ -111,11 +164,17 @@ impl RuntimeInstaller {
                     .enable_all()
                     .build()
                     .map_err(|error| format!("Cannot create download runtime: {error}"))
-                    .and_then(|runtime| runtime.block_on(install(project_root, sender.clone())));
+                    .and_then(|runtime| {
+                        runtime.block_on(install(project_root, selection, sender.clone()))
+                    });
                 let _ = sender.send(Event::Finished(result));
             })
             .map_err(|error| format!("Cannot start llama.cpp installer: {error}"))?;
-        self.state = RuntimeInstallState::Detecting;
+        self.state = RuntimeInstallState::Downloading {
+            asset: String::new(),
+            downloaded: 0,
+            total: self.download_size_bytes().unwrap_or(0),
+        };
         self.events = Some(receiver);
         Ok(())
     }
@@ -127,6 +186,17 @@ impl RuntimeInstaller {
         let mut finished = false;
         loop {
             match events.try_recv() {
+                Ok(Event::Prepared(result)) => {
+                    match result {
+                        Ok(selection) => {
+                            self.state = RuntimeInstallState::Ready;
+                            self.selection = Some(selection);
+                        }
+                        Err(error) => self.state = RuntimeInstallState::Failed(error),
+                    }
+                    finished = true;
+                    break;
+                }
                 Ok(Event::Downloading {
                     asset,
                     downloaded,
@@ -168,10 +238,12 @@ struct ReleaseAsset {
     name: String,
     browser_download_url: String,
     size: u64,
+    sha256: String,
 }
 
 async fn install(
     project_root: PathBuf,
+    selection: RuntimeSelection,
     sender: crossbeam_channel::Sender<Event>,
 ) -> Result<PathBuf, String> {
     if !cfg!(target_os = "windows") || std::env::consts::ARCH != "x86_64" {
@@ -192,66 +264,88 @@ async fn install(
         ));
     }
 
-    let client = reqwest::Client::builder()
-        .user_agent("XRTranslate runtime installer")
-        .build()
-        .map_err(|error| format!("Cannot create download client: {error}"))?;
-    let assets = configured_release_assets(&project_root)?;
-    let selection = select_assets(&assets)?;
-    let staging = project_root.join("runtime").join(".llama.cpp-installing");
-    if staging.exists() {
-        fs::remove_dir_all(&staging)
-            .map_err(|error| format!("Cannot clear old runtime staging folder: {error}"))?;
-    }
-    fs::create_dir_all(&staging)
+    let client =
+        DownloadClient::new("XRTranslate runtime installer").map_err(|error| error.to_string())?;
+    let release = load_runtime_config(&project_root)?.release;
+    let runtime_root = project_root.join("runtime");
+    let staging = runtime_root.join(format!(".llama.cpp-{release}-staging"));
+    prune_obsolete_runtime_staging(&runtime_root, &staging)?;
+    let downloads = staging.join("downloads");
+    let payload = staging.join("payload");
+    fs::create_dir_all(&downloads)
         .map_err(|error| format!("Cannot create runtime staging folder: {error}"))?;
-    for asset in selection.assets {
-        let archive = staging.join(&asset.name);
-        download(&client, &asset, &archive, &sender).await?;
-        let _ = sender.send(Event::Extracting);
-        extract_zip(&archive, &staging)?;
-        fs::remove_file(&archive)
-            .map_err(|error| format!("Cannot remove downloaded archive: {error}"))?;
+    let total = selection.total_bytes();
+    let mut completed = 0_u64;
+    for asset in &selection.assets {
+        let archive = downloads.join(&asset.name);
+        let partial = downloads.join(format!("{}.part", asset.name));
+        client
+            .download(
+                DownloadSpec {
+                    label: &asset.name,
+                    url: &asset.browser_download_url,
+                    bytes: asset.size,
+                    sha256: &asset.sha256,
+                },
+                &partial,
+                &archive,
+                |progress| {
+                    let _ = sender.send(Event::Downloading {
+                        asset: asset.name.clone(),
+                        downloaded: completed.saturating_add(progress.downloaded_bytes),
+                        total,
+                    });
+                },
+            )
+            .await
+            .map_err(|error| error.to_string())?;
+        completed = completed.saturating_add(asset.size);
     }
-    let staged_executable = staging.join("llama-server.exe");
+    let _ = sender.send(Event::Extracting);
+    if payload.exists() {
+        fs::remove_dir_all(&payload)
+            .map_err(|error| format!("Cannot reset runtime extraction folder: {error}"))?;
+    }
+    fs::create_dir_all(&payload)
+        .map_err(|error| format!("Cannot create runtime extraction folder: {error}"))?;
+    for asset in &selection.assets {
+        extract_zip(&downloads.join(&asset.name), &payload)?;
+    }
+    let staged_executable = payload.join("llama-server.exe");
     if !staged_executable.is_file() {
         return Err("The selected llama.cpp release did not contain llama-server.exe.".into());
     }
-    validate_runtime_files(&staging, selection.backend)?;
-    fs::rename(&staging, &target)
+    validate_runtime_files(&payload, selection.backend)?;
+    fs::rename(&payload, &target)
         .map_err(|error| format!("Cannot activate llama.cpp runtime: {error}"))?;
+    let _ = fs::remove_dir_all(&staging);
     crate::backend::BackendManager::persist_llama_server_path(&project_root, &executable)
 }
 
-async fn download(
-    client: &reqwest::Client,
-    asset: &ReleaseAsset,
-    output: &Path,
-    sender: &crossbeam_channel::Sender<Event>,
-) -> Result<(), String> {
-    let response = client
-        .get(&asset.browser_download_url)
-        .send()
-        .await
-        .map_err(|error| format!("Cannot download {}: {error}", asset.name))?
-        .error_for_status()
-        .map_err(|error| format!("Download failed for {}: {error}", asset.name))?;
-    let total = response.content_length().unwrap_or(asset.size);
-    let mut file = fs::File::create(output)
-        .map_err(|error| format!("Cannot create {}: {error}", output.display()))?;
-    let mut downloaded = 0;
-    let mut stream = response.bytes_stream();
-    while let Some(chunk) = stream.next().await {
-        let chunk =
-            chunk.map_err(|error| format!("Download interrupted for {}: {error}", asset.name))?;
-        file.write_all(&chunk)
-            .map_err(|error| format!("Cannot write {}: {error}", output.display()))?;
-        downloaded += chunk.len() as u64;
-        let _ = sender.send(Event::Downloading {
-            asset: asset.name.clone(),
-            downloaded,
-            total,
-        });
+fn prune_obsolete_runtime_staging(runtime_root: &Path, current: &Path) -> Result<(), String> {
+    let entries = match fs::read_dir(runtime_root) {
+        Ok(entries) => entries,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(()),
+        Err(error) => return Err(format!("Cannot inspect runtime staging folders: {error}")),
+    };
+    for entry in entries {
+        let entry =
+            entry.map_err(|error| format!("Cannot inspect runtime staging entry: {error}"))?;
+        let path = entry.path();
+        let name = entry.file_name();
+        let name = name.to_string_lossy();
+        if path != current
+            && entry.file_type().map(|kind| kind.is_dir()).unwrap_or(false)
+            && name.starts_with(".llama.cpp-")
+            && name.ends_with("-staging")
+        {
+            fs::remove_dir_all(&path).map_err(|error| {
+                format!(
+                    "Cannot remove obsolete runtime staging {}: {error}",
+                    path.display()
+                )
+            })?;
+        }
     }
     Ok(())
 }
@@ -348,13 +442,22 @@ fn release_assets_from_config(config: &LlamaCppRuntimeConfig) -> Result<Vec<Rele
                     "model_manager.llama_cpp.downloads[{name}] must use an HTTPS URL."
                 ));
             }
+            if download.bytes == 0 {
+                return Err(format!(
+                    "model_manager.llama_cpp.downloads[{name}].bytes must be greater than zero."
+                ));
+            }
+            let sha256 = download.sha256.trim();
+            if sha256.len() != 64 || !sha256.bytes().all(|byte| byte.is_ascii_hexdigit()) {
+                return Err(format!(
+                    "model_manager.llama_cpp.downloads[{name}].sha256 must be a 64-character hexadecimal digest."
+                ));
+            }
             Ok(ReleaseAsset {
                 name: name.into(),
                 browser_download_url: url.into(),
-                // The response normally supplies Content-Length. A zero
-                // fallback keeps the progress bar indeterminate if a proxy
-                // strips that header.
-                size: 0,
+                size: download.bytes,
+                sha256: sha256.to_ascii_lowercase(),
             })
         })
         .collect()
@@ -654,6 +757,7 @@ mod tests {
             name: name.into(),
             browser_download_url: "https://example.invalid/file.zip".into(),
             size: 1,
+            sha256: "0".repeat(64),
         }
     }
 
@@ -674,6 +778,8 @@ mod tests {
             assert!(!asset.browser_download_url.contains("api.github.com"));
             assert!(!asset.browser_download_url.contains("/latest"));
             assert!(asset.browser_download_url.ends_with(&asset.name));
+            assert!(asset.size > 0);
+            assert_eq!(asset.sha256.len(), 64);
         }
     }
 
@@ -686,10 +792,14 @@ mod tests {
                 xrtranslate_config::LlamaCppDownload {
                     name: "llama-test-bin-win-cpu-x64.zip".into(),
                     url: "https://example.invalid/one.zip".into(),
+                    bytes: 1,
+                    sha256: "0".repeat(64),
                 },
                 xrtranslate_config::LlamaCppDownload {
                     name: "llama-test-bin-win-cpu-x64.zip".into(),
                     url: "http://example.invalid/two.zip".into(),
+                    bytes: 1,
+                    sha256: "0".repeat(64),
                 },
             ],
         };

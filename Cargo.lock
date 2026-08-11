@@ -4179,7 +4179,7 @@ dependencies = [
 
 [[package]]
 name = "rust-client"
-version = "0.1.0"
+version = "0.2.0"
 dependencies = [
  "audioadapter-buffers",
  "cpal",
@@ -4205,6 +4205,8 @@ dependencies = [
  "winres",
  "xrtranslate-assets",
  "xrtranslate-config",
+ "xrtranslate-download",
+ "xrtranslate-protocol",
  "zip",
 ]
 
@@ -6584,18 +6586,43 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "ec7a2a501ed189703dba8b08142f057e887dfc4b2cc4db2d343ac6376ba3e0b9"
 
 [[package]]
-name = "xrtranslate-assets"
+name = "xr-corpus-client"
 version = "0.1.0"
 dependencies = [
  "reqwest",
  "serde",
- "sha2",
+ "serde_json",
  "tokio",
+ "xr-corpus-protocol",
+]
+
+[[package]]
+name = "xr-corpus-core"
+version = "0.1.0"
+dependencies = [
+ "serde",
+]
+
+[[package]]
+name = "xr-corpus-protocol"
+version = "0.1.0"
+dependencies = [
+ "serde",
+ "xr-corpus-core",
+]
+
+[[package]]
+name = "xrtranslate-assets"
+version = "0.2.0"
+dependencies = [
+ "serde",
+ "sha2",
+ "xrtranslate-download",
 ]
 
 [[package]]
 name = "xrtranslate-backend"
-version = "0.1.0"
+version = "0.2.0"
 dependencies = [
  "axum",
  "clap",
@@ -6606,6 +6633,8 @@ dependencies = [
  "tracing",
  "tracing-subscriber",
  "url",
+ "xr-corpus-client",
+ "xr-corpus-protocol",
  "xrtranslate-assets",
  "xrtranslate-config",
  "xrtranslate-engine",
@@ -6618,19 +6647,29 @@ dependencies = [
 
 [[package]]
 name = "xrtranslate-config"
-version = "0.1.0"
+version = "0.2.0"
 dependencies = [
  "serde",
  "serde_json",
+ "xr-corpus-core",
+]
+
+[[package]]
+name = "xrtranslate-download"
+version = "0.2.0"
+dependencies = [
+ "reqwest",
+ "sha2",
+ "tokio",
 ]
 
 [[package]]
 name = "xrtranslate-engine"
-version = "0.1.0"
+version = "0.2.0"
 
 [[package]]
 name = "xrtranslate-inference"
-version = "0.1.0"
+version = "0.2.0"
 dependencies = [
  "base64 0.22.1",
  "reqwest",
@@ -6641,7 +6680,7 @@ dependencies = [
 
 [[package]]
 name = "xrtranslate-installer"
-version = "0.1.0"
+version = "0.2.0"
 dependencies = [
  "clap",
  "tokio",
@@ -6651,26 +6690,28 @@ dependencies = [
 
 [[package]]
 name = "xrtranslate-packager"
-version = "0.1.0"
+version = "0.2.0"
 dependencies = [
  "clap",
  "serde_json",
  "sha2",
+ "xr-corpus-core",
  "xrtranslate-assets",
  "xrtranslate-config",
 ]
 
 [[package]]
 name = "xrtranslate-protocol"
-version = "0.1.0"
+version = "0.2.0"
 dependencies = [
  "serde",
  "serde_json",
+ "xr-corpus-protocol",
 ]
 
 [[package]]
 name = "xrtranslate-speaker"
-version = "0.1.0"
+version = "0.2.0"
 dependencies = [
  "ndarray",
  "ort",
@@ -6678,11 +6719,11 @@ dependencies = [
 
 [[package]]
 name = "xrtranslate-supervisor"
-version = "0.1.0"
+version = "0.2.0"
 
 [[package]]
 name = "xrtranslate-vad"
-version = "0.1.0"
+version = "0.2.0"
 dependencies = [
  "ndarray",
  "ort",

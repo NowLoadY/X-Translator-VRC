@@ -10,16 +10,20 @@ use std::{
     path::{Path, PathBuf},
     time::{Duration, Instant},
 };
+use tracing::warn;
 
-use xrtranslate_assets::{ModelAssetsConfig, ResolvedModelAssets};
+use xrtranslate_assets::{
+    ModelAssetId, ModelAssetsConfig, ModelCapability, ResolvedModelAssets, manifest_for,
+};
 use xrtranslate_config::AppConfig;
 use xrtranslate_engine::{
     TranslationSegmentPair, remove_asr_stutters, remove_transcript_overlap,
     translation_segment_pairs_for_final_text_with_lang,
 };
 use xrtranslate_inference::{
-    Qwen3AsrAdapter, Qwen3AsrOptions, ReqwestClient, TranslationAdapter, TranslationOptions,
-    TranslationProvider,
+    InferenceError, Qwen3AsrAdapter, Qwen3AsrOptions, ReqwestClient, TranslationAdapter,
+    TranslationOptions, TranslationProvider, is_probable_asr_hallucination,
+    is_probable_translation_context_leak,
 };
 use xrtranslate_speaker::{OnlineSpeakerDiarizer, TrackerConfig};
 use xrtranslate_vad::{
@@ -52,11 +56,21 @@ pub(crate) struct TimedUtterance {
 }
 
 impl RecognizedOutput {
+    pub(crate) fn apply_source_correction(&mut self, corrected: String, source_language: &str) {
+        if corrected == self.source_text {
+            return;
+        }
+        self.source_text = corrected;
+        self.segments =
+            translation_segment_pairs_for_final_text_with_lang(&self.source_text, source_language);
+    }
+
     /// Removes text produced from the duplicated audio at a hard VAD boundary.
     /// Returns false when the new result contained only duplicated context.
     pub(crate) fn remove_overlap_with(&mut self, previous: &str, source_language: &str) -> bool {
         self.source_text = remove_transcript_overlap(previous, &self.source_text);
-        self.segments = translation_segment_pairs_for_final_text_with_lang(&self.source_text, source_language);
+        self.segments =
+            translation_segment_pairs_for_final_text_with_lang(&self.source_text, source_language);
         !self.source_text.is_empty()
     }
 }
@@ -66,6 +80,9 @@ impl RecognizedOutput {
 pub(crate) struct TranslationOutput {
     pub(crate) source_text: String,
     pub(crate) translated_text: String,
+    pub(crate) source_language: String,
+    pub(crate) target_language: String,
+    pub(crate) term_matches: Vec<xrtranslate_protocol::CorpusTermMatch>,
     pub(crate) mt_elapsed: Duration,
 }
 
@@ -87,6 +104,11 @@ pub(crate) struct NativePipeline {
 pub(crate) struct NativeInference {
     asr: Qwen3AsrAdapter<ReqwestClient>,
     translation: TranslationAdapter<ReqwestClient>,
+    translation_supports_prompt_context: bool,
+    asr_max_output_tokens: u32,
+    translation_max_output_tokens: u32,
+    asr_context_window_tokens: u32,
+    translation_context_window_tokens: u32,
     speaker: Option<SpeakerInferenceConfig>,
 }
 
@@ -137,6 +159,13 @@ impl NativePipeline {
             TranslationProvider::Hunyuan,
         )
         .map_err(|error| error.to_string())?;
+        let translation_supports_prompt_context = config
+            .translation
+            .provider_config(&config.translation.provider)
+            .and_then(serde_json::Value::as_object)
+            .and_then(|provider| provider.get("supports_prompt_context"))
+            .and_then(serde_json::Value::as_bool)
+            .unwrap_or(false);
         let speaker = if config.speaker.enabled {
             let model_path = if config.speaker.model_path.is_absolute() {
                 config.speaker.model_path.clone()
@@ -180,6 +209,13 @@ impl NativePipeline {
             inference: NativeInference {
                 asr,
                 translation,
+                translation_supports_prompt_context,
+                asr_max_output_tokens: default_route.asr_runtime.max_tokens,
+                translation_max_output_tokens: default_route.translation_runtime.max_tokens,
+                asr_context_window_tokens: default_route.asr_runtime.context_window_tokens,
+                translation_context_window_tokens: default_route
+                    .translation_runtime
+                    .context_window_tokens,
                 speaker,
             },
         })
@@ -307,35 +343,97 @@ impl NativeInference {
         self.speaker.as_ref().map(|config| config.min_utterance_ms)
     }
 
+    pub(crate) fn speaker_is_available(&self) -> bool {
+        self.speaker.is_some()
+    }
+
+    pub(crate) fn prompt_context_token_budgets(&self) -> (usize, usize) {
+        const REQUEST_RESERVE: u32 = 256;
+        let available = |window: u32, output: u32| {
+            usize::try_from(
+                window
+                    .saturating_sub(output)
+                    .saturating_sub(REQUEST_RESERVE),
+            )
+            .unwrap_or(usize::MAX)
+        };
+        (
+            available(self.asr_context_window_tokens, self.asr_max_output_tokens).min(384),
+            available(
+                self.translation_context_window_tokens,
+                self.translation_max_output_tokens,
+            ),
+        )
+    }
+
     /// Runs ASR for a complete utterance and applies the Python-compatible
     /// stutter removal and sentence/filler segmentation before any MT call.
     pub(crate) async fn transcribe(
         &self,
-        utterance: Utterance,
+        samples: &[i16],
         source_language: &str,
-        target_language: &str,
+        prompt_context: Option<String>,
+        echo_candidates: &[String],
     ) -> Result<Option<RecognizedOutput>, String> {
-        let pcm = utterance_to_pcm16le(utterance);
+        let pcm = samples
+            .iter()
+            .flat_map(|sample| sample.to_le_bytes())
+            .collect::<Vec<_>>();
         let asr_started = Instant::now();
-        let transcript = self
+        let max_tokens = asr_max_tokens(samples.len()).min(self.asr_max_output_tokens);
+        let mut transcript = self
             .asr
             .transcribe_pcm16(
                 &pcm,
                 Qwen3AsrOptions {
                     language: asr_language(source_language),
-                    prompt_context: Some(asr_instruction(source_language, target_language)),
-                    max_tokens: 128,
+                    prompt_context: prompt_context.clone(),
+                    max_tokens,
                 },
             )
             .await
             .map_err(|error| format!("ASR request failed: {error}"))?;
+        if is_probable_asr_hallucination(
+            &transcript.text,
+            samples.len(),
+            SAMPLE_RATE_HZ,
+            prompt_context.as_deref(),
+            echo_candidates,
+        ) {
+            warn!("ASR output failed quality checks; retrying with a minimal context-free request");
+            transcript = self
+                .asr
+                .transcribe_pcm16(
+                    &pcm,
+                    Qwen3AsrOptions {
+                        language: asr_language(source_language),
+                        prompt_context: None,
+                        max_tokens,
+                    },
+                )
+                .await
+                .map_err(|error| format!("ASR context-free retry failed: {error}"))?;
+            if is_probable_asr_hallucination(
+                &transcript.text,
+                samples.len(),
+                SAMPLE_RATE_HZ,
+                None,
+                &[],
+            ) {
+                warn!("suppressing ASR output after context-free retry failed quality checks");
+                return Ok(None);
+            }
+        }
         let asr_elapsed = asr_started.elapsed();
         let source_text = remove_asr_stutters(&transcript.text);
         if source_text.is_empty() {
             return Ok(None);
         }
         Ok(Some(RecognizedOutput {
-            segments: translation_segment_pairs_for_final_text_with_lang(&source_text, source_language),
+            segments: translation_segment_pairs_for_final_text_with_lang(
+                &source_text,
+                source_language,
+            ),
             source_text,
             asr_elapsed,
         }))
@@ -347,24 +445,88 @@ impl NativeInference {
         segment: &TranslationSegmentPair,
         source_language: &str,
         target_language: &str,
+        prompt_context: Option<String>,
     ) -> Result<TranslationOutput, String> {
         let route = translation_route(&segment.translation_text, source_language, target_language);
+        let mut options = TranslationOptions::new(route.source.clone(), route.target.clone());
+        options.max_tokens = self.translation_max_output_tokens;
+        if self.translation_supports_prompt_context {
+            options.prompt_context = prompt_context;
+        }
         let mt_started = Instant::now();
-        let translated = self
+        let had_prompt_context = options.prompt_context.is_some();
+        let mut translated = match self
             .translation
-            .translate(
-                &segment.translation_text,
-                TranslationOptions::new(route.source, route.target),
-            )
+            .translate(&segment.translation_text, options.clone())
             .await
-            .map_err(|error| format!("translation request failed: {error}"))?;
+        {
+            Ok(translated) => translated,
+            Err(error) if options.prompt_context.is_some() && is_context_window_error(&error) => {
+                warn!(
+                    %error,
+                    "translation context exceeded the provider window; retrying current segment without optional context"
+                );
+                options.prompt_context = None;
+                self.translation
+                    .translate(&segment.translation_text, options.clone())
+                    .await
+                    .map_err(|retry| format!("translation context-free retry failed: {retry}"))?
+            }
+            Err(error) => return Err(format!("translation request failed: {error}")),
+        };
+
+        if had_prompt_context
+            && is_probable_translation_context_leak(
+                &segment.translation_text,
+                &translated.text,
+                options.prompt_context.as_deref(),
+            )
+        {
+            warn!(
+                "translation output copied optional context; retrying current segment without context"
+            );
+            options.prompt_context = None;
+            translated = self
+                .translation
+                .translate(&segment.translation_text, options)
+                .await
+                .map_err(|retry| format!("translation context-leak retry failed: {retry}"))?;
+        }
+
+        if is_probable_translation_context_leak(&segment.translation_text, &translated.text, None) {
+            return Err("translation output failed context-leak quality checks".into());
+        }
 
         Ok(TranslationOutput {
             source_text: segment.source_text.clone(),
             translated_text: translated.text,
+            source_language: route.source_code,
+            target_language: route.target_code,
+            term_matches: Vec::new(),
             mt_elapsed: mt_started.elapsed(),
         })
     }
+}
+
+fn is_context_window_error(error: &InferenceError) -> bool {
+    match error {
+        InferenceError::HttpStatus {
+            status,
+            body_preview,
+            ..
+        } if *status == 400 => {
+            let body = body_preview.to_ascii_lowercase();
+            body.contains("exceed_context_size")
+                || body.contains("exceeds the available context size")
+                || body.contains("context window")
+        }
+        _ => false,
+    }
+}
+
+fn asr_max_tokens(sample_count: usize) -> u32 {
+    let seconds = sample_count as f64 / f64::from(SAMPLE_RATE_HZ);
+    ((seconds * 18.0).ceil() as u32 + 16).clamp(24, 128)
 }
 
 fn samples_to_ms(samples: u64) -> f64 {
@@ -387,10 +549,23 @@ pub(crate) fn resolved_model_assets(
     config: &AppConfig,
     project_root: &Path,
 ) -> ResolvedModelAssets {
+    let mut asr_asset = None;
+    let mut translation_asset = None;
+    for key in config.active_native_model_assets() {
+        let Some(id) = ModelAssetId::from_config_key(&key) else {
+            continue;
+        };
+        match manifest_for(id).capability {
+            ModelCapability::Asr => asr_asset = Some(id),
+            ModelCapability::Translation => translation_asset = Some(id),
+        }
+    }
     ModelAssetsConfig {
         models_directory: config.model_manager.models_directory.clone(),
         qwen3_asr_gguf_directory: config.model_manager.qwen3_asr_gguf_directory.clone(),
         hunyuan_mt_gguf_directory: config.model_manager.hunyuan_mt_gguf_directory.clone(),
+        qwen3_asr_asset: asr_asset,
+        hunyuan_mt_asset: translation_asset,
     }
     .resolve(project_root)
 }
@@ -400,59 +575,13 @@ pub(crate) fn resolved_model_assets(
 struct TranslationRoute {
     source: String,
     target: String,
-}
-
-fn utterance_to_pcm16le(utterance: Utterance) -> Vec<u8> {
-    utterance
-        .samples
-        .into_iter()
-        .flat_map(i16::to_le_bytes)
-        .collect()
+    source_code: String,
+    target_code: String,
 }
 
 fn asr_language(source_language: &str) -> Option<String> {
     let source = normalized_code(source_language);
     (source != "auto").then(|| language_name(&source).to_owned())
-}
-
-/// Builds the same stateless, route-aware anti-hallucination instruction used
-/// by the legacy Qwen3 one-shot path.  It intentionally never includes prior
-/// transcript text: each VAD utterance must be recognized independently.
-fn asr_instruction(source_language: &str, target_language: &str) -> String {
-    let source = normalized_code(source_language);
-    if source != "auto" {
-        let language = language_name(&source);
-        return format!(
-            "Transcribe only the audible {language} speech in its original writing system. \
-             Return the raw transcript only; never translate, paraphrase, complete, \
-             or repeat text from another utterance."
-        );
-    }
-
-    let pair = target_language
-        .split(',')
-        .map(normalized_code)
-        .filter(|code| !code.is_empty())
-        .collect::<Vec<_>>();
-    let languages = pair
-        .iter()
-        .filter(|code| language_name(code) != *code)
-        .take(2)
-        .map(|code| language_name(code))
-        .collect::<Vec<_>>();
-    if languages.len() >= 2 {
-        return format!(
-            "This is bilingual ASR. The current utterance may be {} or {}. \
-             Identify the spoken language from the audio and transcribe it in its original \
-             writing system. Do not translate between the two languages, infer missing words, \
-             or repeat text from earlier utterances. Return only the audible transcript.",
-            languages[0], languages[1]
-        );
-    }
-
-    "Transcribe only speech audible in this audio. Preserve its original writing system. \
-     Do not translate, paraphrase, infer missing words, or repeat earlier text."
-        .into()
 }
 
 fn translation_route(
@@ -471,6 +600,10 @@ fn translation_route(
         return TranslationRoute {
             source: language_name(&source).to_owned(),
             target: language_list(&targets),
+            source_code: source,
+            target_code: (targets.len() == 1)
+                .then(|| targets[0].clone())
+                .unwrap_or_default(),
         };
     }
 
@@ -483,17 +616,25 @@ fn translation_route(
             return TranslationRoute {
                 source: language_name(detected).to_owned(),
                 target: language_name(target).to_owned(),
+                source_code: detected.to_owned(),
+                target_code: target.clone(),
             };
         }
         return TranslationRoute {
             source: "auto".into(),
             target: language_list(&targets),
+            source_code: "auto".into(),
+            target_code: String::new(),
         };
     }
 
     TranslationRoute {
         source: "auto".into(),
         target: language_list(&targets),
+        source_code: "auto".into(),
+        target_code: (targets.len() == 1)
+            .then(|| targets[0].clone())
+            .unwrap_or_default(),
     }
 }
 
@@ -540,6 +681,16 @@ fn language_name(code: &str) -> &str {
 
 fn detect_language<'a>(text: &str, candidates: &'a [String]) -> Option<&'a str> {
     let contains = |code: &str| candidates.iter().any(|candidate| candidate == code);
+    if contains("zh") && contains("en") {
+        let cjk_units = text
+            .chars()
+            .filter(|character| ('\u{3400}'..='\u{9fff}').contains(character))
+            .count();
+        let ascii_words = ascii_word_count(text);
+        if cjk_units > 0 && ascii_words > 0 {
+            return Some(if cjk_units >= ascii_words { "zh" } else { "en" });
+        }
+    }
     if contains("ja")
         && text
             .chars()
@@ -562,9 +713,10 @@ fn detect_language<'a>(text: &str, candidates: &'a [String]) -> Option<&'a str> 
         return Some("ru");
     }
     if contains("ko")
-        && text
-            .chars()
-            .any(|character| ('\u{ac00}'..='\u{d7af}').contains(&character) || ('\u{1100}'..='\u{11ff}').contains(&character))
+        && text.chars().any(|character| {
+            ('\u{ac00}'..='\u{d7af}').contains(&character)
+                || ('\u{1100}'..='\u{11ff}').contains(&character)
+        })
     {
         return Some("ko");
     }
@@ -576,6 +728,22 @@ fn detect_language<'a>(text: &str, candidates: &'a [String]) -> Option<&'a str> 
         return Some("en");
     }
     None
+}
+
+fn ascii_word_count(text: &str) -> usize {
+    let mut words = 0;
+    let mut inside_word = false;
+    for character in text.chars() {
+        if character.is_ascii_alphabetic() {
+            if !inside_word {
+                words += 1;
+                inside_word = true;
+            }
+        } else {
+            inside_word = false;
+        }
+    }
+    words
 }
 
 /// Ensures the wire stream is compatible with the initial no-resample path.
@@ -605,9 +773,10 @@ pub(crate) fn validate_input_chunk_size(bytes: usize) -> Result<(), String> {
 #[cfg(test)]
 mod tests {
     use super::{
-        MAX_INPUT_PCM_BYTES, asr_instruction, asr_language, frames_for_ms, translation_route,
-        validate_input_chunk_size, validate_input_sample_rate,
+        MAX_INPUT_PCM_BYTES, asr_language, frames_for_ms, is_context_window_error,
+        translation_route, validate_input_chunk_size, validate_input_sample_rate,
     };
+    use xrtranslate_inference::InferenceError;
 
     #[test]
     fn automatic_bilingual_route_follows_the_recognized_script() {
@@ -616,6 +785,8 @@ mod tests {
             super::TranslationRoute {
                 source: "Chinese".into(),
                 target: "English".into(),
+                source_code: "zh".into(),
+                target_code: "en".into(),
             }
         );
         assert_eq!(
@@ -623,7 +794,21 @@ mod tests {
             super::TranslationRoute {
                 source: "English".into(),
                 target: "Chinese".into(),
+                source_code: "en".into(),
+                target_code: "zh".into(),
             }
+        );
+    }
+
+    #[test]
+    fn automatic_bilingual_route_uses_the_dominant_language_in_mixed_text() {
+        assert_eq!(
+            translation_route("\u{6211} also play uh Lucio", "auto", "zh,en").source_code,
+            "en"
+        );
+        assert_eq!(
+            translation_route("\u{4f60}\u{73a9} Overwatch \u{5417}", "auto", "zh,en").source_code,
+            "zh"
         );
     }
 
@@ -635,16 +820,10 @@ mod tests {
             super::TranslationRoute {
                 source: "Japanese".into(),
                 target: "English".into(),
+                source_code: "ja".into(),
+                target_code: "en".into(),
             }
         );
-    }
-
-    #[test]
-    fn asr_instruction_is_pair_aware_without_prior_transcript_context() {
-        let prompt = asr_instruction("auto", "zh,en");
-        assert!(prompt.contains("Chinese or English"));
-        assert!(prompt.contains("Do not translate"));
-        assert!(asr_instruction("ja", "en").contains("audible Japanese"));
     }
 
     #[test]
@@ -657,6 +836,22 @@ mod tests {
     fn input_audio_message_has_a_firm_memory_limit() {
         assert!(validate_input_chunk_size(MAX_INPUT_PCM_BYTES).is_ok());
         assert!(validate_input_chunk_size(MAX_INPUT_PCM_BYTES + 1).is_err());
+    }
+
+    #[test]
+    fn llama_context_overflow_is_recognized_for_safe_retry() {
+        assert!(is_context_window_error(&InferenceError::HttpStatus {
+            endpoint: "http://127.0.0.1:8002".into(),
+            status: 400,
+            body_preview:
+                r#"{"error":{"type":"exceed_context_size_error","message":"request exceeds the available context size"}}"#
+                    .into(),
+        }));
+        assert!(!is_context_window_error(&InferenceError::HttpStatus {
+            endpoint: "http://127.0.0.1:8002".into(),
+            status: 500,
+            body_preview: "internal error".into(),
+        }));
     }
 
     #[test]

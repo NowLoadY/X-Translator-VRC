@@ -19,8 +19,7 @@ pub enum TranslationProvider {
 pub struct TranslationOptions {
     pub source_language: String,
     pub target_language: String,
-    /// Previously translated context. Hunyuan and generic adapters include it
-    /// as context but always clearly delimit the current source segment.
+    /// Reference context for terminology and recent conversation continuity.
     pub prompt_context: Option<String>,
     pub max_tokens: u32,
 }
@@ -143,15 +142,19 @@ pub fn build_hunyuan_prompt(
     let source_language = required_text(source_language, "source_language")?;
     let target_language = required_text(target_language, "target_language")?;
     let prompt = if source_language == "auto" {
-        format!("Translate the following text into the other language among {target_language}. Output only the translation; do not add explanations.")
+        format!(
+            "Translate the following text into the other language among {target_language}. Output only the translation; do not add explanations."
+        )
     } else {
-        format!("Translate the following {source_language} text into natural {target_language}. Output only the translation; do not add explanations.")
+        format!(
+            "Translate the following {source_language} text into natural {target_language}. Output only the translation; do not add explanations."
+        )
     };
-    // The Python Hunyuan provider deliberately did not inject prompt context:
-    // the model is trained for a direct one-shot translation instruction.
-    // Preserve the argument for the generic adapter API, but do not silently
-    // change the default model prompt.
-    let _ = prompt_context;
+    if let Some(context) = normalized_optional(prompt_context) {
+        return Ok(format!(
+            "{prompt}\n\nReference context follows. In its Terminology section, each comma-separated row follows Language Order and represents one concept. A matching terminology row is mandatory and overrides default dictionary translations, transliterations, and guesses; use its target-language cell exactly. Preserve ordinary word meanings otherwise. Never translate or output the reference context.\n\n--- BEGIN REFERENCE CONTEXT ---\n{context}\n--- END REFERENCE CONTEXT ---\n\nCurrent input:\n{text}"
+        ));
+    }
     Ok(format!("{prompt}\n\n{text}"))
 }
 
@@ -172,12 +175,18 @@ pub fn build_translation_messages(
         }])),
         TranslationProvider::OpenAiCompatible => {
             let mut system = if source_language == "auto" {
-                format!("You are a real-time speech translator. The input language is one of the following: {target_language}. Translate it into the OTHER language from that list. Output only the translation.")
+                format!(
+                    "You are a real-time speech translator. The input language is one of the following: {target_language}. Translate it into the OTHER language from that list. Output only the translation."
+                )
             } else {
-                format!("You are a real-time speech translator. If input is already {target_language}, output it unchanged. Otherwise translate it into natural, fluent {target_language}. Output only the translation.")
+                format!(
+                    "You are a real-time speech translator. If input is already {target_language}, output it unchanged. Otherwise translate it into natural, fluent {target_language}. Output only the translation."
+                )
             };
             if let Some(context) = context {
-                system.push_str("\n\nContext (reference only; do not translate it):\n");
+                system.push_str(
+                    "\n\nReference context follows. In its Terminology section, each comma-separated row follows Language Order and represents one concept. A matching terminology row is mandatory and overrides default dictionary translations, transliterations, and guesses; use its target-language cell exactly. Preserve ordinary word meanings otherwise. Never translate or output the reference context:\n",
+                );
                 system.push_str(context);
             }
             let user_content = if source_language == "auto" {
@@ -210,16 +219,99 @@ fn normalized_optional(value: Option<&str>) -> Option<&str> {
 
 fn clean_translation_output(text: &str, provider: TranslationProvider) -> String {
     let text = remove_completion_markers(text);
-    let text = text.trim();
+    let text = strip_current_input_artifacts(text.trim());
     if provider == TranslationProvider::Hunyuan {
-        return text.to_owned();
+        return text;
     }
     for label in ["translation:", "translated text:"] {
         if text.len() >= label.len() && text[..label.len()].eq_ignore_ascii_case(label) {
             return text[label.len()..].trim().to_owned();
         }
     }
-    text.to_owned()
+    text
+}
+
+fn strip_current_input_artifacts(text: &str) -> String {
+    let mut output = Vec::new();
+    for line in text.lines() {
+        let normalized = line
+            .trim()
+            .trim_matches(|character: char| character == '-' || character.is_whitespace())
+            .to_ascii_lowercase();
+        if normalized == "end current input" {
+            break;
+        }
+        if normalized == "begin current input" || normalized == "current input:" {
+            continue;
+        }
+        output.push(line);
+    }
+    output.join("\n").trim().to_owned()
+}
+
+#[must_use]
+pub fn is_probable_translation_context_leak(
+    source_text: &str,
+    translated_text: &str,
+    prompt_context: Option<&str>,
+) -> bool {
+    let output = translated_text.trim();
+    if output.is_empty() {
+        return false;
+    }
+
+    let folded = output.to_ascii_lowercase();
+    const CONTEXT_MARKERS: [&str; 8] = [
+        "# translation context",
+        "## language order",
+        "## terminology",
+        "## recent bilingual history",
+        "begin reference context",
+        "end reference context",
+        "begin current input",
+        "end current input",
+    ];
+    if CONTEXT_MARKERS.iter().any(|marker| folded.contains(marker)) {
+        return true;
+    }
+
+    let glossary_rows = output
+        .lines()
+        .filter(|line| {
+            let cells = line
+                .split(',')
+                .map(str::trim)
+                .filter(|cell| !cell.is_empty())
+                .count();
+            cells >= 2 && line.chars().count() <= 240
+        })
+        .take(3)
+        .count();
+    if glossary_rows >= 3 {
+        return true;
+    }
+
+    if let Some(context) = normalized_optional(prompt_context) {
+        let copied_lines = output
+            .lines()
+            .map(str::trim)
+            .filter(|line| {
+                line.chars().count() >= 4 && context.lines().any(|row| row.trim() == *line)
+            })
+            .take(3)
+            .count();
+        if copied_lines >= 3 {
+            return true;
+        }
+
+        let source_chars = source_text.trim().chars().count().max(1);
+        let output_chars = output.chars().count();
+        if output_chars > (source_chars.saturating_mul(10) + 64).max(192) {
+            return true;
+        }
+    }
+
+    false
 }
 
 #[cfg(test)]
@@ -253,7 +345,7 @@ mod tests {
         let http = RecordingHttpClient::default();
         http.respond_with(HttpResponse {
             status: 200,
-            body: r#"{"choices":[{"message":{"content":"你好 <|im_end|>"}}]}"#.into(),
+            body: r#"{"choices":[{"message":{"content":"你好\n--- END CURRENT INPUT --- <|im_end|>"}}]}"#.into(),
         });
         let adapter = TranslationAdapter::new(
             http,
@@ -285,8 +377,10 @@ mod tests {
         assert_eq!(request.body["messages"].as_array().unwrap().len(), 1);
         let prompt = request.body["messages"][0]["content"].as_str().unwrap();
         assert!(prompt.contains("following English text into natural Chinese"));
-        assert!(!prompt.contains("Context (reference only"));
-        assert!(prompt.ends_with("\n\nhello"));
+        assert!(prompt.contains("--- BEGIN REFERENCE CONTEXT ---"));
+        assert!(prompt.contains("A previous sentence."));
+        assert!(prompt.ends_with("Current input:\nhello"));
+        assert!(!prompt.contains("END CURRENT INPUT"));
     }
 
     #[tokio::test]
@@ -358,6 +452,35 @@ mod tests {
                 field: "source_text",
                 ..
             }
+        ));
+    }
+
+    #[test]
+    fn detects_copied_glossary_instead_of_translation() {
+        let leaked = "Baptiste,Baptiste\nBastion,Bastion\nBrigitte,Brigitte\nMercy,Mercy";
+        assert!(is_probable_translation_context_leak(
+            "卢西奥。",
+            leaked,
+            Some("## Terminology\nBaptiste,Baptiste\nBastion,Bastion")
+        ));
+        assert!(is_probable_translation_context_leak(
+            "hello",
+            "## Terminology\nhello,你好",
+            None
+        ));
+        assert!(is_probable_translation_context_leak(
+            "你玩莱因哈特吗？",
+            "Do you play Reinhardt?\nEND CURRENT INPUT",
+            None
+        ));
+    }
+
+    #[test]
+    fn accepts_concise_translation_with_a_terminology_match() {
+        assert!(!is_probable_translation_context_leak(
+            "I love Mercy.",
+            "我喜欢天使。",
+            Some("## Terminology\n天使,Mercy")
         ));
     }
 }

@@ -1,7 +1,5 @@
 use crate::ui::components::{self, danger_button, primary_button, section, status_badge};
-use crate::{
-    CaptureSource, LANGUAGE_OPTIONS, language_label, route_label,
-};
+use crate::{CaptureSource, LANGUAGE_OPTIONS, language_label, route_label};
 use eframe::egui;
 
 pub fn render(app: &mut crate::XRTranslateApp, ui: &mut egui::Ui) {
@@ -23,21 +21,11 @@ pub fn render(app: &mut crate::XRTranslateApp, ui: &mut egui::Ui) {
             };
             let status = crate::i18n::tr_dynamic(app.ui_language, &app.connection_status);
             status_badge(ui, status.as_ref(), is_active, is_error);
-
-            ui.add_space(10.0);
-            let btn_text = if app.floating_subtitles_enabled {
-                crate::i18n::tr(app.ui_language, "💬 Hide Subtitle Window")
-            } else {
-                crate::i18n::tr(app.ui_language, "🖥️ Desktop Subtitle Window")
-            };
-            if components::animated_button(ui, btn_text).clicked() {
-                app.floating_subtitles_enabled = !app.floating_subtitles_enabled;
-                app.save_settings();
-            }
         });
     });
 
     if let Some(error) = &app.last_error {
+        let error_summary = error.lines().next().unwrap_or(error);
         ui.add_space(8.0);
         components::card(ui, |ui| {
             ui.horizontal(|ui| {
@@ -46,7 +34,6 @@ pub fn render(app: &mut crate::XRTranslateApp, ui: &mut egui::Ui) {
                         .color(egui::Color32::from_rgb(220, 38, 38))
                         .strong(),
                 );
-                ui.label(egui::RichText::new(error).color(egui::Color32::from_rgb(220, 38, 38)));
                 ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
                     if components::animated_button(
                         ui,
@@ -62,6 +49,13 @@ pub fn render(app: &mut crate::XRTranslateApp, ui: &mut egui::Ui) {
                         );
                     }
                 });
+                ui.add(
+                    egui::Label::new(
+                        egui::RichText::new(error_summary)
+                            .color(egui::Color32::from_rgb(220, 38, 38)),
+                    )
+                    .truncate(),
+                );
             });
         });
     }
@@ -233,12 +227,16 @@ pub fn render(app: &mut crate::XRTranslateApp, ui: &mut egui::Ui) {
         egui::Frame::new()
             .fill(egui::Color32::from_rgb(248, 250, 252))
             .corner_radius(egui::CornerRadius::same(10))
-            .stroke(egui::Stroke::new(1.0, egui::Color32::from_rgb(226, 232, 240)))
+            .stroke(egui::Stroke::new(
+                1.0,
+                egui::Color32::from_rgb(226, 232, 240),
+            ))
             .inner_margin(egui::Margin::symmetric(14, 10))
             .show(ui, |ui| {
                 ui.horizontal(|ui| {
                     if app.is_translating {
-                        if danger_button(ui, crate::i18n::tr(app.ui_language, "Stop Translation")).clicked()
+                        if danger_button(ui, crate::i18n::tr(app.ui_language, "Stop Translation"))
+                            .clicked()
                         {
                             app.stop();
                         }
@@ -255,14 +253,42 @@ pub fn render(app: &mut crate::XRTranslateApp, ui: &mut egui::Ui) {
                             ui.label(
                                 egui::RichText::new(format!(
                                     "{} Hz, {} ch ({})",
-                                    config.sample_rate,
-                                    config.channels,
-                                    config.sample_format
+                                    config.sample_rate, config.channels, config.sample_format
                                 ))
                                 .color(crate::ui::theme::text_weak())
                                 .size(11.5),
                             );
                         });
+                    }
+                });
+
+                ui.add_space(8.0);
+                ui.horizontal_wrapped(|ui| {
+                    let mut tts_enabled = app.tts_enabled;
+                    if components::feature_checkbox(
+                        ui,
+                        crate::feature_access::Feature::TtsPlayback,
+                        app.ui_language,
+                        &mut tts_enabled,
+                        crate::i18n::tr(app.ui_language, "TTS"),
+                    )
+                    .changed()
+                    {
+                        app.set_tts_enabled(tts_enabled);
+                    }
+
+                    ui.add_space(12.0);
+                    let mut floating_enabled = app.floating_subtitles_enabled;
+                    if components::feature_checkbox(
+                        ui,
+                        crate::feature_access::Feature::FloatingSubtitles,
+                        app.ui_language,
+                        &mut floating_enabled,
+                        crate::i18n::tr(app.ui_language, "Floating subtitles"),
+                    )
+                    .changed()
+                    {
+                        app.set_floating_subtitles_enabled(floating_enabled);
                     }
                 });
             });
@@ -291,12 +317,9 @@ pub fn render(app: &mut crate::XRTranslateApp, ui: &mut egui::Ui) {
                         ui.set_width(ui.available_width());
                         if app.recognition_history.is_empty() && app.partial_text.is_empty() {
                             ui.label(
-                                egui::RichText::new(crate::i18n::tr(
-                                    app.ui_language,
-                                    "No speech recognized yet...",
-                                ))
-                                .color(crate::ui::theme::text_weak())
-                                .italics(),
+                                egui::RichText::new(crate::i18n::tr(app.ui_language, "No speech"))
+                                    .color(crate::ui::theme::text_weak())
+                                    .italics(),
                             );
                         } else {
                             let total = app.recognition_history.len();
@@ -325,10 +348,13 @@ pub fn render(app: &mut crate::XRTranslateApp, ui: &mut egui::Ui) {
                                         );
                                     }
                                 });
-                                let resp = ui.label(
-                                    egui::RichText::new(&entry.text)
-                                        .color(crate::ui::theme::text_normal())
-                                        .size(13.0),
+                                let resp = render_text_with_term_matches(
+                                    ui,
+                                    &entry.text,
+                                    &entry.activation_matches,
+                                    &entry.context_matches,
+                                    crate::ui::theme::text_normal(),
+                                    false,
                                 );
                                 if is_last {
                                     resp.scroll_to_me(Some(egui::Align::BOTTOM));
@@ -370,7 +396,7 @@ pub fn render(app: &mut crate::XRTranslateApp, ui: &mut egui::Ui) {
                             ui.label(
                                 egui::RichText::new(crate::i18n::tr(
                                     app.ui_language,
-                                    "No translations emitted yet...",
+                                    "No translations",
                                 ))
                                 .color(crate::ui::theme::text_weak())
                                 .italics(),
@@ -383,7 +409,10 @@ pub fn render(app: &mut crate::XRTranslateApp, ui: &mut egui::Ui) {
                                     .fill(egui::Color32::from_rgb(248, 250, 252))
                                     .corner_radius(egui::CornerRadius::same(8))
                                     .inner_margin(egui::Margin::symmetric(10, 8))
-                                    .stroke(egui::Stroke::new(1.0, egui::Color32::from_rgb(226, 232, 240)))
+                                    .stroke(egui::Stroke::new(
+                                        1.0,
+                                        egui::Color32::from_rgb(226, 232, 240),
+                                    ))
                                     .show(ui, |ui| {
                                         ui.set_width(ui.available_width());
                                         ui.horizontal_wrapped(|ui| {
@@ -419,11 +448,13 @@ pub fn render(app: &mut crate::XRTranslateApp, ui: &mut egui::Ui) {
                                                 .size(11.5),
                                         );
                                         ui.add_space(2.0);
-                                        ui.label(
-                                            egui::RichText::new(&entry.translated)
-                                                .color(crate::ui::theme::text_strong())
-                                                .size(13.0)
-                                                .strong(),
+                                        render_text_with_term_matches(
+                                            ui,
+                                            &entry.translated,
+                                            &entry.term_matches,
+                                            &[],
+                                            crate::ui::theme::text_strong(),
+                                            true,
                                         );
                                     })
                                     .response;
@@ -438,6 +469,92 @@ pub fn render(app: &mut crate::XRTranslateApp, ui: &mut egui::Ui) {
             },
         );
     });
+}
+
+fn render_text_with_term_matches(
+    ui: &mut egui::Ui,
+    text: &str,
+    primary_matches: &[xrtranslate_protocol::CorpusTermMatch],
+    secondary_matches: &[xrtranslate_protocol::CorpusTermMatch],
+    base_color: egui::Color32,
+    strong: bool,
+) -> egui::Response {
+    let mut matches = secondary_matches
+        .iter()
+        .map(|term_match| (term_match, false))
+        .chain(primary_matches.iter().map(|term_match| (term_match, true)))
+        .collect::<Vec<_>>();
+    matches.sort_by(|left, right| {
+        left.0
+            .start_byte
+            .cmp(&right.0.start_byte)
+            // Prefer activations when spans coincide.
+            .then_with(|| right.1.cmp(&left.1))
+            .then_with(|| right.0.end_byte.cmp(&left.0.end_byte))
+    });
+    ui.horizontal_wrapped(|ui| {
+        ui.spacing_mut().item_spacing.x = 0.0;
+        let mut cursor = 0usize;
+        for (term_match, primary) in matches {
+            let (Ok(start), Ok(end)) = (
+                usize::try_from(term_match.start_byte),
+                usize::try_from(term_match.end_byte),
+            ) else {
+                continue;
+            };
+            if start < cursor
+                || end <= start
+                || end > text.len()
+                || !text.is_char_boundary(start)
+                || !text.is_char_boundary(end)
+                || text.get(start..end) != Some(term_match.text.as_str())
+            {
+                continue;
+            }
+            if cursor < start {
+                let mut text = egui::RichText::new(&text[cursor..start])
+                    .color(base_color)
+                    .size(13.0);
+                if strong {
+                    text = text.strong();
+                }
+                ui.label(text);
+            }
+            let tooltip = term_match
+                .sources
+                .iter()
+                .map(|source| {
+                    format!(
+                        "{}\n{} / {}\n{}",
+                        source.title, source.domain, source.subdomain, source.corpus_id
+                    )
+                })
+                .collect::<Vec<_>>()
+                .join("\n\n");
+            let mut highlighted = egui::RichText::new(&text[start..end])
+                .color(if primary {
+                    egui::Color32::from_rgb(37, 99, 235)
+                } else {
+                    egui::Color32::from_rgb(96, 165, 250)
+                })
+                .size(13.0);
+            if primary {
+                highlighted = highlighted.strong();
+            }
+            ui.label(highlighted).on_hover_text(tooltip);
+            cursor = end;
+        }
+        if cursor < text.len() {
+            let mut trailing = egui::RichText::new(&text[cursor..])
+                .color(base_color)
+                .size(13.0);
+            if strong {
+                trailing = trailing.strong();
+            }
+            ui.label(trailing);
+        }
+    })
+    .response
 }
 
 fn render_capture_device_selector(app: &mut crate::XRTranslateApp, ui: &mut egui::Ui) {
@@ -528,10 +645,8 @@ fn render_capture_device_selector(app: &mut crate::XRTranslateApp, ui: &mut egui
         if app.is_translating {
             let bar_width = 80.0;
             let bar_height = 6.0;
-            let (rect, _) = ui.allocate_exact_size(
-                egui::vec2(bar_width, bar_height),
-                egui::Sense::hover(),
-            );
+            let (rect, _) =
+                ui.allocate_exact_size(egui::vec2(bar_width, bar_height), egui::Sense::hover());
             ui.painter().rect_filled(
                 rect,
                 egui::CornerRadius::same(3),

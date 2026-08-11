@@ -5,8 +5,8 @@ use xrtranslate_engine::{
     SessionEngine,
 };
 use xrtranslate_protocol::{
-    AsrResult, AsrResultKind, LatencyMetrics, ServerEvent, SourceSegmentReady, TranslationReady,
-    TtsFinished,
+    AsrResult, AsrResultKind, CorpusTermMatch, LatencyMetrics, ServerEvent, SourceSegmentReady,
+    TranslationReady, TtsFinished,
 };
 
 pub(crate) enum WireOutput {
@@ -23,6 +23,8 @@ pub(crate) struct SegmentContext {
     pub(crate) speaker_id: String,
     pub(crate) source_start_ms: f64,
     pub(crate) source_end_ms: f64,
+    pub(crate) activation_matches: Vec<CorpusTermMatch>,
+    pub(crate) context_matches: Vec<CorpusTermMatch>,
 }
 
 /// Translates the no-I/O session engine into the stable WebSocket contract.
@@ -33,6 +35,7 @@ pub(crate) struct SegmentContext {
 pub(crate) struct SessionAdapter {
     engine: SessionEngine,
     turn_id: String,
+    recognized_turn_ids: VecDeque<String>,
     translation_metadata: VecDeque<TranslationMetadata>,
 }
 
@@ -40,6 +43,7 @@ pub(crate) struct SessionAdapter {
 struct TranslationMetadata {
     metrics: LatencyMetrics,
     context: SegmentContext,
+    term_matches: Vec<CorpusTermMatch>,
 }
 
 impl SessionAdapter {
@@ -47,6 +51,7 @@ impl SessionAdapter {
         Ok(Self {
             engine: SessionEngine::new(route(source_lang, target_lang)?, EngineConfig::default()),
             turn_id: "native-1".into(),
+            recognized_turn_ids: VecDeque::new(),
             translation_metadata: VecDeque::new(),
         })
     }
@@ -72,6 +77,7 @@ impl SessionAdapter {
 
     pub(crate) fn set_route(&mut self, source_lang: &str, target_lang: &str) -> Result<(), String> {
         self.engine.set_route(route(source_lang, target_lang)?);
+        self.recognized_turn_ids.clear();
         self.translation_metadata.clear();
         Ok(())
     }
@@ -96,11 +102,22 @@ impl SessionAdapter {
     /// Accepts an ASR result only when its captured route is still current.
     /// A stale result is intentionally ignored instead of becoming a client
     /// error while the user has already selected a different language route.
+    #[cfg(test)]
     pub(crate) fn submit_recognized_for_route(
         &mut self,
         route_epoch: RouteEpoch,
         text: String,
         is_final: bool,
+    ) -> Result<bool, String> {
+        self.submit_recognized_for_route_and_turn(route_epoch, text, is_final, self.turn_id.clone())
+    }
+
+    pub(crate) fn submit_recognized_for_route_and_turn(
+        &mut self,
+        route_epoch: RouteEpoch,
+        text: String,
+        is_final: bool,
+        turn_id: String,
     ) -> Result<bool, String> {
         if route_epoch != self.engine.route_epoch() {
             return Ok(false);
@@ -111,7 +128,10 @@ impl SessionAdapter {
                 text,
                 is_final,
             })
-            .map(|_| true)
+            .map(|_| {
+                self.recognized_turn_ids.push_back(turn_id);
+                true
+            })
             .map_err(|error| error.to_string())
     }
 
@@ -180,6 +200,7 @@ impl SessionAdapter {
             route_epoch,
             source_text,
             translated_text,
+            Vec::new(),
             metrics,
             SegmentContext {
                 turn_id: self.turn_id.clone(),
@@ -188,6 +209,8 @@ impl SessionAdapter {
                 speaker_id: String::new(),
                 source_start_ms: 0.0,
                 source_end_ms: 0.0,
+                activation_matches: Vec::new(),
+                context_matches: Vec::new(),
             },
         )
     }
@@ -199,6 +222,7 @@ impl SessionAdapter {
         route_epoch: RouteEpoch,
         source_text: String,
         translated_text: String,
+        term_matches: Vec<CorpusTermMatch>,
         metrics: LatencyMetrics,
         context: SegmentContext,
     ) -> Result<bool, String> {
@@ -213,8 +237,11 @@ impl SessionAdapter {
                 is_final: true,
             })
             .map_err(|error| error.to_string())?;
-        self.translation_metadata
-            .push_back(TranslationMetadata { metrics, context });
+        self.translation_metadata.push_back(TranslationMetadata {
+            metrics,
+            context,
+            term_matches,
+        });
         Ok(true)
     }
 
@@ -235,6 +262,8 @@ impl SessionAdapter {
                 speaker_id: String::new(),
                 source_start_ms: 0.0,
                 source_end_ms: 0.0,
+                activation_matches: Vec::new(),
+                context_matches: Vec::new(),
             },
         )
     }
@@ -247,6 +276,8 @@ impl SessionAdapter {
     ) -> ServerEvent {
         ServerEvent::SourceSegmentReady(SourceSegmentReady {
             source_text,
+            activation_matches: context.activation_matches,
+            context_matches: context.context_matches,
             turn_id: context.turn_id,
             segment_index: context.segment_index,
             segment_count: context.segment_count,
@@ -262,6 +293,10 @@ impl SessionAdapter {
         for event in self.engine.drain_outbound() {
             match event.payload {
                 OutboundPayload::RecognizedText { text, is_final } => {
+                    let turn_id = self
+                        .recognized_turn_ids
+                        .pop_front()
+                        .unwrap_or_else(|| self.turn_id.clone());
                     output.push(WireOutput::Event(ServerEvent::AsrResult(AsrResult {
                         kind: if is_final {
                             AsrResultKind::Final
@@ -270,6 +305,7 @@ impl SessionAdapter {
                         },
                         text,
                         delta: String::new(),
+                        turn_id,
                         ts: None,
                     })));
                 }
@@ -294,12 +330,16 @@ impl SessionAdapter {
                                     speaker_id: String::new(),
                                     source_start_ms: 0.0,
                                     source_end_ms: 0.0,
+                                    activation_matches: Vec::new(),
+                                    context_matches: Vec::new(),
                                 },
+                                term_matches: Vec::new(),
                             });
                     output.push(WireOutput::Event(ServerEvent::TranslationReady(
                         TranslationReady {
                             source_text,
                             translated_text,
+                            term_matches: metadata.term_matches,
                             turn_id: metadata.context.turn_id,
                             segment_index: metadata.context.segment_index,
                             segment_count: metadata.context.segment_count,
@@ -426,6 +466,7 @@ mod tests {
                     route_epoch,
                     "source".into(),
                     "translation".into(),
+                    Vec::new(),
                     LatencyMetrics {
                         asr_ms: 1,
                         mt_ms: 2,
@@ -438,6 +479,8 @@ mod tests {
                         speaker_id: "speaker-01".into(),
                         source_start_ms: 120.0,
                         source_end_ms: 640.0,
+                        activation_matches: Vec::new(),
+                        context_matches: Vec::new(),
                     },
                 )
                 .unwrap()

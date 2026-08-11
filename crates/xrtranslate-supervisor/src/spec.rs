@@ -152,9 +152,7 @@ impl LlamaServerSpec {
         }
     }
 
-    /// Creates the Hunyuan MT2 GGUF profile used by the existing service
-    /// launcher: port 8002, 1024 context tokens, four slots, and flash
-    /// attention enabled.
+    /// Creates the Hunyuan MT2 GGUF profile.
     #[must_use]
     pub fn hunyuan_mt_gguf(executable: impl Into<PathBuf>, model: impl Into<PathBuf>) -> Self {
         Self {
@@ -164,7 +162,7 @@ impl LlamaServerSpec {
             mmproj: None,
             endpoint: LlamaServerEndpoint::new(IpAddr::V4(Ipv4Addr::UNSPECIFIED), 8002),
             model_alias: LlamaServerRole::HunyuanMt.model_alias().to_owned(),
-            context_size: 1024,
+            context_size: 4096,
             gpu_layers: GpuLayers::Count(99),
             parallel_slots: Some(4),
             flash_attention: Some(FlashAttention::On),

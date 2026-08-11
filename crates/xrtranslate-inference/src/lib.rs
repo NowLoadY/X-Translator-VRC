@@ -17,9 +17,9 @@ mod wav;
 pub use error::{InferenceError, TransportError};
 pub use http::{AsyncHttpClient, HttpRequest, HttpResponse, ReqwestClient};
 pub use openai::{ChatCompletion, OpenAiCompatibleClient};
-pub use qwen3::{AsrTranscript, Qwen3AsrAdapter, Qwen3AsrOptions};
+pub use qwen3::{AsrTranscript, Qwen3AsrAdapter, Qwen3AsrOptions, is_probable_asr_hallucination};
 pub use translation::{
     TranslationAdapter, TranslationOptions, TranslationProvider, TranslationResult,
-    build_hunyuan_prompt, build_translation_messages,
+    build_hunyuan_prompt, build_translation_messages, is_probable_translation_context_leak,
 };
 pub use wav::{PCM16_MONO_16KHZ_FORMAT, pcm16_mono_16khz_to_wav};

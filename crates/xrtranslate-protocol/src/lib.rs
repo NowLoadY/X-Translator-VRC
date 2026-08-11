@@ -9,6 +9,7 @@
 use std::{error::Error, fmt};
 
 use serde::{Deserialize, Serialize};
+pub use xr_corpus_protocol::{CorpusTermMatch, CorpusTermSource};
 
 /// The current WebSocket contract version.
 ///
@@ -171,6 +172,7 @@ pub enum EventControl {
 #[serde(rename_all = "snake_case")]
 pub enum Feature {
     Tts,
+    SpeakerRecognition,
 }
 
 /// JSON events sent from the backend to a WebSocket client.
@@ -200,6 +202,8 @@ pub struct AsrResult {
     pub kind: AsrResultKind,
     pub text: String,
     pub delta: String,
+    #[serde(default)]
+    pub turn_id: String,
     /// Unix timestamp in seconds, as emitted by the existing backend.
     pub ts: Option<f64>,
 }
@@ -218,6 +222,10 @@ pub enum AsrResultKind {
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct SourceSegmentReady {
     pub source_text: String,
+    #[serde(default)]
+    pub activation_matches: Vec<CorpusTermMatch>,
+    #[serde(default)]
+    pub context_matches: Vec<CorpusTermMatch>,
     pub turn_id: String,
     pub segment_index: u32,
     pub segment_count: u32,
@@ -231,6 +239,8 @@ pub struct SourceSegmentReady {
 pub struct TranslationReady {
     pub source_text: String,
     pub translated_text: String,
+    #[serde(default)]
+    pub term_matches: Vec<CorpusTermMatch>,
     pub turn_id: String,
     pub segment_index: u32,
     pub segment_count: u32,
@@ -301,6 +311,18 @@ mod tests {
     }
 
     #[test]
+    fn speaker_recognition_has_an_independent_feature_toggle() {
+        let control = ClientControl::Action(ActionControl::ToggleFeature {
+            feature: Feature::SpeakerRecognition,
+            enabled: true,
+        });
+        assert_eq!(
+            serde_json::to_string(&control).unwrap(),
+            r#"{"action":"toggle_feature","feature":"speaker_recognition","enabled":true}"#
+        );
+    }
+
+    #[test]
     fn translation_event_matches_the_existing_backend_shape() {
         let json = r#"{
             "action":"translation_ready",
@@ -323,6 +345,7 @@ mod tests {
             ServerEvent::TranslationReady(TranslationReady {
                 source_text: "hello".into(),
                 translated_text: "你好".into(),
+                term_matches: Vec::new(),
                 turn_id: "native-1".into(),
                 segment_index: 1,
                 segment_count: 1,

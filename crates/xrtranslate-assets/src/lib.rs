@@ -1,9 +1,8 @@
 //! Local model manifests and preflight checks for the native backend.
 //!
 //! This crate deliberately declares **where** the default GGUF assets belong
-//! and checks whether they can be used. It does not download models or contact
-//! Hugging Face. A higher-level downloader may use its integrity verifier and
-//! atomic staging promotion primitive, but owns network, retry, and UI policy.
+//! and checks whether they can be used. Explicit installers may download these
+//! immutable assets, while backend startup remains strictly read-only.
 
 #![forbid(unsafe_code)]
 
@@ -15,10 +14,9 @@ use std::{
     time::{SystemTime, UNIX_EPOCH},
 };
 
-use reqwest::{StatusCode, header::RANGE};
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
-use tokio::io::AsyncWriteExt;
+use xrtranslate_download::{DownloadClient, DownloadSpec};
 
 /// Stable identifier for a model package required by the initial native route.
 #[derive(Clone, Copy, Debug, Eq, PartialEq, Hash, Serialize, Deserialize)]
@@ -28,6 +26,7 @@ pub enum ModelAssetId {
     Qwen3AsrGguf,
     /// Hunyuan MT2 GGUF used by the local translation server.
     HunyuanMtGguf,
+    HunyuanMt7bGguf,
 }
 
 impl ModelAssetId {
@@ -37,6 +36,7 @@ impl ModelAssetId {
         match self {
             Self::Qwen3AsrGguf => "qwen3-asr-gguf",
             Self::HunyuanMtGguf => "hy-mt2",
+            Self::HunyuanMt7bGguf => "hy-mt2-big",
         }
     }
 
@@ -79,6 +79,25 @@ pub enum ModelCapability {
     Translation,
 }
 
+#[derive(Clone, Copy, Debug, Eq, PartialEq, Hash, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum ModelLevel {
+    Normal,
+    Big,
+    Ultra,
+}
+
+impl ModelLevel {
+    #[must_use]
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::Normal => "normal",
+            Self::Big => "big",
+            Self::Ultra => "ultra",
+        }
+    }
+}
+
 /// A file that must exist within a [`ModelAssetManifest::relative_directory`].
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct RequiredModelFile {
@@ -113,6 +132,7 @@ pub struct ModelAssetManifest {
     pub id: ModelAssetId,
     pub label: &'static str,
     pub capability: ModelCapability,
+    pub level: ModelLevel,
     pub provider: &'static str,
     /// Directory relative to the models root.
     pub relative_directory: &'static str,
@@ -142,11 +162,19 @@ const HUNYUAN_MT_REQUIRED_FILES: &[RequiredModelFile] = &[RequiredModelFile {
     sha256: "dc5f44fcf1fa496ee7ad725982c0c8c553a4de00259b53af84c4b89fb0c06699",
 }];
 
+const HUNYUAN_MT_7B_REQUIRED_FILES: &[RequiredModelFile] = &[RequiredModelFile {
+    relative_path: "Hy-MT2-7B-Q4_K_M.gguf",
+    purpose: "Hy-MT2 7B quantized GGUF model",
+    bytes: 4_624_648_896,
+    sha256: "9f96256500f3fc1ab4d64336b58f52a949a95ad7516b0c229476eef782f9f77b",
+}];
+
 /// Default local Qwen3-ASR GGUF package.
 pub const QWEN3_ASR_GGUF: ModelAssetManifest = ModelAssetManifest {
     id: ModelAssetId::Qwen3AsrGguf,
     label: "Speech Recognition Model",
     capability: ModelCapability::Asr,
+    level: ModelLevel::Normal,
     provider: "qwen3-gguf",
     relative_directory: "Qwen3-ASR-1.7B-GGUF",
     required_files: QWEN3_ASR_REQUIRED_FILES,
@@ -162,6 +190,7 @@ pub const HUNYUAN_MT_GGUF: ModelAssetManifest = ModelAssetManifest {
     id: ModelAssetId::HunyuanMtGguf,
     label: "Translation Model",
     capability: ModelCapability::Translation,
+    level: ModelLevel::Normal,
     provider: "hunyuan",
     relative_directory: "HY-MT2",
     required_files: HUNYUAN_MT_REQUIRED_FILES,
@@ -172,8 +201,33 @@ pub const HUNYUAN_MT_GGUF: ModelAssetManifest = ModelAssetManifest {
     },
 };
 
+/// Larger local Hy-MT2 GGUF package.
+pub const HUNYUAN_MT_7B_GGUF: ModelAssetManifest = ModelAssetManifest {
+    id: ModelAssetId::HunyuanMt7bGguf,
+    label: "Translation Model",
+    capability: ModelCapability::Translation,
+    level: ModelLevel::Big,
+    provider: "hunyuan",
+    relative_directory: "Hy-MT2-7B-GGUF",
+    required_files: HUNYUAN_MT_7B_REQUIRED_FILES,
+    source: ModelSource {
+        repository: "tencent/Hy-MT2-7B-GGUF",
+        revision: "707464294cf5b2a5a69982855020858ed58cf1d1",
+        include_patterns: &["Hy-MT2-7B-Q4_K_M.gguf"],
+    },
+};
+
 /// All GGUF packages required by the first Python-free route.
-pub const DEFAULT_GGUF_MANIFEST: &[ModelAssetManifest] = &[QWEN3_ASR_GGUF, HUNYUAN_MT_GGUF];
+pub const DEFAULT_GGUF_MANIFEST: &[ModelAssetManifest] =
+    &[QWEN3_ASR_GGUF, HUNYUAN_MT_GGUF, HUNYUAN_MT_7B_GGUF];
+
+pub fn manifests_for_capability(
+    capability: ModelCapability,
+) -> impl Iterator<Item = &'static ModelAssetManifest> {
+    DEFAULT_GGUF_MANIFEST
+        .iter()
+        .filter(move |manifest| manifest.capability == capability)
+}
 
 /// Returns the static manifest for `id`.
 #[must_use]
@@ -181,6 +235,7 @@ pub const fn manifest_for(id: ModelAssetId) -> &'static ModelAssetManifest {
     match id {
         ModelAssetId::Qwen3AsrGguf => &QWEN3_ASR_GGUF,
         ModelAssetId::HunyuanMtGguf => &HUNYUAN_MT_GGUF,
+        ModelAssetId::HunyuanMt7bGguf => &HUNYUAN_MT_7B_GGUF,
     }
 }
 
@@ -201,6 +256,8 @@ pub struct ModelAssetsConfig {
     /// Override the Hy-MT2 package directory, while retaining its fixed
     /// required filename. It may be an absolute path.
     pub hunyuan_mt_gguf_directory: Option<PathBuf>,
+    pub qwen3_asr_asset: Option<ModelAssetId>,
+    pub hunyuan_mt_asset: Option<ModelAssetId>,
 }
 
 impl ModelAssetsConfig {
@@ -214,22 +271,34 @@ impl ModelAssetsConfig {
                 .as_deref()
                 .unwrap_or_else(|| Path::new("models")),
         );
+        let qwen3_manifest =
+            manifest_for(self.qwen3_asr_asset.unwrap_or(ModelAssetId::Qwen3AsrGguf));
+        let hunyuan_manifest =
+            manifest_for(self.hunyuan_mt_asset.unwrap_or(ModelAssetId::HunyuanMtGguf));
         let qwen3_directory = self
             .qwen3_asr_gguf_directory
             .as_deref()
             .map(|path| resolve_from_project_root(&project_root, path))
-            .unwrap_or_else(|| models_directory.join(QWEN3_ASR_GGUF.relative_directory));
+            .unwrap_or_else(|| models_directory.join(qwen3_manifest.relative_directory));
         let hunyuan_directory = self
             .hunyuan_mt_gguf_directory
             .as_deref()
             .map(|path| resolve_from_project_root(&project_root, path))
-            .unwrap_or_else(|| models_directory.join(HUNYUAN_MT_GGUF.relative_directory));
+            .unwrap_or_else(|| models_directory.join(hunyuan_manifest.relative_directory));
 
         ResolvedModelAssets {
             project_root,
-            models_directory,
-            qwen3_asr: ResolvedModelAsset::new(&QWEN3_ASR_GGUF, qwen3_directory),
-            hunyuan_mt: ResolvedModelAsset::new(&HUNYUAN_MT_GGUF, hunyuan_directory),
+            models_directory: models_directory.clone(),
+            qwen3_asr: ResolvedModelAsset::new(qwen3_manifest, qwen3_directory),
+            hunyuan_mt: ResolvedModelAsset::new(hunyuan_manifest, hunyuan_directory),
+            hunyuan_mt_normal: ResolvedModelAsset::new(
+                &HUNYUAN_MT_GGUF,
+                models_directory.join(HUNYUAN_MT_GGUF.relative_directory),
+            ),
+            hunyuan_mt_big: ResolvedModelAsset::new(
+                &HUNYUAN_MT_7B_GGUF,
+                models_directory.join(HUNYUAN_MT_7B_GGUF.relative_directory),
+            ),
         }
     }
 }
@@ -251,6 +320,8 @@ pub struct ResolvedModelAssets {
     pub models_directory: PathBuf,
     pub qwen3_asr: ResolvedModelAsset,
     pub hunyuan_mt: ResolvedModelAsset,
+    pub hunyuan_mt_normal: ResolvedModelAsset,
+    pub hunyuan_mt_big: ResolvedModelAsset,
 }
 
 impl ResolvedModelAssets {
@@ -303,7 +374,20 @@ impl ResolvedModelAssets {
     pub fn asset(&self, id: ModelAssetId) -> &ResolvedModelAsset {
         match id {
             ModelAssetId::Qwen3AsrGguf => &self.qwen3_asr,
-            ModelAssetId::HunyuanMtGguf => &self.hunyuan_mt,
+            ModelAssetId::HunyuanMtGguf => {
+                if self.hunyuan_mt.manifest.id == ModelAssetId::HunyuanMtGguf {
+                    &self.hunyuan_mt
+                } else {
+                    &self.hunyuan_mt_normal
+                }
+            }
+            ModelAssetId::HunyuanMt7bGguf => {
+                if self.hunyuan_mt.manifest.id == ModelAssetId::HunyuanMt7bGguf {
+                    &self.hunyuan_mt
+                } else {
+                    &self.hunyuan_mt_big
+                }
+            }
         }
     }
 
@@ -322,7 +406,8 @@ impl ResolvedModelAssets {
     ) -> Result<PathBuf, AtomicInstallError> {
         let target = match id {
             ModelAssetId::Qwen3AsrGguf => &self.qwen3_asr,
-            ModelAssetId::HunyuanMtGguf => &self.hunyuan_mt,
+            ModelAssetId::HunyuanMtGguf => self.asset(ModelAssetId::HunyuanMtGguf),
+            ModelAssetId::HunyuanMt7bGguf => self.asset(ModelAssetId::HunyuanMt7bGguf),
         };
         install_verified_directory(target, staging_directory.as_ref())
     }
@@ -433,7 +518,6 @@ fn install_verified_directory(
     Ok(destination)
 }
 
-/// Progress reported while a single immutable model file is transferred.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct DownloadProgress {
     pub asset_id: ModelAssetId,
@@ -446,47 +530,17 @@ pub struct DownloadProgress {
 /// a safe retry.  The installer never deletes an active model package.
 #[derive(Debug)]
 pub enum ModelDownloadError {
-    HttpClient(reqwest::Error),
-    StagingDirectory {
-        path: PathBuf,
-        source: io::Error,
-    },
+    Download(xrtranslate_download::DownloadError),
+    StagingDirectory { path: PathBuf, source: io::Error },
     Locked(PathBuf),
-    Lock {
-        path: PathBuf,
-        source: io::Error,
-    },
-    HttpStatus {
-        url: String,
-        status: StatusCode,
-    },
-    Transfer {
-        url: String,
-        source: reqwest::Error,
-    },
-    FileIo {
-        path: PathBuf,
-        source: io::Error,
-    },
-    TooLarge {
-        path: PathBuf,
-        expected: u64,
-        actual: u64,
-    },
-    Integrity {
-        path: PathBuf,
-        expected: String,
-        actual: String,
-    },
+    Lock { path: PathBuf, source: io::Error },
     AtomicInstall(AtomicInstallError),
 }
 
 impl fmt::Display for ModelDownloadError {
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
-            Self::HttpClient(error) => {
-                write!(formatter, "cannot create model download client: {error}")
-            }
+            Self::Download(error) => error.fmt(formatter),
             Self::StagingDirectory { path, source } => {
                 write!(
                     formatter,
@@ -506,37 +560,6 @@ impl fmt::Display for ModelDownloadError {
                     path.display()
                 )
             }
-            Self::HttpStatus { url, status } => {
-                write!(formatter, "model download {url} returned HTTP {status}")
-            }
-            Self::Transfer { url, source } => {
-                write!(formatter, "model download {url} failed: {source}")
-            }
-            Self::FileIo { path, source } => {
-                write!(
-                    formatter,
-                    "cannot write staged model file {}: {source}",
-                    path.display()
-                )
-            }
-            Self::TooLarge {
-                path,
-                expected,
-                actual,
-            } => write!(
-                formatter,
-                "staged model file {} is {actual} bytes; expected at most {expected} bytes",
-                path.display()
-            ),
-            Self::Integrity {
-                path,
-                expected,
-                actual,
-            } => write!(
-                formatter,
-                "staged model file {} has SHA-256 {actual}; expected {expected}",
-                path.display()
-            ),
             Self::AtomicInstall(error) => error.fmt(formatter),
         }
     }
@@ -545,15 +568,10 @@ impl fmt::Display for ModelDownloadError {
 impl Error for ModelDownloadError {
     fn source(&self) -> Option<&(dyn Error + 'static)> {
         match self {
-            Self::HttpClient(error) | Self::Transfer { source: error, .. } => Some(error),
-            Self::StagingDirectory { source, .. }
-            | Self::Lock { source, .. }
-            | Self::FileIo { source, .. } => Some(source),
+            Self::Download(error) => Some(error),
+            Self::StagingDirectory { source, .. } | Self::Lock { source, .. } => Some(source),
             Self::AtomicInstall(error) => Some(error),
-            Self::Locked(_)
-            | Self::HttpStatus { .. }
-            | Self::TooLarge { .. }
-            | Self::Integrity { .. } => None,
+            Self::Locked(_) => None,
         }
     }
 }
@@ -568,18 +586,13 @@ impl Error for ModelDownloadError {
 #[derive(Clone, Debug)]
 pub struct NativeModelInstaller {
     assets: ResolvedModelAssets,
-    client: reqwest::Client,
+    client: DownloadClient,
 }
 
 impl NativeModelInstaller {
     pub fn new(assets: ResolvedModelAssets) -> Result<Self, ModelDownloadError> {
-        let client = reqwest::Client::builder()
-            .user_agent(concat!(
-                "xrtranslate-assets/",
-                env!("CARGO_PKG_VERSION")
-            ))
-            .build()
-            .map_err(ModelDownloadError::HttpClient)?;
+        let client = DownloadClient::new(concat!("xrtranslate-assets/", env!("CARGO_PKG_VERSION")))
+            .map_err(ModelDownloadError::Download)?;
         Ok(Self { assets, client })
     }
 
@@ -600,22 +613,39 @@ impl NativeModelInstaller {
             ));
         }
         let staging = self.staging_directory(target.manifest());
+        let staging_parent = staging.parent().expect("staging directory has parent");
+        fs::create_dir_all(staging_parent).map_err(|source| {
+            ModelDownloadError::StagingDirectory {
+                path: staging_parent.to_path_buf(),
+                source,
+            }
+        })?;
+        let _lock = InstallLock::acquire(staging_parent, id)?;
+        prune_obsolete_model_staging(staging_parent, &staging, id)?;
         fs::create_dir_all(&staging).map_err(|source| ModelDownloadError::StagingDirectory {
             path: staging.clone(),
             source,
         })?;
-        let _lock =
-            InstallLock::acquire(staging.parent().expect("staging directory has parent"), id)?;
 
+        let total_bytes = target
+            .manifest()
+            .required_files
+            .iter()
+            .map(|file| file.bytes)
+            .sum();
+        let mut completed_bytes = 0_u64;
         for file in target.manifest().required_files {
             self.download_file(
                 id,
                 target.manifest().source,
                 *file,
                 &staging,
+                completed_bytes,
+                total_bytes,
                 &mut on_progress,
             )
             .await?;
+            completed_bytes = completed_bytes.saturating_add(file.bytes);
         }
         self.assets
             .install_from_staging(id, staging)
@@ -623,10 +653,7 @@ impl NativeModelInstaller {
     }
 
     fn asset(&self, id: ModelAssetId) -> &ResolvedModelAsset {
-        match id {
-            ModelAssetId::Qwen3AsrGguf => &self.assets.qwen3_asr,
-            ModelAssetId::HunyuanMtGguf => &self.assets.hunyuan_mt,
-        }
+        self.assets.asset(id)
     }
 
     fn staging_directory(&self, manifest: &ModelAssetManifest) -> PathBuf {
@@ -646,200 +673,80 @@ impl NativeModelInstaller {
         source: ModelSource,
         file: RequiredModelFile,
         staging: &Path,
+        completed_bytes: u64,
+        total_bytes: u64,
         on_progress: &mut impl FnMut(DownloadProgress),
     ) -> Result<(), ModelDownloadError> {
         let complete = staging.join(file.relative_path);
-        if complete.is_file() {
-            let actual_size = fs::metadata(&complete)
-                .map_err(|source| ModelDownloadError::FileIo {
-                    path: complete.clone(),
-                    source,
-                })?
-                .len();
-            if actual_size != file.bytes {
-                return Err(ModelDownloadError::TooLarge {
-                    path: complete,
-                    expected: file.bytes,
-                    actual: actual_size,
-                });
-            }
-            let actual = sha256_file(&complete).map_err(|source| ModelDownloadError::FileIo {
-                path: complete.clone(),
-                source,
-            })?;
-            if !actual.eq_ignore_ascii_case(file.sha256) {
-                return Err(ModelDownloadError::Integrity {
-                    path: complete,
-                    expected: file.sha256.to_owned(),
-                    actual,
-                });
-            }
-            on_progress(DownloadProgress {
-                asset_id: id,
-                relative_path: file.relative_path,
-                downloaded_bytes: file.bytes,
-                total_bytes: file.bytes,
-            });
-            return Ok(());
-        }
-
         let partial = staging.join(format!("{}.part", file.relative_path));
-        let existing = fs::metadata(&partial)
-            .map(|metadata| metadata.len())
-            .unwrap_or(0);
-        if existing > file.bytes {
-            return Err(ModelDownloadError::TooLarge {
-                path: partial,
-                expected: file.bytes,
-                actual: existing,
-            });
-        }
-        if existing == file.bytes {
-            let actual = sha256_file(&partial).map_err(|source| ModelDownloadError::FileIo {
-                path: partial.clone(),
-                source,
-            })?;
-            if !actual.eq_ignore_ascii_case(file.sha256) {
-                return Err(ModelDownloadError::Integrity {
-                    path: partial,
-                    expected: file.sha256.to_owned(),
-                    actual,
-                });
-            }
-            tokio::fs::rename(&partial, &complete)
-                .await
-                .map_err(|source| ModelDownloadError::FileIo {
-                    path: complete,
-                    source,
-                })?;
-            on_progress(DownloadProgress {
-                asset_id: id,
-                relative_path: file.relative_path,
-                downloaded_bytes: file.bytes,
-                total_bytes: file.bytes,
-            });
-            return Ok(());
-        }
-        if let Some(parent) = partial.parent() {
-            tokio::fs::create_dir_all(parent).await.map_err(|source| {
-                ModelDownloadError::StagingDirectory {
-                    path: parent.to_path_buf(),
-                    source,
-                }
-            })?;
-        }
         let url = source.hugging_face_resolve_url(file.relative_path);
-        let mut request = self.client.get(&url);
-        if existing > 0 {
-            request = request.header(RANGE, format!("bytes={existing}-"));
-        }
-        let response = request
-            .send()
+        self.client
+            .download(
+                DownloadSpec {
+                    label: file.purpose,
+                    url: &url,
+                    bytes: file.bytes,
+                    sha256: file.sha256,
+                },
+                &partial,
+                &complete,
+                |progress| {
+                    on_progress(DownloadProgress {
+                        asset_id: id,
+                        relative_path: file.relative_path,
+                        downloaded_bytes: completed_bytes.saturating_add(progress.downloaded_bytes),
+                        total_bytes,
+                    });
+                },
+            )
             .await
-            .map_err(|source| ModelDownloadError::Transfer {
-                url: url.clone(),
-                source,
-            })?;
-        let status = response.status();
-        if !status.is_success() {
-            return Err(ModelDownloadError::HttpStatus { url, status });
-        }
-        let append = existing > 0 && status == StatusCode::PARTIAL_CONTENT;
-        let mut downloaded = if append { existing } else { 0 };
-        let mut output = tokio::fs::OpenOptions::new()
-            .create(true)
-            .write(true)
-            .append(append)
-            .truncate(!append)
-            .open(&partial)
-            .await
-            .map_err(|source| ModelDownloadError::FileIo {
-                path: partial.clone(),
-                source,
-            })?;
-        on_progress(DownloadProgress {
-            asset_id: id,
-            relative_path: file.relative_path,
-            downloaded_bytes: downloaded,
-            total_bytes: file.bytes,
-        });
-        let mut response = response;
-        while let Some(chunk) =
-            response
-                .chunk()
-                .await
-                .map_err(|source| ModelDownloadError::Transfer {
-                    url: url.clone(),
-                    source,
-                })?
-        {
-            downloaded = downloaded.saturating_add(chunk.len() as u64);
-            if downloaded > file.bytes {
-                return Err(ModelDownloadError::TooLarge {
-                    path: partial,
-                    expected: file.bytes,
-                    actual: downloaded,
-                });
-            }
-            output
-                .write_all(&chunk)
-                .await
-                .map_err(|source| ModelDownloadError::FileIo {
-                    path: partial.clone(),
-                    source,
-                })?;
-            on_progress(DownloadProgress {
-                asset_id: id,
-                relative_path: file.relative_path,
-                downloaded_bytes: downloaded,
-                total_bytes: file.bytes,
-            });
-        }
-        output
-            .flush()
-            .await
-            .map_err(|source| ModelDownloadError::FileIo {
-                path: partial.clone(),
-                source,
-            })?;
-        output
-            .sync_all()
-            .await
-            .map_err(|source| ModelDownloadError::FileIo {
-                path: partial.clone(),
-                source,
-            })?;
-        if downloaded != file.bytes {
-            return Err(ModelDownloadError::TooLarge {
-                path: partial,
-                expected: file.bytes,
-                actual: downloaded,
-            });
-        }
-        tokio::fs::rename(&partial, &complete)
-            .await
-            .map_err(|source| ModelDownloadError::FileIo {
-                path: complete,
-                source,
-            })?;
-        Ok(())
+            .map_err(ModelDownloadError::Download)
     }
+}
+
+fn prune_obsolete_model_staging(
+    staging_parent: &Path,
+    current: &Path,
+    id: ModelAssetId,
+) -> Result<(), ModelDownloadError> {
+    let prefix = format!("{}-", id.as_str());
+    let entries =
+        fs::read_dir(staging_parent).map_err(|source| ModelDownloadError::StagingDirectory {
+            path: staging_parent.to_path_buf(),
+            source,
+        })?;
+    for entry in entries {
+        let entry = entry.map_err(|source| ModelDownloadError::StagingDirectory {
+            path: staging_parent.to_path_buf(),
+            source,
+        })?;
+        let path = entry.path();
+        if path != current
+            && entry.file_type().map(|kind| kind.is_dir()).unwrap_or(false)
+            && entry.file_name().to_string_lossy().starts_with(&prefix)
+        {
+            fs::remove_dir_all(&path)
+                .map_err(|source| ModelDownloadError::StagingDirectory { path, source })?;
+        }
+    }
+    Ok(())
 }
 
 struct InstallLock {
     path: PathBuf,
+    file: Option<fs::File>,
 }
 
 impl InstallLock {
     fn acquire(staging_parent: &Path, id: ModelAssetId) -> Result<Self, ModelDownloadError> {
         let path = staging_parent.join(format!("{}.lock", id.as_str()));
-        match fs::OpenOptions::new()
-            .write(true)
-            .create_new(true)
-            .open(&path)
-        {
+        match open_install_lock(&path) {
             Ok(mut file) => {
                 use std::io::Write;
+                file.set_len(0).map_err(|source| ModelDownloadError::Lock {
+                    path: path.clone(),
+                    source,
+                })?;
                 writeln!(
                     file,
                     "pid={} created_unix={}",
@@ -850,9 +757,17 @@ impl InstallLock {
                     path: path.clone(),
                     source,
                 })?;
-                Ok(Self { path })
+                Ok(Self {
+                    path,
+                    file: Some(file),
+                })
             }
-            Err(error) if error.kind() == io::ErrorKind::AlreadyExists => {
+            Err(error)
+                if matches!(
+                    error.kind(),
+                    io::ErrorKind::AlreadyExists | io::ErrorKind::PermissionDenied
+                ) =>
+            {
                 Err(ModelDownloadError::Locked(path))
             }
             Err(source) => Err(ModelDownloadError::Lock { path, source }),
@@ -862,8 +777,26 @@ impl InstallLock {
 
 impl Drop for InstallLock {
     fn drop(&mut self) {
+        self.file.take();
         let _ = fs::remove_file(&self.path);
     }
+}
+
+#[cfg(windows)]
+fn open_install_lock(path: &Path) -> io::Result<fs::File> {
+    use std::os::windows::fs::OpenOptionsExt;
+
+    let mut options = fs::OpenOptions::new();
+    options.write(true).create(true).share_mode(0);
+    options.open(path)
+}
+
+#[cfg(not(windows))]
+fn open_install_lock(path: &Path) -> io::Result<fs::File> {
+    fs::OpenOptions::new()
+        .write(true)
+        .create_new(true)
+        .open(path)
 }
 
 fn unix_seconds() -> u64 {
@@ -1212,7 +1145,7 @@ mod tests {
 
     #[test]
     fn static_manifest_declares_the_default_gguf_route() {
-        assert_eq!(DEFAULT_GGUF_MANIFEST.len(), 2);
+        assert_eq!(DEFAULT_GGUF_MANIFEST.len(), 3);
         assert_eq!(QWEN3_ASR_GGUF.required_files.len(), 2);
         assert_eq!(HUNYUAN_MT_GGUF.required_files.len(), 1);
         assert_eq!(
@@ -1262,6 +1195,7 @@ mod tests {
             models_directory: Some(PathBuf::from("installed-models")),
             qwen3_asr_gguf_directory: Some(PathBuf::from("custom/qwen")),
             hunyuan_mt_gguf_directory: None,
+            ..ModelAssetsConfig::default()
         };
         let assets = config.resolve("release-root");
 
@@ -1276,6 +1210,29 @@ mod tests {
         assert_eq!(
             assets.hunyuan_mt.directory(),
             Path::new("release-root/installed-models/HY-MT2")
+        );
+    }
+
+    #[test]
+    fn selected_translation_level_changes_the_runtime_and_download_manifest() {
+        let assets = ModelAssetsConfig {
+            hunyuan_mt_asset: Some(ModelAssetId::HunyuanMt7bGguf),
+            ..ModelAssetsConfig::default()
+        }
+        .resolve("release-root");
+
+        assert_eq!(assets.hunyuan_mt.manifest().level, ModelLevel::Big);
+        assert_eq!(
+            assets.llama_cpp_paths().hunyuan_mt_model,
+            Path::new("release-root/models/Hy-MT2-7B-GGUF/Hy-MT2-7B-Q4_K_M.gguf")
+        );
+        assert_eq!(
+            assets
+                .asset(ModelAssetId::HunyuanMt7bGguf)
+                .manifest()
+                .source
+                .repository,
+            "tencent/Hy-MT2-7B-GGUF"
         );
     }
 
@@ -1345,6 +1302,7 @@ mod tests {
             id: ModelAssetId::Qwen3AsrGguf,
             label: "fixture",
             capability: ModelCapability::Asr,
+            level: ModelLevel::Normal,
             provider: "fixture",
             relative_directory: "fixture",
             required_files: files,
@@ -1388,6 +1346,7 @@ mod tests {
             id: ModelAssetId::HunyuanMtGguf,
             label: "fixture",
             capability: ModelCapability::Translation,
+            level: ModelLevel::Normal,
             provider: "fixture",
             relative_directory: "fixture",
             required_files: files,

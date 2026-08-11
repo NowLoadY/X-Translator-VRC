@@ -286,7 +286,6 @@ fn onboarding_feature_card(
     ui: &mut egui::Ui,
     icon: &str,
     title: &'static str,
-    body: &'static str,
     tint: Color32,
     language: crate::i18n::UiLanguage,
 ) {
@@ -297,7 +296,7 @@ fn onboarding_feature_card(
         .stroke(Stroke::new(1.0, Color32::from_black_alpha(12)))
         .show(ui, |ui| {
             ui.set_width(ui.available_width());
-            ui.set_min_height(135.0);
+            ui.set_min_height(82.0);
             ui.label(
                 RichText::new(icon)
                     .size(22.0)
@@ -311,44 +310,30 @@ fn onboarding_feature_card(
                     .color(theme::text_strong())
                     .strong(),
             );
-            ui.add_space(6.0);
-            ui.label(
-                RichText::new(crate::i18n::tr(language, body))
-                    .size(12.0)
-                    .color(theme::text_normal()),
-            );
         });
 }
 
 fn render_onboarding_welcome(language: crate::i18n::UiLanguage, ui: &mut egui::Ui) {
-    onboarding_title(
-        ui,
-        language,
-        "Welcome to XRTranslate",
-        Some("Set up your local tools once, then keep conversations flowing naturally."),
-    );
+    onboarding_title(ui, language, "Welcome to XRTranslate", None);
     ui.columns(3, |columns| {
         onboarding_feature_card(
             &mut columns[0],
             "01",
-            "Bring your own voice",
-            "Use a microphone or the sound already playing on your computer.",
+            "Audio Input",
             Color32::from_rgb(239, 246, 255),
             language,
         );
         onboarding_feature_card(
             &mut columns[1],
             "02",
-            "Understand together",
-            "Read the original words and translation side by side.",
+            "Recognition & Translation",
             Color32::from_rgb(240, 253, 250),
             language,
         );
         onboarding_feature_card(
             &mut columns[2],
             "03",
-            "Share when ready",
-            "Send subtitles to VRChat whenever you choose.",
+            "VRChat OSC",
             Color32::from_rgb(255, 247, 237),
             language,
         );
@@ -359,6 +344,15 @@ fn render_onboarding_runtime(app: &mut crate::XRTranslateApp, ui: &mut egui::Ui)
     use crate::runtime_install::RuntimeInstallState;
 
     let language = app.ui_language;
+    let runtime_is_available = app.backend_manager.llama_server_path_is_valid();
+    if !runtime_is_available
+        && matches!(app.runtime_installer.state(), RuntimeInstallState::Idle)
+        && let Err(error) = app
+            .runtime_installer
+            .prepare_recommended(app.project_root())
+    {
+        app.last_error = Some(error);
+    }
     onboarding_title(ui, language, "Download llama.cpp", None);
 
     // Option A: Automatic Setup
@@ -377,20 +371,36 @@ fn render_onboarding_runtime(app: &mut crate::XRTranslateApp, ui: &mut egui::Ui)
                 .color(Color32::from_rgb(4, 120, 87))
                 .strong(),
             );
-            ui.add_space(6.0);
-            ui.label(
-                RichText::new(crate::i18n::tr(
-                    language,
-                    "Detects your hardware automatically and downloads the optimal package.",
-                ))
-                .size(12.0)
-                .color(theme::text_normal()),
-            );
             ui.add_space(12.0);
+            let download_size = app.runtime_installer.download_size_bytes();
+            let backend = app.runtime_installer.backend_label().unwrap_or_default();
+            let action = if matches!(
+                app.runtime_installer.state(),
+                RuntimeInstallState::Failed(_)
+            ) {
+                crate::i18n::tr(language, "Retry")
+            } else {
+                crate::i18n::tr(language, "Download")
+            };
+            let button_label = if runtime_is_available {
+                crate::i18n::tr(language, "Installed").to_owned()
+            } else {
+                download_size.map_or_else(
+                    || crate::i18n::tr(language, "Preparing download…").to_owned(),
+                    |bytes| {
+                        format!(
+                            "{action} {backend} · {}",
+                            components::format_file_size(bytes)
+                        )
+                    },
+                )
+            };
             if components::primary_button_enabled(
                 ui,
-                crate::i18n::tr(language, "Download and install llama.cpp"),
-                !app.runtime_installer.is_busy(),
+                &button_label,
+                !runtime_is_available
+                    && download_size.is_some()
+                    && !app.runtime_installer.is_busy(),
             )
             .clicked()
             {
@@ -401,69 +411,81 @@ fn render_onboarding_runtime(app: &mut crate::XRTranslateApp, ui: &mut egui::Ui)
                     app.last_error = Some(error);
                 }
             }
-            match app.runtime_installer.state() {
-                RuntimeInstallState::Idle => {}
-                RuntimeInstallState::Detecting => {
-                    ui.add_space(6.0);
-                    ui.label(
-                        RichText::new(crate::i18n::tr(
-                            language,
-                            "Detecting the recommended runtime...",
-                        ))
-                        .size(12.0)
-                        .color(theme::text_weak()),
-                    );
-                }
-                RuntimeInstallState::Downloading {
-                    asset,
-                    downloaded,
-                    total,
-                } => {
-                    ui.add_space(6.0);
-                    ui.label(RichText::new(asset).size(11.0).color(theme::text_weak()));
-                    if *total > 0 {
-                        ui.add(
-                            egui::ProgressBar::new(
-                                (*downloaded as f64 / *total as f64).clamp(0.0, 1.0) as f32,
-                            )
-                            .text(format!(
-                                "{} / {} MiB",
-                                downloaded / (1024 * 1024),
-                                total / (1024 * 1024)
-                            )),
-                        );
-                    }
-                }
-                RuntimeInstallState::Extracting => {
-                    ui.add_space(6.0);
-                    ui.label(
-                        RichText::new(crate::i18n::tr(language, "Extracting llama.cpp..."))
+            if runtime_is_available {
+                ui.add_space(6.0);
+                ui.label(
+                    RichText::new(crate::i18n::tr(
+                        language,
+                        "llama.cpp is installed and ready.",
+                    ))
+                    .size(12.0)
+                    .color(Color32::from_rgb(5, 150, 105)),
+                );
+            } else {
+                match app.runtime_installer.state() {
+                    RuntimeInstallState::Idle | RuntimeInstallState::Ready => {}
+                    RuntimeInstallState::Detecting => {
+                        ui.add_space(6.0);
+                        ui.label(
+                            RichText::new(crate::i18n::tr(
+                                language,
+                                "Detecting the recommended runtime...",
+                            ))
                             .size(12.0)
                             .color(theme::text_weak()),
-                    );
-                }
-                RuntimeInstallState::Installed(path) => {
-                    ui.add_space(6.0);
-                    let installed_path = path.display().to_string();
-                    if app.backend_manager.llama_server_path != installed_path {
-                        app.backend_manager.adopt_installed_llama_server_path(path);
+                        );
                     }
-                    ui.label(
-                        RichText::new(crate::i18n::tr(
-                            language,
-                            "llama.cpp is installed and ready.",
-                        ))
-                        .size(12.0)
-                        .color(Color32::from_rgb(5, 150, 105)),
-                    );
-                }
-                RuntimeInstallState::Failed(error) => {
-                    ui.add_space(6.0);
-                    ui.label(
-                        RichText::new(error)
+                    RuntimeInstallState::Downloading {
+                        asset,
+                        downloaded,
+                        total,
+                    } => {
+                        ui.add_space(6.0);
+                        ui.label(RichText::new(asset).size(11.0).color(theme::text_weak()));
+                        if *total > 0 {
+                            ui.add(
+                                egui::ProgressBar::new(
+                                    (*downloaded as f64 / *total as f64).clamp(0.0, 1.0) as f32,
+                                )
+                                .text(format!(
+                                    "{} / {}",
+                                    components::format_file_size(*downloaded),
+                                    components::format_file_size(*total),
+                                )),
+                            );
+                        }
+                    }
+                    RuntimeInstallState::Extracting => {
+                        ui.add_space(6.0);
+                        ui.label(
+                            RichText::new(crate::i18n::tr(language, "Extracting llama.cpp..."))
+                                .size(12.0)
+                                .color(theme::text_weak()),
+                        );
+                    }
+                    RuntimeInstallState::Installed(path) => {
+                        ui.add_space(6.0);
+                        let installed_path = path.display().to_string();
+                        if app.backend_manager.llama_server_path != installed_path {
+                            app.backend_manager.adopt_installed_llama_server_path(path);
+                        }
+                        ui.label(
+                            RichText::new(crate::i18n::tr(
+                                language,
+                                "llama.cpp is installed and ready.",
+                            ))
                             .size(12.0)
-                            .color(Color32::from_rgb(220, 38, 38)),
-                    );
+                            .color(Color32::from_rgb(5, 150, 105)),
+                        );
+                    }
+                    RuntimeInstallState::Failed(error) => {
+                        ui.add_space(6.0);
+                        ui.label(
+                            RichText::new(error)
+                                .size(12.0)
+                                .color(Color32::from_rgb(220, 38, 38)),
+                        );
+                    }
                 }
             }
         });
@@ -601,7 +623,9 @@ fn render_onboarding_runtime(app: &mut crate::XRTranslateApp, ui: &mut egui::Ui)
 }
 
 fn render_onboarding_models(app: &mut crate::XRTranslateApp, ui: &mut egui::Ui) {
-    use crate::model_install::{NativeModelTaskState, configured_model_packages};
+    use crate::model_install::{
+        NativeModelTaskState, configured_model_packages, model_level_packages, set_model_level,
+    };
 
     let language = app.ui_language;
     onboarding_title(ui, language, "Install your model packages", None);
@@ -623,25 +647,54 @@ fn render_onboarding_models(app: &mut crate::XRTranslateApp, ui: &mut egui::Ui) 
         }
     };
     let mut install = None;
+    let mut level_change = None;
+    let retry = matches!(
+        app.model_task_manager.state(),
+        NativeModelTaskState::Failed(_)
+    );
     ui.columns(packages.len().max(1), |columns| {
         for (index, package) in packages.iter().enumerate() {
             let installed = app.model_task_manager.is_model_present(package.id);
-            if onboarding_model_card(
+            let (download_clicked, selected_level) = onboarding_model_card(
                 &mut columns[index],
                 language,
                 package.label,
-                if installed { "Installed" } else { "Install" },
+                package.level,
+                &model_level_packages(package.capability),
+                if installed {
+                    "Installed"
+                } else if retry {
+                    "Retry"
+                } else {
+                    "Download"
+                },
                 !busy && !installed,
+                (!installed).then_some(package.download_bytes),
                 if index % 2 == 0 {
                     Color32::from_rgb(239, 246, 255)
                 } else {
                     Color32::from_rgb(240, 253, 250)
                 },
-            ) {
+            );
+            if download_clicked {
                 install = Some(package.id);
+            }
+            if let Some(level) = selected_level {
+                level_change = Some((package.capability, level));
             }
         }
     });
+    if let Some((capability, level)) = level_change {
+        install = None;
+        match set_model_level(&project_root, capability, level) {
+            Ok(()) => {
+                app.model_task_manager.invalidate_discovery();
+                app.backend_manager.shutdown();
+                app.last_error = None;
+            }
+            Err(error) => app.last_error = Some(error),
+        }
+    }
     if let Some(asset_id) = install {
         if let Err(error) = app
             .model_task_manager
@@ -704,10 +757,11 @@ fn render_onboarding_models(app: &mut crate::XRTranslateApp, ui: &mut egui::Ui) 
             } else {
                 (*downloaded_bytes as f64 / *total_bytes as f64).clamp(0.0, 1.0) as f32
             };
-            ui.add(
-                egui::ProgressBar::new(fraction)
-                    .text(crate::i18n::tr(language, "Downloading your model package…")),
-            )
+            ui.add(egui::ProgressBar::new(fraction).text(format!(
+                "{} / {}",
+                components::format_file_size(*downloaded_bytes),
+                components::format_file_size(*total_bytes),
+            )))
         }
         NativeModelTaskState::Verifying => ui.label(
             RichText::new(crate::i18n::tr(language, "Checking your model files…"))
@@ -736,10 +790,13 @@ fn onboarding_model_card(
     ui: &mut egui::Ui,
     language: crate::i18n::UiLanguage,
     title: &'static str,
+    selected_level: xrtranslate_assets::ModelLevel,
+    levels: &[crate::model_install::NativeModelPackage],
     action: &'static str,
     enabled: bool,
+    download_bytes: Option<u64>,
     tint: Color32,
-) -> bool {
+) -> (bool, Option<xrtranslate_assets::ModelLevel>) {
     Frame::new()
         .fill(tint)
         .corner_radius(CornerRadius::same(16))
@@ -753,19 +810,43 @@ fn onboarding_model_card(
                     .color(theme::text_strong())
                     .strong(),
             );
+            ui.add_space(10.0);
+            let mut level = selected_level;
+            ui.horizontal(|ui| {
+                ui.label(crate::i18n::tr(language, "Level"));
+                egui::ComboBox::from_id_salt((title, "model_level"))
+                    .selected_text(crate::i18n::tr(language, level.as_str()))
+                    .show_ui(ui, |ui| {
+                        for package in levels {
+                            ui.selectable_value(
+                                &mut level,
+                                package.level,
+                                crate::i18n::tr(language, package.level.as_str()),
+                            );
+                        }
+                    });
+            });
             ui.add_space(14.0);
-            ui.add_enabled(
-                enabled,
-                egui::Button::new(
-                    RichText::new(crate::i18n::tr(language, action))
-                        .color(Color32::WHITE)
-                        .strong(),
+            let action_label = download_bytes.map_or_else(
+                || crate::i18n::tr(language, action).to_owned(),
+                |bytes| {
+                    format!(
+                        "{} · {}",
+                        crate::i18n::tr(language, action),
+                        components::format_file_size(bytes),
+                    )
+                },
+            );
+            let clicked = ui
+                .add_enabled(
+                    enabled,
+                    egui::Button::new(RichText::new(action_label).color(Color32::WHITE).strong())
+                        .fill(Color32::from_rgb(37, 99, 235))
+                        .min_size(egui::Vec2::new(100.0, 32.0))
+                        .corner_radius(CornerRadius::same(10)),
                 )
-                .fill(Color32::from_rgb(37, 99, 235))
-                .min_size(egui::Vec2::new(100.0, 32.0))
-                .corner_radius(CornerRadius::same(10)),
-            )
-            .clicked()
+                .clicked();
+            (clicked, (level != selected_level).then_some(level))
         })
         .inner
 }
@@ -871,17 +952,17 @@ pub fn render_sidebar(
 fn open_guide_modal(modal_dialog: &mut modal::ModalDialog, language: crate::i18n::UiLanguage) {
     *modal_dialog = modal::ModalDialog::carousel(vec![
         modal::ModalPage::new(
-            crate::i18n::tr(language, "Welcome to XRTranslate"),
-            crate::i18n::tr(language, "Choose an audio source, start translation, and show subtitles in VRChat whenever you need them.")
-        ).with_subtitle(crate::i18n::tr(language, "Overview")),
+            crate::i18n::tr(language, "Translation"),
+            crate::i18n::tr(language, "Select audio and start."),
+        ),
         modal::ModalPage::new(
-            crate::i18n::tr(language, "VRChat subtitles"),
-            crate::i18n::tr(language, "Enable VRChat subtitles in Settings, then choose the style that feels right for you.")
-        ).with_subtitle(crate::i18n::tr(language, "VRChat features")),
+            crate::i18n::tr(language, "VRChat OSC"),
+            crate::i18n::tr(language, "Configure chatbox output."),
+        ),
         modal::ModalPage::new(
-            crate::i18n::tr(language, "Get ready"),
-            crate::i18n::tr(language, "In Settings, choose llama-server.exe and install the two recommended model packages. Then return to Translation and begin.")
-        ).with_subtitle(crate::i18n::tr(language, "First-time setup")),
+            crate::i18n::tr(language, "Settings"),
+            crate::i18n::tr(language, "Install llama.cpp and models."),
+        ),
     ]);
 }
 
@@ -904,12 +985,8 @@ fn nav_item_animated(
         is_hovered && !is_selected,
         0.15,
     );
-    let select_factor = animation::AnimationSystem::animate_bool(
-        ui.ctx(),
-        id.with("select"),
-        is_selected,
-        0.20,
-    );
+    let select_factor =
+        animation::AnimationSystem::animate_bool(ui.ctx(), id.with("select"), is_selected, 0.20);
 
     let bg_fill = animation::AnimationSystem::lerp_color(
         animation::AnimationSystem::lerp_color(
@@ -969,9 +1046,7 @@ fn nav_item_animated(
             });
         });
 
-    let response = frame_response
-        .response
-        .interact(egui::Sense::click());
+    let response = frame_response.response.interact(egui::Sense::click());
 
     if expand_factor < 0.3 {
         response.clone().on_hover_text(label);
@@ -1044,12 +1119,12 @@ fn guide_button_animated(
             });
         });
 
-    let response = frame_response
-        .response
-        .interact(egui::Sense::click());
+    let response = frame_response.response.interact(egui::Sense::click());
 
     if expand_factor < 0.3 {
-        response.clone().on_hover_text(crate::i18n::tr(language, "User Guide"));
+        response
+            .clone()
+            .on_hover_text(crate::i18n::tr(language, "User Guide"));
     }
 
     ui.memory_mut(|m| m.data.insert_temp(guide_id, response.hovered()));

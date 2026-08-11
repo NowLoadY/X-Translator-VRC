@@ -23,19 +23,7 @@
 
 ## 使用指南
 
-### 1. 下载并解压
-
-从 [Releases](../../releases) 下载 XRTranslate 发布包并解压到固定位置。请保持解压后的目录完整，切勿随意移动 `config.json`、`resources/` 或 `models/` 目录。
-
-### 2. 按首次启动引导完成配置
-
-首次启动时，应用会开启极简引导：
-* **运行时引擎**：可一键自动检测并下载适合当前电脑的 `llama.cpp`，或指定已有 `llama-server.exe`。
-* **模型自动校验**：极简完成模型下载与准备，无需手动分拣解压。
-
-### 3. 开始翻译
-
-回到 **翻译** 页面，选择麦克风或系统声音，点击 **开始翻译** 即可。客户端会在需要时自动托管本地后台服务，并在退出时自动关闭。
+前往 [GitHub Releases](https://github.com/NowLoadY/XRTranslate/releases) 下载最新的 Windows 版本，解压后打开 XRTranslate。首次启动引导会自动准备运行环境和模型；完成引导后即可开始翻译。
 
 ---
 
@@ -44,6 +32,7 @@
 | 项目 | 默认路径 | 说明 |
 | :--- | :--- | :--- |
 | **模型文件** | `models/` | 放置语音识别模型与翻译模型等模型包 |
+| **专业语料库** | [XR Corpus](https://github.com/NowLoadY/XR-Corpus) | 独立维护的 Markdown 术语与上下文服务 |
 | **运行日志** | `runtime/logs/` | 查看后台服务与客户端日志 |
 | **本地服务设置** | `config.json` | 端口、模型及渲染参数配置 |
 
@@ -82,11 +71,12 @@
 
 同时感谢 [XTalk](https://github.com/xcc-zach/xtalk)、[X-ASR](https://github.com/Gilgamesh-J/X-ASR)、[Paraformer](https://github.com/modelscope/FunASR)、[SenseVoice](https://github.com/FunAudioLLM/SenseVoice)、[NiuTrans LMT](https://github.com/NiuTrans/LMT)、[Hunyuan-MT](https://github.com/Tencent-Hunyuan/Hunyuan-MT)、[X-Voice](https://github.com/sunnyxrxrx/X-Voice)、[IndexTTS](https://github.com/index-tts/index-tts) 与 [OpenSTBench](https://github.com/sjtuayj/OpenSTBench)。
 
+特别感谢 [Yakutan](https://github.com/febilly/Yakutan) 及其作者 [febilly](https://github.com/febilly) 带来的启发与贡献。
+
 ## License
 
 本项目包含采用不同开源许可证发布的代码：
 
 - 原项目 X-Translator 相关代码沿用 [MIT License](LICENSE-MIT)。
 - Rust 原生客户端及新增代码采用 [GNU Affero General Public License v3.0 (AGPL-3.0)](LICENSE)。
-
 具体许可范围以仓库中的许可证文件及对应源码为准。

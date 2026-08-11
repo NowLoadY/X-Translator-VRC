@@ -23,10 +23,5 @@ pub fn version_display_string() -> String {
 
 /// Returns full metadata summary for logging and diagnostics.
 pub fn full_metadata_summary() -> String {
-    format!(
-        "{} v{} [{}]",
-        APP_NAME,
-        APP_VERSION,
-        APP_BUILD_PROFILE
-    )
+    format!("{} v{} [{}]", APP_NAME, APP_VERSION, APP_BUILD_PROFILE)
 }

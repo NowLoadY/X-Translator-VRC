@@ -69,4 +69,3 @@ pub fn text_weak() -> Color32 {
 pub fn primary() -> Color32 {
     Color32::from_rgb(37, 99, 235) // Accent Blue
 }
-

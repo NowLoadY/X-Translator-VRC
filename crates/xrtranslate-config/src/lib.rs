@@ -14,6 +14,7 @@ use std::{
 
 use serde::{Deserialize, Serialize};
 use serde_json::{Map, Value};
+pub use xr_corpus_core::CorpusConfig as PromptContextConfig;
 
 /// A map of provider-specific settings retained without imposing a model
 /// schema on optional providers.
@@ -26,11 +27,14 @@ pub struct AppConfig {
     pub audio: AudioConfig,
     pub asr: AsrConfig,
     pub speaker: SpeakerConfig,
+    pub prompt_context: PromptContextConfig,
+    pub integrations: IntegrationsConfig,
+    pub storage: StorageConfig,
     pub translation: TranslationConfig,
     pub tts: TtsConfig,
     pub model_manager: ModelManagerConfig,
     /// The unmodified parsed document, including sections unknown to this
-    /// crate such as `osc`, `storage`, and frontend preferences.
+    /// crate and frontend preferences.
     pub raw: Value,
     /// The source file when this configuration was loaded from disk.
     pub source_path: Option<PathBuf>,
@@ -64,6 +68,9 @@ impl AppConfig {
             audio: typed.audio,
             asr: typed.asr,
             speaker: typed.speaker,
+            prompt_context: typed.prompt_context,
+            integrations: typed.integrations,
+            storage: typed.storage,
             translation: typed.translation,
             tts: typed.tts,
             model_manager: typed.model_manager,
@@ -122,6 +129,28 @@ impl AppConfig {
             "translation.providers.hunyuan.url",
             &mut issues,
         );
+        let asr_runtime = provider_runtime_config(
+            &self.asr.providers,
+            "qwen3-gguf",
+            "asr.providers.qwen3-gguf",
+            LocalModelRuntimeConfig {
+                context_window_tokens: 2_048,
+                max_tokens: 128,
+                parallel_slots: 1,
+            },
+            &mut issues,
+        );
+        let translation_runtime = provider_runtime_config(
+            &self.translation.providers,
+            "hunyuan",
+            "translation.providers.hunyuan",
+            LocalModelRuntimeConfig {
+                context_window_tokens: 2_048,
+                max_tokens: 256,
+                parallel_slots: 2,
+            },
+            &mut issues,
+        );
 
         if issues.is_empty() {
             Ok(DefaultGgufConfig {
@@ -129,6 +158,8 @@ impl AppConfig {
                 hunyuan_gguf_repo: hunyuan_gguf_repo.expect("checked above"),
                 asr_url: asr_url.expect("checked above"),
                 translation_url: translation_url.expect("checked above"),
+                asr_runtime,
+                translation_runtime,
             })
         } else {
             Err(DefaultGgufValidationError { issues })
@@ -218,6 +249,12 @@ struct TypedConfig {
     asr: AsrConfig,
     #[serde(default)]
     speaker: SpeakerConfig,
+    #[serde(default)]
+    prompt_context: PromptContextConfig,
+    #[serde(default)]
+    integrations: IntegrationsConfig,
+    #[serde(default)]
+    storage: StorageConfig,
     #[serde(default)]
     translation: TranslationConfig,
     #[serde(default)]
@@ -353,6 +390,100 @@ impl Default for SpeakerConfig {
     }
 }
 
+fn provider_runtime_config(
+    providers: &ProviderConfigs,
+    provider: &str,
+    path: &str,
+    defaults: LocalModelRuntimeConfig,
+    issues: &mut Vec<String>,
+) -> LocalModelRuntimeConfig {
+    let object = providers.get(provider).and_then(Value::as_object);
+    let mut value = |field: &str, default: u32, minimum: u32, maximum: u32| {
+        let Some(raw) = object.and_then(|provider| provider.get(field)) else {
+            return default;
+        };
+        let Some(raw) = raw.as_u64().and_then(|value| u32::try_from(value).ok()) else {
+            issues.push(format!("{path}.{field} must be an integer"));
+            return default;
+        };
+        if !(minimum..=maximum).contains(&raw) {
+            issues.push(format!(
+                "{path}.{field} must be within {minimum}..={maximum}"
+            ));
+            return default;
+        }
+        raw
+    };
+    let runtime = LocalModelRuntimeConfig {
+        context_window_tokens: value(
+            "context_window_tokens",
+            defaults.context_window_tokens,
+            256,
+            32_768,
+        ),
+        max_tokens: value("max_tokens", defaults.max_tokens, 16, 4_096),
+        parallel_slots: value("parallel_slots", u32::from(defaults.parallel_slots), 1, 16) as u16,
+    };
+    if runtime.max_tokens.saturating_add(128) > runtime.context_window_tokens {
+        issues.push(format!(
+            "{path}.context_window_tokens must leave at least 128 input tokens beyond max_tokens"
+        ));
+    }
+    runtime
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct StorageConfig {
+    #[serde(default = "default_log_directory")]
+    pub log_dir: PathBuf,
+    #[serde(default = "default_log_max_bytes")]
+    pub log_max_bytes: u64,
+    #[serde(default = "default_log_retained_files")]
+    pub log_retained_files: usize,
+}
+
+impl Default for StorageConfig {
+    fn default() -> Self {
+        Self {
+            log_dir: default_log_directory(),
+            log_max_bytes: default_log_max_bytes(),
+            log_retained_files: default_log_retained_files(),
+        }
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Default, Serialize, Deserialize)]
+pub struct IntegrationsConfig {
+    #[serde(default)]
+    pub vrcx: VrcxIntegrationConfig,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct VrcxIntegrationConfig {
+    #[serde(default = "default_true")]
+    pub enabled: bool,
+    #[serde(default = "default_vrcx_snapshot_ttl_seconds")]
+    pub snapshot_ttl_seconds: u64,
+    #[serde(default = "default_vrcx_max_players")]
+    pub max_players: usize,
+    #[serde(default = "default_vrcx_poll_interval_ms")]
+    pub poll_interval_ms: u64,
+    #[serde(default)]
+    pub database_path: Option<PathBuf>,
+}
+
+impl Default for VrcxIntegrationConfig {
+    fn default() -> Self {
+        Self {
+            enabled: true,
+            snapshot_ttl_seconds: default_vrcx_snapshot_ttl_seconds(),
+            max_players: default_vrcx_max_players(),
+            poll_interval_ms: default_vrcx_poll_interval_ms(),
+            database_path: None,
+        }
+    }
+}
+
 /// Translation selection and untyped provider options.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct TranslationConfig {
@@ -450,6 +581,10 @@ pub struct LlamaCppRuntimeConfig {
 pub struct LlamaCppDownload {
     pub name: String,
     pub url: String,
+    #[serde(default)]
+    pub bytes: u64,
+    #[serde(default)]
+    pub sha256: String,
 }
 
 impl Default for ModelManagerConfig {
@@ -472,6 +607,15 @@ pub struct DefaultGgufConfig {
     pub hunyuan_gguf_repo: String,
     pub asr_url: String,
     pub translation_url: String,
+    pub asr_runtime: LocalModelRuntimeConfig,
+    pub translation_runtime: LocalModelRuntimeConfig,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct LocalModelRuntimeConfig {
+    pub context_window_tokens: u32,
+    pub max_tokens: u32,
+    pub parallel_slots: u16,
 }
 
 /// JSON parse/read failures for [`AppConfig`].
@@ -577,6 +721,27 @@ const fn default_vad_overlap_ms() -> u32 {
 fn default_speaker_model_path() -> PathBuf {
     PathBuf::from("models/3D-Speaker-ERes2NetV2/speaker_embedding.onnx")
 }
+const fn default_true() -> bool {
+    true
+}
+const fn default_vrcx_snapshot_ttl_seconds() -> u64 {
+    60
+}
+const fn default_vrcx_max_players() -> usize {
+    80
+}
+const fn default_vrcx_poll_interval_ms() -> u64 {
+    2_000
+}
+fn default_log_directory() -> PathBuf {
+    PathBuf::from("runtime/logs")
+}
+const fn default_log_max_bytes() -> u64 {
+    2 * 1024 * 1024
+}
+const fn default_log_retained_files() -> usize {
+    2
+}
 const fn default_speaker_similarity_threshold() -> f64 {
     0.62
 }
@@ -632,6 +797,19 @@ mod tests {
         assert!(config.speaker.enabled);
         assert_eq!(config.speaker.max_speakers, 8);
         assert_eq!(config.speaker.min_utterance_ms, 500);
+        assert!(config.prompt_context.enabled);
+        assert_eq!(config.prompt_context.max_entries, 6);
+        assert_eq!(config.prompt_context.asr_max_chars, 800);
+        assert_eq!(config.prompt_context.asr_history_entries, 1);
+        assert_eq!(config.prompt_context.translation_history_entries, 6);
+        assert_eq!(config.prompt_context.translation_max_chars, 1200);
+        assert_eq!(
+            config.prompt_context.corpora_directory,
+            PathBuf::from("XR-Corpus/corpora/v1")
+        );
+        assert_eq!(config.storage.log_dir, PathBuf::from("runtime/logs"));
+        assert_eq!(config.storage.log_max_bytes, 2 * 1024 * 1024);
+        assert_eq!(config.storage.log_retained_files, 2);
         assert_eq!(config.translation.provider, "hunyuan");
         assert_eq!(config.tts.provider, "none");
         assert_eq!(config.model_manager.llama_cpp.release, "b10333");
@@ -663,6 +841,28 @@ mod tests {
         assert_eq!(
             gguf.translation_url,
             "http://127.0.0.1:8002/v1/chat/completions"
+        );
+        assert_eq!(gguf.asr_runtime.context_window_tokens, 2_048);
+        assert_eq!(gguf.asr_runtime.max_tokens, 128);
+        assert_eq!(gguf.asr_runtime.parallel_slots, 1);
+        assert_eq!(gguf.translation_runtime.context_window_tokens, 2_048);
+        assert_eq!(gguf.translation_runtime.max_tokens, 256);
+        assert_eq!(gguf.translation_runtime.parallel_slots, 2);
+    }
+
+    #[test]
+    fn model_runtime_rejects_output_that_leaves_no_input_budget() {
+        let mut document: Value =
+            serde_json::from_str(include_str!("../../../config.json")).unwrap();
+        document["translation"]["providers"]["hunyuan"]["context_window_tokens"] = Value::from(256);
+        document["translation"]["providers"]["hunyuan"]["max_tokens"] = Value::from(256);
+        let config = AppConfig::from_value(document).unwrap();
+        assert!(
+            config
+                .default_gguf()
+                .unwrap_err()
+                .to_string()
+                .contains("must leave at least 128 input tokens")
         );
     }
 

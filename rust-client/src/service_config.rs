@@ -1,6 +1,8 @@
 use serde_json::{Map, Value};
 use std::path::PathBuf;
 
+use crate::ui::components;
+
 #[derive(Clone, Copy, PartialEq, Eq)]
 enum JsonFieldKind {
     String,
@@ -67,7 +69,7 @@ impl ServiceConfigEditor {
         .map(|(key, title)| Self::make_category(&self.document, key, title))
         .collect();
         self.dirty = false;
-        self.message = Some("Reloaded config.json".into());
+        self.message = None;
         Ok(())
     }
 
@@ -133,12 +135,6 @@ impl ServiceConfigEditor {
                 .color(crate::ui::theme::text_strong())
                 .strong(),
         );
-        ui.add_space(4.0);
-        ui.label(
-            egui::RichText::new(crate::i18n::tr(language, "Choose active providers and configure parameters for config.json. Changes take effect after saving and restarting the backend."))
-                .color(crate::ui::theme::text_weak())
-                .size(12.0),
-        );
         ui.add_space(14.0);
 
         if model_tasks.needs_discovery() {
@@ -154,9 +150,7 @@ impl ServiceConfigEditor {
             section(ui, category_title, |ui| {
                 // Row 1: Active Provider selector & View All toggle
                 ui.horizontal(|ui| {
-                    ui.label(
-                        egui::RichText::new(crate::i18n::tr(language, "Active Provider:")).strong(),
-                    );
+                    ui.label(egui::RichText::new(crate::i18n::tr(language, "Provider:")).strong());
                     let previous = self.categories[cat_idx].selected_provider.clone();
                     let selected_label = if self.categories[cat_idx].selected_provider.is_empty() {
                         crate::i18n::tr(language, "No providers configured")
@@ -193,7 +187,7 @@ impl ServiceConfigEditor {
                     ui.add_space(16.0);
                     ui.checkbox(
                         &mut self.categories[cat_idx].show_all,
-                        crate::i18n::tr(language, "Show All Providers"),
+                        crate::i18n::tr(language, "All providers"),
                     );
                 });
 
@@ -201,11 +195,8 @@ impl ServiceConfigEditor {
 
                 if self.categories[cat_idx].providers.is_empty() {
                     ui.label(
-                        egui::RichText::new(crate::i18n::tr(
-                            language,
-                            "No providers found in config.json.",
-                        ))
-                        .color(crate::ui::theme::text_weak()),
+                        egui::RichText::new(crate::i18n::tr(language, "No providers"))
+                            .color(crate::ui::theme::text_weak()),
                     );
                     return;
                 }
@@ -278,12 +269,16 @@ impl ServiceConfigEditor {
                                     let fields_len = self.categories[cat_idx].providers
                                         [provider_idx]
                                         .fields
-                                        .len();
+                                        .iter()
+                                        .filter(|field| {
+                                            provider_field_is_visible(field, model_asset.is_some())
+                                        })
+                                        .count();
                                     if fields_len == 0 {
                                         ui.label(
                                             egui::RichText::new(crate::i18n::tr(
                                                 language,
-                                                "No configurable parameters",
+                                                "No parameters",
                                             ))
                                             .color(crate::ui::theme::text_weak())
                                             .size(12.0),
@@ -298,13 +293,28 @@ impl ServiceConfigEditor {
                                                     [provider_idx]
                                                     .fields
                                                 {
-                                                    ui.label(
-                                                        egui::RichText::new(&field.name)
+                                                    if !provider_field_is_visible(
+                                                        field,
+                                                        model_asset.is_some(),
+                                                    ) {
+                                                        continue;
+                                                    }
+                                                    let label =
+                                                        provider_field_label(language, &field.name);
+                                                    let label_response = ui.label(
+                                                        egui::RichText::new(label)
                                                             .color(crate::ui::theme::text_normal()),
                                                     );
+                                                    if let Some(help) =
+                                                        provider_field_help(language, &field.name)
+                                                    {
+                                                        label_response.on_hover_text(help);
+                                                    }
                                                     let edit_w =
                                                         (ui.available_width() - 20.0).max(200.0);
-                                                    if render_field_input(ui, field, edit_w) {
+                                                    if render_field_input(
+                                                        ui, field, edit_w, language,
+                                                    ) {
                                                         self.dirty = true;
                                                     }
                                                     ui.end_row();
@@ -329,13 +339,10 @@ impl ServiceConfigEditor {
 
                         ui.horizontal_wrapped(|ui| {
                             ui.label(
-                                egui::RichText::new(format!(
-                                    "Parameters for Active Provider ('{}'):",
-                                    provider_name
-                                ))
-                                .size(13.5)
-                                .color(crate::ui::theme::text_strong())
-                                .strong(),
+                                egui::RichText::new(&provider_name)
+                                    .size(13.5)
+                                    .color(crate::ui::theme::text_strong())
+                                    .strong(),
                             );
                             ui.add_space(8.0);
                             if let Some(message) = render_provider_model_action(
@@ -353,14 +360,15 @@ impl ServiceConfigEditor {
                         });
                         ui.add_space(10.0);
 
-                        let fields_len = self.categories[cat_idx].providers[idx].fields.len();
+                        let fields_len = self.categories[cat_idx].providers[idx]
+                            .fields
+                            .iter()
+                            .filter(|field| provider_field_is_visible(field, model_asset.is_some()))
+                            .count();
                         if fields_len == 0 {
                             ui.label(
-                                egui::RichText::new(crate::i18n::tr(
-                                    language,
-                                    "No configurable parameters for this provider.",
-                                ))
-                                .color(crate::ui::theme::text_weak()),
+                                egui::RichText::new(crate::i18n::tr(language, "No parameters"))
+                                    .color(crate::ui::theme::text_weak()),
                             );
                         } else {
                             egui::Grid::new((category_key, &provider_name, "active_grid"))
@@ -370,13 +378,24 @@ impl ServiceConfigEditor {
                                 .show(ui, |ui| {
                                     for field in &mut self.categories[cat_idx].providers[idx].fields
                                     {
-                                        ui.label(
-                                            egui::RichText::new(&field.name)
+                                        if !provider_field_is_visible(field, model_asset.is_some())
+                                        {
+                                            continue;
+                                        }
+                                        let label = provider_field_label(language, &field.name);
+                                        let label_response = ui.label(
+                                            egui::RichText::new(label)
                                                 .strong()
                                                 .color(crate::ui::theme::text_strong()),
                                         );
-                                        let edit_w = (ui.available_width() - 20.0).clamp(240.0, 360.0);
-                                        if render_field_input(ui, field, edit_w) {
+                                        if let Some(help) =
+                                            provider_field_help(language, &field.name)
+                                        {
+                                            label_response.on_hover_text(help);
+                                        }
+                                        let edit_w =
+                                            (ui.available_width() - 20.0).clamp(240.0, 360.0);
+                                        if render_field_input(ui, field, edit_w, language) {
                                             self.dirty = true;
                                         }
                                         ui.end_row();
@@ -392,14 +411,24 @@ impl ServiceConfigEditor {
         // Action Toolbar
         ui.horizontal(|ui| {
             let save_label = if self.dirty {
-                crate::i18n::tr(language, "Save Service Config *")
+                crate::i18n::tr(language, "Save *")
             } else {
-                crate::i18n::tr(language, "Save Service Config")
+                crate::i18n::tr(language, "Save")
             };
             let save = components::primary_button(ui, save_label);
             if save.clicked() {
                 match self.save() {
-                    Ok(()) => self.message = Some(format!("Saved {}", self.path.display())),
+                    Ok(()) => {
+                        // Apply runtime changes on the next translation session.
+                        backend.shutdown();
+                        self.message = Some(
+                            crate::i18n::tr(
+                                language,
+                                "Saved. Start translation again to apply model settings.",
+                            )
+                            .to_owned(),
+                        )
+                    }
                     Err(error) => self.message = Some(error),
                 }
             }
@@ -410,7 +439,7 @@ impl ServiceConfigEditor {
             }
             if self.dirty {
                 ui.label(
-                    egui::RichText::new(crate::i18n::tr(language, "(Unsaved changes)"))
+                    egui::RichText::new(crate::i18n::tr(language, "Unsaved"))
                         .color(egui::Color32::from_rgb(217, 119, 6))
                         .strong(),
                 );
@@ -456,6 +485,11 @@ impl ServiceConfigEditor {
         }
         let formatted = serde_json::to_string_pretty(&self.document)
             .map_err(|error| format!("Cannot serialize config.json: {error}"))?;
+        let parsed = xrtranslate_config::AppConfig::from_value(self.document.clone())
+            .map_err(|error| format!("Invalid configuration: {error}"))?;
+        parsed
+            .default_gguf()
+            .map_err(|error| format!("Invalid model settings: {error}"))?;
         std::fs::write(&self.path, format!("{formatted}\n"))
             .map_err(|error| format!("Cannot save {}: {error}", self.path.display()))?;
         self.dirty = false;
@@ -510,12 +544,24 @@ fn render_provider_model_action(
     let ready = model_tasks.is_model_ready(package.id);
     let present = model_tasks.is_model_present(package.id);
     let busy = model_tasks.is_busy();
-    let action_label = if present { "Verify" } else { "Download" };
-    let clicked = ui
-        .add_enabled(
-            !busy,
-            egui::Button::new(crate::i18n::tr(language, action_label)),
+    let action = if present {
+        "Verify"
+    } else if matches!(model_tasks.state(), NativeModelTaskState::Failed(_)) {
+        "Retry"
+    } else {
+        "Download"
+    };
+    let action_label = if present {
+        crate::i18n::tr(language, action).to_owned()
+    } else {
+        format!(
+            "{} · {}",
+            crate::i18n::tr(language, action),
+            components::format_file_size(package.download_bytes),
         )
+    };
+    let clicked = ui
+        .add_enabled(!busy, egui::Button::new(action_label))
         .on_hover_text(package.label)
         .clicked();
     if clicked {
@@ -572,8 +618,39 @@ fn render_provider_model_action(
     None
 }
 
-fn render_field_input(ui: &mut eframe::egui::Ui, field: &mut ConfigField, width: f32) -> bool {
+fn render_field_input(
+    ui: &mut eframe::egui::Ui,
+    field: &mut ConfigField,
+    width: f32,
+    language: crate::i18n::UiLanguage,
+) -> bool {
     use eframe::egui;
+
+    if field.name == "model_asset" {
+        let Some(current_id) =
+            xrtranslate_assets::ModelAssetId::from_config_key(field.value.trim())
+        else {
+            return false;
+        };
+        let current = xrtranslate_assets::manifest_for(current_id);
+        let mut selected = current_id;
+        let response = egui::ComboBox::from_id_salt(("provider_model_level", current.capability))
+            .selected_text(crate::i18n::tr(language, current.level.as_str()))
+            .show_ui(ui, |ui| {
+                for manifest in xrtranslate_assets::manifests_for_capability(current.capability) {
+                    ui.selectable_value(
+                        &mut selected,
+                        manifest.id,
+                        crate::i18n::tr(language, manifest.level.as_str()),
+                    );
+                }
+            });
+        if response.response.changed() || selected != current_id {
+            field.value = selected.as_str().to_owned();
+            return true;
+        }
+        return false;
+    }
 
     match field.kind {
         JsonFieldKind::Bool => {
@@ -581,6 +658,33 @@ fn render_field_input(ui: &mut eframe::egui::Ui, field: &mut ConfigField, width:
             let label = if val { "true" } else { "false" };
             if ui.checkbox(&mut val, label).changed() {
                 field.value = val.to_string();
+                true
+            } else {
+                false
+            }
+        }
+        JsonFieldKind::Number if provider_numeric_range(&field.name).is_some() => {
+            let (minimum, maximum) = provider_numeric_range(&field.name).expect("checked above");
+            let Ok(mut value) = field.value.trim().parse::<u32>() else {
+                return ui
+                    .add(
+                        egui::TextEdit::singleline(&mut field.value)
+                            .desired_width(width.min(180.0))
+                            .hint_text(crate::i18n::tr(language, "Positive integer")),
+                    )
+                    .changed();
+            };
+            let response = ui.add(
+                egui::DragValue::new(&mut value)
+                    .range(minimum..=maximum)
+                    .speed(if field.name == "context_window_tokens" {
+                        128.0
+                    } else {
+                        1.0
+                    }),
+            );
+            if response.changed() {
+                field.value = value.to_string();
                 true
             } else {
                 false
@@ -613,6 +717,65 @@ fn render_field_input(ui: &mut eframe::egui::Ui, field: &mut ConfigField, width:
             }
         }
     }
+}
+
+fn provider_numeric_range(name: &str) -> Option<(u32, u32)> {
+    match name {
+        "context_window_tokens" => Some((256, 32_768)),
+        "max_tokens" => Some((16, 4_096)),
+        "parallel_slots" => Some((1, 16)),
+        _ => None,
+    }
+}
+
+fn provider_field_label(language: crate::i18n::UiLanguage, name: &str) -> String {
+    let key = match name {
+        "context_window_tokens" => "Context tokens per request",
+        "max_tokens" => "Max output tokens",
+        "parallel_slots" => "Parallel requests",
+        "model_asset" => "Level",
+        "supports_prompt_context" => "Prompt context",
+        "supports_language" => "Language selection",
+        "supports_prompt" => "Custom prompt",
+        "prompt_field" => "Prompt field",
+        "url" => "Endpoint URL",
+        "model" => "Model",
+        _ => return name.to_owned(),
+    };
+    crate::i18n::tr(language, key).to_owned()
+}
+
+fn provider_field_is_visible(field: &ConfigField, native_model: bool) -> bool {
+    if native_model {
+        return matches!(
+            field.name.as_str(),
+            "model_asset" | "context_window_tokens" | "max_tokens"
+        );
+    }
+    !matches!(
+        field.name.as_str(),
+        "context_window_tokens"
+            | "max_tokens"
+            | "parallel_slots"
+            | "supports_prompt_context"
+            | "supports_language"
+            | "supports_prompt"
+            | "prompt_field"
+    )
+}
+
+fn provider_field_help(language: crate::i18n::UiLanguage, name: &str) -> Option<&'static str> {
+    let key = match name {
+        "context_window_tokens" => {
+            "Input and output context available to each parallel model request."
+        }
+        "max_tokens" => "Maximum tokens generated for one result.",
+        "parallel_slots" => {
+            "Concurrent llama.cpp request slots. Total context cache is context tokens multiplied by this value."
+        }
+        _ => return None,
+    };
+    Some(crate::i18n::tr(language, key))
 }
 
 fn project_config_path() -> PathBuf {

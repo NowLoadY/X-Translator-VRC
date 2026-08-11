@@ -1,0 +1,3 @@
+[submodule "XR-Corpus"]
+	path = XR-Corpus
+	url = https://github.com/NowLoadY/XR-Corpus.git

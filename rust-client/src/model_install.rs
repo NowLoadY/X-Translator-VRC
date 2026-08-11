@@ -7,8 +7,8 @@
 use crossbeam_channel::{Receiver, TryRecvError, unbounded};
 use std::{path::PathBuf, thread};
 use xrtranslate_assets::{
-    DownloadProgress, ModelAssetId, ModelAssetsConfig, ModelCapability, NativeModelInstaller,
-    ResolvedModelAssets,
+    DownloadProgress, ModelAssetId, ModelAssetsConfig, ModelCapability, ModelLevel,
+    NativeModelInstaller, ResolvedModelAssets, manifest_for, manifests_for_capability,
 };
 use xrtranslate_config::AppConfig;
 
@@ -42,8 +42,9 @@ pub enum NativeModelTaskState {
 pub struct NativeModelPackage {
     pub id: ModelAssetId,
     pub label: &'static str,
-    #[allow(dead_code)]
+    pub download_bytes: u64,
     pub capability: ModelCapability,
+    pub level: ModelLevel,
 }
 
 impl NativeModelTaskState {
@@ -124,6 +125,13 @@ impl NativeModelTaskManager {
     /// available as a separate action.
     pub fn discover_existing(&mut self, project_root: PathBuf) -> Result<(), String> {
         self.start(project_root, NativeModelTask::Discover)
+    }
+
+    pub fn invalidate_discovery(&mut self) {
+        if !self.is_busy() {
+            self.state = NativeModelTaskState::Idle;
+            self.events = None;
+        }
     }
 
     #[must_use]
@@ -332,10 +340,13 @@ fn verify_models(project_root: PathBuf) -> NativeModelTaskResult {
 
 fn load_assets(project_root: &std::path::Path) -> Result<ResolvedModelAssets, String> {
     let config = load_config(project_root)?;
+    let (asr_asset, translation_asset) = selected_asset_ids(&config)?;
     Ok(ModelAssetsConfig {
         models_directory: config.model_manager.models_directory,
         qwen3_asr_gguf_directory: config.model_manager.qwen3_asr_gguf_directory,
         hunyuan_mt_gguf_directory: config.model_manager.hunyuan_mt_gguf_directory,
+        qwen3_asr_asset: Some(asr_asset),
+        hunyuan_mt_asset: Some(translation_asset),
     }
     .resolve(project_root))
 }
@@ -344,10 +355,13 @@ pub fn configured_model_packages(
     project_root: &std::path::Path,
 ) -> Result<Vec<NativeModelPackage>, String> {
     let config = load_config(project_root)?;
+    let (asr_asset, translation_asset) = selected_asset_ids(&config)?;
     let assets = ModelAssetsConfig {
         models_directory: config.model_manager.models_directory.clone(),
         qwen3_asr_gguf_directory: config.model_manager.qwen3_asr_gguf_directory.clone(),
         hunyuan_mt_gguf_directory: config.model_manager.hunyuan_mt_gguf_directory.clone(),
+        qwen3_asr_asset: Some(asr_asset),
+        hunyuan_mt_asset: Some(translation_asset),
     }
     .resolve(project_root);
     config
@@ -358,11 +372,7 @@ pub fn configured_model_packages(
                 format!("Unknown model_asset in the active provider configuration: {key}")
             })?;
             let manifest = assets.asset(id).manifest();
-            Ok(NativeModelPackage {
-                id,
-                label: manifest.label,
-                capability: manifest.capability,
-            })
+            Ok(package_from_manifest(manifest))
         })
         .collect()
 }
@@ -375,20 +385,97 @@ pub fn model_package_for_config_key(
     key: &str,
 ) -> Result<NativeModelPackage, String> {
     let config = load_config(project_root)?;
+    let (asr_asset, translation_asset) = selected_asset_ids(&config)?;
     let assets = ModelAssetsConfig {
         models_directory: config.model_manager.models_directory,
         qwen3_asr_gguf_directory: config.model_manager.qwen3_asr_gguf_directory,
         hunyuan_mt_gguf_directory: config.model_manager.hunyuan_mt_gguf_directory,
+        qwen3_asr_asset: Some(asr_asset),
+        hunyuan_mt_asset: Some(translation_asset),
     }
     .resolve(project_root);
     let id = ModelAssetId::from_config_key(key)
         .ok_or_else(|| format!("Unknown model_asset in provider configuration: {key}"))?;
     let manifest = assets.asset(id).manifest();
-    Ok(NativeModelPackage {
-        id,
+    Ok(package_from_manifest(manifest))
+}
+
+fn package_from_manifest(manifest: &xrtranslate_assets::ModelAssetManifest) -> NativeModelPackage {
+    NativeModelPackage {
+        id: manifest.id,
         label: manifest.label,
         capability: manifest.capability,
-    })
+        level: manifest.level,
+        download_bytes: manifest.required_files.iter().map(|file| file.bytes).sum(),
+    }
+}
+
+pub fn model_level_packages(capability: ModelCapability) -> Vec<NativeModelPackage> {
+    manifests_for_capability(capability)
+        .map(package_from_manifest)
+        .collect()
+}
+
+pub fn set_model_level(
+    project_root: &std::path::Path,
+    capability: ModelCapability,
+    level: ModelLevel,
+) -> Result<(), String> {
+    let manifest = manifests_for_capability(capability)
+        .find(|manifest| manifest.level == level)
+        .ok_or_else(|| format!("The selected model level is not available for {capability:?}."))?;
+    let path = project_root.join("config.json");
+    let contents = std::fs::read_to_string(&path)
+        .map_err(|error| format!("Cannot read {}: {error}", path.display()))?;
+    let mut document: serde_json::Value =
+        serde_json::from_str(&contents).map_err(|error| format!("Invalid config.json: {error}"))?;
+    let section_name = match capability {
+        ModelCapability::Asr => "asr",
+        ModelCapability::Translation => "translation",
+    };
+    let section = document
+        .get_mut(section_name)
+        .and_then(serde_json::Value::as_object_mut)
+        .ok_or_else(|| format!("Missing {section_name} configuration."))?;
+    let provider = section
+        .get("provider")
+        .and_then(serde_json::Value::as_str)
+        .ok_or_else(|| format!("Missing {section_name}.provider."))?
+        .to_owned();
+    let provider_config = section
+        .get_mut("providers")
+        .and_then(serde_json::Value::as_object_mut)
+        .and_then(|providers| providers.get_mut(&provider))
+        .and_then(serde_json::Value::as_object_mut)
+        .ok_or_else(|| format!("Missing {section_name}.providers.{provider}."))?;
+    provider_config.insert(
+        "model_asset".into(),
+        serde_json::Value::String(manifest.id.as_str().into()),
+    );
+    let formatted = serde_json::to_string_pretty(&document)
+        .map_err(|error| format!("Cannot serialize config.json: {error}"))?;
+    xrtranslate_config::AppConfig::from_value(document)
+        .map_err(|error| format!("Invalid configuration: {error}"))?;
+    std::fs::write(&path, format!("{formatted}\n"))
+        .map_err(|error| format!("Cannot save {}: {error}", path.display()))
+}
+
+fn selected_asset_ids(config: &AppConfig) -> Result<(ModelAssetId, ModelAssetId), String> {
+    let mut asr = None;
+    let mut translation = None;
+    for key in config.active_native_model_assets() {
+        let id = ModelAssetId::from_config_key(&key).ok_or_else(|| {
+            format!("Unknown model_asset in active provider configuration: {key}")
+        })?;
+        match manifest_for(id).capability {
+            ModelCapability::Asr => asr = Some(id),
+            ModelCapability::Translation => translation = Some(id),
+        }
+    }
+    Ok((
+        asr.ok_or("The active ASR provider has no model package.")?,
+        translation.ok_or("The active translation provider has no model package.")?,
+    ))
 }
 
 fn load_config(project_root: &std::path::Path) -> Result<AppConfig, String> {

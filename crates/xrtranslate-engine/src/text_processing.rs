@@ -240,7 +240,10 @@ fn push_translation_segment(
     }
 }
 
-fn translation_pair_with_lang(source_text: &str, source_lang: &str) -> Option<TranslationSegmentPair> {
+fn translation_pair_with_lang(
+    source_text: &str,
+    source_lang: &str,
+) -> Option<TranslationSegmentPair> {
     let source_text = source_text.trim();
     let translation_text = strip_filler_edges_for_lang(source_text, source_lang);
     (content_token_count(&translation_text) > 0).then(|| TranslationSegmentPair {
@@ -643,7 +646,8 @@ mod tests {
         assert_eq!(pairs[0].source_text, "сюкаплеет");
         assert_eq!(pairs[0].translation_text, "сюкаплеет");
 
-        let multi_pairs = translation_segment_pairs_for_final_text_with_lang("Сюжет. Закончено.", "ru");
+        let multi_pairs =
+            translation_segment_pairs_for_final_text_with_lang("Сюжет. Закончено.", "ru");
         assert_eq!(multi_pairs.len(), 2);
         assert_eq!(multi_pairs[0].source_text, "Сюжет.");
         assert_eq!(multi_pairs[1].source_text, "Закончено.");
@@ -705,4 +709,3 @@ mod tests {
         );
     }
 }
-

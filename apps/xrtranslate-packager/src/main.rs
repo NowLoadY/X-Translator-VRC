@@ -1,10 +1,4 @@
-//! Native release packaging for the Python-free default XRTranslate route.
-//!
-//! The packager has a deliberately small allow-list: three Rust executables,
-//! the desktop resources, a rewritten `config.json`, the Silero VAD and
-//! ERes2NetV2 speaker-embedding ONNX models, and optionally the two immutable
-//! GGUF packages declared by `xrtranslate-assets`.
-//! Users provide their own llama.cpp runtime through the client onboarding flow.
+//! XRTranslate release packaging.
 //! It never scans nor copies the repository's Python backend, server, launch
 //! scripts, requirements, or llama.cpp binaries.
 
@@ -22,16 +16,22 @@ use std::{
 use clap::Parser;
 use serde_json::{Map, Value, json};
 use sha2::{Digest, Sha256};
-use xrtranslate_assets::{ModelAssetManifest, ModelAssetsConfig, ResolvedModelAssets};
+use xr_corpus_core::load_markdown_directory;
+use xrtranslate_assets::{
+    ModelAssetId, ModelAssetManifest, ModelAssetsConfig, ModelCapability, ResolvedModelAssets,
+    manifest_for,
+};
 use xrtranslate_config::AppConfig;
 
-const RELEASE_LAYOUT_VERSION: u32 = 2;
+const RELEASE_LAYOUT_VERSION: u32 = 3;
 const VAD_RELATIVE_PATH: &str = "models/silero-vad/src/silero_vad/data/silero_vad.onnx";
 const SPEAKER_RELATIVE_PATH: &str = "models/3D-Speaker-ERes2NetV2/speaker_embedding.onnx";
 const SPEAKER_MODEL_BYTES: u64 = 71_964_309;
 const SPEAKER_MODEL_SHA256: &str =
     "0dde34a7c212b7b4ece05b2a120409507971d1cc504e30ed05ec61c7e5dc5d9b";
 const INTERNAL_BIN_DIRECTORY: &str = "bin";
+const CORPORA_RELEASE_ROOT: &str = "corpora";
+const CORPORA_CONFIG_ROOT: &str = "corpora/v1";
 
 #[derive(Debug, Parser)]
 #[command(
@@ -46,6 +46,8 @@ struct Arguments {
     /// Native xrtranslate-backend executable built for the target platform.
     #[arg(long)]
     backend_bin: PathBuf,
+    #[arg(long)]
+    corpus_bin: PathBuf,
     /// Native xrtranslate-installer executable built for the target platform.
     #[arg(long)]
     installer_bin: PathBuf,
@@ -55,6 +57,10 @@ struct Arguments {
     /// Desktop resources copied into `resources/`.
     #[arg(long, default_value = "rust-client/resources")]
     resources_dir: PathBuf,
+    #[arg(long, default_value = "corpora")]
+    corpora_dir: PathBuf,
+    #[arg(long, default_value = "LICENSE")]
+    license: PathBuf,
     /// Standard Silero VAD 16 kHz ONNX file.
     #[arg(long)]
     vad_model: Option<PathBuf>,
@@ -128,8 +134,11 @@ impl From<xrtranslate_assets::ModelAssetsPreflightError> for PackageError {
 struct ReleasePlan {
     rust_client_bin: PathBuf,
     backend_bin: PathBuf,
+    corpus_bin: PathBuf,
     installer_bin: PathBuf,
     resources_dir: PathBuf,
+    corpora_dir: PathBuf,
+    license: PathBuf,
     vad_model: PathBuf,
     speaker_model: PathBuf,
     output: PathBuf,
@@ -190,9 +199,12 @@ impl ReleasePlan {
     fn from_arguments(arguments: Arguments) -> Result<Self, PackageError> {
         require_regular_file("--rust-client-bin", &arguments.rust_client_bin)?;
         require_regular_file("--backend-bin", &arguments.backend_bin)?;
+        require_regular_file("--corpus-bin", &arguments.corpus_bin)?;
         require_regular_file("--installer-bin", &arguments.installer_bin)?;
         require_regular_file("--config", &arguments.config)?;
         require_directory("--resources-dir", &arguments.resources_dir)?;
+        require_directory("--corpora-dir", &arguments.corpora_dir)?;
+        require_regular_file("--license", &arguments.license)?;
 
         let project_root = arguments
             .config
@@ -210,20 +222,34 @@ impl ReleasePlan {
         require_regular_file("--speaker-model", &speaker_model)?;
 
         ensure_directory_is_native("--resources-dir", &arguments.resources_dir)?;
+        ensure_directory_is_native("--corpora-dir", &arguments.corpora_dir)?;
+        load_markdown_directory(&arguments.corpora_dir.join("v1")).map_err(|error| {
+            PackageError::InvalidInput(format!("invalid --corpora-dir: {error}"))
+        })?;
         ensure_native_file("--vad-model", &vad_model)?;
         ensure_native_file("--speaker-model", &speaker_model)?;
 
         let config = AppConfig::from_path(&arguments.config)?;
-        let assets = ModelAssetsConfig {
-            models_directory: config.model_manager.models_directory,
-            qwen3_asr_gguf_directory: config.model_manager.qwen3_asr_gguf_directory,
-            hunyuan_mt_gguf_directory: config.model_manager.hunyuan_mt_gguf_directory,
+        let mut asset_config = ModelAssetsConfig {
+            models_directory: config.model_manager.models_directory.clone(),
+            qwen3_asr_gguf_directory: config.model_manager.qwen3_asr_gguf_directory.clone(),
+            hunyuan_mt_gguf_directory: config.model_manager.hunyuan_mt_gguf_directory.clone(),
+            ..ModelAssetsConfig::default()
+        };
+        for key in config.active_native_model_assets() {
+            if let Some(id) = ModelAssetId::from_config_key(&key) {
+                match manifest_for(id).capability {
+                    ModelCapability::Asr => asset_config.qwen3_asr_asset = Some(id),
+                    ModelCapability::Translation => asset_config.hunyuan_mt_asset = Some(id),
+                }
+            }
         }
-        .resolve(&project_root);
+        let assets = asset_config.resolve(&project_root);
         let packaged_config = rewrite_config(&arguments.config)?;
         let manifest = release_manifest(
             &arguments.rust_client_bin,
             &arguments.backend_bin,
+            &arguments.corpus_bin,
             &arguments.installer_bin,
             arguments.include_models,
             &assets,
@@ -232,8 +258,11 @@ impl ReleasePlan {
         Ok(Self {
             rust_client_bin: arguments.rust_client_bin,
             backend_bin: arguments.backend_bin,
+            corpus_bin: arguments.corpus_bin,
             installer_bin: arguments.installer_bin,
             resources_dir: arguments.resources_dir,
+            corpora_dir: arguments.corpora_dir,
+            license: arguments.license,
             vad_model,
             speaker_model,
             output: arguments.output,
@@ -270,6 +299,12 @@ fn package(plan: &ReleasePlan) -> Result<PathBuf, PackageError> {
                 )?),
         )?;
         copy_file_to(
+            &plan.corpus_bin,
+            &staging
+                .join(INTERNAL_BIN_DIRECTORY)
+                .join(native_binary_name("xr-corpus-server", &plan.corpus_bin)?),
+        )?;
+        copy_file_to(
             &plan.installer_bin,
             &staging
                 .join(INTERNAL_BIN_DIRECTORY)
@@ -279,6 +314,8 @@ fn package(plan: &ReleasePlan) -> Result<PathBuf, PackageError> {
                 )?),
         )?;
         copy_native_directory(&plan.resources_dir, &staging.join("resources"))?;
+        copy_native_directory(&plan.corpora_dir, &staging.join(CORPORA_RELEASE_ROOT))?;
+        copy_file_to(&plan.license, &staging.join("LICENSE"))?;
         copy_file_to(&plan.vad_model, &staging.join(VAD_RELATIVE_PATH))?;
         copy_file_to(&plan.speaker_model, &staging.join(SPEAKER_RELATIVE_PATH))?;
         fs::write(staging.join("config.json"), &plan.packaged_config).map_err(|source| {
@@ -354,12 +391,24 @@ fn rewrite_config(config_path: &Path) -> Result<String, PackageError> {
         "model_path".into(),
         Value::String(SPEAKER_RELATIVE_PATH.into()),
     );
+    let prompt_context = root_object
+        .entry("prompt_context")
+        .or_insert_with(|| Value::Object(Map::new()))
+        .as_object_mut()
+        .ok_or_else(|| {
+            PackageError::InvalidInput("config.prompt_context must be a JSON object".into())
+        })?;
+    prompt_context.insert(
+        "corpora_directory".into(),
+        Value::String(CORPORA_CONFIG_ROOT.into()),
+    );
     Ok(format!("{}\n", serde_json::to_string_pretty(&root)?))
 }
 
 fn release_manifest(
     rust_client: &Path,
     backend: &Path,
+    corpus: &Path,
     installer: &Path,
     include_models: bool,
     assets: &ResolvedModelAssets,
@@ -375,6 +424,7 @@ fn release_manifest(
         "entrypoints": {
             "client": release_client_name(rust_client).unwrap_or_else(|_| "XRTranslate".into()),
             "backend": format!("{INTERNAL_BIN_DIRECTORY}/{}", native_binary_name("xrtranslate-backend", backend).unwrap_or_else(|_| "xrtranslate-backend".into())),
+            "corpus": format!("{INTERNAL_BIN_DIRECTORY}/{}", native_binary_name("xr-corpus-server", corpus).unwrap_or_else(|_| "xr-corpus-server".into())),
             "installer": format!("{INTERNAL_BIN_DIRECTORY}/{}", native_binary_name("xrtranslate-installer", installer).unwrap_or_else(|_| "xrtranslate-installer".into())),
         },
         "runtime": {
@@ -393,6 +443,11 @@ fn release_manifest(
             "sha256": SPEAKER_MODEL_SHA256,
         },
         "resources": "resources",
+        "corpora": {
+            "root": CORPORA_CONFIG_ROOT,
+            "format": "xrtranslate-corpus/v1",
+            "dynamic_sources_supported": true,
+        },
         "models": {
             "included": include_models,
             "root": "models",
@@ -476,6 +531,18 @@ fn verify_staged_release(staging: &Path) -> Result<(), PackageError> {
         }
     }
     ensure_directory_is_native("staged release", staging)?;
+    for required in [
+        "LICENSE",
+        "corpora/README.md",
+        "corpora/v1/SCHEMA.md",
+        "corpora/v1/domains",
+    ] {
+        if !staging.join(required).exists() {
+            return Err(PackageError::InvalidInput(format!(
+                "staged release is missing required corpus asset {required}"
+            )));
+        }
+    }
     let manifest_path = staging.join("release-manifest.json");
     let manifest: Value =
         serde_json::from_str(&fs::read_to_string(&manifest_path).map_err(|source| {
@@ -791,6 +858,10 @@ mod tests {
         assert_eq!(rewritten["model_manager"]["models_directory"], "models");
         assert_eq!(rewritten["speaker"]["enabled"], true);
         assert_eq!(rewritten["speaker"]["model_path"], SPEAKER_RELATIVE_PATH);
+        assert_eq!(
+            rewritten["prompt_context"]["corpora_directory"],
+            CORPORA_CONFIG_ROOT
+        );
         assert!(
             rewritten["model_manager"]
                 .get("qwen3_asr_gguf_directory")
@@ -822,25 +893,67 @@ mod tests {
         let extension = if cfg!(windows) { ".exe" } else { "" };
         let client = source.join(format!("rust-client{extension}"));
         let backend = source.join(format!("custom-backend{extension}"));
+        let corpus_server = source.join(format!("custom-corpus{extension}"));
         let installer = source.join(format!("custom-installer{extension}"));
         let resources = source.join("resources");
+        let corpora = source.join("corpora");
         let vad = source.join("silero_vad.onnx");
         let speaker = source.join("speaker_embedding.onnx");
         let config = source.join("config.json");
+        let license = source.join("LICENSE");
         write(&client, b"client");
         write(&backend, b"backend");
+        write(&corpus_server, b"corpus");
         write(&installer, b"installer");
         write(&resources.join("docs/welcome.md"), b"native resource");
+        write(&corpora.join("README.md"), b"corpus root");
+        write(&corpora.join("v1/SCHEMA.md"), b"corpus schema");
+        write(
+            &corpora.join("v1/domains/example/domain.md"),
+            b"example domain",
+        );
+        write(
+            &corpora.join("v1/domains/example/subdomains/example/subdomain.md"),
+            b"example subdomain",
+        );
+        write(
+            &corpora.join("v1/domains/example/subdomains/example/corpora/example.md"),
+            br#"# Example
+
+> Fixed-order multilingual fixture.
+
+## Metadata
+
+schema: xrtranslate-corpus/v1
+priority: 0
+
+## Language Order
+
+zh,en,fr,pt,es,ja,ru,ko,th,it,de,vi,id,pl,cs,nl
+
+## Triggers
+
+,example,,,,,,,,,,,,,,
+
+## Terms
+
+,Example,,,,,,,,,,,,,,
+"#,
+        );
         write(&vad, b"onnx");
         write(&speaker, b"onnx");
         write(&config, br#"{"model_manager":{"llama_server_path":"old"}}"#);
+        write(&license, b"AGPL-3.0-only");
 
         let plan = ReleasePlan::from_arguments(Arguments {
             rust_client_bin: client,
             backend_bin: backend,
+            corpus_bin: corpus_server,
             installer_bin: installer,
             config,
             resources_dir: resources,
+            corpora_dir: corpora,
+            license,
             vad_model: Some(vad),
             speaker_model: Some(speaker),
             output: output.clone(),
@@ -851,6 +964,7 @@ mod tests {
         package(&plan).unwrap();
 
         assert!(output.join("config.json").is_file());
+        assert!(output.join("LICENSE").is_file());
         let version = env!("CARGO_PKG_VERSION");
         assert!(
             output
@@ -866,10 +980,22 @@ mod tests {
         assert!(
             output
                 .join(INTERNAL_BIN_DIRECTORY)
+                .join(format!("xr-corpus-server{extension}"))
+                .is_file()
+        );
+        assert!(
+            output
+                .join(INTERNAL_BIN_DIRECTORY)
                 .join(format!("xrtranslate-installer{extension}"))
                 .is_file()
         );
         assert!(output.join("resources/docs/welcome.md").is_file());
+        assert!(output.join("corpora/v1/SCHEMA.md").is_file());
+        assert!(
+            output
+                .join("corpora/v1/domains/example/subdomains/example/corpora/example.md")
+                .is_file()
+        );
         assert!(output.join(VAD_RELATIVE_PATH).is_file());
         assert!(output.join(SPEAKER_RELATIVE_PATH).is_file());
         assert!(output.join("release-manifest.json").is_file());
@@ -890,6 +1016,7 @@ mod tests {
             format!("XRTranslate-v{version}{extension}")
         );
         assert_eq!(manifest["models"]["included"], false);
+        assert_eq!(manifest["corpora"]["root"], CORPORA_CONFIG_ROOT);
         fs::remove_dir_all(root).unwrap();
     }
 }

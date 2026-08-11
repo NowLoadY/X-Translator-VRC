@@ -12,3 +12,4 @@ serde_json = "1.0.151"
 sha2 = "0.10.9"
 xrtranslate-assets = { path = "../../crates/xrtranslate-assets" }
 xrtranslate-config = { path = "../../crates/xrtranslate-config" }
+xr-corpus-core = { path = "../../XR-Corpus/crates/core" }

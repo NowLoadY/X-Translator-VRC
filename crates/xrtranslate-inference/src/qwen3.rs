@@ -13,7 +13,6 @@ pub struct Qwen3AsrOptions {
     /// Language name understood by Qwen3-ASR (for example `English` or
     /// `Chinese`). An empty value asks the model to infer the language.
     pub language: Option<String>,
-    /// Optional prompt context from the current conversation.
     pub prompt_context: Option<String>,
     /// Maximum generated transcript tokens.
     pub max_tokens: u32,
@@ -85,26 +84,20 @@ impl<C: AsyncHttpClient> Qwen3AsrAdapter<C> {
             messages.push(json!({"role": "system", "content": context}));
         }
 
-        let mut content = vec![json!({
+        let content = vec![json!({
             "type": "input_audio",
             "input_audio": {"data": encoded_wav, "format": "wav"}
         })];
-        // The legacy Qwen3 llama.cpp client supplied an explicit user
-        // instruction only when the route pinned the input language.  In an
-        // automatic route its pair-aware system prompt is the instruction;
-        // retaining that distinction avoids biasing language detection.
-        if let Some(language) = normalized_optional(&options.language) {
-            content.push(json!({
-                "type": "text",
-                "text": format!(
-                    "Transcribe this {language} speech. Return only the spoken transcript; do not translate or explain it."
-                )
-            }));
-        }
         messages.push(json!({
             "role": "user",
             "content": content
         }));
+        if let Some(language) = normalized_optional(&options.language) {
+            messages.push(json!({
+                "role": "assistant",
+                "content": format!("language {language}<asr_text>"),
+            }));
+        }
 
         let payload = non_streaming_chat_payload(
             &self.model,
@@ -123,6 +116,97 @@ fn normalized_optional(value: &Option<String>) -> Option<&str> {
         .as_deref()
         .map(str::trim)
         .filter(|value| !value.is_empty())
+}
+
+#[must_use]
+pub fn is_probable_asr_hallucination(
+    text: &str,
+    sample_count: usize,
+    sample_rate: u32,
+    prompt_context: Option<&str>,
+    echo_candidates: &[String],
+) -> bool {
+    let text = text.trim();
+    if text.is_empty() || sample_rate == 0 {
+        return false;
+    }
+
+    let lowercase = text.to_lowercase();
+    let had_prompt_context = prompt_context.is_some_and(|context| !context.trim().is_empty());
+    if lowercase.contains("# asr lexicon")
+        || lowercase.contains("asr_lexicon")
+        || lowercase.contains("<asr_context")
+        || (had_prompt_context && lowercase.starts_with("vocabulary:"))
+        || (had_prompt_context
+            && (lowercase.contains("# asr context")
+                || lowercase.contains("## language order")
+                || lowercase.contains("## terminology")
+                || lowercase.contains("## recent bilingual history")))
+        || (had_prompt_context
+            && text.starts_with('{')
+            && (lowercase.contains("\"kind\"") || lowercase.contains("\"terms\"")))
+    {
+        return true;
+    }
+
+    let normalized_output = normalized_words(text);
+    if spoken_unit_count(text) >= 2
+        && echo_candidates
+            .iter()
+            .map(|candidate| normalized_words(candidate))
+            .any(|candidate| !candidate.is_empty() && candidate == normalized_output)
+    {
+        return true;
+    }
+
+    let seconds = sample_count as f64 / f64::from(sample_rate);
+    let maximum_units = ((seconds * 7.0).ceil() as usize + 1).max(4);
+    spoken_unit_count(text) > maximum_units
+}
+
+fn normalized_words(text: &str) -> String {
+    let mut normalized = String::new();
+    let mut previous_was_space = true;
+    for character in text.chars().flat_map(char::to_lowercase) {
+        if character.is_alphanumeric() {
+            normalized.push(character);
+            previous_was_space = false;
+        } else if !previous_was_space {
+            normalized.push(' ');
+            previous_was_space = true;
+        }
+    }
+    normalized.trim().to_owned()
+}
+
+fn spoken_unit_count(text: &str) -> usize {
+    let mut count = 0;
+    let mut in_word = false;
+    for character in text.chars() {
+        if is_logographic_or_syllabic(character) {
+            count += 1;
+            in_word = false;
+        } else if character.is_alphanumeric() || character == '\'' {
+            if !in_word {
+                count += 1;
+                in_word = true;
+            }
+        } else {
+            in_word = false;
+        }
+    }
+    count
+}
+
+fn is_logographic_or_syllabic(character: char) -> bool {
+    matches!(
+        character as u32,
+        0x3400..=0x4DBF
+            | 0x4E00..=0x9FFF
+            | 0xF900..=0xFAFF
+            | 0x3040..=0x30FF
+            | 0xAC00..=0xD7AF
+    )
 }
 
 fn clean_asr_text(text: &str) -> String {
@@ -210,11 +294,17 @@ mod tests {
         assert_eq!(&wav[0..4], b"RIFF");
         assert_eq!(&wav[8..12], b"WAVE");
         assert_eq!(&wav[44..], &[1, 0, 2, 0]);
-        assert!(
-            request.body["messages"][1]["content"][1]["text"]
-                .as_str()
+        assert_eq!(
+            request.body["messages"][1]["content"]
+                .as_array()
                 .unwrap()
-                .contains("English")
+                .len(),
+            1
+        );
+        assert_eq!(request.body["messages"][2]["role"], "assistant");
+        assert_eq!(
+            request.body["messages"][2]["content"],
+            "language English<asr_text>"
         );
     }
 
@@ -247,5 +337,51 @@ mod tests {
         // A silent audio smoke test on llama.cpp returns this prefix without
         // transcript content. It must not become an OSC subtitle.
         assert_eq!(clean_asr_text("language None<asr_text>"), "");
+    }
+
+    #[test]
+    fn quality_gate_uses_audio_duration_instead_of_expected_words() {
+        assert!(!is_probable_asr_hallucination(
+            "hello",
+            6_400,
+            16_000,
+            None,
+            &[],
+        ));
+        assert!(is_probable_asr_hallucination(
+            "Independent transcription of current audio",
+            6_400,
+            16_000,
+            None,
+            &[],
+        ));
+        assert!(is_probable_asr_hallucination(
+            r#"{"kind":"asr_lexicon","terms":[]}"#,
+            16_000,
+            16_000,
+            None,
+            &[],
+        ));
+        assert!(is_probable_asr_hallucination(
+            "## Recent Bilingual History\nen: hello\nzh: 你好",
+            16_000,
+            16_000,
+            Some("Vocabulary: hello"),
+            &[],
+        ));
+        assert!(is_probable_asr_hallucination(
+            "你们玩什么游戏？",
+            32_000,
+            16_000,
+            Some("Vocabulary: Overwatch"),
+            &["你们玩什么游戏？".into()],
+        ));
+        assert!(!is_probable_asr_hallucination(
+            "Overwatch",
+            16_000,
+            16_000,
+            Some("Vocabulary: Overwatch"),
+            &[],
+        ));
     }
 }

@@ -1,0 +1,12 @@
+[package]
+name = "xrtranslate-download"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+description = "Resumable, verified immutable artifact downloads for XRTranslate."
+
+[dependencies]
+reqwest = { version = "0.13.4", features = ["stream"] }
+sha2 = "0.10.9"
+tokio = { version = "1.53.1", features = ["fs", "io-util", "time"] }

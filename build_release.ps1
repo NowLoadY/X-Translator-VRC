@@ -14,6 +14,7 @@ $workspaceManifest = Join-Path $projectRoot 'Cargo.toml'
 $configPath = Join-Path $projectRoot 'config.json'
 $vadModel = Join-Path $projectRoot 'models\silero-vad\src\silero_vad\data\silero_vad.onnx'
 $speakerModel = Join-Path $projectRoot 'models\3D-Speaker-ERes2NetV2\speaker_embedding.onnx'
+$corporaDirectory = Join-Path $projectRoot 'XR-Corpus\corpora'
 $cargoPath = Join-Path $env:USERPROFILE '.cargo\bin\cargo.exe'
 
 if (-not (Test-Path -LiteralPath $workspaceManifest)) {
@@ -27,6 +28,9 @@ if (-not (Test-Path -LiteralPath $vadModel)) {
 }
 if (-not (Test-Path -LiteralPath $speakerModel)) {
     throw "ERes2NetV2 speaker ONNX model was not found: $speakerModel"
+}
+if (-not (Test-Path -LiteralPath $corporaDirectory)) {
+    throw "Versioned Markdown corpora were not found: $corporaDirectory"
 }
 
 if (Test-Path -LiteralPath $cargoPath) {
@@ -69,13 +73,20 @@ if ($LASTEXITCODE -ne 0) {
     exit $LASTEXITCODE
 }
 
+& $cargo build --manifest-path (Join-Path $projectRoot 'XR-Corpus\Cargo.toml') --target-dir (Join-Path $projectRoot 'target') --release --package xr-corpus-server
+if ($LASTEXITCODE -ne 0) {
+    exit $LASTEXITCODE
+}
+
 $packageArguments = @(
     'run', '--manifest-path', $workspaceManifest, '--release', '--package', 'xrtranslate-packager', '--',
     '--rust-client-bin', (Join-Path $projectRoot 'target\release\rust-client.exe'),
     '--backend-bin', (Join-Path $projectRoot 'target\release\xrtranslate-backend.exe'),
+    '--corpus-bin', (Join-Path $projectRoot 'target\release\xr-corpus-server.exe'),
     '--installer-bin', (Join-Path $projectRoot 'target\release\xrtranslate-installer.exe'),
     '--config', $configPath,
     '--resources-dir', (Join-Path $projectRoot 'rust-client\resources'),
+    '--corpora-dir', $corporaDirectory,
     '--vad-model', $vadModel,
     '--speaker-model', $speakerModel,
     '--output', $Output

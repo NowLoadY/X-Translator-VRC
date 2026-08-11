@@ -5,11 +5,11 @@
 //! lets the remaining engine work land without another client protocol change.
 
 use std::{
-    net::{IpAddr, Ipv4Addr},
+    net::{IpAddr, Ipv4Addr, SocketAddr},
     path::PathBuf,
     sync::{
         Arc,
-        atomic::{AtomicU64, Ordering},
+        atomic::{AtomicBool, AtomicU64, Ordering},
     },
     time::Duration,
 };
@@ -32,16 +32,16 @@ use tokio::{
     sync::{mpsc, watch},
 };
 use tracing::{info, warn};
-use xrtranslate_config::AppConfig;
+use xrtranslate_config::{AppConfig, LocalModelRuntimeConfig};
 use xrtranslate_engine::RouteEpoch;
 use xrtranslate_inference::{AsyncHttpClient, HttpRequest, ReqwestClient};
 use xrtranslate_protocol::{
-    ActionControl, ClientControl, ErrorEvent, EventControl, LatencyMetrics, PcmFormat, PcmFrame,
-    ServerEvent, SessionReady,
+    ActionControl, ClientControl, ErrorEvent, EventControl, Feature, LatencyMetrics, PcmFormat,
+    PcmFrame, ServerEvent, SessionReady,
 };
 use xrtranslate_supervisor::{
-    LlamaServerEndpoint, LlamaServerLauncher, LlamaServerProcess, LlamaServerRole, LlamaServerSpec,
-    StdLlamaServerLauncher,
+    LlamaServerEndpoint, LlamaServerLauncher, LlamaServerProcess, LlamaServerProcessHandle,
+    LlamaServerRole, LlamaServerSpec, StdLlamaServerLauncher,
 };
 use xrtranslate_vad::{FRAME_SAMPLES, SAMPLE_RATE_HZ, Utterance};
 
@@ -55,6 +55,11 @@ use crate::{
 
 mod pipeline;
 mod session;
+use xr_corpus_client::CorpusClient;
+use xr_corpus_protocol::{
+    ContextBudgets, PrepareAsrRequest, PrepareTranslationRequest, RecordTranslationRequest,
+    SegmentContext as CorpusSegmentContext,
+};
 
 /// At most four VAD-complete turns may await local model inference per
 /// WebSocket session. This bounds retained audio and prevents hidden latency
@@ -165,11 +170,14 @@ struct Arguments {
     /// Maximum time to wait for managed llama-server instances to report ready.
     #[arg(long, default_value_t = 120)]
     model_start_timeout_seconds: u64,
+    #[arg(long, default_value = "http://127.0.0.1:7766")]
+    corpus_url: String,
 }
 
 #[derive(Clone)]
 struct BackendState {
     config: AppConfig,
+    corpus_client: CorpusClient,
     project_root: PathBuf,
     next_session_id: Arc<AtomicU64>,
 }
@@ -182,7 +190,14 @@ struct HealthResponse {
 }
 
 #[tokio::main]
-async fn main() -> Result<(), Box<dyn std::error::Error>> {
+async fn main() {
+    if let Err(error) = run_backend().await {
+        eprintln!("[XRTRANSLATE_STARTUP_ERROR] {error}");
+        std::process::exit(1);
+    }
+}
+
+async fn run_backend() -> Result<(), Box<dyn std::error::Error>> {
     tracing_subscriber::fmt()
         .with_env_filter(tracing_subscriber::EnvFilter::from_default_env())
         .with_target(false)
@@ -197,9 +212,16 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         .map(PathBuf::from)
         .unwrap_or_else(|| PathBuf::from("."));
     validate_native_route(&config, &project_root)?;
+    let corpus_client = CorpusClient::new(&args.corpus_url)?;
+    let corpus_health = corpus_client.ensure_compatible().await?;
+    info!(
+        count = corpus_health.corpus_count,
+        api_version = corpus_health.api_version,
+        "connected to XR Corpus"
+    );
     let _model_processes = if args.manage_llama_servers {
-        let processes = start_llama_servers(&config, &project_root)?;
-        wait_for_model_servers(&config, args.model_start_timeout_seconds).await?;
+        let mut processes = start_llama_servers(&config, &project_root)?;
+        wait_for_model_servers(&config, args.model_start_timeout_seconds, &mut processes).await?;
         info!("managed llama.cpp model servers are ready");
         Some(processes)
     } else {
@@ -208,19 +230,24 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let address = format!("{}:{}", config.server.host, config.server.port);
     let state = BackendState {
         config,
+        corpus_client,
         project_root,
         next_session_id: Arc::new(AtomicU64::new(1)),
     };
     let app = Router::new()
         .route("/healthz", get(health))
         .route("/ws", get(websocket))
+        .route("/integrations/vrcx/status", get(vrcx_status))
         .with_state(state);
 
     let listener = TcpListener::bind(&address).await?;
     info!(%address, "native backend transport is listening");
-    axum::serve(listener, app)
-        .with_graceful_shutdown(shutdown_signal())
-        .await?;
+    axum::serve(
+        listener,
+        app.into_make_service_with_connect_info::<SocketAddr>(),
+    )
+    .with_graceful_shutdown(shutdown_signal())
+    .await?;
     Ok(())
 }
 
@@ -230,6 +257,17 @@ async fn health() -> Json<HealthResponse> {
         runtime: "native-gguf",
         protocol_version: xrtranslate_protocol::PROTOCOL_VERSION,
     })
+}
+
+async fn vrcx_status(State(state): State<BackendState>) -> impl IntoResponse {
+    match state.corpus_client.vrcx_status().await {
+        Ok(status) => (axum::http::StatusCode::OK, Json(status)).into_response(),
+        Err(error) => (
+            axum::http::StatusCode::BAD_GATEWAY,
+            Json(serde_json::json!({ "error": error.to_string() })),
+        )
+            .into_response(),
+    }
 }
 
 async fn websocket(
@@ -272,6 +310,9 @@ async fn serve_session(socket: WebSocket, state: BackendState) {
         }
     };
     let mut input_format = PcmFormat::mono_s16le(state.config.audio.sample_rate);
+    let speaker_available = pipeline.inference().speaker_is_available();
+    let speaker_recognition_enabled = Arc::new(AtomicBool::new(false));
+    let speaker_state_revision = Arc::new(AtomicU64::new(0));
 
     let (job_sender, job_receiver) = mpsc::channel(INFERENCE_QUEUE_CAPACITY);
     let (result_sender, mut result_receiver) = mpsc::channel(INFERENCE_RESULT_CAPACITY);
@@ -280,9 +321,13 @@ async fn serve_session(socket: WebSocket, state: BackendState) {
         job_receiver,
         result_sender,
         generation_receiver,
+        state.corpus_client.clone(),
+        Arc::clone(&speaker_recognition_enabled),
+        Arc::clone(&speaker_state_revision),
     ));
     let mut job_sender = Some(job_sender);
     let mut stopping = false;
+    let mut next_utterance_sequence = 1_u64;
 
     if send_event(
         &outbound_sender,
@@ -372,7 +417,13 @@ async fn serve_session(socket: WebSocket, state: BackendState) {
                             match pipeline.flush() {
                                 Ok(Some(utterance)) => {
                                     if let Some(sender) = job_sender.as_ref()
-                                        && let Err(error) = enqueue_utterances(sender, &session, generation, vec![utterance])
+                                        && let Err(error) = enqueue_utterances(
+                                            sender,
+                                            &session,
+                                            generation,
+                                            vec![utterance],
+                                            &mut next_utterance_sequence,
+                                        )
                                     {
                                         if send_error(&outbound_sender, error).await.is_err() {
                                             break;
@@ -390,7 +441,28 @@ async fn serve_session(socket: WebSocket, state: BackendState) {
                             stopping = true;
                         }
                         Ok(ClientControl::Action(ActionControl::ToggleFeature { feature, enabled })) => {
-                            session.set_tts_enabled(enabled);
+                            match feature {
+                                Feature::Tts => session.set_tts_enabled(enabled),
+                                Feature::SpeakerRecognition if enabled && !speaker_available => {
+                                    if send_error(
+                                        &outbound_sender,
+                                        "speaker recognition is unavailable; enable speaker.enabled and install its model".into(),
+                                    )
+                                    .await
+                                    .is_err()
+                                    {
+                                        break;
+                                    }
+                                    continue;
+                                }
+                                Feature::SpeakerRecognition => {
+                                    if speaker_recognition_enabled.swap(enabled, Ordering::AcqRel)
+                                        != enabled
+                                    {
+                                        speaker_state_revision.fetch_add(1, Ordering::AcqRel);
+                                    }
+                                }
+                            }
                             info!(%session_id, ?feature, enabled, "session feature configured");
                         }
                         Ok(ClientControl::Event(EventControl::TurnStarted { turn_id })) => {
@@ -416,7 +488,13 @@ async fn serve_session(socket: WebSocket, state: BackendState) {
                             Ok(frame) => match pipeline.push_pcm(frame.as_bytes()) {
                                 Ok(utterances) => {
                                     if let Some(sender) = job_sender.as_ref()
-                                        && let Err(error) = enqueue_utterances(sender, &session, generation, utterances)
+                                        && let Err(error) = enqueue_utterances(
+                                            sender,
+                                            &session,
+                                            generation,
+                                            utterances,
+                                            &mut next_utterance_sequence,
+                                        )
                                     {
                                         if send_error(&outbound_sender, error).await.is_err() {
                                             break;
@@ -516,15 +594,17 @@ fn start_llama_servers(
     // Model endpoints are an implementation detail of this local backend;
     // never expose their unauthenticated OpenAI-compatible APIs to the LAN.
     let bind = |port| LlamaServerEndpoint::new(IpAddr::V4(Ipv4Addr::LOCALHOST), port);
-    let asr_spec = LlamaServerSpec::qwen3_asr_gguf(
+    let mut asr_spec = LlamaServerSpec::qwen3_asr_gguf(
         &native.llama_server_path,
         paths.qwen3_asr_model,
         paths.qwen3_asr_mmproj,
     )
     .with_endpoint(bind(asr_port));
-    let translation_spec =
+    apply_model_runtime(&mut asr_spec, native.asr_runtime)?;
+    let mut translation_spec =
         LlamaServerSpec::hunyuan_mt_gguf(&native.llama_server_path, paths.hunyuan_mt_model)
             .with_endpoint(bind(translation_port));
+    apply_model_runtime(&mut translation_spec, native.translation_runtime)?;
 
     let launcher = StdLlamaServerLauncher;
     let asr = launcher
@@ -540,7 +620,23 @@ fn start_llama_servers(
     Ok(vec![asr, translation])
 }
 
-async fn wait_for_model_servers(config: &AppConfig, timeout_seconds: u64) -> Result<(), String> {
+fn apply_model_runtime(
+    spec: &mut LlamaServerSpec,
+    runtime: LocalModelRuntimeConfig,
+) -> Result<(), String> {
+    spec.context_size = runtime
+        .context_window_tokens
+        .checked_mul(u32::from(runtime.parallel_slots))
+        .ok_or("model context_window_tokens × parallel_slots exceeds u32")?;
+    spec.parallel_slots = (runtime.parallel_slots > 1).then_some(runtime.parallel_slots);
+    Ok(())
+}
+
+async fn wait_for_model_servers(
+    config: &AppConfig,
+    timeout_seconds: u64,
+    processes: &mut [LlamaServerProcess],
+) -> Result<(), String> {
     let native = config.default_gguf().map_err(|error| error.to_string())?;
     let asr_health = health_url(&native.asr_url)?;
     let translation_health = health_url(&native.translation_url)?;
@@ -551,6 +647,17 @@ async fn wait_for_model_servers(config: &AppConfig, timeout_seconds: u64) -> Res
     let deadline = Instant::now() + Duration::from_secs(timeout_seconds);
 
     loop {
+        for process in processes.iter_mut() {
+            let role = process.role().model_alias();
+            if let Some(status) = process
+                .try_wait()
+                .map_err(|error| format!("cannot inspect managed {role} process: {error}"))?
+            {
+                return Err(format!(
+                    "managed {role} llama-server exited during startup ({status}); check whether its port is already in use and inspect the lines above this error"
+                ));
+            }
+        }
         let asr = check_model_ready(
             &client,
             &asr_health,
@@ -692,12 +799,17 @@ fn enqueue_utterances(
     session: &SessionAdapter,
     generation: PipelineGeneration,
     utterances: Vec<TimedUtterance>,
+    next_utterance_sequence: &mut u64,
 ) -> Result<(), String> {
     debug_assert_eq!(generation.route_epoch, session.route_epoch());
-    let turn_id = session.turn_id();
+    let turn_id_prefix = session.turn_id();
     let source_language = session.source_lang().to_owned();
     let target_language = session.target_lang().to_owned();
     for timed in utterances {
+        let turn_id = format!("{turn_id_prefix}:utterance-{next_utterance_sequence}");
+        *next_utterance_sequence = (*next_utterance_sequence)
+            .checked_add(1)
+            .ok_or_else(|| "utterance identity counter exhausted".to_owned())?;
         let TimedUtterance {
             utterance,
             source_start_ms,
@@ -718,7 +830,7 @@ fn enqueue_utterances(
                 source_start_ms,
                 source_end_ms,
                 generation,
-                turn_id: turn_id.clone(),
+                turn_id,
                 source_language: source_language.clone(),
                 target_language: target_language.clone(),
             })
@@ -739,23 +851,29 @@ async fn run_inference_worker(
     mut jobs: mpsc::Receiver<InferenceJob>,
     events: mpsc::Sender<InferenceEvent>,
     generation: watch::Receiver<PipelineGeneration>,
+    corpus_client: CorpusClient,
+    speaker_recognition_enabled: Arc<AtomicBool>,
+    speaker_state_revision: Arc<AtomicU64>,
 ) {
     let mut previous_transcript: Option<(PipelineGeneration, String)> = None;
-    let mut diarizer = match tokio::task::block_in_place(|| inference.speaker_diarizer()) {
-        Ok(diarizer) => diarizer,
+    let mut diarizer: Option<xrtranslate_speaker::OnlineSpeakerDiarizer> = None;
+    let speaker_min_utterance_ms = inference.speaker_min_utterance_ms().unwrap_or(0);
+    let mut diarizer_generation: Option<PipelineGeneration> = Some(*generation.borrow());
+    let mut speaker_revision_seen = 0;
+    let mut speaker_load_failed = false;
+    let mut corpus_session = match corpus_client.create_session().await {
+        Ok(session) => session,
         Err(message) => {
             let current_generation = *generation.borrow();
             let _ = events
                 .send(InferenceEvent::Error {
                     generation: current_generation,
-                    message,
+                    message: message.to_string(),
                 })
                 .await;
             return;
         }
     };
-    let speaker_min_utterance_ms = inference.speaker_min_utterance_ms().unwrap_or(0);
-    let mut diarizer_generation: Option<PipelineGeneration> = None;
     'jobs: while let Some(job) = jobs.recv().await {
         if *generation.borrow() != job.generation {
             continue;
@@ -770,39 +888,61 @@ async fn run_inference_worker(
             if let Some(diarizer) = &mut diarizer {
                 diarizer.reset();
             }
+            match corpus_client.create_session().await {
+                Ok(session) => {
+                    let old_session = std::mem::replace(&mut corpus_session, session);
+                    tokio::spawn(async move {
+                        let _ = old_session.close().await;
+                    });
+                }
+                Err(message) => {
+                    let _ = events
+                        .send(InferenceEvent::Error {
+                            generation: job.generation,
+                            message: message.to_string(),
+                        })
+                        .await;
+                    continue;
+                }
+            }
             diarizer_generation = Some(job.generation);
         }
-        let duration_ms = job.source_end_ms - job.source_start_ms;
-        let speaker_id = if duration_ms >= f64::from(speaker_min_utterance_ms) {
-            match &mut diarizer {
-                Some(diarizer) => {
-                    match tokio::task::block_in_place(|| diarizer.identify(&job.utterance.samples))
-                    {
-                        Ok(assignment) => {
-                            info!(
-                                speaker_id = assignment.speaker_id,
-                                similarity = assignment.similarity,
-                                is_new = assignment.is_new,
-                                "speaker voiceprint assigned"
-                            );
-                            assignment.speaker_id
-                        }
-                        Err(error) => {
-                            warn!(%error, "speaker embedding failed; preserving ASR with unknown speaker");
-                            "speaker-unknown".into()
-                        }
-                    }
-                }
-                None => String::new(),
-            }
-        } else if diarizer.is_some() {
-            "speaker-unknown".into()
-        } else {
-            String::new()
-        };
         let overlap_frames = job.utterance.overlap_frames;
+        let (asr_tokens, translation_tokens) = inference.prompt_context_token_budgets();
+        let context_budgets = ContextBudgets {
+            asr_tokens,
+            translation_tokens,
+        };
+        let asr_context = match corpus_session
+            .prepare_asr(&PrepareAsrRequest {
+                source_language: job.source_language.clone(),
+                target_language: job.target_language.clone(),
+                budgets: context_budgets,
+            })
+            .await
+        {
+            Ok(prompt) => prompt,
+            Err(message) => {
+                if events
+                    .send(InferenceEvent::Error {
+                        generation: job.generation,
+                        message: message.to_string(),
+                    })
+                    .await
+                    .is_err()
+                {
+                    break;
+                }
+                continue;
+            }
+        };
         let mut recognized = match inference
-            .transcribe(job.utterance, &job.source_language, &job.target_language)
+            .transcribe(
+                &job.utterance.samples,
+                &job.source_language,
+                asr_context.prompt,
+                &asr_context.echo_guard,
+            )
             .await
         {
             Ok(Some(recognized)) => recognized,
@@ -811,7 +951,7 @@ async fn run_inference_worker(
                 if events
                     .send(InferenceEvent::Error {
                         generation: job.generation,
-                        message,
+                        message: message.to_string(),
                     })
                     .await
                     .is_err()
@@ -831,15 +971,109 @@ async fn run_inference_worker(
             );
             continue;
         }
+        if *generation.borrow() != job.generation {
+            continue;
+        }
+        let translation_context = match corpus_session
+            .prepare_translation(&PrepareTranslationRequest {
+                asr_context_id: asr_context.context_id,
+                source_language: job.source_language.clone(),
+                target_language: job.target_language.clone(),
+                recognized_text: recognized.source_text.clone(),
+                segments: recognized
+                    .segments
+                    .iter()
+                    .map(|segment| segment.translation_text.clone())
+                    .collect(),
+                budgets: context_budgets,
+            })
+            .await
+        {
+            Ok(context) => context,
+            Err(message) => {
+                if events
+                    .send(InferenceEvent::Error {
+                        generation: job.generation,
+                        message: message.to_string(),
+                    })
+                    .await
+                    .is_err()
+                {
+                    break;
+                }
+                continue;
+            }
+        };
+        if translation_context.corrected_text != recognized.source_text {
+            info!(
+                before = %recognized.source_text,
+                after = %translation_context.corrected_text,
+                "XR Corpus corrected a unique active-term near match"
+            );
+            recognized.apply_source_correction(
+                translation_context.corrected_text.clone(),
+                &job.source_language,
+            );
+        }
+        for (segment, context) in recognized
+            .segments
+            .iter_mut()
+            .zip(&translation_context.segments)
+        {
+            segment.translation_text.clone_from(&context.corrected_text);
+        }
         previous_transcript = Some((job.generation, recognized.source_text.clone()));
         info!(
             asr_ms = recognized.asr_elapsed.as_millis(),
             segments = recognized.segments.len(),
             "ASR completed an utterance"
         );
-        if *generation.borrow() != job.generation {
-            continue;
+        let speaker_enabled = speaker_recognition_enabled.load(Ordering::Acquire);
+        let speaker_revision = speaker_state_revision.load(Ordering::Acquire);
+        if speaker_revision != speaker_revision_seen {
+            if let Some(diarizer) = &mut diarizer {
+                diarizer.reset();
+            }
+            speaker_revision_seen = speaker_revision;
+            speaker_load_failed = false;
         }
+        let duration_ms = job.source_end_ms - job.source_start_ms;
+        let speaker_id = if speaker_enabled && duration_ms >= f64::from(speaker_min_utterance_ms) {
+            if diarizer.is_none() && !speaker_load_failed {
+                match tokio::task::block_in_place(|| inference.speaker_diarizer()) {
+                    Ok(loaded) => diarizer = loaded,
+                    Err(error) => {
+                        speaker_load_failed = true;
+                        warn!(%error, "speaker model failed to initialize; preserving ASR");
+                    }
+                }
+            }
+            match &mut diarizer {
+                Some(diarizer) => {
+                    match tokio::task::block_in_place(|| diarizer.identify(&job.utterance.samples))
+                    {
+                        Ok(assignment) => {
+                            info!(
+                                speaker_id = assignment.speaker_id,
+                                similarity = assignment.similarity,
+                                is_new = assignment.is_new,
+                                "speaker voiceprint assigned"
+                            );
+                            assignment.speaker_id
+                        }
+                        Err(error) => {
+                            warn!(%error, "speaker embedding failed; preserving ASR with unknown speaker");
+                            "speaker-unknown".into()
+                        }
+                    }
+                }
+                None => "speaker-unknown".into(),
+            }
+        } else if speaker_enabled {
+            "speaker-unknown".into()
+        } else {
+            String::new()
+        };
         let asr_elapsed = recognized.asr_elapsed;
         let segments = recognized.segments.clone();
         let non_overlapping_start_ms = (job.source_start_ms
@@ -847,6 +1081,7 @@ async fn run_inference_worker(
         .min(job.source_end_ms);
         let segment_contexts = segment_contexts(
             &segments,
+            &translation_context.segments,
             job.turn_id.clone(),
             speaker_id,
             non_overlapping_start_ms,
@@ -863,31 +1098,56 @@ async fn run_inference_worker(
         {
             break;
         }
-        let translations = futures_util::stream::iter(segments.into_iter().zip(segment_contexts))
-            .map(|(segment, context)| {
-                let inference = inference.clone();
-                let source_language = job.source_language.clone();
-                let target_language = job.target_language.clone();
-                async move {
-                    let output = inference
-                        .translate_segment(&segment, &source_language, &target_language)
-                        .await;
-                    (context, output)
-                }
-            })
-            // `buffered` executes requests concurrently but yields them in source
-            // order, preserving the protocol timeline and OSC display order.
-            .buffered(TRANSLATION_CONCURRENCY_PER_SESSION);
+        let translations = futures_util::stream::iter(
+            segments
+                .into_iter()
+                .zip(segment_contexts)
+                .zip(translation_context.segments.into_iter()),
+        )
+        .map(|((segment, segment_context), corpus_context)| {
+            let inference = inference.clone();
+            let source_language = job.source_language.clone();
+            let target_language = job.target_language.clone();
+            async move {
+                let output = inference
+                    .translate_segment(
+                        &segment,
+                        &source_language,
+                        &target_language,
+                        corpus_context.prompt,
+                    )
+                    .await;
+                (segment_context, output)
+            }
+        })
+        .buffered(TRANSLATION_CONCURRENCY_PER_SESSION);
         tokio::pin!(translations);
-        while let Some((context, output)) = translations.next().await {
+        while let Some((segment_context, mut output)) = translations.next().await {
             if *generation.borrow() != job.generation {
                 continue 'jobs;
+            }
+            if let Ok(translated) = &mut output {
+                match corpus_session
+                    .record_translation(&RecordTranslationRequest {
+                        context_id: translation_context.context_id,
+                        source_language: translated.source_language.clone(),
+                        target_language: translated.target_language.clone(),
+                        source_text: translated.source_text.clone(),
+                        translated_text: translated.translated_text.clone(),
+                    })
+                    .await
+                {
+                    Ok(recorded) => translated.term_matches = recorded.term_matches,
+                    Err(message) => {
+                        warn!(%message, "could not record XR Corpus translation context")
+                    }
+                }
             }
             if events
                 .send(InferenceEvent::Translation {
                     generation: job.generation,
                     asr_elapsed,
-                    context,
+                    context: segment_context,
                     output,
                 })
                 .await
@@ -914,8 +1174,17 @@ async fn handle_inference_event(
             recognized,
             segments,
         } => {
+            let turn_id = segments
+                .first()
+                .map(|context| context.turn_id.clone())
+                .unwrap_or_else(|| session.turn_id());
             if !session
-                .submit_recognized_for_route(generation.route_epoch, recognized.source_text, true)
+                .submit_recognized_for_route_and_turn(
+                    generation.route_epoch,
+                    recognized.source_text,
+                    true,
+                    turn_id,
+                )
                 .map_err(axum::Error::new)?
             {
                 return Ok(());
@@ -949,6 +1218,7 @@ async fn handle_inference_event(
                     generation.route_epoch,
                     output.source_text,
                     output.translated_text,
+                    output.term_matches,
                     LatencyMetrics {
                         asr_ms: millis(asr_elapsed),
                         mt_ms: millis(output.mt_elapsed),
@@ -974,6 +1244,7 @@ async fn handle_inference_event(
 
 fn segment_contexts(
     segments: &[xrtranslate_engine::TranslationSegmentPair],
+    corpus_contexts: &[CorpusSegmentContext],
     turn_id: String,
     speaker_id: String,
     source_start_ms: f64,
@@ -997,6 +1268,7 @@ fn segment_contexts(
             } else {
                 source_start_ms + duration * consumed as f64 / total_weight
             };
+            let corpus_context = corpus_contexts.get(index);
             SegmentContext {
                 turn_id: turn_id.clone(),
                 segment_index: u32::try_from(index + 1).unwrap_or(u32::MAX),
@@ -1004,6 +1276,12 @@ fn segment_contexts(
                 speaker_id: speaker_id.clone(),
                 source_start_ms: start,
                 source_end_ms: end,
+                activation_matches: corpus_context
+                    .map(|context| context.activation_matches.clone())
+                    .unwrap_or_default(),
+                context_matches: corpus_context
+                    .map(|context| context.context_matches.clone())
+                    .unwrap_or_default(),
             }
         })
         .collect()
@@ -1100,12 +1378,30 @@ async fn shutdown_signal() {
 #[cfg(test)]
 mod tests {
     use super::{
-        AudioEpoch, PipelineGeneration, health_url, local_endpoint_port, model_alias_is_advertised,
-        models_url, outbound_is_current, segment_contexts,
+        AudioEpoch, PipelineGeneration, apply_model_runtime, health_url, local_endpoint_port,
+        model_alias_is_advertised, models_url, outbound_is_current, segment_contexts,
     };
+    use xrtranslate_config::LocalModelRuntimeConfig;
     use xrtranslate_engine::{
         EngineConfig, Language, LanguageRoute, SessionEngine, TranslationSegmentPair,
     };
+    use xrtranslate_supervisor::LlamaServerSpec;
+
+    #[test]
+    fn per_request_context_is_multiplied_by_parallel_slots() {
+        let mut spec = LlamaServerSpec::hunyuan_mt_gguf("llama-server", "hy-mt2.gguf");
+        apply_model_runtime(
+            &mut spec,
+            LocalModelRuntimeConfig {
+                context_window_tokens: 2_048,
+                max_tokens: 256,
+                parallel_slots: 2,
+            },
+        )
+        .unwrap();
+        assert_eq!(spec.context_size, 4_096);
+        assert_eq!(spec.parallel_slots, Some(2));
+    }
 
     #[test]
     fn managed_model_urls_must_be_local_and_have_distinct_explicit_ports() {
@@ -1201,6 +1497,7 @@ mod tests {
         ];
         let metadata = segment_contexts(
             &segments,
+            &[],
             "turn-7".into(),
             "speaker-02".into(),
             1_000.0,

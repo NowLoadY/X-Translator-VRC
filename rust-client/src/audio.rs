@@ -702,7 +702,9 @@ fn run_loopback_capture(
         } else if last_audio_received.elapsed() >= Duration::from_secs(3)
             && last_waiting_log.elapsed() >= Duration::from_secs(3)
         {
-            log::info!("WASAPI loopback is running but has not received audio samples; verify that this is the active Windows playback device");
+            log::info!(
+                "WASAPI loopback is running but has not received audio samples; verify that this is the active Windows playback device"
+            );
             last_waiting_log = std::time::Instant::now();
         }
         while pending.len() >= bytes_per_frame * 960 {

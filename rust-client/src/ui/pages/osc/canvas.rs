@@ -20,27 +20,21 @@ pub fn render_canvas(app: &crate::XRTranslateApp, ui: &mut egui::Ui) {
                 crate::ui::theme::text_weak()
             };
             let lifecycle = if preview.typing {
-                crate::i18n::tr(app.ui_language, "Live typing").to_owned()
-            } else if let Some(remaining) = preview.expires_in {
-                format!(
-                    "{} {:.1}s",
-                    crate::i18n::tr(app.ui_language, "Expires in"),
-                    remaining.as_secs_f64()
-                )
+                Some(crate::i18n::tr(app.ui_language, "Live").to_owned())
+            } else if let Some(remaining) = preview.next_message_expires_in {
+                Some(format!("{:.1}s", remaining.as_secs_f64()))
             } else {
-                crate::i18n::tr(app.ui_language, "Idle").to_owned()
+                None
             };
+            let status = lifecycle.map_or_else(
+                || format!("{char_count}/{limit}"),
+                |lifecycle| format!("{char_count}/{limit} · {lifecycle}"),
+            );
             ui.label(
-                egui::RichText::new(format!(
-                    "{}/{} {} · {}",
-                    char_count,
-                    limit,
-                    crate::i18n::tr(app.ui_language, "chars"),
-                    lifecycle,
-                ))
-                .color(text_color)
-                .size(12.0)
-                .strong(),
+                egui::RichText::new(status)
+                    .color(text_color)
+                    .size(12.0)
+                    .strong(),
             );
         });
 
@@ -65,14 +59,11 @@ pub fn render_canvas(app: &crate::XRTranslateApp, ui: &mut egui::Ui) {
                         ui.set_max_width(380.0);
                         if is_empty {
                             ui.label(
-                                egui::RichText::new(crate::i18n::tr(
-                                    app.ui_language,
-                                    "(Chatbox Cleared / Empty)",
-                                ))
-                                .family(egui::FontFamily::Monospace)
-                                .color(egui::Color32::from_rgb(120, 128, 150))
-                                .size(13.0)
-                                .italics(),
+                                egui::RichText::new(crate::i18n::tr(app.ui_language, "Empty"))
+                                    .family(egui::FontFamily::Monospace)
+                                    .color(egui::Color32::from_rgb(120, 128, 150))
+                                    .size(13.0)
+                                    .italics(),
                             );
                         } else {
                             ui.add(

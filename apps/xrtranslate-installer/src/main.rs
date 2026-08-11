@@ -8,7 +8,8 @@ use std::path::PathBuf;
 
 use clap::{Parser, Subcommand, ValueEnum};
 use xrtranslate_assets::{
-    ModelAssetId, ModelAssetsConfig, NativeModelInstaller, ResolvedModelAssets,
+    ModelAssetId, ModelAssetsConfig, ModelCapability, NativeModelInstaller, ResolvedModelAssets,
+    manifest_for,
 };
 use xrtranslate_config::AppConfig;
 
@@ -38,6 +39,7 @@ enum Command {
 enum Package {
     Qwen3AsrGguf,
     HyMt2,
+    HyMt2Big,
 }
 
 impl From<Package> for ModelAssetId {
@@ -45,6 +47,7 @@ impl From<Package> for ModelAssetId {
         match value {
             Package::Qwen3AsrGguf => Self::Qwen3AsrGguf,
             Package::HyMt2 => Self::HunyuanMtGguf,
+            Package::HyMt2Big => Self::HunyuanMt7bGguf,
         }
     }
 }
@@ -59,12 +62,21 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         .filter(|path| !path.as_os_str().is_empty())
         .map(PathBuf::from)
         .unwrap_or_else(|| PathBuf::from("."));
-    let assets = ModelAssetsConfig {
-        models_directory: config.model_manager.models_directory,
-        qwen3_asr_gguf_directory: config.model_manager.qwen3_asr_gguf_directory,
-        hunyuan_mt_gguf_directory: config.model_manager.hunyuan_mt_gguf_directory,
+    let mut asset_config = ModelAssetsConfig {
+        models_directory: config.model_manager.models_directory.clone(),
+        qwen3_asr_gguf_directory: config.model_manager.qwen3_asr_gguf_directory.clone(),
+        hunyuan_mt_gguf_directory: config.model_manager.hunyuan_mt_gguf_directory.clone(),
+        ..ModelAssetsConfig::default()
+    };
+    for key in config.active_native_model_assets() {
+        if let Some(id) = ModelAssetId::from_config_key(&key) {
+            match manifest_for(id).capability {
+                ModelCapability::Asr => asset_config.qwen3_asr_asset = Some(id),
+                ModelCapability::Translation => asset_config.hunyuan_mt_asset = Some(id),
+            }
+        }
     }
-    .resolve(project_root);
+    let assets = asset_config.resolve(project_root);
 
     match args.command {
         Command::Install { package } => install(assets, package.into()).await?,

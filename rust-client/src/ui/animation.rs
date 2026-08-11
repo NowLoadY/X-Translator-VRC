@@ -13,12 +13,7 @@ impl AnimationSystem {
     /// Computes an animated float over a specified duration (in seconds).
     /// Automatically requests repaints while animating to maintain 60 FPS performance,
     /// and pauses repaints when static for zero idle CPU usage.
-    pub fn animate_value(
-        ctx: &egui::Context,
-        id: Id,
-        target_val: f32,
-        duration: f32,
-    ) -> f32 {
+    pub fn animate_value(ctx: &egui::Context, id: Id, target_val: f32, duration: f32) -> f32 {
         let current = ctx.animate_value_with_time(id, target_val, duration);
         if (current - target_val).abs() > 0.001 {
             ctx.request_repaint();
@@ -48,18 +43,20 @@ impl AnimationSystem {
         ui: &mut egui::Ui,
         page_id: P,
         add_contents: impl FnOnce(&mut egui::Ui) -> R,
-    ) -> R 
+    ) -> R
     where
         P: std::hash::Hash + std::fmt::Debug,
     {
         let current_time = ui.ctx().input(|i| i.time);
         // Scope the state by the type of the page_id to prevent nested transitions from fighting over the same state
         let global_id = Id::new("page_transition_state").with(std::any::type_name::<P>());
-        
+
         let target_hash = Id::new(&page_id).value();
-        
+
         let start_time = ui.ctx().memory_mut(|m| {
-            let state = m.data.get_temp_mut_or_insert_with(global_id, || (target_hash, current_time));
+            let state = m
+                .data
+                .get_temp_mut_or_insert_with(global_id, || (target_hash, current_time));
             if state.0 != target_hash {
                 state.0 = target_hash;
                 state.1 = current_time;
@@ -70,7 +67,7 @@ impl AnimationSystem {
         let elapsed = (current_time - start_time) as f32;
         let duration = 0.25;
         let raw_t = (elapsed / duration).clamp(0.0, 1.0);
-        
+
         if raw_t < 1.0 {
             ui.ctx().request_repaint();
         }
@@ -92,7 +89,11 @@ impl AnimationSystem {
     }
 
     /// Liquid smooth audio level decay easing for audio meters.
-    pub fn smooth_audio_level(ctx: &egui::Context, id: impl std::hash::Hash + std::fmt::Debug, target_level: f32) -> f32 {
+    pub fn smooth_audio_level(
+        ctx: &egui::Context,
+        id: impl std::hash::Hash + std::fmt::Debug,
+        target_level: f32,
+    ) -> f32 {
         let persistent_id = Id::new(id);
         Self::animate_value(ctx, persistent_id, target_level, 0.08)
     }

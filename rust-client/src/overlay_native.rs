@@ -4,7 +4,6 @@ use std::io::{BufRead, BufReader};
 use std::sync::Mutex;
 use std::thread;
 
-use windows::core::*;
 use windows::Win32::Foundation::*;
 use windows::Win32::Graphics::Direct2D::Common::*;
 use windows::Win32::Graphics::Direct2D::*;
@@ -14,6 +13,7 @@ use windows::Win32::Graphics::Gdi::*;
 use windows::Win32::System::LibraryLoader::GetModuleHandleW;
 use windows::Win32::UI::Controls::MARGINS;
 use windows::Win32::UI::WindowsAndMessaging::*;
+use windows::core::*;
 
 use crate::overlay_ipc::{OverlayEvent, OverlayState};
 
@@ -64,7 +64,8 @@ pub fn run_native_overlay() {
             None,
             Some(HINSTANCE(instance.0)),
             None,
-        ).unwrap();
+        )
+        .unwrap();
 
         // Initialize layered window attributes so Windows displays the alpha layer
         let _ = SetLayeredWindowAttributes(hwnd, COLORREF(0), 255, LWA_ALPHA);
@@ -126,7 +127,8 @@ struct RenderResources {
 impl RenderResources {
     fn new() -> Result<Self> {
         unsafe {
-            let d2d_factory: ID2D1Factory = D2D1CreateFactory(D2D1_FACTORY_TYPE_SINGLE_THREADED, None)?;
+            let d2d_factory: ID2D1Factory =
+                D2D1CreateFactory(D2D1_FACTORY_TYPE_SINGLE_THREADED, None)?;
             let dwrite_factory: IDWriteFactory = DWriteCreateFactory(DWRITE_FACTORY_TYPE_SHARED)?;
 
             Ok(Self {
@@ -178,16 +180,74 @@ impl RenderResources {
                 presentOptions: D2D1_PRESENT_OPTIONS_NONE,
             };
 
-            let target = self.d2d_factory.CreateHwndRenderTarget(&rt_props, &hwnd_rt_props)?;
+            let target = self
+                .d2d_factory
+                .CreateHwndRenderTarget(&rt_props, &hwnd_rt_props)?;
 
             // Brushes
-            let brush_header_bg = target.CreateSolidColorBrush(&D2D1_COLOR_F { r: 0.08, g: 0.08, b: 0.10, a: 0.85 }, None)?;
-            let brush_card_bg = target.CreateSolidColorBrush(&D2D1_COLOR_F { r: 0.10, g: 0.11, b: 0.14, a: 0.85 }, None)?;
-            let brush_live_bg = target.CreateSolidColorBrush(&D2D1_COLOR_F { r: 0.12, g: 0.28, b: 0.55, a: 0.90 }, None)?;
-            let brush_text_white = target.CreateSolidColorBrush(&D2D1_COLOR_F { r: 1.0, g: 1.0, b: 1.0, a: 1.0 }, None)?;
-            let brush_text_gray = target.CreateSolidColorBrush(&D2D1_COLOR_F { r: 0.70, g: 0.73, b: 0.78, a: 1.0 }, None)?;
-            let brush_text_sub = target.CreateSolidColorBrush(&D2D1_COLOR_F { r: 0.50, g: 0.53, b: 0.58, a: 1.0 }, None)?;
-            let brush_btn_bg = target.CreateSolidColorBrush(&D2D1_COLOR_F { r: 0.20, g: 0.22, b: 0.26, a: 0.80 }, None)?;
+            let brush_header_bg = target.CreateSolidColorBrush(
+                &D2D1_COLOR_F {
+                    r: 0.08,
+                    g: 0.08,
+                    b: 0.10,
+                    a: 0.85,
+                },
+                None,
+            )?;
+            let brush_card_bg = target.CreateSolidColorBrush(
+                &D2D1_COLOR_F {
+                    r: 0.10,
+                    g: 0.11,
+                    b: 0.14,
+                    a: 0.85,
+                },
+                None,
+            )?;
+            let brush_live_bg = target.CreateSolidColorBrush(
+                &D2D1_COLOR_F {
+                    r: 0.12,
+                    g: 0.28,
+                    b: 0.55,
+                    a: 0.90,
+                },
+                None,
+            )?;
+            let brush_text_white = target.CreateSolidColorBrush(
+                &D2D1_COLOR_F {
+                    r: 1.0,
+                    g: 1.0,
+                    b: 1.0,
+                    a: 1.0,
+                },
+                None,
+            )?;
+            let brush_text_gray = target.CreateSolidColorBrush(
+                &D2D1_COLOR_F {
+                    r: 0.70,
+                    g: 0.73,
+                    b: 0.78,
+                    a: 1.0,
+                },
+                None,
+            )?;
+            let brush_text_sub = target.CreateSolidColorBrush(
+                &D2D1_COLOR_F {
+                    r: 0.50,
+                    g: 0.53,
+                    b: 0.58,
+                    a: 1.0,
+                },
+                None,
+            )?;
+            let brush_btn_bg = target.CreateSolidColorBrush(
+                &D2D1_COLOR_F {
+                    r: 0.20,
+                    g: 0.22,
+                    b: 0.26,
+                    a: 0.80,
+                },
+                None,
+            )?;
 
             // Text Formats
             let font_name = w!("Microsoft YaHei");
@@ -240,7 +300,12 @@ impl RenderResources {
 
 static RESOURCES: Mutex<Option<RenderResources>> = Mutex::new(None);
 
-unsafe extern "system" fn wnd_proc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: LPARAM) -> LRESULT {
+unsafe extern "system" fn wnd_proc(
+    hwnd: HWND,
+    msg: u32,
+    wparam: WPARAM,
+    lparam: LPARAM,
+) -> LRESULT {
     match msg {
         WM_CREATE => {
             if let Ok(res) = RenderResources::new() {
@@ -311,7 +376,9 @@ unsafe extern "system" fn wnd_proc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam:
 
 fn handle_click(hwnd: HWND, x: f32, y: f32) {
     let mut rect = RECT::default();
-    unsafe { let _ = GetClientRect(hwnd, &mut rect); }
+    unsafe {
+        let _ = GetClientRect(hwnd, &mut rect);
+    }
     let width = (rect.right - rect.left) as f32;
 
     // Header buttons (Y: 4..28)
@@ -319,7 +386,9 @@ fn handle_click(hwnd: HWND, x: f32, y: f32) {
         // Close button (Top right: width-28 .. width-8)
         if x >= width - 28.0 && x <= width - 8.0 {
             send_event(&OverlayEvent::CloseRequested);
-            unsafe { DestroyWindow(hwnd).ok(); }
+            unsafe {
+                DestroyWindow(hwnd).ok();
+            }
             return;
         }
 
@@ -407,7 +476,11 @@ fn adjust_window_height_if_needed(hwnd: HWND) {
                     0.0
                 };
                 let top_pad = 8.0;
-                let spacing = if h_src > 0.0 && h_trans > 0.0 { 4.0 } else { 0.0 };
+                let spacing = if h_src > 0.0 && h_trans > 0.0 {
+                    4.0
+                } else {
+                    0.0
+                };
                 let bot_pad = 8.0;
                 let card_h = top_pad + h_src + spacing + h_trans + bot_pad;
                 curr_y += card_h + 6.0;
@@ -457,7 +530,9 @@ fn measure_and_create_layout(
         if utf16.is_empty() {
             return None;
         }
-        let layout = factory.CreateTextLayout(&utf16, format, max_width, 2000.0).ok()?;
+        let layout = factory
+            .CreateTextLayout(&utf16, format, max_width, 2000.0)
+            .ok()?;
         let mut metrics = DWRITE_TEXT_METRICS::default();
         if layout.GetMetrics(&mut metrics).is_ok() {
             let width = metrics.width.max(10.0);
@@ -495,13 +570,23 @@ fn draw_overlay(hwnd: HWND) {
         let width = (rect.right - rect.left) as f32;
 
         target.BeginDraw();
-        target.Clear(Some(&D2D1_COLOR_F { r: 0.0, g: 0.0, b: 0.0, a: 0.0 }));
+        target.Clear(Some(&D2D1_COLOR_F {
+            r: 0.0,
+            g: 0.0,
+            b: 0.0,
+            a: 0.0,
+        }));
 
         let state_opt = STATE.lock().ok().and_then(|s| s.clone());
 
         // 1. Slim Header Bar
         let header_rect = D2D1_ROUNDED_RECT {
-            rect: D2D_RECT_F { left: 0.0, top: 0.0, right: width, bottom: 30.0 },
+            rect: D2D_RECT_F {
+                left: 0.0,
+                top: 0.0,
+                right: width,
+                bottom: 30.0,
+            },
             radiusX: 6.0,
             radiusY: 6.0,
         };
@@ -512,62 +597,131 @@ fn draw_overlay(hwnd: HWND) {
 
         // Header Title
         let max_items = state_opt.as_ref().map(|s| s.max_items).unwrap_or(5);
-        let count = state_opt.as_ref().map(|s| s.visible_entries.len()).unwrap_or(0);
-        let title = format!("≡ Subtitles ({})", count);
+        let count = state_opt
+            .as_ref()
+            .map(|s| s.visible_entries.len())
+            .unwrap_or(0);
+        let title = format!("≡ Subtitles · {count}");
         let title_utf16: Vec<u16> = title.encode_utf16().collect();
 
         if let (Some(format), Some(brush)) = (&res.text_format_title, &res.brush_text_white) {
             target.DrawText(
                 &title_utf16,
                 format,
-                &D2D_RECT_F { left: 10.0, top: 6.0, right: 200.0, bottom: 26.0 },
+                &D2D_RECT_F {
+                    left: 10.0,
+                    top: 6.0,
+                    right: 200.0,
+                    bottom: 26.0,
+                },
                 brush,
                 D2D1_DRAW_TEXT_OPTIONS_NONE,
                 DWRITE_MEASURING_MODE_NATURAL,
             );
         }
 
-        // Header Controls: Max: [ - ] N [ + ]   [ × ]
+        // Header Controls: [ - ] N [ + ] [ × ]
         // Close button
-        if let (Some(brush_btn), Some(brush_txt), Some(format)) = (&res.brush_btn_bg, &res.brush_text_white, &res.text_format_title) {
+        if let (Some(brush_btn), Some(brush_txt), Some(format)) = (
+            &res.brush_btn_bg,
+            &res.brush_text_white,
+            &res.text_format_title,
+        ) {
             let close_rect = D2D1_ROUNDED_RECT {
-                rect: D2D_RECT_F { left: width - 28.0, top: 4.0, right: width - 8.0, bottom: 26.0 },
+                rect: D2D_RECT_F {
+                    left: width - 28.0,
+                    top: 4.0,
+                    right: width - 8.0,
+                    bottom: 26.0,
+                },
                 radiusX: 4.0,
                 radiusY: 4.0,
             };
             target.FillRoundedRectangle(&close_rect, brush_btn);
             let close_str: Vec<u16> = "×".encode_utf16().collect();
-            target.DrawText(&close_str, format, &D2D_RECT_F { left: width - 22.0, top: 5.0, right: width - 8.0, bottom: 26.0 }, brush_txt, D2D1_DRAW_TEXT_OPTIONS_NONE, DWRITE_MEASURING_MODE_NATURAL);
+            target.DrawText(
+                &close_str,
+                format,
+                &D2D_RECT_F {
+                    left: width - 22.0,
+                    top: 5.0,
+                    right: width - 8.0,
+                    bottom: 26.0,
+                },
+                brush_txt,
+                D2D1_DRAW_TEXT_OPTIONS_NONE,
+                DWRITE_MEASURING_MODE_NATURAL,
+            );
 
             // Plus button
             let plus_rect = D2D1_ROUNDED_RECT {
-                rect: D2D_RECT_F { left: width - 60.0, top: 4.0, right: width - 40.0, bottom: 26.0 },
+                rect: D2D_RECT_F {
+                    left: width - 60.0,
+                    top: 4.0,
+                    right: width - 40.0,
+                    bottom: 26.0,
+                },
                 radiusX: 4.0,
                 radiusY: 4.0,
             };
             target.FillRoundedRectangle(&plus_rect, brush_btn);
             let plus_str: Vec<u16> = "+".encode_utf16().collect();
-            target.DrawText(&plus_str, format, &D2D_RECT_F { left: width - 54.0, top: 5.0, right: width - 40.0, bottom: 26.0 }, brush_txt, D2D1_DRAW_TEXT_OPTIONS_NONE, DWRITE_MEASURING_MODE_NATURAL);
+            target.DrawText(
+                &plus_str,
+                format,
+                &D2D_RECT_F {
+                    left: width - 54.0,
+                    top: 5.0,
+                    right: width - 40.0,
+                    bottom: 26.0,
+                },
+                brush_txt,
+                D2D1_DRAW_TEXT_OPTIONS_NONE,
+                DWRITE_MEASURING_MODE_NATURAL,
+            );
 
             // Max count number
             let num_str: Vec<u16> = format!("{}", max_items).encode_utf16().collect();
-            target.DrawText(&num_str, format, &D2D_RECT_F { left: width - 82.0, top: 6.0, right: width - 64.0, bottom: 26.0 }, brush_txt, D2D1_DRAW_TEXT_OPTIONS_NONE, DWRITE_MEASURING_MODE_NATURAL);
+            target.DrawText(
+                &num_str,
+                format,
+                &D2D_RECT_F {
+                    left: width - 82.0,
+                    top: 6.0,
+                    right: width - 64.0,
+                    bottom: 26.0,
+                },
+                brush_txt,
+                D2D1_DRAW_TEXT_OPTIONS_NONE,
+                DWRITE_MEASURING_MODE_NATURAL,
+            );
 
             // Minus button
             let minus_rect = D2D1_ROUNDED_RECT {
-                rect: D2D_RECT_F { left: width - 110.0, top: 4.0, right: width - 90.0, bottom: 26.0 },
+                rect: D2D_RECT_F {
+                    left: width - 110.0,
+                    top: 4.0,
+                    right: width - 90.0,
+                    bottom: 26.0,
+                },
                 radiusX: 4.0,
                 radiusY: 4.0,
             };
             target.FillRoundedRectangle(&minus_rect, brush_btn);
             let minus_str: Vec<u16> = "-".encode_utf16().collect();
-            target.DrawText(&minus_str, format, &D2D_RECT_F { left: width - 104.0, top: 5.0, right: width - 90.0, bottom: 26.0 }, brush_txt, D2D1_DRAW_TEXT_OPTIONS_NONE, DWRITE_MEASURING_MODE_NATURAL);
-
-            // Label "Max:"
-            if let Some(brush_sub) = &res.brush_text_sub {
-                let max_lbl: Vec<u16> = "Max:".encode_utf16().collect();
-                target.DrawText(&max_lbl, format, &D2D_RECT_F { left: width - 145.0, top: 6.0, right: width - 114.0, bottom: 26.0 }, brush_sub, D2D1_DRAW_TEXT_OPTIONS_NONE, DWRITE_MEASURING_MODE_NATURAL);
-            }
+            target.DrawText(
+                &minus_str,
+                format,
+                &D2D_RECT_F {
+                    left: width - 104.0,
+                    top: 5.0,
+                    right: width - 90.0,
+                    bottom: 26.0,
+                },
+                brush_txt,
+                D2D1_DRAW_TEXT_OPTIONS_NONE,
+                DWRITE_MEASURING_MODE_NATURAL,
+            );
         }
 
         // 2. Render Subtitle Cards with Smart Dynamic Auto-Sizing
@@ -580,16 +734,34 @@ fn draw_overlay(hwnd: HWND) {
                 // Empty placeholder card
                 let card_h = 36.0;
                 let card_rect = D2D1_ROUNDED_RECT {
-                    rect: D2D_RECT_F { left: 0.0, top: curr_y, right: width, bottom: curr_y + card_h },
+                    rect: D2D_RECT_F {
+                        left: 0.0,
+                        top: curr_y,
+                        right: width,
+                        bottom: curr_y + card_h,
+                    },
                     radiusX: 8.0,
                     radiusY: 8.0,
                 };
                 if let Some(brush) = &res.brush_card_bg {
                     target.FillRoundedRectangle(&card_rect, brush);
                 }
-                if let (Some(brush_txt), Some(format)) = (&res.brush_text_sub, &res.text_format_sub) {
-                    let waiting_str: Vec<u16> = "Waiting for speech input...".encode_utf16().collect();
-                    target.DrawText(&waiting_str, format, &D2D_RECT_F { left: padding_x, top: curr_y + 10.0, right: width - padding_x, bottom: curr_y + 30.0 }, brush_txt, D2D1_DRAW_TEXT_OPTIONS_NONE, DWRITE_MEASURING_MODE_NATURAL);
+                if let (Some(brush_txt), Some(format)) = (&res.brush_text_sub, &res.text_format_sub)
+                {
+                    let waiting_str: Vec<u16> = "Listening".encode_utf16().collect();
+                    target.DrawText(
+                        &waiting_str,
+                        format,
+                        &D2D_RECT_F {
+                            left: padding_x,
+                            top: curr_y + 10.0,
+                            right: width - padding_x,
+                            bottom: curr_y + 30.0,
+                        },
+                        brush_txt,
+                        D2D1_DRAW_TEXT_OPTIONS_NONE,
+                        DWRITE_MEASURING_MODE_NATURAL,
+                    );
                 }
                 let _ = card_h;
             } else {
@@ -602,7 +774,12 @@ fn draw_overlay(hwnd: HWND) {
                     };
 
                     let layout_trans = if let Some(format) = &res.text_format_body {
-                        measure_and_create_layout(&res.dwrite_factory, translated, format, max_text_w)
+                        measure_and_create_layout(
+                            &res.dwrite_factory,
+                            translated,
+                            format,
+                            max_text_w,
+                        )
                     } else {
                         None
                     };
@@ -611,12 +788,21 @@ fn draw_overlay(hwnd: HWND) {
                     let h_trans = layout_trans.as_ref().map(|(_, _, h)| *h).unwrap_or(0.0);
 
                     let top_pad = 8.0;
-                    let spacing = if h_src > 0.0 && h_trans > 0.0 { 4.0 } else { 0.0 };
+                    let spacing = if h_src > 0.0 && h_trans > 0.0 {
+                        4.0
+                    } else {
+                        0.0
+                    };
                     let bot_pad = 8.0;
                     let card_h = top_pad + h_src + spacing + h_trans + bot_pad;
 
                     let card_rect = D2D1_ROUNDED_RECT {
-                        rect: D2D_RECT_F { left: 0.0, top: curr_y, right: width, bottom: curr_y + card_h },
+                        rect: D2D_RECT_F {
+                            left: 0.0,
+                            top: curr_y,
+                            right: width,
+                            bottom: curr_y + card_h,
+                        },
                         radiusX: 8.0,
                         radiusY: 8.0,
                     };
@@ -627,9 +813,13 @@ fn draw_overlay(hwnd: HWND) {
 
                     // Render source text layout
                     let mut text_y = curr_y + top_pad;
-                    if let (Some((layout, _, _)), Some(brush)) = (&layout_src, &res.brush_text_gray) {
+                    if let (Some((layout, _, _)), Some(brush)) = (&layout_src, &res.brush_text_gray)
+                    {
                         target.DrawTextLayout(
-                            D2D_POINT_2F { x: padding_x, y: text_y },
+                            D2D_POINT_2F {
+                                x: padding_x,
+                                y: text_y,
+                            },
                             layout,
                             brush,
                             D2D1_DRAW_TEXT_OPTIONS_NONE,
@@ -638,9 +828,14 @@ fn draw_overlay(hwnd: HWND) {
                     }
 
                     // Render translation text layout
-                    if let (Some((layout, _, _)), Some(brush)) = (&layout_trans, &res.brush_text_white) {
+                    if let (Some((layout, _, _)), Some(brush)) =
+                        (&layout_trans, &res.brush_text_white)
+                    {
                         target.DrawTextLayout(
-                            D2D_POINT_2F { x: padding_x, y: text_y },
+                            D2D_POINT_2F {
+                                x: padding_x,
+                                y: text_y,
+                            },
                             layout,
                             brush,
                             D2D1_DRAW_TEXT_OPTIONS_NONE,
@@ -662,7 +857,12 @@ fn draw_overlay(hwnd: HWND) {
                     let card_h = 8.0 + h_partial + 8.0;
 
                     let card_rect = D2D1_ROUNDED_RECT {
-                        rect: D2D_RECT_F { left: 0.0, top: curr_y, right: width, bottom: curr_y + card_h },
+                        rect: D2D_RECT_F {
+                            left: 0.0,
+                            top: curr_y,
+                            right: width,
+                            bottom: curr_y + card_h,
+                        },
                         radiusX: 8.0,
                         radiusY: 8.0,
                     };
@@ -671,9 +871,14 @@ fn draw_overlay(hwnd: HWND) {
                         target.FillRoundedRectangle(&card_rect, brush);
                     }
 
-                    if let (Some((layout, _, _)), Some(brush)) = (&layout_partial, &res.brush_text_white) {
+                    if let (Some((layout, _, _)), Some(brush)) =
+                        (&layout_partial, &res.brush_text_white)
+                    {
                         target.DrawTextLayout(
-                            D2D_POINT_2F { x: padding_x, y: curr_y + 8.0 },
+                            D2D_POINT_2F {
+                                x: padding_x,
+                                y: curr_y + 8.0,
+                            },
                             layout,
                             brush,
                             D2D1_DRAW_TEXT_OPTIONS_NONE,

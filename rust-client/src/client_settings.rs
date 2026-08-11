@@ -31,6 +31,9 @@ pub struct ClientSettings {
     pub target_lang: String,
     #[serde(default)]
     pub tts_enabled: bool,
+    /// Enables speaker recognition and OSC speaker numbering.
+    #[serde(default)]
+    pub speaker_recognition_enabled: bool,
     #[serde(default)]
     pub mute_self_pauses_translation: bool,
     #[serde(default)]
@@ -86,6 +89,7 @@ impl Default for ClientSettings {
             source_lang: default_source_lang(),
             target_lang: default_target_lang(),
             tts_enabled: false,
+            speaker_recognition_enabled: false,
             mute_self_pauses_translation: false,
             ui_language: UiLanguage::default(),
             first_run: true,
@@ -102,32 +106,59 @@ impl Default for ClientSettings {
 
 impl ClientSettings {
     pub fn load(project_root: &Path) -> Self {
-        let settings_path = project_root.join("runtime").join("rust-client-settings.json");
-        if let Ok(contents) = std::fs::read_to_string(&settings_path) {
-            if let Ok(settings) = serde_json::from_str::<ClientSettings>(&contents) {
-                return settings;
-            }
-        }
-
-        // Migration from legacy app_state.json if available
-        let app_state_path = project_root.join("runtime").join("app_state.json");
-        let mut settings = Self::default();
-        if let Ok(contents) = std::fs::read_to_string(&app_state_path) {
-            #[derive(Deserialize)]
-            struct LegacyAppState {
-                first_run: Option<bool>,
-                ui_language: Option<UiLanguage>,
-            }
-            if let Ok(legacy) = serde_json::from_str::<LegacyAppState>(&contents) {
-                if let Some(first_run) = legacy.first_run {
-                    settings.first_run = first_run;
-                }
-                if let Some(ui_language) = legacy.ui_language {
-                    settings.ui_language = ui_language;
-                }
-            }
-        }
+        let settings_path = project_root
+            .join("runtime")
+            .join("rust-client-settings.json");
+        let mut settings = std::fs::read_to_string(&settings_path)
+            .ok()
+            .and_then(|contents| serde_json::from_str::<ClientSettings>(&contents).ok())
+            .unwrap_or_default();
+        // Keep lifecycle state authoritative across development and packaged launches.
+        settings.apply_app_state(project_root);
+        settings.normalize_feature_dependencies();
         settings
+    }
+
+    fn apply_app_state(&mut self, project_root: &Path) {
+        #[derive(Deserialize)]
+        struct AppState {
+            first_run: Option<bool>,
+            ui_language: Option<UiLanguage>,
+        }
+        let path = project_root.join("runtime").join("app_state.json");
+        let Ok(contents) = std::fs::read_to_string(path) else {
+            return;
+        };
+        let Ok(state) = serde_json::from_str::<AppState>(&contents) else {
+            return;
+        };
+        if let Some(first_run) = state.first_run {
+            self.first_run = first_run;
+        }
+        if let Some(ui_language) = state.ui_language {
+            self.ui_language = ui_language;
+        }
+    }
+
+    /// Normalizes settings that share one user-facing feature.
+    pub fn normalize_feature_dependencies(&mut self) {
+        let speaker_numbers_enabled =
+            self.speaker_recognition_enabled || self.osc_settings.show_speaker_number;
+        self.speaker_recognition_enabled = speaker_numbers_enabled;
+        self.osc_settings.show_speaker_number = speaker_numbers_enabled;
+
+        // Persisted preferences remain subject to feature availability.
+        self.tts_enabled &=
+            crate::feature_access::is_available(crate::feature_access::Feature::TtsPlayback);
+        self.floating_subtitles_enabled &=
+            crate::feature_access::is_available(crate::feature_access::Feature::FloatingSubtitles);
+        self.osc_settings.enabled &=
+            crate::feature_access::is_available(crate::feature_access::Feature::OscChatbox);
+        self.speaker_recognition_enabled &=
+            crate::feature_access::is_available(crate::feature_access::Feature::SpeakerNumbers);
+        self.osc_settings.show_speaker_number = self.speaker_recognition_enabled;
+        self.mute_self_pauses_translation &=
+            crate::feature_access::is_available(crate::feature_access::Feature::MuteSync);
     }
 
     pub fn sanitize_devices(
@@ -141,7 +172,9 @@ impl ClientSettings {
         self.floating_subtitles_font_size = self.floating_subtitles_font_size.clamp(10.0, 24.0);
 
         if !self.selected_device_id.is_empty()
-            && !available_mics.iter().any(|d| d.id == self.selected_device_id)
+            && !available_mics
+                .iter()
+                .any(|d| d.id == self.selected_device_id)
         {
             log::warn!(
                 "Saved microphone ID '{}' is no longer available. Falling back to default.",
@@ -168,7 +201,21 @@ impl ClientSettings {
         let _ = std::fs::create_dir_all(&directory);
         let path = directory.join("rust-client-settings.json");
         let contents = serde_json::to_string_pretty(self).map_err(|e| e.to_string())?;
-        std::fs::write(&path, format!("{contents}\n")).map_err(|e| e.to_string())
+        std::fs::write(&path, format!("{contents}\n")).map_err(|e| e.to_string())?;
+
+        let app_state_path = directory.join("app_state.json");
+        let mut app_state = std::fs::read_to_string(&app_state_path)
+            .ok()
+            .and_then(|contents| serde_json::from_str::<serde_json::Value>(&contents).ok())
+            .and_then(|value| value.as_object().cloned())
+            .unwrap_or_default();
+        app_state.insert("first_run".into(), serde_json::Value::Bool(self.first_run));
+        app_state.insert(
+            "ui_language".into(),
+            serde_json::to_value(self.ui_language).map_err(|e| e.to_string())?,
+        );
+        let contents = serde_json::to_string_pretty(&app_state).map_err(|e| e.to_string())?;
+        std::fs::write(app_state_path, format!("{contents}\n")).map_err(|e| e.to_string())
     }
 }
 
@@ -187,6 +234,7 @@ mod tests {
         settings.selected_device_id = "mic-1".into();
         settings.selected_loopback_device_id = "loopback-1".into();
         settings.tts_enabled = true;
+        settings.speaker_recognition_enabled = true;
         settings.source_lang = "en".into();
         settings.sidebar_collapsed = true;
         settings.active_page = Page::Osc;
@@ -198,7 +246,8 @@ mod tests {
         assert_eq!(loaded.capture_source, CaptureSource::SystemAudio);
         assert_eq!(loaded.selected_device_id, "mic-1");
         assert_eq!(loaded.selected_loopback_device_id, "loopback-1");
-        assert_eq!(loaded.tts_enabled, true);
+        assert!(!loaded.tts_enabled);
+        assert!(loaded.speaker_recognition_enabled);
         assert_eq!(loaded.source_lang, "en");
         assert_eq!(loaded.sidebar_collapsed, true);
         assert_eq!(loaded.active_page, Page::Osc);
@@ -219,5 +268,63 @@ mod tests {
         assert_eq!(loaded.selected_loopback_device_id, "loopback-1"); // Kept
 
         let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn legacy_split_speaker_toggles_are_merged_on_load() {
+        let root = std::env::temp_dir().join("xrtranslate_test_speaker_toggle_migration");
+        let _ = std::fs::remove_dir_all(&root);
+        std::fs::create_dir_all(root.join("runtime")).unwrap();
+        let mut settings = ClientSettings::default();
+        settings.speaker_recognition_enabled = false;
+        settings.osc_settings.show_speaker_number = true;
+        settings.save(&root).unwrap();
+
+        let loaded = ClientSettings::load(&root);
+        assert!(loaded.speaker_recognition_enabled);
+        assert!(loaded.osc_settings.show_speaker_number);
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn unavailable_feature_preferences_are_disabled_on_load() {
+        let root = std::env::temp_dir().join("xrtranslate_test_feature_access");
+        let _ = std::fs::remove_dir_all(&root);
+        let mut settings = ClientSettings::default();
+        settings.tts_enabled = true;
+        settings.save(&root).unwrap();
+
+        assert!(!ClientSettings::load(&root).tts_enabled);
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn app_state_can_reset_onboarding_after_client_settings_exist() {
+        let root = std::env::temp_dir().join("xrtranslate_test_first_run_reset");
+        let _ = std::fs::remove_dir_all(&root);
+        std::fs::create_dir_all(root.join("runtime")).unwrap();
+
+        let mut settings = ClientSettings {
+            first_run: false,
+            ..ClientSettings::default()
+        };
+        settings.save(&root).unwrap();
+        std::fs::write(
+            root.join("runtime/app_state.json"),
+            r#"{"first_run":true,"ui_language":"english"}"#,
+        )
+        .unwrap();
+
+        assert!(ClientSettings::load(&root).first_run);
+        settings = ClientSettings::load(&root);
+        settings.first_run = false;
+        settings.save(&root).unwrap();
+        let state: serde_json::Value = serde_json::from_str(
+            &std::fs::read_to_string(root.join("runtime/app_state.json")).unwrap(),
+        )
+        .unwrap();
+        assert_eq!(state["first_run"], false);
+
+        let _ = std::fs::remove_dir_all(root);
     }
 }

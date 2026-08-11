@@ -23,19 +23,7 @@
 
 ## User Guide
 
-### 1. Download and Extract
-
-Download the latest release package from [Releases](../../releases) and extract it to a fixed folder. Please keep the extracted directory intact, and do not move `config.json`, `resources/`, or `models/`.
-
-### 2. Complete Setup via First-Run Onboarding
-
-When launching for the first time, the client will guide you through setup:
-* **Runtime Engine**: Automatically detect and download the optimal `llama.cpp` package for your PC in one click, or select an existing `llama-server.exe`.
-* **Model Package Setup**: Easily download and verify model assets without manual file placement.
-
-### 3. Start Translating
-
-Return to the **Translation** page, select your microphone or system desktop audio, and click **Start Translation**. The client automatically manages local backend services when needed and shuts them down on exit.
+Download the latest Windows version from [GitHub Releases](https://github.com/NowLoadY/XRTranslate/releases), extract it, and open XRTranslate. The first-run guide prepares the runtime and models automatically; once it finishes, you can start translating.
 
 ---
 
@@ -44,6 +32,7 @@ Return to the **Translation** page, select your microphone or system desktop aud
 | Item | Default Path | Description |
 | :--- | :--- | :--- |
 | **Model Assets** | `models/` | Stores speech recognition and translation model packages |
+| **Terminology Corpora** | [XR Corpus](https://github.com/NowLoadY/XR-Corpus) | Independently maintained Markdown terminology and context service |
 | **Execution Logs** | `runtime/logs/` | Service & client execution logs |
 | **Local Config** | `config.json` | Port numbers, model models, and rendering parameters |
 
@@ -82,11 +71,12 @@ Special thanks to the original [X-Translator](https://github.com/zhaoyx239/X-Tra
 
 This project also uses or draws inspiration from [XTalk](https://github.com/xcc-zach/xtalk), [X-ASR](https://github.com/Gilgamesh-J/X-ASR), [Paraformer](https://github.com/modelscope/FunASR), [SenseVoice](https://github.com/FunAudioLLM/SenseVoice), [NiuTrans LMT](https://github.com/NiuTrans/NiuTrans.LMT), [Hunyuan-MT](https://github.com/Tencent-Hunyuan/Hunyuan-MT), [X-Voice](https://github.com/sunxy1997/X-Voice), [IndexTTS](https://github.com/index-tts/index-tts), and [OpenSTBench](https://github.com/sjtuyaj/OpenSTBench).
 
+Special thanks to [Yakutan](https://github.com/febilly/Yakutan) and its author [febilly](https://github.com/febilly) for their inspiration and contributions.
+
 ## License
 
 This repository contains code released under different open-source licenses:
 
 - Code originating from the original X-Translator project remains under the [MIT License](LICENSE-MIT).
 - The native Rust client and newly added code are released under the [GNU Affero General Public License v3.0 (AGPL-3.0)](LICENSE).
-
 Please refer to the corresponding license files and source files for the applicable licensing terms.

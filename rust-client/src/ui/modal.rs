@@ -5,7 +5,6 @@ use eframe::egui::{
 #[derive(Clone, Debug)]
 pub struct ModalPage {
     pub title: String,
-    pub subtitle: Option<String>,
     pub content: String,
     pub is_code: bool,
     pub icon: Option<String>,
@@ -15,7 +14,6 @@ impl ModalPage {
     pub fn new(title: impl Into<String>, content: impl Into<String>) -> Self {
         Self {
             title: title.into(),
-            subtitle: None,
             content: content.into(),
             is_code: false,
             icon: None,
@@ -25,11 +23,6 @@ impl ModalPage {
     #[allow(dead_code)]
     pub fn with_icon(mut self, icon: impl Into<String>) -> Self {
         self.icon = Some(icon.into());
-        self
-    }
-
-    pub fn with_subtitle(mut self, subtitle: impl Into<String>) -> Self {
-        self.subtitle = Some(subtitle.into());
         self
     }
 
@@ -156,7 +149,7 @@ impl ModalDialog {
             )
             .show(ctx, |ui| {
                 ui.vertical(|ui| {
-                    // Header Bar (Title, Subtitle, Close Button)
+                    // Header Bar
                     ui.horizontal(|ui| {
                         ui.label(
                             RichText::new(&page.title)
@@ -176,15 +169,6 @@ impl ModalDialog {
                             }
                         });
                     });
-
-                    if let Some(subtitle) = &page.subtitle {
-                        ui.add_space(2.0);
-                        ui.label(
-                            RichText::new(subtitle)
-                                .size(12.0)
-                                .color(crate::ui::theme::text_weak()),
-                        );
-                    }
 
                     ui.add_space(10.0);
                     ui.separator();

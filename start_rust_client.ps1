@@ -7,9 +7,10 @@ $ErrorActionPreference = 'Stop'
 $projectRoot = $PSScriptRoot
 $manifestPath = Join-Path $projectRoot 'rust-client\Cargo.toml'
 $workspaceManifestPath = Join-Path $projectRoot 'Cargo.toml'
+$corpusManifestPath = Join-Path $projectRoot 'XR-Corpus\Cargo.toml'
 $cargoPath = Join-Path $env:USERPROFILE '.cargo\bin\cargo.exe'
 
-foreach ($path in @($manifestPath, $workspaceManifestPath)) {
+foreach ($path in @($manifestPath, $workspaceManifestPath, $corpusManifestPath)) {
     if (-not (Test-Path -LiteralPath $path)) {
         throw "Rust workspace manifest was not found: $path"
     }
@@ -38,6 +39,19 @@ if ($Release) {
 
 Write-Host 'Preparing the local translation service...'
 & $cargo @buildArguments
+if ($LASTEXITCODE -ne 0) {
+    exit $LASTEXITCODE
+}
+
+$corpusBuildArguments = @(
+    'build', '--manifest-path', $corpusManifestPath,
+    '--target-dir', (Join-Path $projectRoot 'target'),
+    '--package', 'xr-corpus-server'
+)
+if ($Release) {
+    $corpusBuildArguments += '--release'
+}
+& $cargo @corpusBuildArguments
 if ($LASTEXITCODE -ne 0) {
     exit $LASTEXITCODE
 }
