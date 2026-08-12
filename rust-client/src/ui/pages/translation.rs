@@ -336,17 +336,6 @@ pub fn render(app: &mut crate::XRTranslateApp, ui: &mut egui::Ui) {
                                                 .strong(),
                                         );
                                     }
-                                    if entry.source_end_ms > entry.source_start_ms {
-                                        ui.label(
-                                            egui::RichText::new(format!(
-                                                "{}–{}",
-                                                crate::format_timeline_ms(entry.source_start_ms),
-                                                crate::format_timeline_ms(entry.source_end_ms),
-                                            ))
-                                            .color(crate::ui::theme::text_weak())
-                                            .size(10.5),
-                                        );
-                                    }
                                 });
                                 let resp = render_text_with_term_matches(
                                     ui,
@@ -424,21 +413,6 @@ pub fn render(app: &mut crate::XRTranslateApp, ui: &mut egui::Ui) {
                                                         .color(egui::Color32::from_rgb(37, 99, 235))
                                                         .size(11.5)
                                                         .strong(),
-                                                );
-                                            }
-                                            if entry.source_end_ms > entry.source_start_ms {
-                                                ui.label(
-                                                    egui::RichText::new(format!(
-                                                        "{}–{}",
-                                                        crate::format_timeline_ms(
-                                                            entry.source_start_ms,
-                                                        ),
-                                                        crate::format_timeline_ms(
-                                                            entry.source_end_ms,
-                                                        ),
-                                                    ))
-                                                    .color(crate::ui::theme::text_weak())
-                                                    .size(10.5),
                                                 );
                                             }
                                         });

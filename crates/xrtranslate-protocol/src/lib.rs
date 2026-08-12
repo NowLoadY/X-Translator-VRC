@@ -9,7 +9,7 @@
 use std::{error::Error, fmt};
 
 use serde::{Deserialize, Serialize};
-pub use xr_corpus_protocol::{CorpusTermMatch, CorpusTermSource};
+pub use xr_corpus_protocol::{CorpusRecognitionCorrection, CorpusTermMatch, CorpusTermSource};
 
 /// The current WebSocket contract version.
 ///

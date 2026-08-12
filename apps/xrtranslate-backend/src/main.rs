@@ -51,10 +51,12 @@ use crate::{
         resolved_model_assets, validate_input_chunk_size, validate_input_sample_rate,
     },
     session::{SegmentContext, SessionAdapter, WireOutput},
+    terminology::{rewrite_recognition_terms, rewrite_translation_terms},
 };
 
 mod pipeline;
 mod session;
+mod terminology;
 use xr_corpus_client::CorpusClient;
 use xr_corpus_protocol::{
     ContextBudgets, PrepareAsrRequest, PrepareTranslationRequest, RecordTranslationRequest,
@@ -1004,14 +1006,18 @@ async fn run_inference_worker(
                 continue;
             }
         };
-        if translation_context.corrected_text != recognized.source_text {
+        let source_rewrite = rewrite_recognition_terms(
+            &recognized.source_text,
+            &translation_context.source_corrections,
+        );
+        if source_rewrite.corrected_text != recognized.source_text {
             info!(
                 before = %recognized.source_text,
-                after = %translation_context.corrected_text,
-                "XR Corpus corrected a unique active-term near match"
+                after = %source_rewrite.corrected_text,
+                "applied XR Corpus ASR terminology correction"
             );
             recognized.apply_source_correction(
-                translation_context.corrected_text.clone(),
+                source_rewrite.corrected_text.clone(),
                 &job.source_language,
             );
         }
@@ -1020,7 +1026,10 @@ async fn run_inference_worker(
             .iter_mut()
             .zip(&translation_context.segments)
         {
-            segment.translation_text.clone_from(&context.corrected_text);
+            let rewrite =
+                rewrite_recognition_terms(&segment.translation_text, &context.source_corrections);
+            segment.translation_text = rewrite.corrected_text;
+            segment.source_text.clone_from(&segment.translation_text);
         }
         previous_transcript = Some((job.generation, recognized.source_text.clone()));
         info!(
@@ -1108,6 +1117,8 @@ async fn run_inference_worker(
             let inference = inference.clone();
             let source_language = job.source_language.clone();
             let target_language = job.target_language.clone();
+            let source_for_terms = segment.translation_text.clone();
+            let prompt_terms = corpus_context.prompt_terms.clone();
             async move {
                 let output = inference
                     .translate_segment(
@@ -1117,16 +1128,26 @@ async fn run_inference_worker(
                         corpus_context.prompt,
                     )
                     .await;
-                (segment_context, output)
+                (segment_context, source_for_terms, prompt_terms, output)
             }
         })
         .buffered(TRANSLATION_CONCURRENCY_PER_SESSION);
         tokio::pin!(translations);
-        while let Some((segment_context, mut output)) = translations.next().await {
+        while let Some((segment_context, source_for_terms, prompt_terms, mut output)) =
+            translations.next().await
+        {
             if *generation.borrow() != job.generation {
                 continue 'jobs;
             }
             if let Ok(translated) = &mut output {
+                let rewrite = rewrite_translation_terms(
+                    &source_for_terms,
+                    &translated.translated_text,
+                    &translated.target_language,
+                    &prompt_terms,
+                );
+                translated.translated_text = rewrite.translated_text;
+                translated.term_matches = rewrite.term_matches;
                 match corpus_session
                     .record_translation(&RecordTranslationRequest {
                         context_id: translation_context.context_id,
@@ -1137,7 +1158,7 @@ async fn run_inference_worker(
                     })
                     .await
                 {
-                    Ok(recorded) => translated.term_matches = recorded.term_matches,
+                    Ok(_) => {}
                     Err(message) => {
                         warn!(%message, "could not record XR Corpus translation context")
                     }
@@ -1279,9 +1300,15 @@ fn segment_contexts(
                 activation_matches: corpus_context
                     .map(|context| context.activation_matches.clone())
                     .unwrap_or_default(),
-                context_matches: corpus_context
-                    .map(|context| context.context_matches.clone())
-                    .unwrap_or_default(),
+                context_matches: corpus_context.map_or_else(Vec::new, |context| {
+                    let mut matches = context.context_matches.clone();
+                    let rewrite = rewrite_recognition_terms(
+                        &context.corrected_text,
+                        &context.source_corrections,
+                    );
+                    matches.extend(rewrite.term_matches);
+                    matches
+                }),
             }
         })
         .collect()

@@ -125,6 +125,101 @@ fn render_general_appearance_section(app: &mut crate::XRTranslateApp, ui: &mut e
                 "https://github.com/NowLoadY/XRTranslate",
             );
         });
+        ui.add_space(14.0);
+        render_update_controls(app, ui);
+    });
+}
+
+fn render_update_controls(app: &mut crate::XRTranslateApp, ui: &mut egui::Ui) {
+    use crate::app_update::AppUpdateState;
+
+    let state = app.app_update_state().clone();
+    ui.horizontal_wrapped(|ui| {
+        ui.label(
+            egui::RichText::new("Update")
+                .color(crate::ui::theme::text_strong())
+                .strong(),
+        );
+        ui.add_space(4.0);
+        let status = match &state {
+            AppUpdateState::Idle => "Ready",
+            AppUpdateState::Checking => "Checking for updates...",
+            AppUpdateState::Current => "You're up to date",
+            AppUpdateState::Available(_) => "Update available",
+            AppUpdateState::Downloading { .. } => "Downloading",
+            AppUpdateState::Ready(_) => "Ready to install",
+            AppUpdateState::Installing => "Installing...",
+            AppUpdateState::Failed(_) => "Check failed",
+        };
+        ui.label(egui::RichText::new(status).color(crate::ui::theme::text_weak()));
+        match &state {
+            AppUpdateState::Available(info) | AppUpdateState::Ready(info) => {
+                ui.add_space(10.0);
+                ui.vertical(|ui| {
+                    ui.label(
+                        egui::RichText::new(format!("v{}", info.version))
+                            .color(crate::ui::theme::text_strong())
+                            .strong(),
+                    );
+                    ui.label(
+                        egui::RichText::new(info.asset_name.as_str())
+                            .size(12.0)
+                            .color(crate::ui::theme::text_weak()),
+                    );
+                });
+            }
+            AppUpdateState::Downloading {
+                downloaded, total, ..
+            } => {
+                ui.add_space(10.0);
+                ui.label(
+                    egui::RichText::new(format!(
+                        "{} / {}",
+                        components::format_file_size(*downloaded),
+                        components::format_file_size(*total)
+                    ))
+                    .color(crate::ui::theme::text_strong()),
+                );
+            }
+            _ => {}
+        }
+    });
+
+    if let AppUpdateState::Failed(error) = &state {
+        ui.add_space(6.0);
+        ui.label(
+            egui::RichText::new(error)
+                .size(12.0)
+                .color(egui::Color32::from_rgb(220, 38, 38)),
+        );
+    }
+
+    ui.add_space(10.0);
+    ui.horizontal(|ui| {
+        let busy = app.app_update_manager.is_busy();
+        let primary_label = match &state {
+            AppUpdateState::Ready(_) => "Install and Restart",
+            AppUpdateState::Available(_) => "Download Update",
+            AppUpdateState::Checking => "Checking...",
+            AppUpdateState::Downloading { .. } => "Downloading...",
+            AppUpdateState::Installing => "Installing...",
+            AppUpdateState::Current => "Check for Updates",
+            AppUpdateState::Failed(_) => "Try Again",
+            AppUpdateState::Idle => "Check for Updates",
+        };
+
+        if components::primary_button_enabled(ui, primary_label, !busy).clicked() {
+            match &state {
+                AppUpdateState::Ready(_) => app.install_update_and_restart(),
+                AppUpdateState::Available(_) => app.download_update(),
+                AppUpdateState::Current | AppUpdateState::Idle | AppUpdateState::Failed(_) => {
+                    app.check_for_updates()
+                }
+                AppUpdateState::Checking
+                | AppUpdateState::Downloading { .. }
+                | AppUpdateState::Installing => {}
+            }
+        }
     });
 }
 

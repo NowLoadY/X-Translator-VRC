@@ -14,10 +14,11 @@ members = [
     "apps/xrtranslate-backend",
     "apps/xrtranslate-installer",
     "apps/xrtranslate-packager",
+    "apps/xrtranslate-updater",
 ]
 
 [workspace.package]
-version = "0.2.0"
+version = "0.2.1"
 edition = "2024"
 license = "AGPL-3.0-only"
 repository = "https://github.com/NowLoadY/XRTranslate"

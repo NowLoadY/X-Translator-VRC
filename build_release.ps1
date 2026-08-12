@@ -64,6 +64,7 @@ $buildArguments = @(
     '--package', 'rust-client',
     '--package', 'xrtranslate-backend',
     '--package', 'xrtranslate-installer',
+    '--package', 'xrtranslate-updater',
     '--package', 'xrtranslate-packager'
 )
 
@@ -84,6 +85,7 @@ $packageArguments = @(
     '--backend-bin', (Join-Path $projectRoot 'target\release\xrtranslate-backend.exe'),
     '--corpus-bin', (Join-Path $projectRoot 'target\release\xr-corpus-server.exe'),
     '--installer-bin', (Join-Path $projectRoot 'target\release\xrtranslate-installer.exe'),
+    '--updater-bin', (Join-Path $projectRoot 'target\release\xrtranslate-updater.exe'),
     '--config', $configPath,
     '--resources-dir', (Join-Path $projectRoot 'rust-client\resources'),
     '--corpora-dir', $corporaDirectory,

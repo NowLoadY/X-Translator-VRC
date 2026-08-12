@@ -9,6 +9,7 @@ use std::sync::{
     atomic::{AtomicBool, AtomicU32, AtomicUsize, Ordering},
 };
 
+mod app_update;
 mod audio;
 mod backend;
 mod client_settings;
@@ -124,6 +125,7 @@ struct XRTranslateApp {
     backend_manager: backend::BackendManager,
     model_task_manager: model_install::NativeModelTaskManager,
     runtime_installer: runtime_install::RuntimeInstaller,
+    app_update_manager: app_update::AppUpdateManager,
     backend_start_deadline: Option<std::time::Instant>,
     pub settings_section: ui::pages::settings::SettingsSection,
     pub modal_dialog: ui::modal::ModalDialog,
@@ -398,6 +400,7 @@ impl Default for XRTranslateApp {
             backend_manager,
             model_task_manager: model_install::NativeModelTaskManager::default(),
             runtime_installer: runtime_install::RuntimeInstaller::default(),
+            app_update_manager: app_update::AppUpdateManager::default(),
             backend_start_deadline: None,
             settings_section: ui::pages::settings::SettingsSection::default(),
             modal_dialog: ui::modal::ModalDialog::default(),
@@ -461,6 +464,42 @@ impl XRTranslateApp {
     pub fn set_ui_language(&mut self, language: UiLanguage) {
         self.ui_language = language;
         self.save_settings();
+    }
+
+    pub fn app_update_state(&self) -> &app_update::AppUpdateState {
+        self.app_update_manager.state()
+    }
+
+    pub fn check_for_updates(&mut self) {
+        if let Err(error) = self.app_update_manager.check() {
+            self.last_error = Some(error);
+        }
+    }
+
+    pub fn download_update(&mut self) {
+        if let Err(error) = self.app_update_manager.download(self.project_root()) {
+            self.last_error = Some(error);
+        }
+    }
+
+    pub fn install_update_and_restart(&mut self) {
+        let install = match self.app_update_manager.begin_install() {
+            Ok(install) => install,
+            Err(error) => {
+                self.last_error = Some(error);
+                return;
+            }
+        };
+        self.stop();
+        self.backend_start_deadline = None;
+        self.backend_manager.shutdown();
+        if let Ok(mut overlay) = self.overlay_manager.lock() {
+            overlay.stop();
+        }
+        match app_update::spawn_updater(install) {
+            Ok(()) => std::process::exit(0),
+            Err(error) => self.last_error = Some(error),
+        }
     }
 
     fn set_connection_status(&mut self, status: impl Into<String>) {
@@ -816,14 +855,6 @@ impl XRTranslateApp {
     }
 }
 
-fn format_timeline_ms(milliseconds: f64) -> String {
-    let total_milliseconds = milliseconds.max(0.0).round() as u64;
-    let minutes = total_milliseconds / 60_000;
-    let seconds = total_milliseconds % 60_000 / 1_000;
-    let millis = total_milliseconds % 1_000;
-    format!("{minutes:02}:{seconds:02}.{millis:03}")
-}
-
 fn compact_speaker_label(speaker_id: &str) -> Option<String> {
     let value = speaker_id.trim();
     if value.is_empty() {
@@ -844,6 +875,7 @@ impl eframe::App for XRTranslateApp {
     fn ui(&mut self, ui: &mut egui::Ui, _frame: &mut eframe::Frame) {
         self.model_task_manager.poll();
         self.runtime_installer.poll();
+        self.app_update_manager.poll();
         ui.ctx()
             .request_repaint_after(std::time::Duration::from_millis(100));
         if self.first_run {

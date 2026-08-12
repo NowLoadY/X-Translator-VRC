@@ -51,6 +51,9 @@ struct Arguments {
     /// Native xrtranslate-installer executable built for the target platform.
     #[arg(long)]
     installer_bin: PathBuf,
+    /// Native xrtranslate-updater executable built for the target platform.
+    #[arg(long)]
+    updater_bin: PathBuf,
     /// Compatibility configuration to rewrite for the staged release.
     #[arg(long, default_value = "config.json")]
     config: PathBuf,
@@ -136,6 +139,7 @@ struct ReleasePlan {
     backend_bin: PathBuf,
     corpus_bin: PathBuf,
     installer_bin: PathBuf,
+    updater_bin: PathBuf,
     resources_dir: PathBuf,
     corpora_dir: PathBuf,
     license: PathBuf,
@@ -201,6 +205,7 @@ impl ReleasePlan {
         require_regular_file("--backend-bin", &arguments.backend_bin)?;
         require_regular_file("--corpus-bin", &arguments.corpus_bin)?;
         require_regular_file("--installer-bin", &arguments.installer_bin)?;
+        require_regular_file("--updater-bin", &arguments.updater_bin)?;
         require_regular_file("--config", &arguments.config)?;
         require_directory("--resources-dir", &arguments.resources_dir)?;
         require_directory("--corpora-dir", &arguments.corpora_dir)?;
@@ -251,6 +256,7 @@ impl ReleasePlan {
             &arguments.backend_bin,
             &arguments.corpus_bin,
             &arguments.installer_bin,
+            &arguments.updater_bin,
             arguments.include_models,
             &assets,
         );
@@ -260,6 +266,7 @@ impl ReleasePlan {
             backend_bin: arguments.backend_bin,
             corpus_bin: arguments.corpus_bin,
             installer_bin: arguments.installer_bin,
+            updater_bin: arguments.updater_bin,
             resources_dir: arguments.resources_dir,
             corpora_dir: arguments.corpora_dir,
             license: arguments.license,
@@ -311,6 +318,15 @@ fn package(plan: &ReleasePlan) -> Result<PathBuf, PackageError> {
                 .join(native_binary_name(
                     "xrtranslate-installer",
                     &plan.installer_bin,
+                )?),
+        )?;
+        copy_file_to(
+            &plan.updater_bin,
+            &staging
+                .join(INTERNAL_BIN_DIRECTORY)
+                .join(native_binary_name(
+                    "xrtranslate-updater",
+                    &plan.updater_bin,
                 )?),
         )?;
         copy_native_directory(&plan.resources_dir, &staging.join("resources"))?;
@@ -410,6 +426,7 @@ fn release_manifest(
     backend: &Path,
     corpus: &Path,
     installer: &Path,
+    updater: &Path,
     include_models: bool,
     assets: &ResolvedModelAssets,
 ) -> Value {
@@ -426,6 +443,7 @@ fn release_manifest(
             "backend": format!("{INTERNAL_BIN_DIRECTORY}/{}", native_binary_name("xrtranslate-backend", backend).unwrap_or_else(|_| "xrtranslate-backend".into())),
             "corpus": format!("{INTERNAL_BIN_DIRECTORY}/{}", native_binary_name("xr-corpus-server", corpus).unwrap_or_else(|_| "xr-corpus-server".into())),
             "installer": format!("{INTERNAL_BIN_DIRECTORY}/{}", native_binary_name("xrtranslate-installer", installer).unwrap_or_else(|_| "xrtranslate-installer".into())),
+            "updater": format!("{INTERNAL_BIN_DIRECTORY}/{}", native_binary_name("xrtranslate-updater", updater).unwrap_or_else(|_| "xrtranslate-updater".into())),
         },
         "runtime": {
             "included": false,
@@ -895,6 +913,7 @@ mod tests {
         let backend = source.join(format!("custom-backend{extension}"));
         let corpus_server = source.join(format!("custom-corpus{extension}"));
         let installer = source.join(format!("custom-installer{extension}"));
+        let updater = source.join(format!("custom-updater{extension}"));
         let resources = source.join("resources");
         let corpora = source.join("corpora");
         let vad = source.join("silero_vad.onnx");
@@ -905,6 +924,7 @@ mod tests {
         write(&backend, b"backend");
         write(&corpus_server, b"corpus");
         write(&installer, b"installer");
+        write(&updater, b"updater");
         write(&resources.join("docs/welcome.md"), b"native resource");
         write(&corpora.join("README.md"), b"corpus root");
         write(&corpora.join("v1/SCHEMA.md"), b"corpus schema");
@@ -950,6 +970,7 @@ zh,en,fr,pt,es,ja,ru,ko,th,it,de,vi,id,pl,cs,nl
             backend_bin: backend,
             corpus_bin: corpus_server,
             installer_bin: installer,
+            updater_bin: updater,
             config,
             resources_dir: resources,
             corpora_dir: corpora,
@@ -989,6 +1010,12 @@ zh,en,fr,pt,es,ja,ru,ko,th,it,de,vi,id,pl,cs,nl
                 .join(format!("xrtranslate-installer{extension}"))
                 .is_file()
         );
+        assert!(
+            output
+                .join(INTERNAL_BIN_DIRECTORY)
+                .join(format!("xrtranslate-updater{extension}"))
+                .is_file()
+        );
         assert!(output.join("resources/docs/welcome.md").is_file());
         assert!(output.join("corpora/v1/SCHEMA.md").is_file());
         assert!(
@@ -1017,6 +1044,10 @@ zh,en,fr,pt,es,ja,ru,ko,th,it,de,vi,id,pl,cs,nl
         );
         assert_eq!(manifest["models"]["included"], false);
         assert_eq!(manifest["corpora"]["root"], CORPORA_CONFIG_ROOT);
+        assert_eq!(
+            manifest["entrypoints"]["updater"],
+            format!("{INTERNAL_BIN_DIRECTORY}/xrtranslate-updater{extension}")
+        );
         fs::remove_dir_all(root).unwrap();
     }
 }

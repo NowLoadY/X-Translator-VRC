@@ -1,0 +1,274 @@
+#![forbid(unsafe_code)]
+
+use std::{
+    collections::HashSet,
+    error::Error,
+    ffi::OsStr,
+    fs, io,
+    path::{Path, PathBuf},
+    process::Command,
+    thread,
+    time::{Duration, Instant},
+};
+
+use clap::Parser;
+
+const PROTECTED_TOP_LEVEL: &[&str] = &["models", "runtime", "config.json"];
+const RETRY_TIMEOUT: Duration = Duration::from_secs(45);
+
+#[derive(Debug, Parser)]
+#[command(
+    name = "xrtranslate-updater",
+    version,
+    about = "Apply an XRTranslate update"
+)]
+struct Arguments {
+    #[arg(long)]
+    source: PathBuf,
+    #[arg(long)]
+    target: PathBuf,
+    #[arg(long)]
+    current_pid: u32,
+    #[arg(long)]
+    restart: bool,
+}
+
+fn main() -> Result<(), Box<dyn Error>> {
+    let args = Arguments::parse();
+    wait_for_app_exit(args.current_pid);
+    apply_update(&args.source, &args.target)?;
+    if args.restart {
+        restart_app(&args.source, &args.target)?;
+    }
+    Ok(())
+}
+
+fn wait_for_app_exit(current_pid: u32) {
+    let started = Instant::now();
+    while started.elapsed() < RETRY_TIMEOUT {
+        if !process_exists(current_pid) {
+            return;
+        }
+        thread::sleep(Duration::from_millis(250));
+    }
+}
+
+fn process_exists(pid: u32) -> bool {
+    #[cfg(target_os = "linux")]
+    {
+        Path::new("/proc").join(pid.to_string()).exists()
+    }
+    #[cfg(target_os = "windows")]
+    {
+        Command::new("tasklist")
+            .args(["/FI", &format!("PID eq {pid}"), "/NH"])
+            .output()
+            .ok()
+            .filter(|output| output.status.success())
+            .is_some_and(|output| {
+                String::from_utf8_lossy(&output.stdout)
+                    .split_whitespace()
+                    .any(|part| part == pid.to_string())
+            })
+    }
+    #[cfg(not(any(target_os = "linux", target_os = "windows")))]
+    {
+        let _ = pid;
+        false
+    }
+}
+
+fn apply_update(source: &Path, target: &Path) -> Result<(), Box<dyn Error>> {
+    require_directory(source, "source")?;
+    require_directory(target, "target")?;
+    let source_entries = source_entries(source)?;
+    let backup = target
+        .join("runtime")
+        .join("updates")
+        .join(format!("backup-{}", std::process::id()));
+    if backup.exists() {
+        fs::remove_dir_all(&backup)?;
+    }
+    fs::create_dir_all(&backup)?;
+
+    let result = replace_entries(source, target, &source_entries, &backup);
+    if let Err(error) = result {
+        let _ = restore_backup(target, &backup);
+        return Err(error.into());
+    }
+    let _ = fs::remove_dir_all(&backup);
+    Ok(())
+}
+
+fn source_entries(source: &Path) -> Result<HashSet<String>, io::Error> {
+    let mut entries = HashSet::new();
+    for entry in fs::read_dir(source)? {
+        let entry = entry?;
+        if let Some(name) = entry.file_name().to_str() {
+            entries.insert(name.to_owned());
+        }
+    }
+    Ok(entries)
+}
+
+fn replace_entries(
+    source: &Path,
+    target: &Path,
+    source_entries: &HashSet<String>,
+    backup: &Path,
+) -> Result<(), String> {
+    remove_old_client_binary(target, source_entries, backup)?;
+    for entry in fs::read_dir(source).map_err(|error| error.to_string())? {
+        let entry = entry.map_err(|error| error.to_string())?;
+        let name = entry.file_name();
+        if is_protected(&name) {
+            if name.eq_ignore_ascii_case(OsStr::new("config.json")) && !target.join(&name).exists()
+            {
+                copy_path(&entry.path(), &target.join(&name))?;
+            }
+            continue;
+        }
+        let destination = target.join(&name);
+        backup_existing(&destination, target, backup)?;
+        copy_path(&entry.path(), &destination)?;
+    }
+    Ok(())
+}
+
+fn remove_old_client_binary(
+    target: &Path,
+    source_entries: &HashSet<String>,
+    backup: &Path,
+) -> Result<(), String> {
+    let entries = fs::read_dir(target).map_err(|error| error.to_string())?;
+    for entry in entries {
+        let entry = entry.map_err(|error| error.to_string())?;
+        let path = entry.path();
+        if !path.is_file() {
+            continue;
+        }
+        let name = entry.file_name();
+        let Some(name_text) = name.to_str() else {
+            continue;
+        };
+        if source_entries.contains(name_text) {
+            continue;
+        }
+        let lower = name_text.to_ascii_lowercase();
+        let is_client = if cfg!(target_os = "windows") {
+            lower.starts_with("xrtranslate") && lower.ends_with(".exe")
+        } else {
+            lower.starts_with("xrtranslate")
+        };
+        if is_client {
+            backup_existing(&path, target, backup)?;
+        }
+    }
+    Ok(())
+}
+
+fn backup_existing(path: &Path, target: &Path, backup: &Path) -> Result<(), String> {
+    if !path.exists() {
+        return Ok(());
+    }
+    let relative = path
+        .strip_prefix(target)
+        .map_err(|error| format!("invalid update path {}: {error}", path.display()))?;
+    let backup_path = backup.join(relative);
+    if let Some(parent) = backup_path.parent() {
+        fs::create_dir_all(parent).map_err(|error| error.to_string())?;
+    }
+    retry_io(|| fs::rename(path, &backup_path))
+        .map_err(|error| format!("cannot replace {}: {error}", path.display()))
+}
+
+fn restore_backup(target: &Path, backup: &Path) -> Result<(), String> {
+    if !backup.exists() {
+        return Ok(());
+    }
+    restore_entries(backup, backup, target)
+}
+
+fn restore_entries(root: &Path, directory: &Path, target: &Path) -> Result<(), String> {
+    for entry in fs::read_dir(directory).map_err(|error| error.to_string())? {
+        let entry = entry.map_err(|error| error.to_string())?;
+        let path = entry.path();
+        if path.is_dir() {
+            restore_entries(root, &path, target)?;
+            continue;
+        }
+        let relative = path
+            .strip_prefix(root)
+            .map_err(|error| format!("invalid backup path: {error}"))?;
+        let destination = target.join(relative);
+        if let Some(parent) = destination.parent() {
+            fs::create_dir_all(parent).map_err(|error| error.to_string())?;
+        }
+        let _ = fs::remove_file(&destination);
+        fs::rename(&path, &destination).map_err(|error| error.to_string())?;
+    }
+    Ok(())
+}
+
+fn copy_path(source: &Path, destination: &Path) -> Result<(), String> {
+    if source.is_dir() {
+        fs::create_dir_all(destination).map_err(|error| error.to_string())?;
+        for entry in fs::read_dir(source).map_err(|error| error.to_string())? {
+            let entry = entry.map_err(|error| error.to_string())?;
+            copy_path(&entry.path(), &destination.join(entry.file_name()))?;
+        }
+        return Ok(());
+    }
+    if let Some(parent) = destination.parent() {
+        fs::create_dir_all(parent).map_err(|error| error.to_string())?;
+    }
+    retry_io(|| fs::copy(source, destination))
+        .map(|_| ())
+        .map_err(|error| format!("cannot copy {}: {error}", source.display()))
+}
+
+fn retry_io<T>(mut action: impl FnMut() -> io::Result<T>) -> io::Result<T> {
+    let started = Instant::now();
+    loop {
+        match action() {
+            Ok(value) => return Ok(value),
+            Err(error) if started.elapsed() < RETRY_TIMEOUT => {
+                thread::sleep(Duration::from_millis(250));
+                if error.kind() == io::ErrorKind::NotFound {
+                    return Err(error);
+                }
+            }
+            Err(error) => return Err(error),
+        }
+    }
+}
+
+fn restart_app(source: &Path, target: &Path) -> Result<(), Box<dyn Error>> {
+    let manifest_path = source.join("release-manifest.json");
+    let manifest: serde_json::Value = serde_json::from_str(&fs::read_to_string(manifest_path)?)?;
+    let Some(entrypoint) = manifest
+        .pointer("/entrypoints/client")
+        .and_then(serde_json::Value::as_str)
+    else {
+        return Ok(());
+    };
+    let executable = target.join(entrypoint);
+    if executable.is_file() {
+        Command::new(executable).current_dir(target).spawn()?;
+    }
+    Ok(())
+}
+
+fn is_protected(name: &OsStr) -> bool {
+    PROTECTED_TOP_LEVEL
+        .iter()
+        .any(|protected| name.eq_ignore_ascii_case(OsStr::new(protected)))
+}
+
+fn require_directory(path: &Path, label: &str) -> Result<(), Box<dyn Error>> {
+    if path.is_dir() {
+        Ok(())
+    } else {
+        Err(format!("{label} directory does not exist: {}", path.display()).into())
+    }
+}

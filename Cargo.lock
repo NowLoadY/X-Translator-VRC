@@ -4196,6 +4196,7 @@ dependencies = [
  "rubato",
  "serde",
  "serde_json",
+ "sha2",
  "tokio",
  "tokio-tungstenite 0.30.0",
  "tungstenite 0.30.0",
@@ -6720,6 +6721,14 @@ dependencies = [
 [[package]]
 name = "xrtranslate-supervisor"
 version = "0.2.0"
+
+[[package]]
+name = "xrtranslate-updater"
+version = "0.2.0"
+dependencies = [
+ "clap",
+ "serde_json",
+]
 
 [[package]]
 name = "xrtranslate-vad"
