@@ -70,6 +70,7 @@ pub(crate) struct TimedUtterance {
     pub(crate) source_start_ms: f64,
     pub(crate) source_end_ms: f64,
     pub(crate) revisable: bool,
+    pub(crate) topic_turn_sequence: Option<u64>,
 }
 
 #[derive(Debug)]
@@ -153,6 +154,8 @@ struct FixedWindow {
     dense_results: u8,
     stream_open: bool,
     idle_frames: usize,
+    current_topic_turn_sequence: u64,
+    next_topic_turn_sequence: u64,
 }
 
 impl FixedWindow {
@@ -182,6 +185,8 @@ impl FixedWindow {
             dense_results: 0,
             stream_open: false,
             idle_frames: 0,
+            current_topic_turn_sequence: 0,
+            next_topic_turn_sequence: 1,
         }
     }
 
@@ -205,6 +210,11 @@ impl FixedWindow {
                 return Vec::new();
             }
             self.gate_open = true;
+            self.current_topic_turn_sequence = self.next_topic_turn_sequence;
+            self.next_topic_turn_sequence = self
+                .next_topic_turn_sequence
+                .checked_add(1)
+                .expect("continuous topic turn sequence overflow");
             self.stream_open = true;
             self.idle_frames = 0;
             self.quiet_frames = 0;
@@ -540,8 +550,17 @@ impl NativePipeline {
                     .unwrap_or_default();
                 for event in window_events {
                     match event {
-                        FixedWindowEvent::Utterance(utterance) => utterances
-                            .push(PipelineEvent::Utterance(self.with_timeline(utterance, 0))),
+                        FixedWindowEvent::Utterance(utterance) => {
+                            let topic_turn_sequence = self
+                                .fixed_window
+                                .as_ref()
+                                .map(|window| window.current_topic_turn_sequence);
+                            utterances.push(PipelineEvent::Utterance(self.with_timeline(
+                                utterance,
+                                0,
+                                topic_turn_sequence,
+                            )))
+                        }
                         FixedWindowEvent::StreamEnded => {
                             utterances.push(PipelineEvent::StreamEnded)
                         }
@@ -573,7 +592,9 @@ impl NativePipeline {
                 .map_err(|error| error.to_string())?;
             self.processed_samples = self.processed_samples.saturating_add(FRAME_SAMPLES as u64);
             if let EndpointEvent::Finalized(utterance) = event {
-                utterances.push(PipelineEvent::Utterance(self.with_timeline(utterance, 0)));
+                utterances.push(PipelineEvent::Utterance(
+                    self.with_timeline(utterance, 0, None),
+                ));
             }
         }
         Ok(utterances)
@@ -583,8 +604,13 @@ impl NativePipeline {
     pub(crate) fn flush(&mut self) -> Result<Option<PipelineEvent>, String> {
         if let Some(window) = &mut self.fixed_window {
             let utterance = window.flush();
-            return Ok(utterance
-                .map(|utterance| PipelineEvent::Utterance(self.with_timeline(utterance, 0))));
+            return Ok(utterance.map(|utterance| {
+                let topic_turn_sequence = self
+                    .fixed_window
+                    .as_ref()
+                    .map(|window| window.current_topic_turn_sequence);
+                PipelineEvent::Utterance(self.with_timeline(utterance, 0, topic_turn_sequence))
+            }));
         }
         let mut trailing_padding_samples = 0;
         let mut finalized = None;
@@ -611,7 +637,11 @@ impl NativePipeline {
         Ok(finalized
             .or_else(|| self.endpoint.flush())
             .map(|utterance| {
-                PipelineEvent::Utterance(self.with_timeline(utterance, trailing_padding_samples))
+                PipelineEvent::Utterance(self.with_timeline(
+                    utterance,
+                    trailing_padding_samples,
+                    None,
+                ))
             }))
     }
 
@@ -674,6 +704,7 @@ impl NativePipeline {
         &self,
         utterance: Utterance,
         trailing_padding_samples: usize,
+        topic_turn_sequence: Option<u64>,
     ) -> TimedUtterance {
         let real_samples = utterance
             .samples
@@ -686,6 +717,7 @@ impl NativePipeline {
             source_start_ms: samples_to_ms(start_samples),
             source_end_ms: samples_to_ms(end_samples),
             revisable: self.fixed_window.is_some(),
+            topic_turn_sequence,
         }
     }
 }
@@ -1211,6 +1243,7 @@ mod tests {
         };
         assert_eq!(first.samples.len(), FixedWindow::FIRST_WINDOW_SAMPLES);
         assert_eq!(first.overlap_frames, 0);
+        let first_topic_turn = window.current_topic_turn_sequence;
         assert_eq!(
             window.samples.len(),
             FixedWindow::WINDOW_SAMPLES - FixedWindow::HOP_SAMPLES
@@ -1224,6 +1257,7 @@ mod tests {
         };
         assert_eq!(second.samples.len(), FixedWindow::WINDOW_SAMPLES);
         assert_eq!(second.overlap_frames, 32);
+        assert_eq!(window.current_topic_turn_sequence, first_topic_turn);
         assert_eq!(
             window.samples.len(),
             FixedWindow::WINDOW_SAMPLES - FixedWindow::HOP_SAMPLES
@@ -1281,6 +1315,12 @@ mod tests {
             (FixedWindow::PRE_ROLL_FRAMES + FixedWindow::RELEASE_FRAMES) * FRAME_SAMPLES
         );
         assert!(!window.gate_open);
+
+        for _ in 0..FixedWindow::OPENING_FRAMES {
+            assert!(window.push(&speech, true).is_empty());
+        }
+        assert!(window.gate_open);
+        assert_eq!(window.current_topic_turn_sequence, 2);
     }
 
     #[test]

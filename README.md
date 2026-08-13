@@ -5,6 +5,10 @@
 <h1 align="center">XRTranslate</h1>
 
 <p align="center">
+  <a href="https://github.com/NowLoadY/XRTranslate/releases/latest">Download the latest release</a>
+</p>
+
+<p align="center">
   <strong>为 VRChat 提供实时字幕与双向语音翻译</strong>
 </p>
 
@@ -13,11 +17,43 @@
 </p>
 
 <p align="center">
+  <a href="#界面预览">界面预览</a> •
   <a href="#使用指南">使用指南</a> •
   <a href="#常用位置">常用位置</a> •
   <a href="#citation">Citation</a> •
   <a href="#acknowledgements">致谢</a>
 </p>
+
+<p align="center">
+  <img src="assets/preview-Translation.png" alt="XRTranslate 翻译界面" width="900" />
+</p>
+
+<p align="center">
+  选择语言和麦克风，一键开启实时翻译。
+</p>
+
+---
+
+## 界面预览
+
+首次打开时，欢迎页会带你完成必要准备。之后也可以随时从侧边栏重新打开。
+
+<p align="center">
+  <img src="assets/preview-Welcome-1.png" alt="XRTranslate 欢迎页" width="760" />
+</p>
+
+OSC 字幕可以逐条显示，也可以合并排列。
+
+<table>
+  <tr>
+    <td width="50%" align="center"><img src="assets/preview-OSC-Bilingual-Separate.png" alt="OSC 字幕逐条显示" /></td>
+    <td width="50%" align="center"><img src="assets/preview-OSC-Bilingual-Merge.png" alt="OSC 字幕合并显示" /></td>
+  </tr>
+  <tr>
+    <td align="center"><sub>逐条显示</sub></td>
+    <td align="center"><sub>合并显示</sub></td>
+  </tr>
+</table>
 
 ---
 

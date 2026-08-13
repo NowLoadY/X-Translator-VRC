@@ -71,7 +71,11 @@ enum ActiveCapture {
 impl ActiveCapture {
     fn stop(self) {
         match self {
-            Self::Microphone(stream) => drop(stream),
+            Self::Microphone(stream) => {
+                let _ = thread::Builder::new()
+                    .name("audio-stream-reaper".into())
+                    .spawn(move || drop(stream));
+            }
             #[cfg(windows)]
             Self::Loopback(capture) => capture.stop(),
         }
@@ -88,8 +92,17 @@ struct LoopbackCapture {
 impl LoopbackCapture {
     fn stop(self) {
         self.stop_requested.store(true, Ordering::Release);
-        let _ = self.worker.join();
+        reap_worker(self.worker);
     }
+}
+
+#[cfg(windows)]
+fn reap_worker(worker: thread::JoinHandle<()>) {
+    let _ = thread::Builder::new()
+        .name("wasapi-worker-reaper".into())
+        .spawn(move || {
+            let _ = worker.join();
+        });
 }
 
 impl AudioSystem {
@@ -249,88 +262,6 @@ impl AudioSystem {
         self.add_active_capture(ActiveCapture::Microphone(stream));
 
         Ok(())
-    }
-
-    pub fn start_level_preview(
-        &mut self,
-        device_id: &str,
-        level: Arc<AtomicU32>,
-    ) -> Result<(), String> {
-        let device = if device_id.is_empty() {
-            self.host
-                .default_input_device()
-                .ok_or("No default input device available.")?
-        } else {
-            let parsed_id = device_id
-                .parse()
-                .map_err(|error| format!("Invalid microphone ID '{device_id}': {error}"))?;
-            self.host
-                .device_by_id(&parsed_id)
-                .ok_or_else(|| format!("Microphone '{device_id}' is no longer available"))?
-        };
-        let config = device
-            .default_input_config()
-            .map_err(|error| format!("Failed to get default input config: {error}"))?;
-        let channels = config.channels() as usize;
-        let stream_config: cpal::StreamConfig = config.into();
-        macro_rules! build_stream {
-            ($sample:ty) => {
-                self.build_level_stream::<$sample>(&device, stream_config, channels, level)
-            };
-        }
-        let stream = match config.sample_format() {
-            cpal::SampleFormat::F32 => build_stream!(f32),
-            cpal::SampleFormat::F64 => build_stream!(f64),
-            cpal::SampleFormat::I8 => build_stream!(i8),
-            cpal::SampleFormat::I16 => build_stream!(i16),
-            cpal::SampleFormat::I24 => build_stream!(cpal::I24),
-            cpal::SampleFormat::I32 => build_stream!(i32),
-            cpal::SampleFormat::I64 => build_stream!(i64),
-            cpal::SampleFormat::U8 => build_stream!(u8),
-            cpal::SampleFormat::U16 => build_stream!(u16),
-            cpal::SampleFormat::U24 => build_stream!(cpal::U24),
-            cpal::SampleFormat::U32 => build_stream!(u32),
-            cpal::SampleFormat::U64 => build_stream!(u64),
-            format => Err(format!("Unsupported microphone sample format: {format}")),
-        }?;
-        stream
-            .play()
-            .map_err(|error| format!("Failed to start input level preview: {error}"))?;
-        self.add_active_capture(ActiveCapture::Microphone(stream));
-        Ok(())
-    }
-
-    fn build_level_stream<T: Sample + cpal::SizedSample>(
-        &self,
-        device: &cpal::Device,
-        config: cpal::StreamConfig,
-        channels: usize,
-        level: Arc<AtomicU32>,
-    ) -> Result<Stream, String>
-    where
-        f32: cpal::FromSample<T>,
-    {
-        device
-            .build_input_stream(
-                config,
-                move |data: &[T], _: &cpal::InputCallbackInfo| {
-                    let sum = data
-                        .chunks(channels)
-                        .map(|frame| {
-                            let mono = frame
-                                .iter()
-                                .map(|sample| f32::from_sample(*sample))
-                                .sum::<f32>()
-                                / frame.len() as f32;
-                            mono * mono
-                        })
-                        .sum::<f32>();
-                    update_input_level_from_energy(sum, data.len() / channels, &level);
-                },
-                |error| log::error!("Input level preview failed: {error}"),
-                None,
-            )
-            .map_err(|error| format!("Failed to build input level preview: {error}"))
     }
 
     fn build_stream<T: Sample + cpal::SizedSample>(
@@ -610,14 +541,6 @@ impl AudioSystem {
         self.start_loopback(device_id, Some(output_tx), level, "wasapi-loopback")
     }
 
-    pub fn start_loopback_level_preview(
-        &mut self,
-        device_id: &str,
-        level: Arc<AtomicU32>,
-    ) -> Result<(), String> {
-        self.start_loopback(device_id, None, level, "wasapi-loopback-level-preview")
-    }
-
     fn start_loopback(
         &mut self,
         device_id: &str,
@@ -651,12 +574,12 @@ impl AudioSystem {
             }
             Ok(Err(error)) => {
                 stop_requested.store(true, Ordering::Release);
-                let _ = worker.join();
+                reap_worker(worker);
                 Err(error)
             }
             Err(_) => {
                 stop_requested.store(true, Ordering::Release);
-                let _ = worker.join();
+                reap_worker(worker);
                 Err("Timed out while opening the WASAPI loopback device".into())
             }
         }

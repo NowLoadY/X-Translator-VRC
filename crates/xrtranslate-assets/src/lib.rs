@@ -591,8 +591,18 @@ pub struct NativeModelInstaller {
 
 impl NativeModelInstaller {
     pub fn new(assets: ResolvedModelAssets) -> Result<Self, ModelDownloadError> {
-        let client = DownloadClient::new(concat!("xrtranslate-assets/", env!("CARGO_PKG_VERSION")))
-            .map_err(ModelDownloadError::Download)?;
+        Self::with_proxy(assets, None)
+    }
+
+    pub fn with_proxy(
+        assets: ResolvedModelAssets,
+        proxy_url: Option<&str>,
+    ) -> Result<Self, ModelDownloadError> {
+        let client = DownloadClient::with_proxy(
+            concat!("xrtranslate-assets/", env!("CARGO_PKG_VERSION")),
+            proxy_url,
+        )
+        .map_err(ModelDownloadError::Download)?;
         Ok(Self { assets, client })
     }
 

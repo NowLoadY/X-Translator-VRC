@@ -2,7 +2,7 @@
 // build so double-clicking the executable never creates a transient console.
 #![cfg_attr(windows, windows_subsystem = "windows")]
 
-use crossbeam_channel::{Sender, unbounded};
+use crossbeam_channel::{Receiver, Sender, bounded, unbounded};
 use eframe::egui;
 use std::sync::{
     Arc, Mutex,
@@ -492,6 +492,7 @@ fn route_label(ui_language: UiLanguage, _source: &str, target: &str) -> &'static
 struct XRTranslateApp {
     audio_system: AudioSystem,
     devices: Vec<InputDevice>,
+    device_refresh_rx: Option<Receiver<AudioDeviceSnapshot>>,
     selected_device_id: String,
     loopback_devices: Vec<InputDevice>,
     selected_loopback_device_id: String,
@@ -513,6 +514,7 @@ struct XRTranslateApp {
     translations: Vec<TranslationHistoryEntry>,
     last_error: Option<String>,
     server_url: String,
+    download_proxy_url: String,
     source_lang: String,
     target_lang: String,
     tts_enabled: bool,
@@ -524,6 +526,7 @@ struct XRTranslateApp {
     model_task_manager: model_install::NativeModelTaskManager,
     runtime_installer: runtime_install::RuntimeInstaller,
     app_update_manager: app_update::AppUpdateManager,
+    notified_update_version: Option<String>,
     backend_start_deadline: Option<std::time::Instant>,
     pub settings_section: ui::pages::settings::SettingsSection,
     pub modal_dialog: ui::modal::ModalDialog,
@@ -540,6 +543,11 @@ struct XRTranslateApp {
     overlay_enabled_atomic: Arc<AtomicBool>,
     overlay_max_count_atomic: Arc<AtomicUsize>,
     overlay_font_size_atomic: Arc<AtomicU32>,
+}
+
+struct AudioDeviceSnapshot {
+    devices: Vec<InputDevice>,
+    loopback_devices: Vec<InputDevice>,
 }
 
 #[derive(Default)]
@@ -566,6 +574,12 @@ impl Default for XRTranslateApp {
 
         let osc_draft = settings.osc_settings.clone();
         let osc_manager = OscManager::new(osc_draft.clone());
+        let mut model_task_manager = model_install::NativeModelTaskManager::default();
+        model_task_manager.set_proxy_url(&settings.download_proxy_url);
+        let mut runtime_installer = runtime_install::RuntimeInstaller::default();
+        runtime_installer.set_proxy_url(&settings.download_proxy_url);
+        let mut app_update_manager = app_update::AppUpdateManager::default();
+        app_update_manager.set_proxy_url(&settings.download_proxy_url);
 
         let selected_input_config = match settings.capture_source {
             CaptureSource::Microphone => {
@@ -906,6 +920,7 @@ impl Default for XRTranslateApp {
         let mut app = Self {
             audio_system,
             devices,
+            device_refresh_rx: None,
             selected_device_id: settings.selected_device_id,
             loopback_devices,
             selected_loopback_device_id: settings.selected_loopback_device_id,
@@ -927,6 +942,7 @@ impl Default for XRTranslateApp {
             translations: Vec::new(),
             last_error: None,
             server_url: settings.server_url,
+            download_proxy_url: settings.download_proxy_url,
             source_lang: settings.source_lang,
             target_lang: settings.target_lang,
             tts_enabled: settings.tts_enabled,
@@ -935,9 +951,10 @@ impl Default for XRTranslateApp {
             osc_draft,
             service_config: service_config::ServiceConfigEditor::load(),
             backend_manager,
-            model_task_manager: model_install::NativeModelTaskManager::default(),
-            runtime_installer: runtime_install::RuntimeInstaller::default(),
-            app_update_manager: app_update::AppUpdateManager::default(),
+            model_task_manager,
+            runtime_installer,
+            app_update_manager,
+            notified_update_version: None,
             backend_start_deadline: None,
             settings_section: ui::pages::settings::SettingsSection::default(),
             modal_dialog: ui::modal::ModalDialog::default(),
@@ -960,7 +977,7 @@ impl Default for XRTranslateApp {
             overlay_max_count_atomic,
             overlay_font_size_atomic,
         };
-        app.restart_level_preview();
+        app.check_for_updates();
         app
     }
 }
@@ -988,6 +1005,7 @@ impl XRTranslateApp {
             ui_language: self.ui_language,
             first_run: self.first_run,
             server_url: self.server_url.clone(),
+            download_proxy_url: self.download_proxy_url.clone(),
             osc_settings: self.osc_draft.clone(),
             active_page: self.navigation.page,
             sidebar_collapsed: self.navigation.collapsed,
@@ -1018,6 +1036,29 @@ impl XRTranslateApp {
         if let Err(error) = self.app_update_manager.check() {
             self.last_error = Some(error);
         }
+    }
+
+    pub fn set_download_proxy_url(&mut self, proxy_url: String) {
+        self.download_proxy_url = proxy_url.trim().to_owned();
+        self.model_task_manager
+            .set_proxy_url(&self.download_proxy_url);
+        self.runtime_installer
+            .set_proxy_url(&self.download_proxy_url);
+        self.app_update_manager
+            .set_proxy_url(&self.download_proxy_url);
+        self.save_settings();
+    }
+
+    fn show_available_update(&mut self) {
+        let app_update::AppUpdateState::Available(info) = self.app_update_manager.state() else {
+            return;
+        };
+        if self.notified_update_version.as_deref() == Some(&info.version) {
+            return;
+        }
+        self.notified_update_version = Some(info.version.clone());
+        self.modal_dialog =
+            ui::modal::ModalDialog::update_available(&info.version, self.ui_language);
     }
 
     pub fn download_update(&mut self) {
@@ -1168,7 +1209,7 @@ impl XRTranslateApp {
             }
             Err(error) => {
                 self.set_startup_error("Audio input failed", error);
-                self.restart_level_preview();
+                self.reset_audio_levels();
             }
         }
     }
@@ -1225,6 +1266,52 @@ impl XRTranslateApp {
         }
     }
 
+    fn request_audio_device_refresh(&mut self, ctx: eframe::egui::Context) {
+        if self.device_refresh_rx.is_some() {
+            return;
+        }
+
+        let (tx, rx) = bounded(1);
+        self.device_refresh_rx = Some(rx);
+        let spawn_result = std::thread::Builder::new()
+            .name("audio-device-refresh".into())
+            .spawn(move || {
+                let audio_system = AudioSystem::new();
+                let snapshot = AudioDeviceSnapshot {
+                    devices: audio_system.available_devices(),
+                    loopback_devices: audio_system.available_loopback_devices(),
+                };
+                let _ = tx.send(snapshot);
+                ctx.request_repaint();
+            });
+        if let Err(error) = spawn_result {
+            self.device_refresh_rx = None;
+            self.last_error = Some(format!("Could not refresh audio devices: {error}"));
+        }
+    }
+
+    fn poll_audio_device_refresh(&mut self) {
+        let Some(rx) = &self.device_refresh_rx else {
+            return;
+        };
+        match rx.try_recv() {
+            Ok(snapshot) => {
+                self.device_refresh_rx = None;
+                self.devices = snapshot.devices;
+                self.loopback_devices = snapshot.loopback_devices;
+                self.refresh_selected_input_config();
+                if !self.is_translating {
+                    self.reset_audio_levels();
+                }
+            }
+            Err(crossbeam_channel::TryRecvError::Empty) => {}
+            Err(crossbeam_channel::TryRecvError::Disconnected) => {
+                self.device_refresh_rx = None;
+                self.last_error = Some("Audio device refresh stopped unexpectedly".into());
+            }
+        }
+    }
+
     fn start_selected_capture(
         &mut self,
         routes: &[CaptureSource],
@@ -1258,41 +1345,19 @@ impl XRTranslateApp {
         Ok(())
     }
 
-    fn restart_level_preview(&mut self) {
-        if self.is_translating {
-            return;
-        }
-        self.audio_system.stop();
+    fn reset_audio_levels(&self) {
         self.input_level.store(0.0_f32.to_bits(), Ordering::Relaxed);
         self.loopback_level
             .store(0.0_f32.to_bits(), Ordering::Relaxed);
         self.microphone_vad_active.store(false, Ordering::Relaxed);
         self.loopback_vad_active.store(false, Ordering::Relaxed);
-
-        for source in self.capture_source.routes() {
-            let result = match source {
-                CaptureSource::Microphone => self
-                    .audio_system
-                    .start_level_preview(&self.selected_device_id, Arc::clone(&self.input_level)),
-                CaptureSource::SystemAudio => self.audio_system.start_loopback_level_preview(
-                    &self.selected_loopback_device_id,
-                    Arc::clone(&self.loopback_level),
-                ),
-                CaptureSource::Both => unreachable!("Both expands into individual routes"),
-            };
-            if let Err(error) = result {
-                self.audio_system.stop();
-                self.last_error = Some(format!("Audio level preview failed: {error}"));
-                return;
-            }
-        }
     }
 
     fn switch_capture_device(&mut self, source: CaptureSource, previous_device_id: String) {
         self.refresh_selected_input_config();
         self.save_settings();
         if !self.is_translating {
-            self.restart_level_preview();
+            self.reset_audio_levels();
             return;
         }
 
@@ -1334,7 +1399,7 @@ impl XRTranslateApp {
         self.refresh_selected_input_config();
         self.save_settings();
         if !self.is_translating {
-            self.restart_level_preview();
+            self.reset_audio_levels();
             return;
         }
         if self.capture_source.routes().len() != previous_source.routes().len() {
@@ -1503,7 +1568,7 @@ impl XRTranslateApp {
             state.connection_status = "Stopped".into();
             state.is_translating = false;
         }
-        self.restart_level_preview();
+        self.reset_audio_levels();
     }
 
     fn poll_session_events(&mut self) {
@@ -1587,12 +1652,15 @@ impl eframe::App for XRTranslateApp {
         self.model_task_manager.poll();
         self.runtime_installer.poll();
         self.app_update_manager.poll();
+        self.poll_audio_device_refresh();
         ui.ctx()
             .request_repaint_after(std::time::Duration::from_millis(100));
         if self.first_run {
             ui::render_onboarding_fullscreen(self, ui);
             return;
         }
+
+        self.show_available_update();
 
         self.poll_backend_startup(Some(ui.ctx().clone()));
         self.poll_session_events();
@@ -1678,6 +1746,9 @@ impl eframe::App for XRTranslateApp {
             });
 
         self.modal_dialog.render(ui.ctx(), self.ui_language);
+        if self.modal_dialog.take_action() == Some(ui::modal::ModalAction::DownloadUpdate) {
+            self.download_update();
+        }
     }
 }
 

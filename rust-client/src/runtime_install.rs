@@ -95,6 +95,7 @@ pub struct RuntimeInstaller {
     state: RuntimeInstallState,
     events: Option<Receiver<Event>>,
     selection: Option<RuntimeSelection>,
+    proxy_url: Option<String>,
 }
 
 impl Default for RuntimeInstaller {
@@ -103,11 +104,15 @@ impl Default for RuntimeInstaller {
             state: RuntimeInstallState::Idle,
             events: None,
             selection: None,
+            proxy_url: None,
         }
     }
 }
 
 impl RuntimeInstaller {
+    pub fn set_proxy_url(&mut self, proxy_url: &str) {
+        self.proxy_url = (!proxy_url.trim().is_empty()).then(|| proxy_url.trim().to_owned());
+    }
     #[must_use]
     pub fn state(&self) -> &RuntimeInstallState {
         &self.state
@@ -157,6 +162,7 @@ impl RuntimeInstaller {
                 .to_owned()
         })?;
         let (sender, receiver) = unbounded();
+        let proxy_url = self.proxy_url.clone();
         thread::Builder::new()
             .name("llama-cpp-installer".into())
             .spawn(move || {
@@ -165,7 +171,12 @@ impl RuntimeInstaller {
                     .build()
                     .map_err(|error| format!("Cannot create download runtime: {error}"))
                     .and_then(|runtime| {
-                        runtime.block_on(install(project_root, selection, sender.clone()))
+                        runtime.block_on(install(
+                            project_root,
+                            selection,
+                            sender.clone(),
+                            proxy_url.as_deref(),
+                        ))
                     });
                 let _ = sender.send(Event::Finished(result));
             })
@@ -245,6 +256,7 @@ async fn install(
     project_root: PathBuf,
     selection: RuntimeSelection,
     sender: crossbeam_channel::Sender<Event>,
+    proxy_url: Option<&str>,
 ) -> Result<PathBuf, String> {
     if !cfg!(target_os = "windows") || std::env::consts::ARCH != "x86_64" {
         return Err("Automatic llama.cpp installation currently supports Windows x64 only.".into());
@@ -264,8 +276,8 @@ async fn install(
         ));
     }
 
-    let client =
-        DownloadClient::new("XRTranslate runtime installer").map_err(|error| error.to_string())?;
+    let client = DownloadClient::with_proxy("XRTranslate runtime installer", proxy_url)
+        .map_err(|error| error.to_string())?;
     let release = load_runtime_config(&project_root)?.release;
     let runtime_root = project_root.join("runtime");
     let staging = runtime_root.join(format!(".llama.cpp-{release}-staging"));

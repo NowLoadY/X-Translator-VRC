@@ -3,7 +3,7 @@
     "provider": "qwen3-gguf",
     "providers": {
       "qwen3-gguf": {
-        "context_window_tokens": 2048,
+        "context_window_tokens": 3200,
         "max_tokens": 128,
         "model_asset": "qwen3-asr-gguf",
         "parallel_slots": 1,

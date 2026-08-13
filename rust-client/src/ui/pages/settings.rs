@@ -43,12 +43,10 @@ pub fn render(app: &mut crate::XRTranslateApp, ui: &mut egui::Ui) {
     ];
 
     ui.horizontal_top(|ui| {
-        // 1. Modular Reusable Secondary Left Sub-Sidebar (Section Navigation)
         sub_sidebar(ui, &mut app.settings_section, &nav_items, app.ui_language);
 
         ui.add_space(12.0);
 
-        // 2. Section Content View Area (Vertical Column)
         ui.vertical(|ui| {
             ui.set_min_width(ui.available_width());
             egui::ScrollArea::vertical()
@@ -94,6 +92,35 @@ fn render_general_appearance_section(app: &mut crate::XRTranslateApp, ui: &mut e
         if components::language_selector(ui, "settings_ui_language", &mut app.ui_language) {
             app.set_ui_language(app.ui_language);
         }
+    });
+    ui.add_space(14.0);
+
+    section(ui, crate::i18n::tr(app.ui_language, "Downloads"), |ui| {
+        ui.label(
+            egui::RichText::new(crate::i18n::tr(app.ui_language, "Download proxy"))
+                .color(crate::ui::theme::text_strong())
+                .strong(),
+        );
+        let response = ui.add(
+            egui::TextEdit::singleline(&mut app.download_proxy_url)
+                .hint_text(crate::i18n::tr(
+                    app.ui_language,
+                    "Optional, e.g. http://127.0.0.1:7890",
+                ))
+                .desired_width(300.0),
+        );
+        if response.lost_focus() && response.changed() {
+            app.set_download_proxy_url(app.download_proxy_url.clone());
+        }
+        ui.add_space(4.0);
+        ui.label(
+            egui::RichText::new(crate::i18n::tr(
+                app.ui_language,
+                "Used only for updates and downloads. Leave empty when your VPN uses global mode.",
+            ))
+            .size(12.0)
+            .color(crate::ui::theme::text_weak()),
+        );
     });
     ui.add_space(14.0);
 

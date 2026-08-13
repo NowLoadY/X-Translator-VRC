@@ -5,6 +5,10 @@
 <h1 align="center">XRTranslate</h1>
 
 <p align="center">
+  <a href="https://github.com/NowLoadY/XRTranslate/releases/latest">Download the latest release</a>
+</p>
+
+<p align="center">
   <strong>Real-Time Subtitles & Bidirectional Voice Translation for VRChat</strong>
 </p>
 
@@ -13,11 +17,43 @@
 </p>
 
 <p align="center">
+  <a href="#interface-preview">Interface Preview</a> •
   <a href="#user-guide">User Guide</a> •
   <a href="#common-locations">Common Locations</a> •
   <a href="#citation">Citation</a> •
   <a href="#acknowledgements">Acknowledgements</a>
 </p>
+
+<p align="center">
+  <img src="assets/preview-Translation.png" alt="XRTranslate translation screen" width="900" />
+</p>
+
+<p align="center">
+  Select your languages and microphone, then start real-time translation with one click.
+</p>
+
+---
+
+## Interface Preview
+
+The welcome page walks through the initial setup and remains available from the sidebar.
+
+<p align="center">
+  <img src="assets/preview-Welcome-1.png" alt="XRTranslate welcome page" width="760" />
+</p>
+
+OSC subtitles can keep messages separate or arrange them together.
+
+<table>
+  <tr>
+    <td width="50%" align="center"><img src="assets/preview-OSC-Bilingual-Separate.png" alt="OSC subtitles shown separately" /></td>
+    <td width="50%" align="center"><img src="assets/preview-OSC-Bilingual-Merge.png" alt="OSC subtitles merged" /></td>
+  </tr>
+  <tr>
+    <td align="center"><sub>Separate</sub></td>
+    <td align="center"><sub>Merge</sub></td>
+  </tr>
+</table>
 
 ---
 

@@ -5,7 +5,6 @@ use crate::ui::components::card;
 use eframe::egui;
 
 pub fn render(app: &mut crate::XRTranslateApp, ui: &mut egui::Ui) {
-    // Header Title
     ui.label(
         egui::RichText::new(crate::i18n::tr(app.ui_language, "VRChat OSC Studio"))
             .size(22.0)
@@ -25,11 +24,9 @@ pub fn render(app: &mut crate::XRTranslateApp, ui: &mut egui::Ui) {
         ui.add_space(10.0);
     }
 
-    // Modular Document Toolbar
     toolbar::render_toolbar(app, ui);
 
     ui.add_space(12.0);
 
-    // Modular Chatbox Canvas Simulator (Centered, Title-free)
     canvas::render_canvas(app, ui);
 }

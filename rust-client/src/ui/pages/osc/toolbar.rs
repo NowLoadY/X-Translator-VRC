@@ -13,7 +13,6 @@ pub fn render_toolbar(app: &mut crate::XRTranslateApp, ui: &mut egui::Ui) {
             app.ui_language,
             |ui| {
                 ui.vertical(|ui| {
-                    // Row 1: OSC Enable Switch on Left, Clear Action on Right
                     ui.horizontal(|ui| {
                         if components::feature_checkbox(
                             ui,
@@ -55,10 +54,9 @@ pub fn render_toolbar(app: &mut crate::XRTranslateApp, ui: &mut egui::Ui) {
                     }
 
                     ui.add_space(8.0);
-                    components::wavy_divider(ui, egui::Color32::from_rgb(230, 235, 246));
+                    components::wavy_divider(ui, egui::Color32::from_rgb(226, 232, 240));
                     ui.add_space(8.0);
 
-                    // Row 2: Text Format Selector & Speaker Number Toggle
                     ui.horizontal_wrapped(|ui| {
                         ui.allocate_ui_with_layout(
                             egui::vec2(100.0, 20.0),
@@ -166,7 +164,6 @@ pub fn render_toolbar(app: &mut crate::XRTranslateApp, ui: &mut egui::Ui) {
                     });
                     ui.add_space(8.0);
 
-                    // Row 3: Header Content Selector
                     if render_banner_selector(
                         ui,
                         crate::i18n::tr(app.ui_language, "Header:"),
@@ -179,7 +176,6 @@ pub fn render_toolbar(app: &mut crate::XRTranslateApp, ui: &mut egui::Ui) {
 
                     ui.add_space(8.0);
 
-                    // Row 4: Footer Content Selector
                     if render_banner_selector(
                         ui,
                         crate::i18n::tr(app.ui_language, "Footer:"),
@@ -192,7 +188,6 @@ pub fn render_toolbar(app: &mut crate::XRTranslateApp, ui: &mut egui::Ui) {
 
                     ui.add_space(8.0);
 
-                    // Row 5: Message TTL Slider (10s ~ 20s)
                     if components::modern_slider_f64(
                         ui,
                         &mut app.osc_draft.history_ttl_seconds,

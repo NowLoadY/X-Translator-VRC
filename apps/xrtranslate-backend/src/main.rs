@@ -112,6 +112,7 @@ struct UtteranceJob {
     revisable: bool,
     generation: PipelineGeneration,
     turn_id: String,
+    topic_turn_id: String,
     source_language: String,
     target_language: String,
 }
@@ -886,16 +887,21 @@ fn enqueue_utterances(
         let PipelineEvent::Utterance(timed) = event else {
             unreachable!()
         };
-        let turn_id = format!("{turn_id_prefix}:utterance-{next_utterance_sequence}");
-        *next_utterance_sequence = (*next_utterance_sequence)
-            .checked_add(1)
-            .ok_or_else(|| "utterance identity counter exhausted".to_owned())?;
         let TimedUtterance {
             utterance,
             source_start_ms,
             source_end_ms,
             revisable,
+            topic_turn_sequence,
         } = timed;
+        let turn_id = format!("{turn_id_prefix}:utterance-{next_utterance_sequence}");
+        *next_utterance_sequence = (*next_utterance_sequence)
+            .checked_add(1)
+            .ok_or_else(|| "utterance identity counter exhausted".to_owned())?;
+        let topic_turn_id = topic_turn_sequence.map_or_else(
+            || turn_id.clone(),
+            |sequence| format!("{turn_id_prefix}:generation-{generation:?}:speech-{sequence}"),
+        );
         let duration_ms = utterance.samples.len().saturating_mul(1_000) / SAMPLE_RATE_HZ as usize;
         let queued = INFERENCE_QUEUE_CAPACITY.saturating_sub(sender.capacity());
         info!(
@@ -913,6 +919,7 @@ fn enqueue_utterances(
                 revisable,
                 generation,
                 turn_id,
+                topic_turn_id,
                 source_language: source_language.clone(),
                 target_language: target_language.clone(),
             }))
@@ -1123,6 +1130,7 @@ async fn run_inference_worker(
         let translation_context = match corpus_session
             .prepare_translation(&PrepareTranslationRequest {
                 asr_context_id: asr_context.context_id,
+                turn_id: Some(job.topic_turn_id.clone()),
                 source_language: recognized.source_language.clone(),
                 target_language: recognized.target_language.clone(),
                 recognized_text: recognized.source_text.clone(),

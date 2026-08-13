@@ -1,5 +1,4 @@
 use std::sync::Arc;
-use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::Duration;
 
 #[derive(Clone, Debug)]
@@ -38,18 +37,24 @@ impl SystemMonitor {
         std::thread::Builder::new()
             .name("sys-monitor".into())
             .spawn(move || {
+                let mut cpu_sampler = CpuUsageSampler::new();
+                let mut gpu_sampler = GpuUsageSampler::new();
                 loop {
                     let now_str = get_formatted_time();
-                    let cpu_usage = sample_cpu_usage();
-                    let gpu_usage = sample_gpu_usage();
+                    let cpu_usage = cpu_sampler.sample();
+                    let gpu_usage = gpu_sampler.as_mut().and_then(GpuUsageSampler::sample);
 
                     {
                         let mut guard = metrics_clone.lock();
                         guard.time_str = now_str;
-                        guard.cpu_usage = cpu_usage;
                         guard.cpu_name = cpu_name.clone();
-                        guard.gpu_usage = gpu_usage;
                         guard.gpu_name = gpu_name.clone();
+                        if let Some(cpu_usage) = cpu_usage {
+                            guard.cpu_usage = cpu_usage;
+                        }
+                        if let Some(gpu_usage) = gpu_usage {
+                            guard.gpu_usage = gpu_usage;
+                        }
                     }
 
                     std::thread::sleep(Duration::from_millis(1000));
@@ -102,60 +107,200 @@ fn get_formatted_time() -> String {
     }
 }
 
-fn sample_cpu_usage() -> u32 {
+#[cfg(target_os = "windows")]
+type SystemTimes = (u64, u64, u64);
+
+struct CpuUsageSampler {
     #[cfg(target_os = "windows")]
-    unsafe {
-        #[repr(C)]
-        struct FileTime {
-            dw_low_datetime: u32,
-            dw_high_datetime: u32,
-        }
-        unsafe extern "system" {
-            fn GetSystemTimes(
-                lpIdleTime: *mut FileTime,
-                lpKernelTime: *mut FileTime,
-                lpUserTime: *mut FileTime,
-            ) -> i32;
-        }
-
-        static LAST_IDLE: AtomicU64 = AtomicU64::new(0);
-        static LAST_KERNEL: AtomicU64 = AtomicU64::new(0);
-        static LAST_USER: AtomicU64 = AtomicU64::new(0);
-
-        fn filetime_to_u64(ft: FileTime) -> u64 {
-            ((ft.dw_high_datetime as u64) << 32) | (ft.dw_low_datetime as u64)
-        }
-
-        let mut idle = std::mem::zeroed::<FileTime>();
-        let mut kernel = std::mem::zeroed::<FileTime>();
-        let mut user = std::mem::zeroed::<FileTime>();
-
-        if GetSystemTimes(&mut idle, &mut kernel, &mut user) != 0 {
-            let idle_u64 = filetime_to_u64(idle);
-            let kernel_u64 = filetime_to_u64(kernel);
-            let user_u64 = filetime_to_u64(user);
-
-            let prev_idle = LAST_IDLE.swap(idle_u64, Ordering::Relaxed);
-            let prev_kernel = LAST_KERNEL.swap(kernel_u64, Ordering::Relaxed);
-            let prev_user = LAST_USER.swap(user_u64, Ordering::Relaxed);
-
-            let idle_diff = idle_u64.saturating_sub(prev_idle);
-            let kernel_diff = kernel_u64.saturating_sub(prev_kernel);
-            let user_diff = user_u64.saturating_sub(prev_user);
-
-            let total_diff = kernel_diff.saturating_add(user_diff);
-            if total_diff > 0 {
-                let busy_diff = total_diff.saturating_sub(idle_diff);
-                let pct = ((busy_diff as f64 / total_diff as f64) * 100.0).round() as u32;
-                return pct.min(100);
-            }
-        }
-    }
-    18
+    previous: Option<SystemTimes>,
 }
 
-fn sample_gpu_usage() -> u32 {
-    24
+impl CpuUsageSampler {
+    fn new() -> Self {
+        Self {
+            #[cfg(target_os = "windows")]
+            previous: read_system_times(),
+        }
+    }
+
+    fn sample(&mut self) -> Option<u32> {
+        #[cfg(target_os = "windows")]
+        {
+            let current = read_system_times()?;
+            let previous = self.previous.replace(current)?;
+            let idle = current.0.saturating_sub(previous.0);
+            let kernel = current.1.saturating_sub(previous.1);
+            let user = current.2.saturating_sub(previous.2);
+            let total = kernel.saturating_add(user);
+            if total == 0 {
+                return None;
+            }
+            let busy = total.saturating_sub(idle);
+            return Some(((busy as f64 * 100.0 / total as f64).round() as u32).min(100));
+        }
+        #[cfg(not(target_os = "windows"))]
+        None
+    }
+}
+
+#[cfg(target_os = "windows")]
+fn read_system_times() -> Option<SystemTimes> {
+    use windows_sys::Win32::Foundation::FILETIME;
+    use windows_sys::Win32::System::Threading::GetSystemTimes;
+
+    fn as_u64(value: FILETIME) -> u64 {
+        ((value.dwHighDateTime as u64) << 32) | value.dwLowDateTime as u64
+    }
+
+    unsafe {
+        let mut idle = std::mem::zeroed();
+        let mut kernel = std::mem::zeroed();
+        let mut user = std::mem::zeroed();
+        (GetSystemTimes(&mut idle, &mut kernel, &mut user) != 0)
+            .then(|| (as_u64(idle), as_u64(kernel), as_u64(user)))
+    }
+}
+
+#[cfg(target_os = "windows")]
+struct GpuUsageSampler {
+    query: windows_sys::Win32::System::Performance::PDH_HQUERY,
+    counter: windows_sys::Win32::System::Performance::PDH_HCOUNTER,
+}
+
+#[cfg(target_os = "windows")]
+impl GpuUsageSampler {
+    fn new() -> Option<Self> {
+        use windows_sys::Win32::System::Performance::{
+            PDH_HCOUNTER, PDH_HQUERY, PdhAddEnglishCounterW, PdhCloseQuery, PdhCollectQueryData,
+            PdhOpenQueryW,
+        };
+
+        unsafe {
+            let mut query: PDH_HQUERY = std::ptr::null_mut();
+            if PdhOpenQueryW(std::ptr::null(), 0, &mut query) != 0 {
+                return None;
+            }
+            let path = "\\GPU Engine(*)\\Utilization Percentage\0"
+                .encode_utf16()
+                .collect::<Vec<_>>();
+            let mut counter: PDH_HCOUNTER = std::ptr::null_mut();
+            if PdhAddEnglishCounterW(query, path.as_ptr(), 0, &mut counter) != 0 {
+                PdhCloseQuery(query);
+                return None;
+            }
+            if PdhCollectQueryData(query) != 0 {
+                PdhCloseQuery(query);
+                return None;
+            }
+            Some(Self { query, counter })
+        }
+    }
+
+    fn sample(&mut self) -> Option<u32> {
+        use std::collections::HashMap;
+        use windows_sys::Win32::System::Performance::{
+            PDH_CSTATUS_NEW_DATA, PDH_CSTATUS_VALID_DATA, PDH_FMT_COUNTERVALUE_ITEM_W,
+            PDH_FMT_DOUBLE, PDH_MORE_DATA, PdhCollectQueryData, PdhGetFormattedCounterArrayW,
+        };
+
+        unsafe {
+            if PdhCollectQueryData(self.query) != 0 {
+                return None;
+            }
+            let mut byte_count = 0;
+            let mut item_count = 0;
+            let status = PdhGetFormattedCounterArrayW(
+                self.counter,
+                PDH_FMT_DOUBLE,
+                &mut byte_count,
+                &mut item_count,
+                std::ptr::null_mut(),
+            );
+            if status != PDH_MORE_DATA || byte_count == 0 || item_count == 0 {
+                return None;
+            }
+
+            let word_size = std::mem::size_of::<usize>();
+            let mut buffer = vec![0usize; (byte_count as usize).div_ceil(word_size)];
+            let items = buffer.as_mut_ptr().cast::<PDH_FMT_COUNTERVALUE_ITEM_W>();
+            if PdhGetFormattedCounterArrayW(
+                self.counter,
+                PDH_FMT_DOUBLE,
+                &mut byte_count,
+                &mut item_count,
+                items,
+            ) != 0
+            {
+                return None;
+            }
+
+            let mut engines = HashMap::<String, f64>::new();
+            for item in std::slice::from_raw_parts(items, item_count as usize) {
+                if !matches!(
+                    item.FmtValue.CStatus,
+                    PDH_CSTATUS_VALID_DATA | PDH_CSTATUS_NEW_DATA
+                ) {
+                    continue;
+                }
+                let name = wide_ptr_to_string(item.szName);
+                let Some(engine) = gpu_engine_key(&name) else {
+                    continue;
+                };
+                let usage = item.FmtValue.Anonymous.doubleValue;
+                if usage.is_finite() && usage >= 0.0 {
+                    *engines.entry(engine).or_default() += usage;
+                }
+            }
+            let usage = engines.values().copied().fold(0.0_f64, f64::max);
+            Some(usage.round().clamp(0.0, 100.0) as u32)
+        }
+    }
+}
+
+#[cfg(target_os = "windows")]
+impl Drop for GpuUsageSampler {
+    fn drop(&mut self) {
+        unsafe {
+            windows_sys::Win32::System::Performance::PdhCloseQuery(self.query);
+        }
+    }
+}
+
+#[cfg(target_os = "windows")]
+unsafe fn wide_ptr_to_string(value: *const u16) -> String {
+    if value.is_null() {
+        return String::new();
+    }
+    let mut length = 0;
+    unsafe {
+        while *value.add(length) != 0 {
+            length += 1;
+        }
+        String::from_utf16_lossy(std::slice::from_raw_parts(value, length))
+    }
+}
+
+#[cfg(target_os = "windows")]
+fn gpu_engine_key(instance: &str) -> Option<String> {
+    let lower = instance.to_ascii_lowercase();
+    let luid = lower.find("luid_")?;
+    let engine = lower.find("_eng_")?;
+    let engine_type = lower.find("_engtype_").unwrap_or(lower.len());
+    (luid < engine && engine < engine_type).then(|| lower[luid..engine_type].to_owned())
+}
+
+#[cfg(not(target_os = "windows"))]
+struct GpuUsageSampler;
+
+#[cfg(not(target_os = "windows"))]
+impl GpuUsageSampler {
+    fn new() -> Option<Self> {
+        None
+    }
+
+    fn sample(&mut self) -> Option<u32> {
+        None
+    }
 }
 
 fn detect_cpu_name() -> String {
@@ -237,5 +382,19 @@ fn clean_hardware_name(raw: &str) -> String {
             .replace("AMD Radeon ", "")
     } else {
         cleaned
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    #[cfg(target_os = "windows")]
+    #[test]
+    fn gpu_engine_instances_from_different_processes_share_an_engine_key() {
+        let first = "pid_120_luid_0x00000000_0x0000A123_phys_0_eng_2_engtype_Compute_0";
+        let second = "pid_456_luid_0x00000000_0x0000A123_phys_0_eng_2_engtype_Compute_0";
+        let other = "pid_456_luid_0x00000000_0x0000A123_phys_0_eng_3_engtype_Copy";
+
+        assert_eq!(super::gpu_engine_key(first), super::gpu_engine_key(second));
+        assert_ne!(super::gpu_engine_key(first), super::gpu_engine_key(other));
     }
 }

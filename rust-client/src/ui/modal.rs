@@ -32,6 +32,13 @@ pub struct ModalDialog {
     pub ok_label: String,
     pub show_cancel_button: bool,
     pub cancel_label: String,
+    action: Option<ModalAction>,
+    ok_action: Option<ModalAction>,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum ModalAction {
+    DownloadUpdate,
 }
 
 impl Default for ModalDialog {
@@ -44,11 +51,38 @@ impl Default for ModalDialog {
             ok_label: "OK".into(),
             show_cancel_button: false,
             cancel_label: "Cancel".into(),
+            action: None,
+            ok_action: None,
         }
     }
 }
 
 impl ModalDialog {
+    pub fn update_available(version: &str, language: crate::i18n::UiLanguage) -> Self {
+        Self {
+            open: true,
+            pages: vec![ModalPage::new(
+                crate::i18n::tr(language, "Update available"),
+                format!(
+                    "{} v{}",
+                    crate::i18n::tr(language, "A new version is available:"),
+                    version
+                ),
+            )],
+            current_page: 0,
+            show_ok_button: true,
+            ok_label: crate::i18n::tr(language, "Update").into(),
+            show_cancel_button: true,
+            cancel_label: crate::i18n::tr(language, "Later").into(),
+            action: None,
+            ok_action: Some(ModalAction::DownloadUpdate),
+        }
+    }
+
+    pub fn take_action(&mut self) -> Option<ModalAction> {
+        self.action.take()
+    }
+
     pub fn error(
         title: impl Into<String>,
         message: impl Into<String>,
@@ -70,6 +104,8 @@ impl ModalDialog {
             ok_label: "OK".into(),
             show_cancel_button: false,
             cancel_label: "Close".into(),
+            action: None,
+            ok_action: None,
         }
     }
 
@@ -82,6 +118,8 @@ impl ModalDialog {
             ok_label: "Finish".into(),
             show_cancel_button: false,
             cancel_label: "Close".into(),
+            action: None,
+            ok_action: None,
         }
     }
 
@@ -97,7 +135,6 @@ impl ModalDialog {
             0.20,
         );
 
-        // 1. Fullscreen Dimming Backdrop (Captures clicks behind modal)
         let backdrop_response = egui::Area::new(egui::Id::new("modal_backdrop"))
             .interactable(true)
             .order(egui::Order::Middle)
@@ -126,7 +163,6 @@ impl ModalDialog {
         let total_pages = self.pages.len();
         let is_multi_page = total_pages > 1;
 
-        // 2. Centered Floating Window
         egui::Window::new("modal_dialog_window")
             .title_bar(false)
             .resizable(false)
@@ -137,12 +173,11 @@ impl ModalDialog {
                 Frame::new()
                     .fill(Color32::WHITE)
                     .corner_radius(CornerRadius::same(20))
-                    .stroke(Stroke::new(1.0, Color32::from_rgb(230, 235, 246)))
+                    .stroke(Stroke::new(1.0, Color32::from_rgb(226, 232, 240)))
                     .inner_margin(Margin::same(20)),
             )
             .show(ctx, |ui| {
                 ui.vertical(|ui| {
-                    // Header Bar
                     ui.horizontal(|ui| {
                         ui.label(
                             RichText::new(&page.title)
@@ -170,7 +205,6 @@ impl ModalDialog {
                     ui.separator();
                     ui.add_space(10.0);
 
-                    // Body Content Area
                     let body_height = if is_multi_page { 220.0 } else { 240.0 };
                     egui::ScrollArea::vertical()
                         .id_salt("modal_body_scroll")
@@ -178,19 +212,15 @@ impl ModalDialog {
                         .show(ui, |ui| {
                             ui.set_width(ui.available_width());
                             if page.is_code {
-                                Frame::new()
-                                    .fill(Color32::from_rgb(24, 26, 38))
-                                    .corner_radius(CornerRadius::same(12))
-                                    .inner_margin(Margin::same(12))
-                                    .show(ui, |ui| {
-                                        ui.set_width(ui.available_width());
-                                        ui.label(
-                                            RichText::new(&page.content)
-                                                .family(egui::FontFamily::Monospace)
-                                                .color(Color32::from_rgb(240, 244, 255))
-                                                .size(12.0),
-                                        );
-                                    });
+                                crate::ui::components::dark_container_frame(ui, |ui| {
+                                    ui.set_width(ui.available_width());
+                                    ui.label(
+                                        RichText::new(&page.content)
+                                            .family(egui::FontFamily::Monospace)
+                                            .color(Color32::from_rgb(240, 244, 255))
+                                            .size(12.0),
+                                    );
+                                });
 
                                 ui.add_space(6.0);
                                 ui.horizontal(|ui| {
@@ -216,7 +246,6 @@ impl ModalDialog {
                     ui.separator();
                     ui.add_space(8.0);
 
-                    // Footer / Controls
                     ui.horizontal(|ui| {
                         if is_multi_page {
                             ui.label(
@@ -263,6 +292,7 @@ impl ModalDialog {
                                         &self.ok_label
                                     };
                                 if crate::ui::components::primary_button(ui, ok_text).clicked() {
+                                    self.action = self.ok_action;
                                     close_dialog = true;
                                 }
                             }

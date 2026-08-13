@@ -39,7 +39,6 @@ pub fn render_onboarding_fullscreen(app: &mut crate::XRTranslateApp, ui: &mut eg
     let requirement = onboarding_requirement(app);
     let can_advance = requirement.is_none();
 
-    // Pinned Bottom Action Bar
     egui::Panel::bottom("onboarding_bottom_nav")
         .frame(
             Frame::new()
@@ -89,7 +88,6 @@ pub fn render_onboarding_fullscreen(app: &mut crate::XRTranslateApp, ui: &mut eg
             });
         });
 
-    // Central Panel filling remaining vertical area cleanly
     egui::CentralPanel::default()
         .frame(
             Frame::new()
@@ -98,7 +96,6 @@ pub fn render_onboarding_fullscreen(app: &mut crate::XRTranslateApp, ui: &mut eg
         )
         .show(ui, |ui| {
             ui.vertical(|ui| {
-                // Top Header
                 ui.horizontal(|ui| {
                     ui.vertical(|ui| {
                         ui.label(
@@ -144,12 +141,10 @@ pub fn render_onboarding_fullscreen(app: &mut crate::XRTranslateApp, ui: &mut eg
 
                 ui.add_space(14.0);
 
-                // Steps Row (compact horizontal pill indicator)
                 render_onboarding_steps(ui, app.ui_language, app.onboarding_page, &STEPS);
 
                 ui.add_space(14.0);
 
-                // Middle Content Card
                 Frame::new()
                     .fill(Color32::WHITE)
                     .corner_radius(CornerRadius::same(20))
@@ -216,28 +211,36 @@ fn render_onboarding_steps(
             let active = index == active_step;
             let complete = index < active_step;
             let (fill, text) = if active {
-                (Color32::from_rgb(37, 99, 235), Color32::WHITE)
+                (Color32::from_rgb(59, 130, 246), Color32::WHITE)
             } else if complete {
                 (
-                    Color32::from_rgb(219, 234, 254),
-                    Color32::from_rgb(29, 78, 216),
+                    Color32::from_rgb(239, 246, 255),
+                    Color32::from_rgb(37, 99, 235),
                 )
             } else {
                 (
-                    Color32::from_rgb(241, 245, 249),
-                    Color32::from_rgb(100, 116, 139),
+                    Color32::from_rgb(245, 248, 252),
+                    Color32::from_rgb(148, 163, 184),
                 )
             };
 
+            let check_mark = if complete { "✓ " } else { "" };
+
             Frame::new()
                 .fill(fill)
-                .corner_radius(CornerRadius::same(10))
+                .stroke(Stroke::NONE)
+                .corner_radius(CornerRadius::same(14))
                 .inner_margin(Margin::symmetric(14, 7))
                 .show(ui, |ui| {
                     ui.label(
                         RichText::new(format!(
-                            "{}  {}",
-                            index + 1,
+                            "{}{}{}",
+                            check_mark,
+                            if !complete {
+                                format!("{}  ", index + 1)
+                            } else {
+                                "".to_string()
+                            },
                             crate::i18n::tr(language, step)
                         ))
                         .size(12.5)
@@ -249,9 +252,9 @@ fn render_onboarding_steps(
             if index + 1 < steps.len() {
                 ui.add_space(2.0);
                 ui.label(
-                    RichText::new("—")
-                        .size(13.0)
-                        .color(Color32::from_rgb(203, 213, 225)),
+                    RichText::new("›")
+                        .size(14.0)
+                        .color(Color32::from_rgb(203, 218, 235)),
                 );
                 ui.add_space(2.0);
             }
@@ -916,7 +919,6 @@ pub fn render_sidebar(
 
         ui.add_space(16.0);
 
-        // Animated Navigation Items
         nav_item_animated(
             ui,
             navigation,
@@ -948,7 +950,6 @@ pub fn render_sidebar(
         components::wavy_divider_black_shadow(ui);
         ui.add_space(12.0);
 
-        // Animated User Guide Button
         guide_button_animated(
             ui,
             modal_dialog,
@@ -980,15 +981,25 @@ fn sidebar_text_button(
     expand_factor: f32,
 ) -> bool {
     let id = ui.make_persistent_id(id_source);
-    let hovered = ui.memory(|memory| memory.data.get_temp::<bool>(id).unwrap_or(false));
+    let hovered = ui.memory(|memory| memory.data.get_temp::<bool>(id.with("hover_state")).unwrap_or(false));
+    let active = ui.memory(|memory| memory.data.get_temp::<bool>(id.with("active_state")).unwrap_or(false));
+
     let hover = animation::AnimationSystem::animate_bool(ui.ctx(), id.with("hover"), hovered, 0.15);
-    let response = Frame::new()
-        .fill(animation::AnimationSystem::lerp_color(
+    let active_factor = animation::AnimationSystem::animate_bool(ui.ctx(), id.with("active"), active, 0.08);
+
+    let bg_fill = animation::AnimationSystem::lerp_color(
+        animation::AnimationSystem::lerp_color(
             Color32::TRANSPARENT,
-            Color32::from_rgb(241, 245, 249),
+            Color32::from_rgb(238, 244, 253),
             hover,
-        ))
-        .corner_radius(CornerRadius::same(14))
+        ),
+        Color32::from_rgb(229, 239, 255),
+        active_factor,
+    );
+
+    let response = Frame::new()
+        .fill(bg_fill)
+        .corner_radius(CornerRadius::same(16))
         .inner_margin(Margin::symmetric(
             (12.0 * expand_factor + 8.0 * (1.0 - expand_factor)).round() as i8,
             8,
@@ -1021,7 +1032,13 @@ fn sidebar_text_button(
             .clone()
             .on_hover_text(crate::i18n::tr(language, label));
     }
-    ui.memory_mut(|memory| memory.data.insert_temp(id, response.hovered()));
+    ui.memory_mut(|memory| {
+        memory.data.insert_temp(id.with("hover_state"), response.hovered());
+        memory.data.insert_temp(id.with("active_state"), response.is_pointer_button_down_on());
+    });
+    if response.hovered() {
+        ui.ctx().set_cursor_icon(egui::CursorIcon::PointingHand);
+    }
     response.clicked()
 }
 
@@ -1053,7 +1070,8 @@ fn nav_item_animated(
     let is_selected = navigation.page == page;
     let id = ui.make_persistent_id(label);
 
-    let is_hovered = ui.memory(|m| m.data.get_temp::<bool>(id).unwrap_or(false));
+    let is_hovered = ui.memory(|m| m.data.get_temp::<bool>(id.with("hover_state")).unwrap_or(false));
+    let is_active = ui.memory(|m| m.data.get_temp::<bool>(id.with("active_state")).unwrap_or(false));
 
     let hover_factor = animation::AnimationSystem::animate_bool(
         ui.ctx(),
@@ -1061,15 +1079,27 @@ fn nav_item_animated(
         is_hovered && !is_selected,
         0.15,
     );
+    let active_factor = animation::AnimationSystem::animate_bool(
+        ui.ctx(),
+        id.with("active"),
+        is_active && !is_selected,
+        0.08,
+    );
     let select_factor =
         animation::AnimationSystem::animate_bool(ui.ctx(), id.with("select"), is_selected, 0.20);
 
+    let base_hover = animation::AnimationSystem::lerp_color(
+        Color32::TRANSPARENT,
+        Color32::from_rgb(238, 244, 253),
+        hover_factor,
+    );
+    let base_active = animation::AnimationSystem::lerp_color(
+        base_hover,
+        Color32::from_rgb(229, 239, 255),
+        active_factor,
+    );
     let bg_fill = animation::AnimationSystem::lerp_color(
-        animation::AnimationSystem::lerp_color(
-            Color32::TRANSPARENT,
-            Color32::from_rgb(241, 245, 249),
-            hover_factor,
-        ),
+        base_active,
         Color32::from_rgb(239, 246, 255),
         select_factor,
     );
@@ -1080,25 +1110,33 @@ fn nav_item_animated(
         select_factor,
     );
 
-    let border_color = animation::AnimationSystem::lerp_color(
-        Color32::TRANSPARENT,
-        Color32::from_rgb(219, 234, 254),
-        select_factor,
-    );
-
     let inner_padding_x = (12.0 * expand_factor + 8.0 * (1.0 - expand_factor)).round();
 
     let frame_response = Frame::new()
         .fill(bg_fill)
-        .corner_radius(CornerRadius::same(14))
+        .corner_radius(CornerRadius::same(16))
         .inner_margin(Margin::symmetric(inner_padding_x as i8, 9))
-        .stroke(Stroke::new(1.0, border_color))
+        .stroke(Stroke::NONE)
         .show(ui, |ui| {
             ui.set_width(ui.available_width());
             ui.horizontal(|ui| {
                 if expand_factor < 0.2 {
                     let indent = ((ui.available_width() - 16.0) / 2.0).max(0.0);
                     ui.add_space(indent);
+                }
+
+                if select_factor > 0.05 && expand_factor > 0.2 {
+                    let (bar_rect, _) =
+                        ui.allocate_exact_size(egui::vec2(3.0, 14.0), egui::Sense::hover());
+                    let bar_color = Color32::from_rgba_premultiplied(
+                        37,
+                        99,
+                        235,
+                        (255.0 * select_factor) as u8,
+                    );
+                    ui.painter()
+                        .rect_filled(bar_rect, CornerRadius::same(2), bar_color);
+                    ui.add_space(3.0);
                 }
 
                 ui.add(
@@ -1128,7 +1166,10 @@ fn nav_item_animated(
         response.clone().on_hover_text(label);
     }
 
-    ui.memory_mut(|m| m.data.insert_temp(id, response.hovered()));
+    ui.memory_mut(|m| {
+        m.data.insert_temp(id.with("hover_state"), response.hovered());
+        m.data.insert_temp(id.with("active_state"), response.is_pointer_button_down_on());
+    });
 
     if response.clicked() {
         navigation.page = page;
@@ -1147,25 +1188,38 @@ fn guide_button_animated(
     expand_factor: f32,
 ) {
     let guide_id = ui.make_persistent_id("sidebar_guide_btn");
-    let is_hovered = ui.memory(|m| m.data.get_temp::<bool>(guide_id).unwrap_or(false));
+    let is_hovered = ui.memory(|m| m.data.get_temp::<bool>(guide_id.with("hover_state")).unwrap_or(false));
+    let is_active = ui.memory(|m| m.data.get_temp::<bool>(guide_id.with("active_state")).unwrap_or(false));
+
     let hover_factor = animation::AnimationSystem::animate_bool(
         ui.ctx(),
         guide_id.with("hover"),
         is_hovered,
         0.15,
     );
+    let active_factor = animation::AnimationSystem::animate_bool(
+        ui.ctx(),
+        guide_id.with("active"),
+        is_active,
+        0.08,
+    );
 
-    let bg_fill = animation::AnimationSystem::lerp_color(
+    let base_hover = animation::AnimationSystem::lerp_color(
         Color32::TRANSPARENT,
-        Color32::from_rgb(241, 245, 249),
+        Color32::from_rgb(238, 244, 253),
         hover_factor,
+    );
+    let bg_fill = animation::AnimationSystem::lerp_color(
+        base_hover,
+        Color32::from_rgb(229, 239, 255),
+        active_factor,
     );
 
     let inner_padding_x = (12.0 * expand_factor + 8.0 * (1.0 - expand_factor)).round();
 
     let frame_response = Frame::new()
         .fill(bg_fill)
-        .corner_radius(CornerRadius::same(8))
+        .corner_radius(CornerRadius::same(16))
         .inner_margin(Margin::symmetric(inner_padding_x as i8, 8))
         .show(ui, |ui| {
             ui.set_width(ui.available_width());
@@ -1203,7 +1257,14 @@ fn guide_button_animated(
             .on_hover_text(crate::i18n::tr(language, "User Guide"));
     }
 
-    ui.memory_mut(|m| m.data.insert_temp(guide_id, response.hovered()));
+    ui.memory_mut(|m| {
+        m.data.insert_temp(guide_id.with("hover_state"), response.hovered());
+        m.data.insert_temp(guide_id.with("active_state"), response.is_pointer_button_down_on());
+    });
+
+    if response.hovered() {
+        ui.ctx().set_cursor_icon(egui::CursorIcon::PointingHand);
+    }
 
     if response.clicked() {
         open_guide_modal(modal_dialog, language);

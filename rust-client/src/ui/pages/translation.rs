@@ -1,9 +1,8 @@
-use crate::ui::components::{self, danger_button, primary_button, section, status_badge};
+use crate::ui::components::{self, danger_button, section, status_badge};
 use crate::{CaptureSource, LANGUAGE_OPTIONS, language_label, route_label};
 use eframe::egui;
 
 pub fn render(app: &mut crate::XRTranslateApp, ui: &mut egui::Ui) {
-    // Header
     ui.horizontal(|ui| {
         ui.label(
             egui::RichText::new(crate::i18n::tr(app.ui_language, "Translation"))
@@ -60,7 +59,6 @@ pub fn render(app: &mut crate::XRTranslateApp, ui: &mut egui::Ui) {
 
     ui.add_space(14.0);
 
-    // Section 1: Voice Route
     section(ui, crate::i18n::tr(app.ui_language, "Voice Route"), |ui| {
         let previous_source = app.source_lang.clone();
         let previous_target = app.target_lang.clone();
@@ -89,15 +87,8 @@ pub fn render(app: &mut crate::XRTranslateApp, ui: &mut egui::Ui) {
                 &source_options,
             );
 
-            ui.add_space(8.0);
-            ui.label(
-                egui::RichText::new("↔")
-                    .color(crate::ui::theme::text_weak())
-                    .strong(),
-            );
-            ui.add_space(8.0);
-
             if app.source_lang == "auto" {
+                ui.add_space(8.0);
                 ui.label(
                     egui::RichText::new(crate::i18n::tr(app.ui_language, "Pair:"))
                         .color(crate::ui::theme::text_strong())
@@ -159,6 +150,14 @@ pub fn render(app: &mut crate::XRTranslateApp, ui: &mut egui::Ui) {
                     app.target_lang = new_target;
                 }
             } else {
+                ui.add_space(4.0);
+                if components::swap_capsule_button(ui, true).clicked() {
+                    let temp = app.source_lang.clone();
+                    app.source_lang = app.target_lang.clone();
+                    app.target_lang = temp;
+                    app.apply_language_route();
+                }
+                ui.add_space(4.0);
                 ui.label(
                     egui::RichText::new(crate::i18n::tr(app.ui_language, "Target:"))
                         .color(crate::ui::theme::text_strong())
@@ -190,7 +189,6 @@ pub fn render(app: &mut crate::XRTranslateApp, ui: &mut egui::Ui) {
 
     ui.add_space(10.0);
 
-    // Section 2: Audio Input & Action Bar
     section(ui, crate::i18n::tr(app.ui_language, "Audio Input"), |ui| {
         ui.horizontal(|ui| {
             ui.label(
@@ -229,13 +227,14 @@ pub fn render(app: &mut crate::XRTranslateApp, ui: &mut egui::Ui) {
             }
 
             ui.add_space(6.0);
-            if components::animated_button(ui, crate::i18n::tr(app.ui_language, "Refresh"))
-                .clicked()
+            if components::animated_button_enabled(
+                ui,
+                crate::i18n::tr(app.ui_language, "Refresh"),
+                app.device_refresh_rx.is_none(),
+            )
+            .clicked()
             {
-                app.devices = app.audio_system.available_devices();
-                app.loopback_devices = app.audio_system.available_loopback_devices();
-                app.refresh_selected_input_config();
-                app.restart_level_preview();
+                app.request_audio_device_refresh(ui.ctx().clone());
             }
         });
 
@@ -246,7 +245,6 @@ pub fn render(app: &mut crate::XRTranslateApp, ui: &mut egui::Ui) {
         if app.capture_source == CaptureSource::Both {
             let avail_w = ui.available_width();
             if avail_w < 620.0 {
-                // Responsive Single-Column Stack when window is narrow
                 egui::Frame::new()
                     .fill(egui::Color32::from_rgb(248, 250, 252))
                     .corner_radius(egui::CornerRadius::same(14))
@@ -273,7 +271,6 @@ pub fn render(app: &mut crate::XRTranslateApp, ui: &mut egui::Ui) {
                         render_input_adaptation(app, ui, CaptureSource::SystemAudio);
                     });
             } else {
-                // Dual Column layout when window width is spacious
                 ui.columns(2, |columns| {
                     egui::Frame::new()
                         .fill(egui::Color32::from_rgb(248, 250, 252))
@@ -306,82 +303,75 @@ pub fn render(app: &mut crate::XRTranslateApp, ui: &mut egui::Ui) {
 
         ui.add_space(12.0);
 
-        // Integrated Frosted Action Bar
-        egui::Frame::new()
-            .fill(egui::Color32::from_rgb(241, 245, 249))
-            .corner_radius(egui::CornerRadius::same(16))
-            .stroke(egui::Stroke::new(
-                1.0,
-                egui::Color32::from_rgb(226, 232, 240),
-            ))
-            .inner_margin(egui::Margin::symmetric(16, 12))
-            .show(ui, |ui| {
-                ui.horizontal(|ui| {
-                    if app.is_translating {
-                        if danger_button(ui, crate::i18n::tr(app.ui_language, "Stop Translation"))
-                            .clicked()
-                        {
-                            app.stop();
-                        }
-                    } else {
-                        if primary_button(ui, crate::i18n::tr(app.ui_language, "Start Translation"))
-                            .clicked()
-                        {
-                            app.start(Some(ui.ctx().clone()));
-                        }
-                    }
-
-                    if let Some(config) = &app.selected_input_config {
-                        ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                            ui.label(
-                                egui::RichText::new(format!(
-                                    "{} Hz, {} ch ({})",
-                                    config.sample_rate, config.channels, config.sample_format
-                                ))
-                                .color(crate::ui::theme::text_weak())
-                                .size(11.5),
-                            );
-                        });
-                    }
-                });
-
-                ui.add_space(8.0);
-                ui.horizontal_wrapped(|ui| {
-                    let mut tts_enabled = app.tts_enabled;
-                    if components::feature_checkbox(
-                        ui,
-                        crate::feature_access::Feature::TtsPlayback,
-                        app.ui_language,
-                        &mut tts_enabled,
-                        crate::i18n::tr(app.ui_language, "TTS"),
-                    )
-                    .changed()
+        components::action_card(ui, |ui| {
+            ui.horizontal(|ui| {
+                if app.is_translating {
+                    if danger_button(ui, crate::i18n::tr(app.ui_language, "Stop Translation"))
+                        .clicked()
                     {
-                        app.set_tts_enabled(tts_enabled);
+                        app.stop();
                     }
-
-                    ui.add_space(12.0);
-                    let mut floating_enabled = app.floating_subtitles_enabled;
-                    if components::feature_checkbox(
+                } else {
+                    if components::primary_button_enabled(
                         ui,
-                        crate::feature_access::Feature::FloatingSubtitles,
-                        app.ui_language,
-                        &mut floating_enabled,
-                        crate::i18n::tr(app.ui_language, "Floating subtitles"),
+                        crate::i18n::tr(app.ui_language, "Start Translation"),
+                        app.backend_start_deadline.is_none(),
                     )
-                    .changed()
+                    .clicked()
                     {
-                        app.set_floating_subtitles_enabled(floating_enabled);
+                        app.start(Some(ui.ctx().clone()));
                     }
-                });
+                }
+
+                if let Some(config) = &app.selected_input_config {
+                    ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                        ui.label(
+                            egui::RichText::new(format!(
+                                "{} Hz, {} ch ({})",
+                                config.sample_rate, config.channels, config.sample_format
+                            ))
+                            .color(crate::ui::theme::text_weak())
+                            .size(11.5),
+                        );
+                    });
+                }
             });
+
+            ui.add_space(8.0);
+            ui.horizontal_wrapped(|ui| {
+                let mut tts_enabled = app.tts_enabled;
+                if components::feature_checkbox(
+                    ui,
+                    crate::feature_access::Feature::TtsPlayback,
+                    app.ui_language,
+                    &mut tts_enabled,
+                    crate::i18n::tr(app.ui_language, "TTS"),
+                )
+                .changed()
+                {
+                    app.set_tts_enabled(tts_enabled);
+                }
+
+                ui.add_space(12.0);
+                let mut floating_enabled = app.floating_subtitles_enabled;
+                if components::feature_checkbox(
+                    ui,
+                    crate::feature_access::Feature::FloatingSubtitles,
+                    app.ui_language,
+                    &mut floating_enabled,
+                    crate::i18n::tr(app.ui_language, "Floating subtitles"),
+                )
+                .changed()
+                {
+                    app.set_floating_subtitles_enabled(floating_enabled);
+                }
+            });
+        });
     });
 
     ui.add_space(10.0);
 
-    // Section 3: Dual History Panels (Recognition & Translation)
     ui.columns(2, |columns| {
-        // Recognition Panel
         section(
             &mut columns[0],
             &format!(
@@ -408,43 +398,48 @@ pub fn render(app: &mut crate::XRTranslateApp, ui: &mut egui::Ui) {
                             let total = app.recognition_history.len();
                             for (i, entry) in app.recognition_history.iter().enumerate() {
                                 let is_last = i == total - 1 && app.partial_text.is_empty();
-                                let resp = history_entry_frame()
-                                    .show(ui, |ui| {
-                                        ui.set_width(ui.available_width());
-                                        ui.horizontal_wrapped(|ui| {
-                                            if let Some(speaker) =
-                                                crate::compact_speaker_label(&entry.speaker_id)
-                                            {
-                                                ui.label(
-                                                    egui::RichText::new(speaker)
-                                                        .color(egui::Color32::from_rgb(37, 99, 235))
-                                                        .size(11.5)
-                                                        .strong(),
-                                                );
-                                            }
+                                let resp = components::history_entry_card(ui, |ui| {
+                                    ui.set_width(ui.available_width());
+                                    if let Some(speaker) =
+                                        crate::compact_speaker_label(&entry.speaker_id)
+                                    {
+                                        ui.horizontal(|ui| {
+                                            components::speaker_badge(ui, &speaker);
                                         });
-                                        render_text_with_term_matches(
-                                            ui,
-                                            &entry.text,
-                                            &entry.activation_matches,
-                                            &entry.context_matches,
-                                            crate::ui::theme::text_normal(),
-                                            false,
-                                        );
-                                    })
-                                    .response;
+                                        ui.add_space(2.0);
+                                    }
+                                    render_text_with_term_matches(
+                                        ui,
+                                        &entry.text,
+                                        &entry.activation_matches,
+                                        &entry.context_matches,
+                                        crate::ui::theme::text_normal(),
+                                        false,
+                                    );
+                                });
                                 if is_last {
                                     resp.scroll_to_me(Some(egui::Align::BOTTOM));
                                 }
                                 ui.add_space(4.0);
                             }
                             if !app.partial_text.is_empty() {
-                                let resp = ui.label(
-                                    egui::RichText::new(&app.partial_text)
-                                        .color(egui::Color32::from_rgb(37, 99, 235))
-                                        .size(13.0)
-                                        .italics(),
-                                );
+                                let resp = ui
+                                    .horizontal(|ui| {
+                                        ui.label(
+                                            egui::RichText::new("• • •")
+                                                .color(egui::Color32::from_rgb(59, 130, 246))
+                                                .size(11.0)
+                                                .strong(),
+                                        );
+                                        ui.add_space(2.0);
+                                        ui.label(
+                                            egui::RichText::new(&app.partial_text)
+                                                .color(egui::Color32::from_rgb(37, 99, 235))
+                                                .size(13.0)
+                                                .italics(),
+                                        )
+                                    })
+                                    .response;
                                 resp.scroll_to_me(Some(egui::Align::BOTTOM));
                             }
                         }
@@ -452,7 +447,6 @@ pub fn render(app: &mut crate::XRTranslateApp, ui: &mut egui::Ui) {
             },
         );
 
-        // Translation Panel
         section(
             &mut columns[1],
             &format!(
@@ -482,37 +476,33 @@ pub fn render(app: &mut crate::XRTranslateApp, ui: &mut egui::Ui) {
                             let total = app.translations.len();
                             for (i, entry) in app.translations.iter().enumerate() {
                                 let is_last = i == total - 1;
-                                let group_resp = history_entry_frame()
-                                    .show(ui, |ui| {
-                                        ui.set_width(ui.available_width());
-                                        ui.horizontal_wrapped(|ui| {
-                                            if let Some(speaker) =
-                                                crate::compact_speaker_label(&entry.speaker_id)
-                                            {
-                                                ui.label(
-                                                    egui::RichText::new(speaker)
-                                                        .color(egui::Color32::from_rgb(37, 99, 235))
-                                                        .size(11.5)
-                                                        .strong(),
-                                                );
-                                            }
+                                let group_resp = components::history_entry_card(ui, |ui| {
+                                    ui.set_width(ui.available_width());
+                                    if let Some(speaker) =
+                                        crate::compact_speaker_label(&entry.speaker_id)
+                                    {
+                                        ui.horizontal(|ui| {
+                                            components::speaker_badge(ui, &speaker);
                                         });
+                                        ui.add_space(2.0);
+                                    }
+                                    if !entry.source.is_empty() {
                                         ui.label(
                                             egui::RichText::new(&entry.source)
                                                 .color(crate::ui::theme::text_weak())
                                                 .size(11.5),
                                         );
                                         ui.add_space(2.0);
-                                        render_text_with_term_matches(
-                                            ui,
-                                            &entry.translated,
-                                            &entry.term_matches,
-                                            &[],
-                                            crate::ui::theme::text_strong(),
-                                            true,
-                                        );
-                                    })
-                                    .response;
+                                    }
+                                    render_text_with_term_matches(
+                                        ui,
+                                        &entry.translated,
+                                        &entry.term_matches,
+                                        &[],
+                                        crate::ui::theme::text_strong(),
+                                        true,
+                                    );
+                                });
 
                                 if is_last {
                                     group_resp.scroll_to_me(Some(egui::Align::BOTTOM));
@@ -524,17 +514,6 @@ pub fn render(app: &mut crate::XRTranslateApp, ui: &mut egui::Ui) {
             },
         );
     });
-}
-
-fn history_entry_frame() -> egui::Frame {
-    egui::Frame::new()
-        .fill(egui::Color32::from_rgb(248, 250, 252))
-        .corner_radius(egui::CornerRadius::same(8))
-        .inner_margin(egui::Margin::symmetric(10, 8))
-        .stroke(egui::Stroke::new(
-            1.0,
-            egui::Color32::from_rgb(226, 232, 240),
-        ))
 }
 
 fn render_text_with_term_matches(
@@ -630,13 +609,10 @@ fn render_input_adaptation(
 ) {
     if app.capture_source == CaptureSource::Both {
         let title = match source {
-            CaptureSource::Microphone => {
-                format!("🎤 {}", crate::i18n::tr(app.ui_language, "Microphone"))
+            CaptureSource::Microphone => crate::i18n::tr(app.ui_language, "Microphone").to_string(),
+            CaptureSource::SystemAudio => {
+                crate::i18n::tr(app.ui_language, "System Audio (WASAPI)").to_string()
             }
-            CaptureSource::SystemAudio => format!(
-                "🔊 {}",
-                crate::i18n::tr(app.ui_language, "System Audio (WASAPI)")
-            ),
             CaptureSource::Both => unreachable!(),
         };
         ui.label(
@@ -709,44 +685,17 @@ fn render_input_adaptation(
 
 fn render_audio_level(
     ui: &mut egui::Ui,
-    id: &'static str,
     level: &std::sync::Arc<std::sync::atomic::AtomicU32>,
     vad_active: &std::sync::Arc<std::sync::atomic::AtomicBool>,
     visible: bool,
+    updating: bool,
 ) {
     let level = f32::from_bits(level.load(std::sync::atomic::Ordering::Relaxed)).clamp(0.0, 1.0);
     let decibels = 20.0 * level.max(0.000_001).log10();
     let raw_fraction = ((decibels + 60.0) / 60.0).clamp(0.0, 1.0);
-    let animated_fraction =
-        crate::ui::animation::AnimationSystem::smooth_audio_level(ui.ctx(), id, raw_fraction);
     let active = vad_active.load(std::sync::atomic::Ordering::Relaxed);
 
-    if visible {
-        let (rect, _) = ui.allocate_exact_size(egui::vec2(80.0, 6.0), egui::Sense::hover());
-        ui.painter().rect_filled(
-            rect,
-            egui::CornerRadius::same(3),
-            if active {
-                egui::Color32::from_rgb(220, 252, 231) // Fresh light green mint background
-            } else {
-                egui::Color32::from_rgb(241, 245, 249)
-            },
-        );
-        if animated_fraction > 0.01 {
-            ui.painter().rect_filled(
-                egui::Rect::from_min_size(
-                    rect.min,
-                    egui::vec2(rect.width() * animated_fraction, rect.height()),
-                ),
-                egui::CornerRadius::same(3),
-                if active {
-                    egui::Color32::from_rgb(34, 197, 94) // Vibrant emerald green
-                } else {
-                    egui::Color32::from_rgb(37, 99, 235)
-                },
-            );
-        }
-    }
+    components::segmented_audio_meter(ui, raw_fraction, active, visible, updating);
 }
 
 fn render_capture_device_selector(app: &mut crate::XRTranslateApp, ui: &mut egui::Ui) {
@@ -843,19 +792,13 @@ fn render_capture_device_selector(app: &mut crate::XRTranslateApp, ui: &mut egui
             }
         }
         ui.add_space(8.0);
-        let (meter_id, level, vad_active) = match app.capture_source {
-            CaptureSource::Microphone | CaptureSource::Both => (
-                "input_level_meter",
-                &app.input_level,
-                &app.microphone_vad_active,
-            ),
-            CaptureSource::SystemAudio => (
-                "loopback_level_meter",
-                &app.loopback_level,
-                &app.loopback_vad_active,
-            ),
+        let (level, vad_active) = match app.capture_source {
+            CaptureSource::Microphone | CaptureSource::Both => {
+                (&app.input_level, &app.microphone_vad_active)
+            }
+            CaptureSource::SystemAudio => (&app.loopback_level, &app.loopback_vad_active),
         };
-        render_audio_level(ui, meter_id, level, vad_active, true);
+        render_audio_level(ui, level, vad_active, true, app.is_translating);
     });
 
     if app.capture_source == CaptureSource::Both {
@@ -896,10 +839,10 @@ fn render_capture_device_selector(app: &mut crate::XRTranslateApp, ui: &mut egui
             ui.add_space(8.0);
             render_audio_level(
                 ui,
-                "loopback_level_meter",
                 &app.loopback_level,
                 &app.loopback_vad_active,
                 true,
+                app.is_translating,
             );
         });
     }

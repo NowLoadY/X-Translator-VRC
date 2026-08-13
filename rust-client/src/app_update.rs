@@ -7,7 +7,7 @@
 use crossbeam_channel::{Receiver, TryRecvError, unbounded};
 use reqwest::{
     StatusCode,
-    header::{ACCEPT, ACCEPT_ENCODING, CONTENT_RANGE, RANGE},
+    header::{ACCEPT, ACCEPT_ENCODING, CONTENT_RANGE, HeaderValue, RANGE},
 };
 use serde::Deserialize;
 use sha2::{Digest, Sha256};
@@ -25,6 +25,7 @@ const LATEST_RELEASE_URL: &str =
     "https://api.github.com/repos/NowLoadY/XRTranslate/releases/latest";
 const USER_AGENT: &str = concat!("XRTranslate updater/", env!("CARGO_PKG_VERSION"));
 const MAX_DOWNLOAD_ATTEMPTS: u32 = 4;
+const GITHUB_API_VERSION: &str = "2022-11-28";
 
 #[derive(Clone, Debug)]
 pub struct AppUpdateInfo {
@@ -87,9 +88,13 @@ pub struct AppUpdateManager {
     events: Option<Receiver<Event>>,
     available: Option<ReleaseAsset>,
     prepared: Option<PreparedUpdate>,
+    proxy_url: Option<String>,
 }
 
 impl AppUpdateManager {
+    pub fn set_proxy_url(&mut self, proxy_url: &str) {
+        self.proxy_url = (!proxy_url.trim().is_empty()).then(|| proxy_url.trim().to_owned());
+    }
     #[must_use]
     pub fn state(&self) -> &AppUpdateState {
         &self.state
@@ -105,10 +110,11 @@ impl AppUpdateManager {
             return Ok(());
         }
         let (sender, receiver) = unbounded();
+        let proxy_url = self.proxy_url.clone();
         thread::Builder::new()
             .name("app-update-checker".into())
             .spawn(move || {
-                let result = run_async(check_latest_release);
+                let result = run_async(|| check_latest_release(proxy_url.as_deref()));
                 let _ = sender.send(Event::Checked(result));
             })
             .map_err(|error| format!("Cannot start update checker: {error}"))?;
@@ -127,11 +133,14 @@ impl AppUpdateManager {
             .ok_or("Check for updates before downloading.")?;
         let info = asset.info();
         let (sender, receiver) = unbounded();
+        let proxy_url = self.proxy_url.clone();
         thread::Builder::new()
             .name("app-update-downloader".into())
             .spawn(move || {
                 let progress = sender.clone();
-                let result = run_async(|| download_and_stage(project_root, asset, progress));
+                let result = run_async(|| {
+                    download_and_stage(project_root, asset, progress, proxy_url.as_deref())
+                });
                 let _ = sender.send(Event::Prepared(result));
             })
             .map_err(|error| format!("Cannot start update download: {error}"))?;
@@ -257,14 +266,18 @@ struct GitHubAsset {
     digest: Option<String>,
 }
 
-async fn check_latest_release() -> Result<Option<ReleaseAsset>, String> {
+async fn check_latest_release(proxy_url: Option<&str>) -> Result<Option<ReleaseAsset>, String> {
     if !cfg!(any(target_os = "windows", target_os = "linux")) {
         return Err("Updates are available for Windows and Linux builds only.".into());
     }
-    let client = http_client()?;
+    let client = http_client(proxy_url)?;
     let release = client
         .get(LATEST_RELEASE_URL)
         .header(ACCEPT, "application/vnd.github+json")
+        .header(
+            "X-GitHub-Api-Version",
+            HeaderValue::from_static(GITHUB_API_VERSION),
+        )
         .send()
         .await
         .map_err(|error| format!("Cannot check for updates: {error}"))?
@@ -292,6 +305,7 @@ async fn download_and_stage(
     project_root: PathBuf,
     asset: ReleaseAsset,
     sender: crossbeam_channel::Sender<Event>,
+    proxy_url: Option<&str>,
 ) -> Result<PreparedUpdate, String> {
     if !asset.download_url.starts_with("https://") {
         return Err("The update download URL is not secure.".into());
@@ -309,7 +323,7 @@ async fn download_and_stage(
 
     let archive = download_dir.join(&asset.name);
     let partial = download_dir.join(format!("{}.part", asset.name));
-    let client = http_client()?;
+    let client = http_client(proxy_url)?;
     download_asset(&client, &asset, &partial, &archive, |downloaded, total| {
         let _ = sender.send(Event::Downloading { downloaded, total });
     })
@@ -691,11 +705,18 @@ fn parse_sha256_digest(value: &str) -> Option<String> {
         .then(|| digest.to_ascii_lowercase())
 }
 
-fn http_client() -> Result<reqwest::Client, String> {
-    reqwest::Client::builder()
+fn http_client(proxy_url: Option<&str>) -> Result<reqwest::Client, String> {
+    let mut builder = reqwest::Client::builder()
         .user_agent(USER_AGENT)
         .connect_timeout(Duration::from_secs(15))
-        .read_timeout(Duration::from_secs(45))
+        .read_timeout(Duration::from_secs(45));
+    if let Some(proxy_url) = proxy_url.filter(|url| !url.trim().is_empty()) {
+        builder = builder.proxy(
+            reqwest::Proxy::all(proxy_url)
+                .map_err(|error| format!("Cannot configure download proxy: {error}"))?,
+        );
+    }
+    builder
         .build()
         .map_err(|error| format!("Cannot create update client: {error}"))
 }

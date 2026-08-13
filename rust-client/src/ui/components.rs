@@ -3,27 +3,252 @@ use eframe::egui::{self, Color32, CornerRadius, Frame, Margin, Stroke, Ui, Vec2}
 pub fn card<R>(ui: &mut Ui, add_contents: impl FnOnce(&mut Ui) -> R) -> R {
     Frame::new()
         .fill(Color32::WHITE)
-        .corner_radius(CornerRadius::same(18))
+        .corner_radius(CornerRadius::same(20))
         .inner_margin(Margin::same(18))
-        .stroke(Stroke::new(1.0, Color32::from_rgb(232, 237, 246)))
+        .stroke(Stroke::new(1.0, Color32::from_rgb(235, 240, 248)))
         .shadow(egui::Shadow {
-            offset: [0, 3],
-            blur: 10,
+            offset: [0, 4],
+            blur: 16,
             spread: 0,
-            color: Color32::from_black_alpha(7),
+            color: Color32::from_rgba_unmultiplied(15, 23, 42, 10),
         })
         .show(ui, add_contents)
         .inner
 }
 
-/// Paints a subtle, sparse dot-matrix background pattern across the available panel area.
+pub fn action_card<R>(ui: &mut Ui, add_contents: impl FnOnce(&mut Ui) -> R) -> R {
+    Frame::new()
+        .fill(Color32::from_rgb(245, 248, 252))
+        .corner_radius(CornerRadius::same(18))
+        .stroke(Stroke::NONE)
+        .inner_margin(Margin::symmetric(16, 12))
+        .show(ui, add_contents)
+        .inner
+}
+
+pub fn history_entry_card<R>(
+    ui: &mut Ui,
+    add_contents: impl FnOnce(&mut Ui) -> R,
+) -> egui::Response {
+    Frame::new()
+        .fill(Color32::from_rgb(245, 248, 252))
+        .corner_radius(CornerRadius::same(14))
+        .inner_margin(Margin::symmetric(12, 9))
+        .stroke(Stroke::NONE)
+        .show(ui, add_contents)
+        .response
+}
+
+pub fn dark_container_frame<R>(ui: &mut Ui, add_contents: impl FnOnce(&mut Ui) -> R) -> R {
+    Frame::new()
+        .fill(Color32::from_rgb(15, 23, 42))
+        .stroke(Stroke::new(1.0, Color32::from_rgb(51, 65, 85)))
+        .corner_radius(CornerRadius::same(14))
+        .inner_margin(Margin::same(12))
+        .show(ui, add_contents)
+        .inner
+}
+
+pub fn speaker_badge(ui: &mut Ui, speaker: &str) {
+    Frame::new()
+        .fill(Color32::from_rgb(239, 246, 255))
+        .stroke(Stroke::NONE)
+        .corner_radius(CornerRadius::same(6))
+        .inner_margin(Margin::symmetric(6, 2))
+        .show(ui, |ui| {
+            ui.label(
+                egui::RichText::new(speaker)
+                    .color(Color32::from_rgb(37, 99, 235))
+                    .size(11.5)
+                    .strong(),
+            );
+        });
+}
+
+pub fn swap_capsule_button(ui: &mut Ui, enabled: bool) -> egui::Response {
+    let id = ui.make_persistent_id("lang_swap_capsule");
+    let is_hovered = ui.memory(|m| m.data.get_temp::<bool>(id.with("hover_state")).unwrap_or(false));
+    let is_active = ui.memory(|m| m.data.get_temp::<bool>(id.with("active_state")).unwrap_or(false));
+
+    let hover_factor = crate::ui::animation::AnimationSystem::animate_bool(
+        ui.ctx(),
+        id.with("hover"),
+        is_hovered && enabled,
+        0.15,
+    );
+    let active_factor = crate::ui::animation::AnimationSystem::animate_bool(
+        ui.ctx(),
+        id.with("active"),
+        is_active && enabled,
+        0.08,
+    );
+
+    let current_time = ui.ctx().input(|i| i.time);
+    let click_time = ui.memory(|m| m.data.get_temp::<f64>(id.with("click_time")).unwrap_or(0.0));
+    let elapsed = (current_time - click_time) as f32;
+    let is_animating_click = elapsed >= 0.0 && elapsed < 0.28;
+    let click_factor = if is_animating_click {
+        ui.ctx().request_repaint();
+        let t = (elapsed / 0.28).clamp(0.0, 1.0);
+        (1.0 - crate::ui::animation::AnimationSystem::ease_out_cubic(t)).clamp(0.0, 1.0)
+    } else {
+        0.0
+    };
+
+    let rest_fill = Color32::WHITE;
+    let hover_fill = Color32::from_rgb(245, 248, 253);
+    let active_fill = Color32::from_rgb(235, 242, 254);
+
+    let fill = if enabled {
+        let base = crate::ui::animation::AnimationSystem::lerp_color(rest_fill, hover_fill, hover_factor);
+        let base = crate::ui::animation::AnimationSystem::lerp_color(base, active_fill, active_factor);
+        crate::ui::animation::AnimationSystem::lerp_color(base, Color32::from_rgb(230, 240, 255), click_factor)
+    } else {
+        Color32::from_rgb(245, 248, 252)
+    };
+
+    let text_color = if enabled {
+        let base = crate::ui::animation::AnimationSystem::lerp_color(
+            Color32::from_rgb(59, 130, 246),
+            Color32::from_rgb(37, 99, 235),
+            hover_factor,
+        );
+        crate::ui::animation::AnimationSystem::lerp_color(base, Color32::from_rgb(29, 78, 216), active_factor)
+    } else {
+        Color32::from_rgb(148, 163, 184)
+    };
+
+    let rest_stroke = Stroke::new(1.0, Color32::from_rgb(226, 232, 240));
+    let hover_stroke = Stroke::new(1.0, Color32::from_rgb(203, 213, 225));
+    let active_stroke = Stroke::new(1.0, Color32::from_rgb(148, 163, 184));
+    let stroke_color = if enabled {
+        let base = crate::ui::animation::AnimationSystem::lerp_color(rest_stroke.color, hover_stroke.color, hover_factor);
+        crate::ui::animation::AnimationSystem::lerp_color(base, active_stroke.color, active_factor)
+    } else {
+        rest_stroke.color
+    };
+
+    let rest_shadow = egui::Shadow {
+        offset: [0, 2],
+        blur: 4,
+        spread: 0,
+        color: Color32::from_black_alpha(10),
+    };
+    let hover_shadow = egui::Shadow {
+        offset: [0, 3],
+        blur: 6,
+        spread: 0,
+        color: Color32::from_black_alpha(15),
+    };
+    let active_shadow = egui::Shadow {
+        offset: [0, 1],
+        blur: 2,
+        spread: 0,
+        color: Color32::from_black_alpha(6),
+    };
+
+    let shadow = if enabled {
+        let base = crate::ui::animation::AnimationSystem::lerp_shadow(rest_shadow, hover_shadow, hover_factor);
+        crate::ui::animation::AnimationSystem::lerp_shadow(base, active_shadow, active_factor)
+    } else {
+        egui::Shadow::NONE
+    };
+
+    let resp = Frame::new()
+        .fill(fill)
+        .stroke(Stroke::new(1.0, stroke_color))
+        .corner_radius(CornerRadius::same(12))
+        .inner_margin(Margin::symmetric(9, 4))
+        .shadow(shadow)
+        .show(ui, |ui| {
+            ui.label(
+                egui::RichText::new("↔")
+                    .color(text_color)
+                    .size(13.0)
+                    .strong(),
+            )
+        })
+        .response
+        .interact(egui::Sense::click());
+
+    if resp.clicked() {
+        ui.memory_mut(|m| {
+            m.data.insert_temp(id.with("click_time"), current_time);
+        });
+        ui.ctx().request_repaint();
+    }
+
+    ui.memory_mut(|m| {
+        m.data.insert_temp(id.with("hover_state"), resp.hovered());
+        m.data.insert_temp(id.with("active_state"), resp.is_pointer_button_down_on());
+    });
+    if resp.hovered() && enabled {
+        ui.ctx().set_cursor_icon(egui::CursorIcon::PointingHand);
+    }
+    resp
+}
+
+pub fn segmented_audio_meter(
+    ui: &mut Ui,
+    raw_fraction: f32,
+    active: bool,
+    visible: bool,
+    updating: bool,
+) {
+    if visible {
+        if updating {
+            ui.ctx()
+                .request_repaint_after(std::time::Duration::from_millis(33));
+        }
+        let animated_fraction = raw_fraction.clamp(0.0, 1.0);
+
+        let seg_count = 6;
+        let seg_w = 8.5;
+        let seg_h = 8.5;
+        let gap = 3.5;
+        let total_w = (seg_count as f32) * seg_w + (seg_count - 1) as f32 * gap;
+
+        let (rect, _) = ui.allocate_exact_size(Vec2::new(total_w, seg_h), egui::Sense::hover());
+
+        if ui.is_rect_visible(rect) {
+            let painter = ui.painter();
+            let step = 1.0 / seg_count as f32;
+
+            for i in 0..seg_count {
+                let seg_threshold = (i as f32) * step;
+                let is_filled = animated_fraction > seg_threshold;
+
+                let min_x = rect.min.x + (i as f32) * (seg_w + gap);
+                let seg_rect = egui::Rect::from_min_size(
+                    egui::pos2(min_x, rect.min.y),
+                    Vec2::new(seg_w, seg_h),
+                );
+
+                let radius = CornerRadius::same(4);
+
+                let color = if is_filled {
+                    if active {
+                        Color32::from_rgb(16, 185, 129)
+                    } else {
+                        Color32::from_rgb(59, 130, 246)
+                    }
+                } else {
+                    Color32::from_rgb(226, 232, 240)
+                };
+
+                painter.rect_filled(seg_rect, radius, color);
+            }
+        }
+    }
+}
+
 pub fn sparse_dot_background(ui: &mut Ui) {
     let rect = ui.max_rect();
     if ui.is_rect_visible(rect) {
         let painter = ui.painter();
-        let spacing = 22.0;
+        let spacing = 26.0;
         let radius = 1.0;
-        let color = Color32::from_rgba_unmultiplied(148, 163, 184, 60);
+        let color = Color32::from_rgba_unmultiplied(148, 163, 184, 38);
 
         let start_x = (rect.min.x / spacing).floor() * spacing + (spacing / 2.0);
         let start_y = (rect.min.y / spacing).floor() * spacing + (spacing / 2.0);
@@ -42,7 +267,6 @@ pub fn sparse_dot_background(ui: &mut Ui) {
     }
 }
 
-/// Renders a pure black sine wave line with a subtle drop shadow.
 pub fn wavy_divider_black_shadow(ui: &mut Ui) {
     let available_width = ui.available_width();
     let (rect, _) = ui.allocate_exact_size(Vec2::new(available_width, 8.0), egui::Sense::hover());
@@ -85,7 +309,6 @@ pub fn wavy_divider_black_shadow(ui: &mut Ui) {
     }
 }
 
-/// Renders a smooth sine wave decorative line.
 pub fn wavy_divider(ui: &mut Ui, color: Color32) {
     let available_width = ui.available_width();
     let (rect, _) = ui.allocate_exact_size(Vec2::new(available_width, 8.0), egui::Sense::hover());
@@ -149,37 +372,128 @@ pub fn format_file_size(bytes: u64) -> String {
 
 pub fn animated_button_enabled(ui: &mut Ui, text: &str, enabled: bool) -> egui::Response {
     let id = ui.make_persistent_id(text);
-    let is_hovered = ui.memory(|m| m.data.get_temp::<bool>(id).unwrap_or(false));
+    let is_hovered = ui.memory(|m| m.data.get_temp::<bool>(id.with("hover_state")).unwrap_or(false));
+    let is_active = ui.memory(|m| m.data.get_temp::<bool>(id.with("active_state")).unwrap_or(false));
 
     let hover_factor = crate::ui::animation::AnimationSystem::animate_bool(
         ui.ctx(),
-        id.with("anim"),
+        id.with("anim_hover"),
         is_hovered && enabled,
         0.15,
     );
+    let active_factor = crate::ui::animation::AnimationSystem::animate_bool(
+        ui.ctx(),
+        id.with("anim_active"),
+        is_active && enabled,
+        0.08,
+    );
+
+    let current_time = ui.ctx().input(|i| i.time);
+    let click_time = ui.memory(|m| m.data.get_temp::<f64>(id.with("click_time")).unwrap_or(0.0));
+    let elapsed = (current_time - click_time) as f32;
+    let is_animating_click = elapsed >= 0.0 && elapsed < 0.25;
+    let click_factor = if is_animating_click {
+        ui.ctx().request_repaint();
+        let t = (elapsed / 0.25).clamp(0.0, 1.0);
+        (1.0 - crate::ui::animation::AnimationSystem::ease_out_cubic(t)).clamp(0.0, 1.0)
+    } else {
+        0.0
+    };
+
+    let rest_fill = Color32::WHITE;
+    let hover_fill = Color32::from_rgb(245, 248, 253);
+    let active_fill = Color32::from_rgb(235, 241, 250);
+
     let fill = if enabled {
-        crate::ui::animation::AnimationSystem::lerp_color(
-            Color32::from_rgb(241, 245, 249),
-            Color32::from_rgb(226, 232, 240),
-            hover_factor,
-        )
+        let base = crate::ui::animation::AnimationSystem::lerp_color(rest_fill, hover_fill, hover_factor);
+        let base = crate::ui::animation::AnimationSystem::lerp_color(base, active_fill, active_factor);
+        crate::ui::animation::AnimationSystem::lerp_color(base, Color32::from_rgb(230, 240, 255), click_factor)
     } else {
         Color32::from_rgb(241, 245, 249)
     };
 
-    let button =
-        egui::Button::new(egui::RichText::new(text).color(crate::ui::theme::text_normal()))
-            .fill(fill)
-            .min_size(Vec2::new(80.0, 30.0))
-            .corner_radius(CornerRadius::same(14));
+    let text_color = if enabled {
+        crate::ui::theme::text_strong()
+    } else {
+        crate::ui::theme::text_weak()
+    };
 
-    let response = ui.add_enabled(enabled, button);
+    let rest_stroke = Stroke::new(1.0, Color32::from_rgb(226, 232, 240));
+    let hover_stroke = Stroke::new(1.0, Color32::from_rgb(203, 213, 225));
+    let active_stroke = Stroke::new(1.0, Color32::from_rgb(148, 163, 184));
+    let click_stroke = Stroke::new(1.0, Color32::from_rgb(147, 197, 253));
 
-    ui.memory_mut(|m| m.data.insert_temp(id, response.hovered()));
-    if response.hovered() && enabled {
+    let stroke = if enabled {
+        let base = crate::ui::animation::AnimationSystem::lerp_color(rest_stroke.color, hover_stroke.color, hover_factor);
+        let base = crate::ui::animation::AnimationSystem::lerp_color(base, active_stroke.color, active_factor);
+        let color = crate::ui::animation::AnimationSystem::lerp_color(base, click_stroke.color, click_factor);
+        Stroke::new(1.0, color)
+    } else {
+        Stroke::new(1.0, Color32::from_rgb(226, 232, 240))
+    };
+
+    let rest_shadow = egui::Shadow {
+        offset: [0, 2],
+        blur: 5,
+        spread: 0,
+        color: Color32::from_black_alpha(12),
+    };
+    let hover_shadow = egui::Shadow {
+        offset: [0, 3],
+        blur: 7,
+        spread: 0,
+        color: Color32::from_black_alpha(16),
+    };
+    let active_shadow = egui::Shadow {
+        offset: [0, 1],
+        blur: 2,
+        spread: 0,
+        color: Color32::from_black_alpha(6),
+    };
+
+    let shadow = if enabled {
+        let base = crate::ui::animation::AnimationSystem::lerp_shadow(rest_shadow, hover_shadow, hover_factor);
+        crate::ui::animation::AnimationSystem::lerp_shadow(base, active_shadow, active_factor)
+    } else {
+        egui::Shadow::NONE
+    };
+
+    let resp = ui
+        .add_enabled_ui(enabled, |ui| {
+            Frame::new()
+                .fill(fill)
+                .stroke(stroke)
+                .corner_radius(CornerRadius::same(14))
+                .inner_margin(Margin::symmetric(14, 7))
+                .shadow(shadow)
+                .show(ui, |ui| {
+                    ui.label(
+                        egui::RichText::new(text)
+                            .color(text_color)
+                            .size(13.0)
+                            .strong(),
+                    );
+                })
+                .response
+                .interact(egui::Sense::click())
+        })
+        .inner;
+
+    if resp.clicked() {
+        ui.memory_mut(|m| {
+            m.data.insert_temp(id.with("click_time"), current_time);
+        });
+        ui.ctx().request_repaint();
+    }
+
+    ui.memory_mut(|m| {
+        m.data.insert_temp(id.with("hover_state"), resp.hovered());
+        m.data.insert_temp(id.with("active_state"), resp.is_pointer_button_down_on());
+    });
+    if resp.hovered() && enabled {
         ui.ctx().set_cursor_icon(egui::CursorIcon::PointingHand);
     }
-    response
+    resp
 }
 
 pub fn primary_button(ui: &mut Ui, text: &str) -> egui::Response {
@@ -188,39 +502,96 @@ pub fn primary_button(ui: &mut Ui, text: &str) -> egui::Response {
 
 pub fn primary_button_enabled(ui: &mut Ui, text: &str, enabled: bool) -> egui::Response {
     let id = ui.make_persistent_id(text);
-    let is_hovered = ui.memory(|m| m.data.get_temp::<bool>(id).unwrap_or(false));
+    let is_hovered = ui.memory(|m| m.data.get_temp::<bool>(id.with("hover_state")).unwrap_or(false));
+    let is_active = ui.memory(|m| m.data.get_temp::<bool>(id.with("active_state")).unwrap_or(false));
 
     let hover_factor = crate::ui::animation::AnimationSystem::animate_bool(
         ui.ctx(),
-        id.with("anim"),
+        id.with("anim_hover"),
         is_hovered && enabled,
         0.15,
     );
+    let active_factor = crate::ui::animation::AnimationSystem::animate_bool(
+        ui.ctx(),
+        id.with("anim_active"),
+        is_active && enabled,
+        0.08,
+    );
+
+    let rest_fill = Color32::from_rgb(59, 130, 246);
+    let hover_fill = Color32::from_rgb(37, 99, 235);
+    let active_fill = Color32::from_rgb(29, 78, 216);
+
     let fill = if enabled {
-        crate::ui::animation::AnimationSystem::lerp_color(
-            Color32::from_rgb(37, 99, 235),
-            Color32::from_rgb(29, 78, 216),
-            hover_factor,
-        )
+        let base = crate::ui::animation::AnimationSystem::lerp_color(rest_fill, hover_fill, hover_factor);
+        crate::ui::animation::AnimationSystem::lerp_color(base, active_fill, active_factor)
     } else {
-        Color32::from_rgb(191, 219, 254)
+        Color32::from_rgb(219, 234, 254)
     };
 
-    let button = egui::Button::new(egui::RichText::new(text).color(Color32::WHITE).strong())
-        .fill(fill)
-        .min_size(Vec2::new(100.0, 32.0))
-        .corner_radius(CornerRadius::same(14));
+    let text_color = if enabled {
+        Color32::WHITE
+    } else {
+        Color32::from_rgb(147, 197, 253)
+    };
 
-    let response = ui.add_enabled(enabled, button);
+    let rest_shadow = egui::Shadow {
+        offset: [0, 2],
+        blur: 4,
+        spread: 0,
+        color: Color32::from_black_alpha(15),
+    };
+    let hover_shadow = egui::Shadow {
+        offset: [0, 3],
+        blur: 6,
+        spread: 0,
+        color: Color32::from_black_alpha(20),
+    };
+    let active_shadow = egui::Shadow {
+        offset: [0, 1],
+        blur: 2,
+        spread: 0,
+        color: Color32::from_black_alpha(8),
+    };
 
-    ui.memory_mut(|m| m.data.insert_temp(id, response.hovered()));
-    if response.hovered() && enabled {
+    let shadow = if enabled {
+        let base = crate::ui::animation::AnimationSystem::lerp_shadow(rest_shadow, hover_shadow, hover_factor);
+        crate::ui::animation::AnimationSystem::lerp_shadow(base, active_shadow, active_factor)
+    } else {
+        egui::Shadow::NONE
+    };
+
+    let resp = ui
+        .add_enabled_ui(enabled, |ui| {
+            Frame::new()
+                .fill(fill)
+                .stroke(Stroke::NONE)
+                .corner_radius(CornerRadius::same(16))
+                .inner_margin(Margin::symmetric(18, 8))
+                .shadow(shadow)
+                .show(ui, |ui| {
+                    ui.label(
+                        egui::RichText::new(text)
+                            .color(text_color)
+                            .size(13.5)
+                            .strong(),
+                    );
+                })
+                .response
+                .interact(egui::Sense::click())
+        })
+        .inner;
+
+    ui.memory_mut(|m| {
+        m.data.insert_temp(id.with("hover_state"), resp.hovered());
+        m.data.insert_temp(id.with("active_state"), resp.is_pointer_button_down_on());
+    });
+    if resp.hovered() && enabled {
         ui.ctx().set_cursor_icon(egui::CursorIcon::PointingHand);
     }
-    response
+    resp
 }
 
-/// Renders a smart combobox that automatically includes an integrated search input box when options > 3.
 pub fn searchable_combobox<T: PartialEq + Clone>(
     ui: &mut Ui,
     id: impl std::hash::Hash + std::fmt::Debug,
@@ -291,8 +662,6 @@ pub fn searchable_combobox<T: PartialEq + Clone>(
     changed
 }
 
-/// Shared language selector used by settings and first-run onboarding.
-/// Returns whether the selected language changed.
 pub fn language_selector(
     ui: &mut Ui,
     id: impl std::hash::Hash + std::fmt::Debug,
@@ -312,47 +681,110 @@ pub fn danger_button(ui: &mut Ui, text: &str) -> egui::Response {
 
 pub fn danger_button_enabled(ui: &mut Ui, text: &str, enabled: bool) -> egui::Response {
     let id = ui.make_persistent_id(text);
-    let is_hovered = ui.memory(|m| m.data.get_temp::<bool>(id).unwrap_or(false));
+    let is_hovered = ui.memory(|m| m.data.get_temp::<bool>(id.with("hover_state")).unwrap_or(false));
+    let is_active = ui.memory(|m| m.data.get_temp::<bool>(id.with("active_state")).unwrap_or(false));
+
     let hover_factor = crate::ui::animation::AnimationSystem::animate_bool(
         ui.ctx(),
-        id.with("anim"),
+        id.with("anim_hover"),
         is_hovered && enabled,
         0.15,
     );
+    let active_factor = crate::ui::animation::AnimationSystem::animate_bool(
+        ui.ctx(),
+        id.with("anim_active"),
+        is_active && enabled,
+        0.08,
+    );
+
+    let rest_fill = Color32::from_rgb(239, 68, 68);
+    let hover_fill = Color32::from_rgb(220, 38, 38);
+    let active_fill = Color32::from_rgb(185, 28, 28);
+
     let fill = if enabled {
-        crate::ui::animation::AnimationSystem::lerp_color(
-            Color32::from_rgb(239, 68, 68),
-            Color32::from_rgb(220, 38, 38),
-            hover_factor,
-        )
+        let base = crate::ui::animation::AnimationSystem::lerp_color(rest_fill, hover_fill, hover_factor);
+        crate::ui::animation::AnimationSystem::lerp_color(base, active_fill, active_factor)
     } else {
         Color32::from_rgb(254, 202, 202)
     };
-    let button = egui::Button::new(egui::RichText::new(text).color(Color32::WHITE).strong())
-        .fill(fill)
-        .min_size(Vec2::new(90.0, 32.0))
-        .corner_radius(CornerRadius::same(14));
 
-    let response = ui.add_enabled(enabled, button);
+    let text_color = Color32::WHITE;
 
-    ui.memory_mut(|m| m.data.insert_temp(id, response.hovered()));
-    if response.hovered() && enabled {
+    let rest_shadow = egui::Shadow {
+        offset: [0, 2],
+        blur: 4,
+        spread: 0,
+        color: Color32::from_black_alpha(15),
+    };
+    let hover_shadow = egui::Shadow {
+        offset: [0, 3],
+        blur: 6,
+        spread: 0,
+        color: Color32::from_black_alpha(20),
+    };
+    let active_shadow = egui::Shadow {
+        offset: [0, 1],
+        blur: 2,
+        spread: 0,
+        color: Color32::from_black_alpha(8),
+    };
+
+    let shadow = if enabled {
+        let base = crate::ui::animation::AnimationSystem::lerp_shadow(rest_shadow, hover_shadow, hover_factor);
+        crate::ui::animation::AnimationSystem::lerp_shadow(base, active_shadow, active_factor)
+    } else {
+        egui::Shadow::NONE
+    };
+
+    let resp = ui
+        .add_enabled_ui(enabled, |ui| {
+            Frame::new()
+                .fill(fill)
+                .stroke(Stroke::NONE)
+                .corner_radius(CornerRadius::same(16))
+                .inner_margin(Margin::symmetric(18, 8))
+                .shadow(shadow)
+                .show(ui, |ui| {
+                    ui.label(
+                        egui::RichText::new(text)
+                            .color(text_color)
+                            .size(13.5)
+                            .strong(),
+                    );
+                })
+                .response
+                .interact(egui::Sense::click())
+        })
+        .inner;
+
+    ui.memory_mut(|m| {
+        m.data.insert_temp(id.with("hover_state"), resp.hovered());
+        m.data.insert_temp(id.with("active_state"), resp.is_pointer_button_down_on());
+    });
+    if resp.hovered() && enabled {
         ui.ctx().set_cursor_icon(egui::CursorIcon::PointingHand);
     }
-    response
+    resp
 }
 
-/// Renders a cute pill-like toggle switch.
 pub fn pill_toggle(ui: &mut Ui, checked: &mut bool) -> egui::Response {
     let id = ui
         .make_persistent_id("pill_toggle")
         .with(checked as *const bool);
-    let is_hovered = ui.memory(|m| m.data.get_temp::<bool>(id).unwrap_or(false));
+    let is_hovered = ui.memory(|m| m.data.get_temp::<bool>(id.with("hover_state")).unwrap_or(false));
+    let is_active = ui.memory(|m| m.data.get_temp::<bool>(id.with("active_state")).unwrap_or(false));
+
     let hover_factor = crate::ui::animation::AnimationSystem::animate_bool(
         ui.ctx(),
         id.with("hover"),
         is_hovered,
         0.15,
+    );
+    let active_factor = crate::ui::animation::AnimationSystem::animate_bool(
+        ui.ctx(),
+        id.with("active"),
+        is_active,
+        0.08,
     );
     let switch_factor = crate::ui::animation::AnimationSystem::animate_bool(
         ui.ctx(),
@@ -361,7 +793,7 @@ pub fn pill_toggle(ui: &mut Ui, checked: &mut bool) -> egui::Response {
         0.18,
     );
 
-    let (rect, mut response) = ui.allocate_exact_size(Vec2::new(34.0, 18.0), egui::Sense::click());
+    let (rect, mut response) = ui.allocate_exact_size(Vec2::new(36.0, 20.0), egui::Sense::click());
     if response.clicked() {
         *checked = !*checked;
         response.mark_changed();
@@ -370,32 +802,57 @@ pub fn pill_toggle(ui: &mut Ui, checked: &mut bool) -> egui::Response {
     if ui.is_rect_visible(rect) {
         let painter = ui.painter();
 
-        let track_fill = if *checked {
-            crate::ui::animation::AnimationSystem::lerp_color(
-                Color32::from_rgb(37, 99, 235),
-                Color32::from_rgb(29, 78, 216),
-                hover_factor,
-            )
-        } else {
-            crate::ui::animation::AnimationSystem::lerp_color(
-                Color32::from_rgb(226, 232, 240),
-                Color32::from_rgb(203, 213, 225),
-                hover_factor,
-            )
-        };
+        let track_checked_base = Color32::from_rgb(59, 130, 246);
+        let track_checked_hover = Color32::from_rgb(37, 99, 235);
+        let track_checked_active = Color32::from_rgb(29, 78, 216);
 
-        painter.rect_filled(rect, CornerRadius::same(9), track_fill);
+        let track_unchecked_base = Color32::from_rgb(226, 232, 240);
+        let track_unchecked_hover = Color32::from_rgb(203, 213, 225);
+        let track_unchecked_active = Color32::from_rgb(186, 198, 214);
 
-        let knob_radius = 7.0;
-        let min_x = rect.min.x + 9.0;
-        let max_x = rect.max.x - 9.0;
+        let track_checked = crate::ui::animation::AnimationSystem::lerp_color(
+            track_checked_base,
+            track_checked_hover,
+            hover_factor,
+        );
+        let track_checked = crate::ui::animation::AnimationSystem::lerp_color(
+            track_checked,
+            track_checked_active,
+            active_factor,
+        );
+
+        let track_unchecked = crate::ui::animation::AnimationSystem::lerp_color(
+            track_unchecked_base,
+            track_unchecked_hover,
+            hover_factor,
+        );
+        let track_unchecked = crate::ui::animation::AnimationSystem::lerp_color(
+            track_unchecked,
+            track_unchecked_active,
+            active_factor,
+        );
+
+        let track_fill = crate::ui::animation::AnimationSystem::lerp_color(
+            track_unchecked,
+            track_checked,
+            switch_factor,
+        );
+
+        painter.rect_filled(rect, CornerRadius::same(10), track_fill);
+
+        let knob_radius = 7.5;
+        let min_x = rect.min.x + 10.0;
+        let max_x = rect.max.x - 10.0;
         let current_x = min_x + (max_x - min_x) * switch_factor;
 
         let knob_center = egui::pos2(current_x, rect.center().y);
         painter.circle_filled(knob_center, knob_radius, Color32::WHITE);
     }
 
-    ui.memory_mut(|m| m.data.insert_temp(id, response.hovered()));
+    ui.memory_mut(|m| {
+        m.data.insert_temp(id.with("hover_state"), response.hovered());
+        m.data.insert_temp(id.with("active_state"), response.is_pointer_button_down_on());
+    });
     if response.hovered() {
         ui.ctx().set_cursor_icon(egui::CursorIcon::PointingHand);
     }
@@ -421,7 +878,6 @@ pub fn toggle_with_label(ui: &mut Ui, checked: &mut bool, label: &str) -> egui::
     .inner
 }
 
-/// Adds a feature-aware checkbox using the cute pill toggle.
 pub fn feature_checkbox(
     ui: &mut Ui,
     feature: crate::feature_access::Feature,
@@ -437,7 +893,6 @@ pub fn feature_checkbox(
     response
 }
 
-/// Adds controls governed by one feature.
 pub fn feature_ui<R>(
     ui: &mut Ui,
     feature: crate::feature_access::Feature,
@@ -463,8 +918,6 @@ fn decorate_unavailable(
     }
 }
 
-/// Rounded file-picker input used wherever a local executable or model path
-/// is configured. The caller owns all labels, so fixed copy remains in i18n.
 pub fn file_path_input(
     ui: &mut Ui,
     value: &mut String,
@@ -497,19 +950,19 @@ pub fn file_path_input(
 pub fn status_badge(ui: &mut Ui, status: &str, is_active: bool, is_error: bool) {
     let (bg_color, fg_color, dot) = if is_error {
         (
-            Color32::from_rgb(254, 226, 226),
-            Color32::from_rgb(185, 28, 28),
+            Color32::from_rgb(254, 242, 242),
+            Color32::from_rgb(220, 38, 38),
             "● ",
         )
     } else if is_active {
         (
-            Color32::from_rgb(220, 252, 231),
-            Color32::from_rgb(21, 128, 61),
+            Color32::from_rgb(236, 253, 245),
+            Color32::from_rgb(5, 150, 105),
             "● ",
         )
     } else {
         (
-            Color32::from_rgb(241, 245, 249),
+            Color32::from_rgb(239, 246, 255),
             Color32::from_rgb(37, 99, 235),
             "",
         )
@@ -518,6 +971,7 @@ pub fn status_badge(ui: &mut Ui, status: &str, is_active: bool, is_error: bool) 
     Frame::new()
         .fill(bg_color)
         .corner_radius(CornerRadius::same(14))
+        .stroke(Stroke::NONE)
         .inner_margin(Margin::symmetric(12, 5))
         .show(ui, |ui| {
             ui.label(
@@ -529,14 +983,12 @@ pub fn status_badge(ui: &mut Ui, status: &str, is_active: bool, is_error: bool) 
         });
 }
 
-/// Generic item representation for the secondary inner sidebar navigation.
 pub struct SubNavItem<T: Copy + PartialEq> {
     pub id: T,
     pub icon: &'static str,
     pub label: &'static str,
 }
 
-/// Modular, reusable secondary left sub-sidebar component for sub-page section navigation.
 pub fn sub_sidebar<T: Copy + PartialEq>(
     ui: &mut Ui,
     selected: &mut T,
@@ -546,18 +998,16 @@ pub fn sub_sidebar<T: Copy + PartialEq>(
     let width = 175.0;
     let card_id = ui.make_persistent_id("sub_sidebar_layout_measurement");
 
-    // Read actual measured header height from memory (defaults to 32.0 on frame 1)
     let header_h = ui.memory(|m| m.data.get_temp::<f32>(card_id).unwrap_or(32.0));
 
     let card_height = ui.available_height().max(240.0);
-    let inner_height = card_height - 24.0; // Frame top & bottom inner_margin (12 + 12)
+    let inner_height = card_height - 24.0;
     let count = items.len();
 
     let gap = 8.0;
     let total_gaps = count.saturating_sub(1) as f32 * gap;
     let space_for_buttons = (inner_height - header_h - total_gaps).max(0.0);
 
-    // Dynamic button height scaling with available space (retaining 38.0px minimum constraint)
     let item_height = if count > 0 {
         (space_for_buttons / count as f32).max(38.0)
     } else {
@@ -565,8 +1015,8 @@ pub fn sub_sidebar<T: Copy + PartialEq>(
     };
 
     Frame::new()
-        .fill(Color32::from_rgb(248, 250, 252))
-        .corner_radius(CornerRadius::same(16))
+        .fill(Color32::from_rgb(245, 248, 252))
+        .corner_radius(CornerRadius::same(18))
         .stroke(Stroke::new(1.0, Color32::from_rgb(226, 232, 240)))
         .inner_margin(Margin::symmetric(10, 12))
         .show(ui, |ui| {
@@ -597,7 +1047,8 @@ pub fn sub_sidebar<T: Copy + PartialEq>(
                     let is_selected = *selected == item.id;
                     let id = ui.make_persistent_id(item.label);
 
-                    let is_hovered = ui.memory(|m| m.data.get_temp::<bool>(id).unwrap_or(false));
+                    let is_hovered = ui.memory(|m| m.data.get_temp::<bool>(id.with("hover_state")).unwrap_or(false));
+                    let is_active = ui.memory(|m| m.data.get_temp::<bool>(id.with("active_state")).unwrap_or(false));
 
                     let select_factor = crate::ui::animation::AnimationSystem::animate_bool(
                         ui.ctx(),
@@ -613,16 +1064,29 @@ pub fn sub_sidebar<T: Copy + PartialEq>(
                         0.15,
                     );
 
+                    let active_factor = crate::ui::animation::AnimationSystem::animate_bool(
+                        ui.ctx(),
+                        id.with("active"),
+                        is_active && !is_selected,
+                        0.08,
+                    );
+
                     let bg_fill = if select_factor > 0.0 {
                         crate::ui::animation::AnimationSystem::lerp_color(
                             Color32::TRANSPARENT,
-                            Color32::WHITE,
+                            Color32::from_rgb(239, 246, 255),
                             select_factor,
+                        )
+                    } else if active_factor > 0.0 {
+                        crate::ui::animation::AnimationSystem::lerp_color(
+                            Color32::TRANSPARENT,
+                            Color32::from_rgb(229, 239, 255),
+                            active_factor,
                         )
                     } else if hover_factor > 0.0 {
                         crate::ui::animation::AnimationSystem::lerp_color(
                             Color32::TRANSPARENT,
-                            Color32::from_rgb(241, 245, 249),
+                            Color32::from_rgb(238, 244, 253),
                             hover_factor,
                         )
                     } else {
@@ -631,17 +1095,8 @@ pub fn sub_sidebar<T: Copy + PartialEq>(
 
                     let text_color = crate::ui::animation::AnimationSystem::lerp_color(
                         crate::ui::theme::text_normal(),
-                        Color32::from_rgb(37, 99, 235), // Accent Blue
+                        Color32::from_rgb(37, 99, 235),
                         select_factor,
-                    );
-
-                    let stroke = Stroke::new(
-                        1.0,
-                        crate::ui::animation::AnimationSystem::lerp_color(
-                            Color32::TRANSPARENT,
-                            Color32::from_rgb(219, 234, 254),
-                            select_factor,
-                        ),
                     );
 
                     let text = if item.icon.is_empty() {
@@ -655,12 +1110,30 @@ pub fn sub_sidebar<T: Copy + PartialEq>(
 
                     let resp = Frame::new()
                         .fill(bg_fill)
-                        .corner_radius(CornerRadius::same(12))
+                        .corner_radius(CornerRadius::same(14))
                         .inner_margin(Margin::symmetric(14, v_padding as i8))
-                        .stroke(stroke)
+                        .stroke(Stroke::NONE)
                         .show(ui, |ui| {
                             ui.set_width(ui.available_width());
                             ui.horizontal(|ui| {
+                                if select_factor > 0.1 {
+                                    let (bar_rect, _) = ui.allocate_exact_size(
+                                        Vec2::new(3.0, 14.0),
+                                        egui::Sense::hover(),
+                                    );
+                                    let bar_color = Color32::from_rgba_premultiplied(
+                                        37,
+                                        99,
+                                        235,
+                                        (255.0 * select_factor) as u8,
+                                    );
+                                    ui.painter().rect_filled(
+                                        bar_rect,
+                                        CornerRadius::same(2),
+                                        bar_color,
+                                    );
+                                    ui.add_space(4.0);
+                                }
                                 let mut rt =
                                     egui::RichText::new(&text).size(13.5).color(text_color);
                                 if is_selected {
@@ -672,7 +1145,10 @@ pub fn sub_sidebar<T: Copy + PartialEq>(
                         .response
                         .interact(egui::Sense::click());
 
-                    ui.memory_mut(|m| m.data.insert_temp(id, resp.hovered()));
+                    ui.memory_mut(|m| {
+                        m.data.insert_temp(id.with("hover_state"), resp.hovered());
+                        m.data.insert_temp(id.with("active_state"), resp.is_pointer_button_down_on());
+                    });
 
                     if resp.clicked() {
                         *selected = item.id;
@@ -685,7 +1161,6 @@ pub fn sub_sidebar<T: Copy + PartialEq>(
         });
 }
 
-/// A modern, styled slider component with smooth track styling, active fill, rounded handle, and formatted value display.
 pub fn modern_slider_f64(
     ui: &mut Ui,
     value: &mut f64,
@@ -725,20 +1200,26 @@ pub fn modern_slider_f64(
         let value_text = format!("{:.1}{}", *value, suffix);
         ui.add_space(4.0);
         Frame::new()
-            .fill(Color32::from_rgb(241, 245, 249))
-            .corner_radius(CornerRadius::same(10))
-            .inner_margin(Margin::symmetric(8, 3))
+            .fill(Color32::WHITE)
+            .corner_radius(CornerRadius::same(12))
+            .inner_margin(Margin::symmetric(10, 4))
             .stroke(Stroke::new(1.0, Color32::from_rgb(226, 232, 240)))
+            .shadow(egui::Shadow {
+                offset: [0, 2],
+                blur: 4,
+                spread: 0,
+                color: Color32::from_black_alpha(15),
+            })
             .show(ui, |ui| {
                 ui.label(
                     egui::RichText::new(value_text)
                         .size(12.5)
-                        .color(crate::ui::theme::primary())
+                        .color(crate::ui::theme::text_strong())
                         .strong(),
                 );
             });
 
-        let mut reset = reset_button(ui);
+        let mut reset = reset_button(ui, label);
         if reset.clicked() && *value != default {
             *value = default;
             reset.mark_changed();
@@ -784,10 +1265,16 @@ pub fn modern_slider_f32(
         );
         ui.add_space(4.0);
         Frame::new()
-            .fill(Color32::from_rgb(241, 245, 249))
-            .corner_radius(CornerRadius::same(10))
-            .inner_margin(Margin::symmetric(8, 3))
+            .fill(Color32::WHITE)
+            .corner_radius(CornerRadius::same(12))
+            .inner_margin(Margin::symmetric(10, 4))
             .stroke(Stroke::new(1.0, Color32::from_rgb(226, 232, 240)))
+            .shadow(egui::Shadow {
+                offset: [0, 2],
+                blur: 4,
+                spread: 0,
+                color: Color32::from_black_alpha(15),
+            })
             .show(ui, |ui| {
                 let label = slider_state_label(*value, &range, states)
                     .map(str::to_owned)
@@ -795,11 +1282,11 @@ pub fn modern_slider_f32(
                 ui.label(
                     egui::RichText::new(label)
                         .size(12.5)
-                        .color(crate::ui::theme::primary())
+                        .color(crate::ui::theme::text_strong())
                         .strong(),
                 );
             });
-        let mut reset = reset_button(ui);
+        let mut reset = reset_button(ui, label);
         if reset.clicked() && *value != default {
             *value = default;
             reset.mark_changed();
@@ -827,13 +1314,120 @@ fn slider_state_label<'a>(
     states.get(index).copied()
 }
 
-fn reset_button(ui: &mut Ui) -> egui::Response {
-    let image = egui::Image::new(egui::include_image!("../../resources/icons/reset.svg"))
-        .fit_to_exact_size(Vec2::splat(14.0))
-        .tint(crate::ui::theme::text_normal());
-    ui.add(
-        egui::Button::image(image)
-            .min_size(Vec2::splat(28.0))
-            .corner_radius(CornerRadius::same(10)),
-    )
+pub fn reset_button(ui: &mut Ui, id_salt: &str) -> egui::Response {
+    let id = ui.make_persistent_id("slider_reset_btn").with(id_salt);
+    let is_hovered = ui.memory(|m| m.data.get_temp::<bool>(id.with("hover_state")).unwrap_or(false));
+    let is_active = ui.memory(|m| m.data.get_temp::<bool>(id.with("active_state")).unwrap_or(false));
+
+    let hover_factor = crate::ui::animation::AnimationSystem::animate_bool(
+        ui.ctx(),
+        id.with("hover"),
+        is_hovered,
+        0.15,
+    );
+    let active_factor = crate::ui::animation::AnimationSystem::animate_bool(
+        ui.ctx(),
+        id.with("active"),
+        is_active,
+        0.08,
+    );
+
+    let current_time = ui.ctx().input(|i| i.time);
+    let spin_start = ui.memory(|m| m.data.get_temp::<f64>(id.with("spin_start")).unwrap_or(0.0));
+    let elapsed = (current_time - spin_start) as f32;
+    let spin_duration = 0.40;
+    let is_spinning = elapsed >= 0.0 && elapsed < spin_duration;
+
+    let (rotation_angle, spin_accent_factor) = if is_spinning {
+        ui.ctx().request_repaint();
+        let t = (elapsed / spin_duration).clamp(0.0, 1.0);
+        let progress = crate::ui::animation::AnimationSystem::ease_out_cubic(t);
+        let angle = -std::f32::consts::TAU * progress;
+        let accent = (1.0 - progress).clamp(0.0, 1.0);
+        (angle, accent)
+    } else {
+        (0.0, 0.0)
+    };
+
+    let rest_fill = Color32::WHITE;
+    let hover_fill = Color32::from_rgb(248, 250, 252);
+    let active_fill = Color32::from_rgb(235, 241, 250);
+    let spin_fill = Color32::from_rgb(239, 246, 255);
+
+    let base_fill = crate::ui::animation::AnimationSystem::lerp_color(rest_fill, hover_fill, hover_factor);
+    let fill = crate::ui::animation::AnimationSystem::lerp_color(base_fill, active_fill, active_factor);
+    let fill = crate::ui::animation::AnimationSystem::lerp_color(fill, spin_fill, spin_accent_factor);
+
+    let rest_stroke = Color32::from_rgb(226, 232, 240);
+    let hover_stroke = Color32::from_rgb(203, 213, 225);
+    let active_stroke = Color32::from_rgb(148, 163, 184);
+    let spin_stroke = Color32::from_rgb(147, 197, 253);
+
+    let stroke_color = crate::ui::animation::AnimationSystem::lerp_color(rest_stroke, hover_stroke, hover_factor);
+    let stroke_color = crate::ui::animation::AnimationSystem::lerp_color(stroke_color, active_stroke, active_factor);
+    let stroke_color = crate::ui::animation::AnimationSystem::lerp_color(stroke_color, spin_stroke, spin_accent_factor);
+
+    let rest_shadow = egui::Shadow {
+        offset: [0, 2],
+        blur: 4,
+        spread: 0,
+        color: Color32::from_black_alpha(10),
+    };
+    let hover_shadow = egui::Shadow {
+        offset: [0, 3],
+        blur: 6,
+        spread: 0,
+        color: Color32::from_black_alpha(15),
+    };
+    let active_shadow = egui::Shadow {
+        offset: [0, 1],
+        blur: 2,
+        spread: 0,
+        color: Color32::from_black_alpha(6),
+    };
+
+    let shadow = {
+        let s = crate::ui::animation::AnimationSystem::lerp_shadow(rest_shadow, hover_shadow, hover_factor);
+        crate::ui::animation::AnimationSystem::lerp_shadow(s, active_shadow, active_factor)
+    };
+
+    let icon_rest_tint = crate::ui::theme::text_strong();
+    let icon_spin_tint = Color32::from_rgb(37, 99, 235);
+    let icon_tint = crate::ui::animation::AnimationSystem::lerp_color(icon_rest_tint, icon_spin_tint, spin_accent_factor);
+
+    let mut image = egui::Image::new(egui::include_image!("../../resources/icons/reset.svg"))
+        .fit_to_exact_size(Vec2::splat(13.0))
+        .tint(icon_tint);
+
+    if rotation_angle.abs() > 0.0001 {
+        image = image.rotate(rotation_angle, Vec2::splat(0.5));
+    }
+
+    let resp = Frame::new()
+        .fill(fill)
+        .corner_radius(CornerRadius::same(12))
+        .inner_margin(Margin::same(6))
+        .stroke(Stroke::new(1.0, stroke_color))
+        .shadow(shadow)
+        .show(ui, |ui| {
+            ui.add(image);
+        })
+        .response
+        .interact(egui::Sense::click());
+
+    if resp.clicked() {
+        ui.memory_mut(|m| {
+            m.data.insert_temp(id.with("spin_start"), current_time);
+        });
+        ui.ctx().request_repaint();
+    }
+
+    ui.memory_mut(|m| {
+        m.data.insert_temp(id.with("hover_state"), resp.hovered());
+        m.data.insert_temp(id.with("active_state"), resp.is_pointer_button_down_on());
+    });
+    if resp.hovered() {
+        ui.ctx().set_cursor_icon(egui::CursorIcon::PointingHand);
+    }
+    resp
 }

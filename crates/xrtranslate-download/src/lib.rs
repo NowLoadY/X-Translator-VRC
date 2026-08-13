@@ -55,19 +55,38 @@ pub struct DownloadClient {
 
 impl DownloadClient {
     pub fn new(user_agent: &str) -> Result<Self, DownloadError> {
-        Self::with_policy(user_agent, DownloadPolicy::default())
+        Self::with_policy_and_proxy(user_agent, DownloadPolicy::default(), None)
     }
 
     pub fn with_policy(user_agent: &str, policy: DownloadPolicy) -> Result<Self, DownloadError> {
+        Self::with_policy_and_proxy(user_agent, policy, None)
+    }
+
+    pub fn with_proxy(user_agent: &str, proxy_url: Option<&str>) -> Result<Self, DownloadError> {
+        Self::with_policy_and_proxy(user_agent, DownloadPolicy::default(), proxy_url)
+    }
+
+    fn with_policy_and_proxy(
+        user_agent: &str,
+        policy: DownloadPolicy,
+        proxy_url: Option<&str>,
+    ) -> Result<Self, DownloadError> {
         if policy.max_attempts == 0 {
             return Err(DownloadError::InvalidSpec(
                 "download max_attempts must be greater than zero".into(),
             ));
         }
-        let client = reqwest::Client::builder()
+        let mut builder = reqwest::Client::builder()
             .user_agent(user_agent)
             .connect_timeout(policy.connect_timeout)
-            .read_timeout(policy.read_timeout)
+            .read_timeout(policy.read_timeout);
+        if let Some(proxy_url) = proxy_url.filter(|url| !url.trim().is_empty()) {
+            builder = builder.proxy(
+                reqwest::Proxy::all(proxy_url)
+                    .map_err(|error| DownloadError::Client(error.to_string()))?,
+            );
+        }
+        let client = builder
             .build()
             .map_err(|error| DownloadError::Client(error.to_string()))?;
         Ok(Self { client, policy })
