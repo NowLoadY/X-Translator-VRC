@@ -90,6 +90,7 @@ enum NativeModelTaskResult {
 pub struct NativeModelTaskManager {
     state: NativeModelTaskState,
     events: Option<Receiver<NativeModelTaskEvent>>,
+    proxy_url: Option<String>,
 }
 
 impl Default for NativeModelTaskManager {
@@ -97,11 +98,15 @@ impl Default for NativeModelTaskManager {
         Self {
             state: NativeModelTaskState::Idle,
             events: None,
+            proxy_url: None,
         }
     }
 }
 
 impl NativeModelTaskManager {
+    pub fn set_proxy_url(&mut self, proxy_url: &str) {
+        self.proxy_url = (!proxy_url.trim().is_empty()).then(|| proxy_url.trim().to_owned());
+    }
     #[must_use]
     pub fn state(&self) -> &NativeModelTaskState {
         &self.state
@@ -235,9 +240,10 @@ impl NativeModelTaskManager {
         }
 
         let (event_tx, event_rx) = unbounded();
+        let proxy_url = self.proxy_url.clone();
         thread::Builder::new()
             .name("native-model-installer".into())
-            .spawn(move || run_task(project_root, task, event_tx))
+            .spawn(move || run_task(project_root, task, event_tx, proxy_url))
             .map_err(|error| format!("Cannot start native model worker: {error}"))?;
         self.state = match task {
             NativeModelTask::Discover => NativeModelTaskState::Discovering,
@@ -258,10 +264,13 @@ fn run_task(
     project_root: PathBuf,
     task: NativeModelTask,
     event_tx: crossbeam_channel::Sender<NativeModelTaskEvent>,
+    proxy_url: Option<String>,
 ) {
     let result = match task {
         NativeModelTask::Discover => discover_models(project_root),
-        NativeModelTask::Install(asset_id) => install_model(project_root, asset_id, &event_tx),
+        NativeModelTask::Install(asset_id) => {
+            install_model(project_root, asset_id, &event_tx, proxy_url.as_deref())
+        }
         NativeModelTask::Verify => verify_models(project_root),
     };
     let _ = event_tx.send(NativeModelTaskEvent::Finished(result));
@@ -292,10 +301,12 @@ fn install_model(
     project_root: PathBuf,
     asset_id: ModelAssetId,
     event_tx: &crossbeam_channel::Sender<NativeModelTaskEvent>,
+    proxy_url: Option<&str>,
 ) -> NativeModelTaskResult {
     let result = (|| -> Result<PathBuf, String> {
         let assets = load_assets(&project_root)?;
-        let installer = NativeModelInstaller::new(assets).map_err(|error| error.to_string())?;
+        let installer = NativeModelInstaller::with_proxy(assets, proxy_url)
+            .map_err(|error| error.to_string())?;
         let runtime = tokio::runtime::Builder::new_current_thread()
             .enable_all()
             .build()

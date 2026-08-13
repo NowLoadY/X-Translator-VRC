@@ -513,6 +513,7 @@ struct XRTranslateApp {
     translations: Vec<TranslationHistoryEntry>,
     last_error: Option<String>,
     server_url: String,
+    download_proxy_url: String,
     source_lang: String,
     target_lang: String,
     tts_enabled: bool,
@@ -524,6 +525,7 @@ struct XRTranslateApp {
     model_task_manager: model_install::NativeModelTaskManager,
     runtime_installer: runtime_install::RuntimeInstaller,
     app_update_manager: app_update::AppUpdateManager,
+    notified_update_version: Option<String>,
     backend_start_deadline: Option<std::time::Instant>,
     pub settings_section: ui::pages::settings::SettingsSection,
     pub modal_dialog: ui::modal::ModalDialog,
@@ -566,6 +568,12 @@ impl Default for XRTranslateApp {
 
         let osc_draft = settings.osc_settings.clone();
         let osc_manager = OscManager::new(osc_draft.clone());
+        let mut model_task_manager = model_install::NativeModelTaskManager::default();
+        model_task_manager.set_proxy_url(&settings.download_proxy_url);
+        let mut runtime_installer = runtime_install::RuntimeInstaller::default();
+        runtime_installer.set_proxy_url(&settings.download_proxy_url);
+        let mut app_update_manager = app_update::AppUpdateManager::default();
+        app_update_manager.set_proxy_url(&settings.download_proxy_url);
 
         let selected_input_config = match settings.capture_source {
             CaptureSource::Microphone => {
@@ -927,6 +935,7 @@ impl Default for XRTranslateApp {
             translations: Vec::new(),
             last_error: None,
             server_url: settings.server_url,
+            download_proxy_url: settings.download_proxy_url,
             source_lang: settings.source_lang,
             target_lang: settings.target_lang,
             tts_enabled: settings.tts_enabled,
@@ -935,9 +944,10 @@ impl Default for XRTranslateApp {
             osc_draft,
             service_config: service_config::ServiceConfigEditor::load(),
             backend_manager,
-            model_task_manager: model_install::NativeModelTaskManager::default(),
-            runtime_installer: runtime_install::RuntimeInstaller::default(),
-            app_update_manager: app_update::AppUpdateManager::default(),
+            model_task_manager,
+            runtime_installer,
+            app_update_manager,
+            notified_update_version: None,
             backend_start_deadline: None,
             settings_section: ui::pages::settings::SettingsSection::default(),
             modal_dialog: ui::modal::ModalDialog::default(),
@@ -961,6 +971,7 @@ impl Default for XRTranslateApp {
             overlay_font_size_atomic,
         };
         app.restart_level_preview();
+        app.check_for_updates();
         app
     }
 }
@@ -988,6 +999,7 @@ impl XRTranslateApp {
             ui_language: self.ui_language,
             first_run: self.first_run,
             server_url: self.server_url.clone(),
+            download_proxy_url: self.download_proxy_url.clone(),
             osc_settings: self.osc_draft.clone(),
             active_page: self.navigation.page,
             sidebar_collapsed: self.navigation.collapsed,
@@ -1018,6 +1030,29 @@ impl XRTranslateApp {
         if let Err(error) = self.app_update_manager.check() {
             self.last_error = Some(error);
         }
+    }
+
+    pub fn set_download_proxy_url(&mut self, proxy_url: String) {
+        self.download_proxy_url = proxy_url.trim().to_owned();
+        self.model_task_manager
+            .set_proxy_url(&self.download_proxy_url);
+        self.runtime_installer
+            .set_proxy_url(&self.download_proxy_url);
+        self.app_update_manager
+            .set_proxy_url(&self.download_proxy_url);
+        self.save_settings();
+    }
+
+    fn show_available_update(&mut self) {
+        let app_update::AppUpdateState::Available(info) = self.app_update_manager.state() else {
+            return;
+        };
+        if self.notified_update_version.as_deref() == Some(&info.version) {
+            return;
+        }
+        self.notified_update_version = Some(info.version.clone());
+        self.modal_dialog =
+            ui::modal::ModalDialog::update_available(&info.version, self.ui_language);
     }
 
     pub fn download_update(&mut self) {
@@ -1594,6 +1629,8 @@ impl eframe::App for XRTranslateApp {
             return;
         }
 
+        self.show_available_update();
+
         self.poll_backend_startup(Some(ui.ctx().clone()));
         self.poll_session_events();
 
@@ -1678,6 +1715,9 @@ impl eframe::App for XRTranslateApp {
             });
 
         self.modal_dialog.render(ui.ctx(), self.ui_language);
+        if self.modal_dialog.take_action() == Some(ui::modal::ModalAction::DownloadUpdate) {
+            self.download_update();
+        }
     }
 }
 

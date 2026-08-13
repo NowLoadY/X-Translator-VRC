@@ -78,6 +78,8 @@ pub struct ClientSettings {
     pub first_run: bool,
     #[serde(default = "default_server_url")]
     pub server_url: String,
+    #[serde(default)]
+    pub download_proxy_url: String,
     #[serde(default = "OscSettings::from_project_config")]
     pub osc_settings: OscSettings,
     #[serde(default)]
@@ -142,6 +144,7 @@ impl Default for ClientSettings {
             ui_language: UiLanguage::default(),
             first_run: true,
             server_url: default_server_url(),
+            download_proxy_url: String::new(),
             osc_settings: OscSettings::from_project_config(),
             active_page: Page::default(),
             sidebar_collapsed: false,
@@ -315,6 +318,7 @@ mod tests {
             tts_enabled: true,
             speaker_recognition_enabled: true,
             source_lang: "en".into(),
+            download_proxy_url: "socks5://127.0.0.1:1080".into(),
             sidebar_collapsed: true,
             active_page: Page::Osc,
             osc_settings: OscSettings {
@@ -334,6 +338,7 @@ mod tests {
         assert!(!loaded.tts_enabled);
         assert!(loaded.speaker_recognition_enabled);
         assert_eq!(loaded.source_lang, "en");
+        assert_eq!(loaded.download_proxy_url, "socks5://127.0.0.1:1080");
         assert!(loaded.sidebar_collapsed);
         assert_eq!(loaded.active_page, Page::Osc);
         assert!(loaded.osc_settings.show_speaker_number);

@@ -32,6 +32,13 @@ pub struct ModalDialog {
     pub ok_label: String,
     pub show_cancel_button: bool,
     pub cancel_label: String,
+    action: Option<ModalAction>,
+    ok_action: Option<ModalAction>,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum ModalAction {
+    DownloadUpdate,
 }
 
 impl Default for ModalDialog {
@@ -44,11 +51,38 @@ impl Default for ModalDialog {
             ok_label: "OK".into(),
             show_cancel_button: false,
             cancel_label: "Cancel".into(),
+            action: None,
+            ok_action: None,
         }
     }
 }
 
 impl ModalDialog {
+    pub fn update_available(version: &str, language: crate::i18n::UiLanguage) -> Self {
+        Self {
+            open: true,
+            pages: vec![ModalPage::new(
+                crate::i18n::tr(language, "Update available"),
+                format!(
+                    "{} v{}",
+                    crate::i18n::tr(language, "A new version is available:"),
+                    version
+                ),
+            )],
+            current_page: 0,
+            show_ok_button: true,
+            ok_label: crate::i18n::tr(language, "Update").into(),
+            show_cancel_button: true,
+            cancel_label: crate::i18n::tr(language, "Later").into(),
+            action: None,
+            ok_action: Some(ModalAction::DownloadUpdate),
+        }
+    }
+
+    pub fn take_action(&mut self) -> Option<ModalAction> {
+        self.action.take()
+    }
+
     pub fn error(
         title: impl Into<String>,
         message: impl Into<String>,
@@ -70,6 +104,8 @@ impl ModalDialog {
             ok_label: "OK".into(),
             show_cancel_button: false,
             cancel_label: "Close".into(),
+            action: None,
+            ok_action: None,
         }
     }
 
@@ -82,6 +118,8 @@ impl ModalDialog {
             ok_label: "Finish".into(),
             show_cancel_button: false,
             cancel_label: "Close".into(),
+            action: None,
+            ok_action: None,
         }
     }
 
@@ -263,6 +301,7 @@ impl ModalDialog {
                                         &self.ok_label
                                     };
                                 if crate::ui::components::primary_button(ui, ok_text).clicked() {
+                                    self.action = self.ok_action;
                                     close_dialog = true;
                                 }
                             }
