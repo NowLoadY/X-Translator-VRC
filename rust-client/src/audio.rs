@@ -32,7 +32,7 @@ pub struct InputConfigInfo {
 
 pub struct AudioSystem {
     host: cpal::Host,
-    active_capture: Option<ActiveCapture>,
+    active_captures: Vec<ActiveCapture>,
     tts_player: Option<TtsPlayer>,
 }
 
@@ -96,7 +96,7 @@ impl AudioSystem {
     pub fn new() -> Self {
         Self {
             host: cpal::default_host(),
-            active_capture: None,
+            active_captures: Vec::new(),
             tts_player: None,
         }
     }
@@ -146,7 +146,7 @@ impl AudioSystem {
 
     /// Stop the currently active audio stream
     pub fn stop(&mut self) {
-        if let Some(capture) = self.active_capture.take() {
+        for capture in self.active_captures.drain(..) {
             capture.stop();
         }
         self.clear_tts_playback();
@@ -202,7 +202,7 @@ impl AudioSystem {
         let channels = config.channels() as usize;
         let sample_format = config.sample_format();
 
-        log::info!("Starting capture on device: '{}'", device.to_string());
+        log::info!("Starting capture on device: '{}'", device);
         log::info!(
             "Format: {:?}, Rate: {}, Channels: {}",
             sample_format,
@@ -215,116 +215,29 @@ impl AudioSystem {
 
         let stream_config: cpal::StreamConfig = config.into();
 
-        // Build the stream based on the sample format
+        macro_rules! build_stream {
+            ($sample:ty) => {
+                self.build_stream::<$sample>(
+                    &device,
+                    (stream_config, channels, sample_rate, target_rate),
+                    tx,
+                    level,
+                )
+            };
+        }
         let stream = match sample_format {
-            cpal::SampleFormat::F32 => self.build_stream::<f32>(
-                &device,
-                stream_config,
-                channels,
-                sample_rate,
-                target_rate,
-                tx,
-                Arc::clone(&level),
-            ),
-            cpal::SampleFormat::F64 => self.build_stream::<f64>(
-                &device,
-                stream_config,
-                channels,
-                sample_rate,
-                target_rate,
-                tx,
-                Arc::clone(&level),
-            ),
-            cpal::SampleFormat::I8 => self.build_stream::<i8>(
-                &device,
-                stream_config,
-                channels,
-                sample_rate,
-                target_rate,
-                tx,
-                Arc::clone(&level),
-            ),
-            cpal::SampleFormat::I16 => self.build_stream::<i16>(
-                &device,
-                stream_config,
-                channels,
-                sample_rate,
-                target_rate,
-                tx,
-                Arc::clone(&level),
-            ),
-            cpal::SampleFormat::I24 => self.build_stream::<cpal::I24>(
-                &device,
-                stream_config,
-                channels,
-                sample_rate,
-                target_rate,
-                tx,
-                Arc::clone(&level),
-            ),
-            cpal::SampleFormat::I32 => self.build_stream::<i32>(
-                &device,
-                stream_config,
-                channels,
-                sample_rate,
-                target_rate,
-                tx,
-                Arc::clone(&level),
-            ),
-            cpal::SampleFormat::I64 => self.build_stream::<i64>(
-                &device,
-                stream_config,
-                channels,
-                sample_rate,
-                target_rate,
-                tx,
-                Arc::clone(&level),
-            ),
-            cpal::SampleFormat::U8 => self.build_stream::<u8>(
-                &device,
-                stream_config,
-                channels,
-                sample_rate,
-                target_rate,
-                tx,
-                Arc::clone(&level),
-            ),
-            cpal::SampleFormat::U16 => self.build_stream::<u16>(
-                &device,
-                stream_config,
-                channels,
-                sample_rate,
-                target_rate,
-                tx,
-                Arc::clone(&level),
-            ),
-            cpal::SampleFormat::U24 => self.build_stream::<cpal::U24>(
-                &device,
-                stream_config,
-                channels,
-                sample_rate,
-                target_rate,
-                tx,
-                Arc::clone(&level),
-            ),
-            cpal::SampleFormat::U32 => self.build_stream::<u32>(
-                &device,
-                stream_config,
-                channels,
-                sample_rate,
-                target_rate,
-                tx,
-                Arc::clone(&level),
-            ),
-            cpal::SampleFormat::U64 => self.build_stream::<u64>(
-                &device,
-                stream_config,
-                channels,
-                sample_rate,
-                target_rate,
-                tx,
-                level,
-            ),
+            cpal::SampleFormat::F32 => build_stream!(f32),
+            cpal::SampleFormat::F64 => build_stream!(f64),
+            cpal::SampleFormat::I8 => build_stream!(i8),
+            cpal::SampleFormat::I16 => build_stream!(i16),
+            cpal::SampleFormat::I24 => build_stream!(cpal::I24),
+            cpal::SampleFormat::I32 => build_stream!(i32),
+            cpal::SampleFormat::I64 => build_stream!(i64),
+            cpal::SampleFormat::U8 => build_stream!(u8),
+            cpal::SampleFormat::U16 => build_stream!(u16),
+            cpal::SampleFormat::U24 => build_stream!(cpal::U24),
+            cpal::SampleFormat::U32 => build_stream!(u32),
+            cpal::SampleFormat::U64 => build_stream!(u64),
             sample_format => Err(format!(
                 "Unsupported microphone sample format: {sample_format}"
             )),
@@ -333,24 +246,104 @@ impl AudioSystem {
         stream
             .play()
             .map_err(|e| format!("Failed to play stream: {}", e))?;
-        self.replace_active_capture(ActiveCapture::Microphone(stream));
+        self.add_active_capture(ActiveCapture::Microphone(stream));
 
         Ok(())
+    }
+
+    pub fn start_level_preview(
+        &mut self,
+        device_id: &str,
+        level: Arc<AtomicU32>,
+    ) -> Result<(), String> {
+        let device = if device_id.is_empty() {
+            self.host
+                .default_input_device()
+                .ok_or("No default input device available.")?
+        } else {
+            let parsed_id = device_id
+                .parse()
+                .map_err(|error| format!("Invalid microphone ID '{device_id}': {error}"))?;
+            self.host
+                .device_by_id(&parsed_id)
+                .ok_or_else(|| format!("Microphone '{device_id}' is no longer available"))?
+        };
+        let config = device
+            .default_input_config()
+            .map_err(|error| format!("Failed to get default input config: {error}"))?;
+        let channels = config.channels() as usize;
+        let stream_config: cpal::StreamConfig = config.into();
+        macro_rules! build_stream {
+            ($sample:ty) => {
+                self.build_level_stream::<$sample>(&device, stream_config, channels, level)
+            };
+        }
+        let stream = match config.sample_format() {
+            cpal::SampleFormat::F32 => build_stream!(f32),
+            cpal::SampleFormat::F64 => build_stream!(f64),
+            cpal::SampleFormat::I8 => build_stream!(i8),
+            cpal::SampleFormat::I16 => build_stream!(i16),
+            cpal::SampleFormat::I24 => build_stream!(cpal::I24),
+            cpal::SampleFormat::I32 => build_stream!(i32),
+            cpal::SampleFormat::I64 => build_stream!(i64),
+            cpal::SampleFormat::U8 => build_stream!(u8),
+            cpal::SampleFormat::U16 => build_stream!(u16),
+            cpal::SampleFormat::U24 => build_stream!(cpal::U24),
+            cpal::SampleFormat::U32 => build_stream!(u32),
+            cpal::SampleFormat::U64 => build_stream!(u64),
+            format => Err(format!("Unsupported microphone sample format: {format}")),
+        }?;
+        stream
+            .play()
+            .map_err(|error| format!("Failed to start input level preview: {error}"))?;
+        self.add_active_capture(ActiveCapture::Microphone(stream));
+        Ok(())
+    }
+
+    fn build_level_stream<T: Sample + cpal::SizedSample>(
+        &self,
+        device: &cpal::Device,
+        config: cpal::StreamConfig,
+        channels: usize,
+        level: Arc<AtomicU32>,
+    ) -> Result<Stream, String>
+    where
+        f32: cpal::FromSample<T>,
+    {
+        device
+            .build_input_stream(
+                config,
+                move |data: &[T], _: &cpal::InputCallbackInfo| {
+                    let sum = data
+                        .chunks(channels)
+                        .map(|frame| {
+                            let mono = frame
+                                .iter()
+                                .map(|sample| f32::from_sample(*sample))
+                                .sum::<f32>()
+                                / frame.len() as f32;
+                            mono * mono
+                        })
+                        .sum::<f32>();
+                    update_input_level_from_energy(sum, data.len() / channels, &level);
+                },
+                |error| log::error!("Input level preview failed: {error}"),
+                None,
+            )
+            .map_err(|error| format!("Failed to build input level preview: {error}"))
     }
 
     fn build_stream<T: Sample + cpal::SizedSample>(
         &self,
         device: &cpal::Device,
-        config: cpal::StreamConfig,
-        channels: usize,
-        src_rate: u32,
-        target_rate: u32,
+        input: (cpal::StreamConfig, usize, u32, u32),
         tx: Sender<Vec<f32>>,
         level: Arc<AtomicU32>,
     ) -> Result<Stream, String>
     where
         f32: cpal::FromSample<T>,
     {
+        let (config, channels, src_rate, target_rate) = input;
         // 1. Resampler setup (if rates don't match)
         let (raw_tx, raw_rx) = bounded::<Vec<f32>>(32);
         Self::spawn_processing_worker(raw_rx, src_rate, target_rate, tx)?;
@@ -439,10 +432,8 @@ impl AudioSystem {
             .map_err(|error| format!("Failed to start audio processing thread: {error}"))
     }
 
-    fn replace_active_capture(&mut self, capture: ActiveCapture) {
-        if let Some(previous) = self.active_capture.replace(capture) {
-            previous.stop();
-        }
+    fn add_active_capture(&mut self, capture: ActiveCapture) {
+        self.active_captures.push(capture);
     }
 
     fn ensure_tts_player(&mut self) -> Result<(), String> {
@@ -459,7 +450,7 @@ impl AudioSystem {
         let sample_rate = config.sample_rate();
         let channels = config.channels() as usize;
         let queue = Arc::new(Mutex::new(VecDeque::new()));
-        let stream_config: cpal::StreamConfig = config.clone().into();
+        let stream_config: cpal::StreamConfig = config.into();
         let stream = match config.sample_format() {
             cpal::SampleFormat::F32 => {
                 build_tts_output_stream::<f32>(&device, stream_config, channels, Arc::clone(&queue))
@@ -616,12 +607,30 @@ impl AudioSystem {
         output_tx: Sender<Vec<f32>>,
         level: Arc<AtomicU32>,
     ) -> Result<(), String> {
+        self.start_loopback(device_id, Some(output_tx), level, "wasapi-loopback")
+    }
+
+    pub fn start_loopback_level_preview(
+        &mut self,
+        device_id: &str,
+        level: Arc<AtomicU32>,
+    ) -> Result<(), String> {
+        self.start_loopback(device_id, None, level, "wasapi-loopback-level-preview")
+    }
+
+    fn start_loopback(
+        &mut self,
+        device_id: &str,
+        output_tx: Option<Sender<Vec<f32>>>,
+        level: Arc<AtomicU32>,
+        worker_name: &str,
+    ) -> Result<(), String> {
         let device_id = device_id.to_owned();
         let stop_requested = Arc::new(AtomicBool::new(false));
         let worker_stop = Arc::clone(&stop_requested);
         let (ready_tx, ready_rx) = std::sync::mpsc::sync_channel(1);
         let worker = thread::Builder::new()
-            .name("wasapi-loopback".into())
+            .name(worker_name.into())
             .spawn(move || {
                 if let Err(error) =
                     run_loopback_capture(&device_id, output_tx, level, worker_stop, &ready_tx)
@@ -634,7 +643,7 @@ impl AudioSystem {
 
         match ready_rx.recv_timeout(Duration::from_secs(2)) {
             Ok(Ok(())) => {
-                self.replace_active_capture(ActiveCapture::Loopback(LoopbackCapture {
+                self.add_active_capture(ActiveCapture::Loopback(LoopbackCapture {
                     stop_requested,
                     worker,
                 }));
@@ -657,7 +666,7 @@ impl AudioSystem {
 #[cfg(windows)]
 fn run_loopback_capture(
     device_id: &str,
-    output_tx: Sender<Vec<f32>>,
+    output_tx: Option<Sender<Vec<f32>>>,
     level: Arc<AtomicU32>,
     stop_requested: Arc<AtomicBool>,
     ready_tx: &std::sync::mpsc::SyncSender<Result<(), String>>,
@@ -680,8 +689,13 @@ fn run_loopback_capture(
     let capture = client
         .get_audiocaptureclient()
         .map_err(|error| format!("Cannot create WASAPI capture client: {error}"))?;
-    let (raw_tx, raw_rx) = bounded::<Vec<f32>>(32);
-    AudioSystem::spawn_processing_worker(raw_rx, 48_000, 16_000, output_tx)?;
+    let raw_tx = if let Some(output_tx) = output_tx {
+        let (raw_tx, raw_rx) = bounded::<Vec<f32>>(32);
+        AudioSystem::spawn_processing_worker(raw_rx, 48_000, 16_000, output_tx)?;
+        Some(raw_tx)
+    } else {
+        None
+    };
     client
         .start_stream()
         .map_err(|error| format!("Cannot start WASAPI loopback capture: {error}"))?;
@@ -710,7 +724,9 @@ fn run_loopback_capture(
         while pending.len() >= bytes_per_frame * 960 {
             let samples = take_loopback_mono(&mut pending, 960);
             update_input_level(&samples, &level);
-            let _ = raw_tx.try_send(samples);
+            if let Some(raw_tx) = &raw_tx {
+                let _ = raw_tx.try_send(samples);
+            }
         }
         let _ = event.wait_for_event(100_000);
     }
@@ -723,9 +739,18 @@ fn update_input_level(samples: &[f32], level: &AtomicU32) {
         return;
     }
 
-    let rms = (samples.iter().map(|sample| sample * sample).sum::<f32>() / samples.len() as f32)
-        .sqrt()
-        .clamp(0.0, 1.0);
+    update_input_level_from_energy(
+        samples.iter().map(|sample| sample * sample).sum(),
+        samples.len(),
+        level,
+    );
+}
+
+fn update_input_level_from_energy(sum: f32, sample_count: usize, level: &AtomicU32) {
+    if sample_count == 0 {
+        return;
+    }
+    let rms = (sum / sample_count as f32).sqrt().clamp(0.0, 1.0);
     let previous = f32::from_bits(level.load(Ordering::Relaxed));
     // A quick rise and gentle fall makes speech activity readable without the
     // meter flickering at the audio callback rate.

@@ -79,7 +79,7 @@ fn get_formatted_time() -> String {
     #[cfg(target_os = "windows")]
     unsafe {
         #[repr(C)]
-        struct SYSTEMTIME {
+        struct SystemTime {
             w_year: u16,
             w_month: u16,
             w_day_of_week: u16,
@@ -90,9 +90,9 @@ fn get_formatted_time() -> String {
             w_milliseconds: u16,
         }
         unsafe extern "system" {
-            fn GetLocalTime(lpSystemTime: *mut SYSTEMTIME);
+            fn GetLocalTime(lpSystemTime: *mut SystemTime);
         }
-        let mut st = std::mem::zeroed::<SYSTEMTIME>();
+        let mut st = std::mem::zeroed::<SystemTime>();
         GetLocalTime(&mut st);
         format!("{:02}:{:02}:{:02}", st.w_hour, st.w_minute, st.w_second)
     }
@@ -106,15 +106,15 @@ fn sample_cpu_usage() -> u32 {
     #[cfg(target_os = "windows")]
     unsafe {
         #[repr(C)]
-        struct FILETIME {
+        struct FileTime {
             dw_low_datetime: u32,
             dw_high_datetime: u32,
         }
         unsafe extern "system" {
             fn GetSystemTimes(
-                lpIdleTime: *mut FILETIME,
-                lpKernelTime: *mut FILETIME,
-                lpUserTime: *mut FILETIME,
+                lpIdleTime: *mut FileTime,
+                lpKernelTime: *mut FileTime,
+                lpUserTime: *mut FileTime,
             ) -> i32;
         }
 
@@ -122,13 +122,13 @@ fn sample_cpu_usage() -> u32 {
         static LAST_KERNEL: AtomicU64 = AtomicU64::new(0);
         static LAST_USER: AtomicU64 = AtomicU64::new(0);
 
-        fn filetime_to_u64(ft: FILETIME) -> u64 {
+        fn filetime_to_u64(ft: FileTime) -> u64 {
             ((ft.dw_high_datetime as u64) << 32) | (ft.dw_low_datetime as u64)
         }
 
-        let mut idle = std::mem::zeroed::<FILETIME>();
-        let mut kernel = std::mem::zeroed::<FILETIME>();
-        let mut user = std::mem::zeroed::<FILETIME>();
+        let mut idle = std::mem::zeroed::<FileTime>();
+        let mut kernel = std::mem::zeroed::<FileTime>();
+        let mut user = std::mem::zeroed::<FileTime>();
 
         if GetSystemTimes(&mut idle, &mut kernel, &mut user) != 0 {
             let idle_u64 = filetime_to_u64(idle);
@@ -162,7 +162,7 @@ fn detect_cpu_name() -> String {
     #[cfg(target_os = "windows")]
     {
         use std::process::Command;
-        if let Ok(output) = Command::new("reg")
+        if let Ok(output) = crate::child_process::hide_console(&mut Command::new("reg"))
             .args([
                 "query",
                 "HKLM\\HARDWARE\\DESCRIPTION\\System\\CentralProcessor\\0",
@@ -173,12 +173,12 @@ fn detect_cpu_name() -> String {
         {
             let stdout = String::from_utf8_lossy(&output.stdout);
             for line in stdout.lines() {
-                if line.contains("ProcessorNameString") {
-                    if let Some(pos) = line.find("REG_SZ") {
-                        let name = line[pos + 6..].trim();
-                        if !name.is_empty() {
-                            return clean_hardware_name(name);
-                        }
+                if line.contains("ProcessorNameString")
+                    && let Some(pos) = line.find("REG_SZ")
+                {
+                    let name = line[pos + 6..].trim();
+                    if !name.is_empty() {
+                        return clean_hardware_name(name);
                     }
                 }
             }
@@ -195,18 +195,18 @@ fn detect_gpu_name() -> String {
             let key = format!(
                 "HKLM\\SYSTEM\\CurrentControlSet\\Control\\Class\\{{4d36e968-e325-11ce-bfc1-08002be10318}}\\{index}"
             );
-            if let Ok(output) = Command::new("reg")
+            if let Ok(output) = crate::child_process::hide_console(&mut Command::new("reg"))
                 .args(["query", &key, "/v", "DriverDesc"])
                 .output()
             {
                 let stdout = String::from_utf8_lossy(&output.stdout);
                 for line in stdout.lines() {
-                    if line.contains("DriverDesc") {
-                        if let Some(pos) = line.find("REG_SZ") {
-                            let name = line[pos + 6..].trim();
-                            if !name.is_empty() {
-                                return clean_hardware_name(name);
-                            }
+                    if line.contains("DriverDesc")
+                        && let Some(pos) = line.find("REG_SZ")
+                    {
+                        let name = line[pos + 6..].trim();
+                        if !name.is_empty() {
+                            return clean_hardware_name(name);
                         }
                     }
                 }

@@ -359,7 +359,7 @@ fn extract_zip(archive: &Path, destination: &Path) -> Result<(), String> {
         let mut entry = zip
             .by_index(index)
             .map_err(|error| format!("Cannot read archive entry: {error}"))?;
-        let Some(name) = entry.enclosed_name().map(PathBuf::from) else {
+        let Some(name) = entry.enclosed_name() else {
             continue;
         };
         let output = destination.join(name);
@@ -578,7 +578,7 @@ fn supported_nvidia_cuda() -> Result<Option<NvidiaCuda>, String> {
         return Ok(None);
     };
 
-    let version_output = Command::new(&program)
+    let version_output = crate::child_process::hide_console(&mut Command::new(&program))
         .output()
         .map_err(|error| format!("Cannot run {}: {error}", program.display()))?;
     if !version_output.status.success() {
@@ -636,7 +636,10 @@ fn run_nvidia_smi(args: &[&str]) -> Result<Option<(PathBuf, std::process::Output
     candidates.push(PathBuf::from("nvidia-smi"));
 
     for program in candidates {
-        match Command::new(&program).args(args).output() {
+        match crate::child_process::hide_console(&mut Command::new(&program))
+            .args(args)
+            .output()
+        {
             Ok(output) => return Ok(Some((program, output))),
             Err(error) if error.kind() == std::io::ErrorKind::NotFound => continue,
             Err(error) => {
@@ -656,7 +659,7 @@ fn windows_reports_nvidia_adapter() -> bool {
     if !cfg!(target_os = "windows") {
         return false;
     }
-    Command::new("reg")
+    crate::child_process::hide_console(&mut Command::new("reg"))
         .args([
             "query",
             "HKLM\\SYSTEM\\CurrentControlSet\\Control\\Class\\{4d36e968-e325-11ce-bfc1-08002be10318}",
@@ -851,8 +854,7 @@ mod tests {
             driver_cuda: "12.8".into(),
         };
         let error = select_assets_for_hardware(&assets, Some(&nvidia))
-            .err()
-            .expect("incompatible release must fail");
+            .expect_err("incompatible release must fail");
         assert!(error.contains("requires CUDA 12.8 or newer"));
         assert!(error.contains("driver supports up to CUDA 12.8"));
     }
@@ -866,8 +868,7 @@ mod tests {
             driver_cuda: "13.3".into(),
         };
         let error = select_assets_for_hardware(&assets, Some(&nvidia))
-            .err()
-            .expect("missing cudart must fail");
+            .expect_err("missing cudart must fail");
         assert!(error.contains("cudart-llama-bin-win-cuda-13.3-x64.zip"));
     }
 

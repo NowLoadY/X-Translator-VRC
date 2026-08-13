@@ -403,13 +403,11 @@ fn render_onboarding_runtime(app: &mut crate::XRTranslateApp, ui: &mut egui::Ui)
                     && !app.runtime_installer.is_busy(),
             )
             .clicked()
-            {
-                if let Err(error) = app
+                && let Err(error) = app
                     .runtime_installer
                     .install_recommended(app.project_root())
-                {
-                    app.last_error = Some(error);
-                }
+            {
+                app.last_error = Some(error);
             }
             if runtime_is_available {
                 ui.add_space(6.0);
@@ -630,13 +628,12 @@ fn render_onboarding_models(app: &mut crate::XRTranslateApp, ui: &mut egui::Ui) 
     let language = app.ui_language;
     onboarding_title(ui, language, "Install your model packages", None);
     let project_root = app.project_root();
-    if app.model_task_manager.needs_discovery() {
-        if let Err(error) = app
+    if app.model_task_manager.needs_discovery()
+        && let Err(error) = app
             .model_task_manager
             .discover_existing(project_root.clone())
-        {
-            app.last_error = Some(error);
-        }
+    {
+        app.last_error = Some(error);
     }
     let busy = app.model_task_manager.is_busy();
     let packages = match configured_model_packages(&project_root) {
@@ -658,22 +655,24 @@ fn render_onboarding_models(app: &mut crate::XRTranslateApp, ui: &mut egui::Ui) 
             let (download_clicked, selected_level) = onboarding_model_card(
                 &mut columns[index],
                 language,
-                package.label,
-                package.level,
-                &model_level_packages(package.capability),
-                if installed {
-                    "Installed"
-                } else if retry {
-                    "Retry"
-                } else {
-                    "Download"
-                },
-                !busy && !installed,
-                (!installed).then_some(package.download_bytes),
-                if index % 2 == 0 {
-                    Color32::from_rgb(239, 246, 255)
-                } else {
-                    Color32::from_rgb(240, 253, 250)
+                OnboardingModelCard {
+                    title: package.label,
+                    selected_level: package.level,
+                    levels: &model_level_packages(package.capability),
+                    action: if installed {
+                        "Installed"
+                    } else if retry {
+                        "Retry"
+                    } else {
+                        "Download"
+                    },
+                    enabled: !busy && !installed,
+                    download_bytes: (!installed).then_some(package.download_bytes),
+                    tint: if index % 2 == 0 {
+                        Color32::from_rgb(239, 246, 255)
+                    } else {
+                        Color32::from_rgb(240, 253, 250)
+                    },
                 },
             );
             if download_clicked {
@@ -695,19 +694,18 @@ fn render_onboarding_models(app: &mut crate::XRTranslateApp, ui: &mut egui::Ui) 
             Err(error) => app.last_error = Some(error),
         }
     }
-    if let Some(asset_id) = install {
-        if let Err(error) = app
+    if let Some(asset_id) = install
+        && let Err(error) = app
             .model_task_manager
             .install(project_root.clone(), asset_id)
-        {
-            app.last_error = Some(error);
-        }
+    {
+        app.last_error = Some(error);
     }
     ui.add_space(16.0);
-    if components::animated_button(ui, crate::i18n::tr(language, "Verify models")).clicked() {
-        if let Err(error) = app.model_task_manager.verify(project_root) {
-            app.last_error = Some(error);
-        }
+    if components::animated_button(ui, crate::i18n::tr(language, "Verify models")).clicked()
+        && let Err(error) = app.model_task_manager.verify(project_root)
+    {
+        app.last_error = Some(error);
     }
     ui.add_space(10.0);
     match app.model_task_manager.state() {
@@ -786,38 +784,42 @@ fn render_onboarding_models(app: &mut crate::XRTranslateApp, ui: &mut egui::Ui) 
     };
 }
 
-fn onboarding_model_card(
-    ui: &mut egui::Ui,
-    language: crate::i18n::UiLanguage,
+struct OnboardingModelCard<'a> {
     title: &'static str,
     selected_level: xrtranslate_assets::ModelLevel,
-    levels: &[crate::model_install::NativeModelPackage],
+    levels: &'a [crate::model_install::NativeModelPackage],
     action: &'static str,
     enabled: bool,
     download_bytes: Option<u64>,
     tint: Color32,
+}
+
+fn onboarding_model_card(
+    ui: &mut egui::Ui,
+    language: crate::i18n::UiLanguage,
+    card: OnboardingModelCard<'_>,
 ) -> (bool, Option<xrtranslate_assets::ModelLevel>) {
     Frame::new()
-        .fill(tint)
+        .fill(card.tint)
         .corner_radius(CornerRadius::same(16))
         .inner_margin(Margin::same(18))
         .stroke(Stroke::new(1.0, Color32::from_black_alpha(10)))
         .show(ui, |ui| {
             ui.set_width(ui.available_width());
             ui.label(
-                RichText::new(crate::i18n::tr(language, title))
+                RichText::new(crate::i18n::tr(language, card.title))
                     .size(16.0)
                     .color(theme::text_strong())
                     .strong(),
             );
             ui.add_space(10.0);
-            let mut level = selected_level;
+            let mut level = card.selected_level;
             ui.horizontal(|ui| {
                 ui.label(crate::i18n::tr(language, "Level"));
-                egui::ComboBox::from_id_salt((title, "model_level"))
+                egui::ComboBox::from_id_salt((card.title, "model_level"))
                     .selected_text(crate::i18n::tr(language, level.as_str()))
                     .show_ui(ui, |ui| {
-                        for package in levels {
+                        for package in card.levels {
                             ui.selectable_value(
                                 &mut level,
                                 package.level,
@@ -827,26 +829,26 @@ fn onboarding_model_card(
                     });
             });
             ui.add_space(14.0);
-            let action_label = download_bytes.map_or_else(
-                || crate::i18n::tr(language, action).to_owned(),
+            let action_label = card.download_bytes.map_or_else(
+                || crate::i18n::tr(language, card.action).to_owned(),
                 |bytes| {
                     format!(
                         "{} · {}",
-                        crate::i18n::tr(language, action),
+                        crate::i18n::tr(language, card.action),
                         components::format_file_size(bytes),
                     )
                 },
             );
             let clicked = ui
                 .add_enabled(
-                    enabled,
+                    card.enabled,
                     egui::Button::new(RichText::new(action_label).color(Color32::WHITE).strong())
                         .fill(Color32::from_rgb(37, 99, 235))
                         .min_size(egui::Vec2::new(100.0, 32.0))
                         .corner_radius(CornerRadius::same(10)),
                 )
                 .clicked();
-            (clicked, (level != selected_level).then_some(level))
+            (clicked, (level != card.selected_level).then_some(level))
         })
         .inner
 }
@@ -855,6 +857,8 @@ pub fn render_sidebar(
     ui: &mut egui::Ui,
     navigation: &mut NavigationState,
     modal_dialog: &mut modal::ModalDialog,
+    first_run: &mut bool,
+    onboarding_page: &mut usize,
     language: crate::i18n::UiLanguage,
     expand_factor: f32,
 ) {
@@ -900,7 +904,7 @@ pub fn render_sidebar(
                     .add(
                         egui::Button::image(toggle_img)
                             .min_size(egui::vec2(28.0, 28.0))
-                            .corner_radius(CornerRadius::same(8)),
+                            .corner_radius(CornerRadius::same(14)),
                     )
                     .on_hover_text(crate::i18n::tr(language, tooltip));
 
@@ -941,12 +945,84 @@ pub fn render_sidebar(
         );
 
         ui.add_space(20.0);
-        ui.separator();
+        components::wavy_divider_black_shadow(ui);
         ui.add_space(12.0);
 
         // Animated User Guide Button
-        guide_button_animated(ui, modal_dialog, language, icon_guide, expand_factor);
+        guide_button_animated(
+            ui,
+            modal_dialog,
+            language,
+            icon_guide.clone(),
+            expand_factor,
+        );
+        ui.add_space(4.0);
+        if sidebar_text_button(
+            ui,
+            "sidebar_welcome_btn",
+            "Welcome Page",
+            icon_guide,
+            language,
+            expand_factor,
+        ) {
+            *onboarding_page = 0;
+            *first_run = true;
+        }
     });
+}
+
+fn sidebar_text_button(
+    ui: &mut egui::Ui,
+    id_source: &str,
+    label: &'static str,
+    icon: egui::ImageSource<'static>,
+    language: crate::i18n::UiLanguage,
+    expand_factor: f32,
+) -> bool {
+    let id = ui.make_persistent_id(id_source);
+    let hovered = ui.memory(|memory| memory.data.get_temp::<bool>(id).unwrap_or(false));
+    let hover = animation::AnimationSystem::animate_bool(ui.ctx(), id.with("hover"), hovered, 0.15);
+    let response = Frame::new()
+        .fill(animation::AnimationSystem::lerp_color(
+            Color32::TRANSPARENT,
+            Color32::from_rgb(241, 245, 249),
+            hover,
+        ))
+        .corner_radius(CornerRadius::same(14))
+        .inner_margin(Margin::symmetric(
+            (12.0 * expand_factor + 8.0 * (1.0 - expand_factor)).round() as i8,
+            8,
+        ))
+        .show(ui, |ui| {
+            ui.set_width(ui.available_width());
+            ui.horizontal(|ui| {
+                if expand_factor < 0.2 {
+                    ui.add_space(((ui.available_width() - 16.0) / 2.0).max(0.0));
+                }
+                ui.add(
+                    egui::Image::new(icon)
+                        .fit_to_exact_size(egui::vec2(16.0, 16.0))
+                        .tint(theme::text_strong()),
+                );
+                if expand_factor > 0.1 {
+                    ui.add_space(10.0 * ((expand_factor - 0.1) / 0.9).clamp(0.0, 1.0));
+                    ui.label(
+                        RichText::new(crate::i18n::tr(language, label))
+                            .color(theme::text_strong())
+                            .size(13.0),
+                    );
+                }
+            });
+        })
+        .response
+        .interact(egui::Sense::click());
+    if expand_factor < 0.3 {
+        response
+            .clone()
+            .on_hover_text(crate::i18n::tr(language, label));
+    }
+    ui.memory_mut(|memory| memory.data.insert_temp(id, response.hovered()));
+    response.clicked()
 }
 
 fn open_guide_modal(modal_dialog: &mut modal::ModalDialog, language: crate::i18n::UiLanguage) {
@@ -1014,7 +1090,7 @@ fn nav_item_animated(
 
     let frame_response = Frame::new()
         .fill(bg_fill)
-        .corner_radius(CornerRadius::same(8))
+        .corner_radius(CornerRadius::same(14))
         .inner_margin(Margin::symmetric(inner_padding_x as i8, 9))
         .stroke(Stroke::new(1.0, border_color))
         .show(ui, |ui| {

@@ -141,10 +141,10 @@ pub fn strip_filler_edges_for_lang(text: &str, source_lang: &str) -> String {
     while !value.is_empty() && previous.as_deref() != Some(value.as_str()) {
         previous = Some(value.clone());
         let characters: Vec<char> = value.chars().collect();
-        let prefix_end = filler_prefix_end_custom(&characters, &fillers);
+        let prefix_end = filler_prefix_end_custom(&characters, fillers);
         let without_prefix = characters[prefix_end..].iter().collect::<String>();
         let characters: Vec<char> = without_prefix.trim().chars().collect();
-        let suffix_start = filler_suffix_start_custom(&characters, &fillers);
+        let suffix_start = filler_suffix_start_custom(&characters, fillers);
         value = characters[..suffix_start]
             .iter()
             .collect::<String>()
@@ -520,7 +520,7 @@ fn filler_prefix_end_custom(characters: &[char], fillers: &[char]) -> usize {
             found_filler = true;
             index += 1;
         } else {
-            return found_filler.then_some(index).unwrap_or(0);
+            return if found_filler { index } else { 0 };
         }
     }
 }
@@ -536,7 +536,11 @@ fn filler_suffix_start_custom(characters: &[char], fillers: &[char]) -> usize {
             found_filler = true;
             index -= 1;
         } else {
-            return found_filler.then_some(index).unwrap_or(characters.len());
+            return if found_filler {
+                index
+            } else {
+                characters.len()
+            };
         }
     }
 }

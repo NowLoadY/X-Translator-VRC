@@ -636,12 +636,14 @@ impl NativeModelInstaller {
         let mut completed_bytes = 0_u64;
         for file in target.manifest().required_files {
             self.download_file(
-                id,
-                target.manifest().source,
                 *file,
-                &staging,
-                completed_bytes,
-                total_bytes,
+                AssetDownloadContext {
+                    id,
+                    source: target.manifest().source,
+                    staging: &staging,
+                    completed_bytes,
+                    total_bytes,
+                },
                 &mut on_progress,
             )
             .await?;
@@ -669,17 +671,13 @@ impl NativeModelInstaller {
 
     async fn download_file(
         &self,
-        id: ModelAssetId,
-        source: ModelSource,
         file: RequiredModelFile,
-        staging: &Path,
-        completed_bytes: u64,
-        total_bytes: u64,
+        context: AssetDownloadContext<'_>,
         on_progress: &mut impl FnMut(DownloadProgress),
     ) -> Result<(), ModelDownloadError> {
-        let complete = staging.join(file.relative_path);
-        let partial = staging.join(format!("{}.part", file.relative_path));
-        let url = source.hugging_face_resolve_url(file.relative_path);
+        let complete = context.staging.join(file.relative_path);
+        let partial = context.staging.join(format!("{}.part", file.relative_path));
+        let url = context.source.hugging_face_resolve_url(file.relative_path);
         self.client
             .download(
                 DownloadSpec {
@@ -692,16 +690,27 @@ impl NativeModelInstaller {
                 &complete,
                 |progress| {
                     on_progress(DownloadProgress {
-                        asset_id: id,
+                        asset_id: context.id,
                         relative_path: file.relative_path,
-                        downloaded_bytes: completed_bytes.saturating_add(progress.downloaded_bytes),
-                        total_bytes,
+                        downloaded_bytes: context
+                            .completed_bytes
+                            .saturating_add(progress.downloaded_bytes),
+                        total_bytes: context.total_bytes,
                     });
                 },
             )
             .await
             .map_err(ModelDownloadError::Download)
     }
+}
+
+#[derive(Clone, Copy)]
+struct AssetDownloadContext<'a> {
+    id: ModelAssetId,
+    source: ModelSource,
+    staging: &'a Path,
+    completed_bytes: u64,
+    total_bytes: u64,
 }
 
 fn prune_obsolete_model_staging(
@@ -859,8 +868,7 @@ impl ResolvedModelAsset {
         self.manifest
             .required_files
             .iter()
-            .map(|required_file| self.check_file(*required_file))
-            .filter_map(Result::err)
+            .filter_map(|required_file| self.check_file(*required_file))
             .collect()
     }
 
@@ -868,20 +876,19 @@ impl ResolvedModelAsset {
         self.manifest
             .required_files
             .iter()
-            .map(|required_file| self.verify_file(*required_file))
-            .filter_map(Result::err)
+            .filter_map(|required_file| self.verify_file(*required_file))
             .collect()
     }
 
-    fn check_file(&self, required_file: RequiredModelFile) -> Result<(), ModelAssetDiagnostic> {
+    fn check_file(&self, required_file: RequiredModelFile) -> Option<ModelAssetDiagnostic> {
         let path = self.directory.join(required_file.relative_path);
         let metadata = match fs::metadata(&path) {
             Ok(metadata) => metadata,
             Err(error) if error.kind() == io::ErrorKind::NotFound => {
-                return Err(self.diagnostic(required_file, path, ModelAssetProblem::Missing));
+                return Some(self.diagnostic(required_file, path, ModelAssetProblem::Missing));
             }
             Err(error) => {
-                return Err(self.diagnostic(
+                return Some(self.diagnostic(
                     required_file,
                     path,
                     ModelAssetProblem::MetadataUnavailable {
@@ -893,11 +900,11 @@ impl ResolvedModelAsset {
         };
 
         if !metadata.is_file() {
-            return Err(self.diagnostic(required_file, path, ModelAssetProblem::NotAFile));
+            return Some(self.diagnostic(required_file, path, ModelAssetProblem::NotAFile));
         }
 
         if let Err(error) = fs::File::open(&path) {
-            return Err(self.diagnostic(
+            return Some(self.diagnostic(
                 required_file,
                 path,
                 ModelAssetProblem::Unreadable {
@@ -907,27 +914,30 @@ impl ResolvedModelAsset {
             ));
         }
 
-        Ok(())
+        None
     }
 
-    fn verify_file(&self, required_file: RequiredModelFile) -> Result<(), ModelAssetDiagnostic> {
+    fn verify_file(&self, required_file: RequiredModelFile) -> Option<ModelAssetDiagnostic> {
         let path = self.directory.join(required_file.relative_path);
-        let metadata = fs::metadata(&path).map_err(|error| {
-            let problem = if error.kind() == io::ErrorKind::NotFound {
-                ModelAssetProblem::Missing
-            } else {
-                ModelAssetProblem::MetadataUnavailable {
-                    kind: error.kind(),
-                    message: error.to_string(),
-                }
-            };
-            self.diagnostic(required_file, path.clone(), problem)
-        })?;
+        let metadata = match fs::metadata(&path) {
+            Ok(metadata) => metadata,
+            Err(error) => {
+                let problem = if error.kind() == io::ErrorKind::NotFound {
+                    ModelAssetProblem::Missing
+                } else {
+                    ModelAssetProblem::MetadataUnavailable {
+                        kind: error.kind(),
+                        message: error.to_string(),
+                    }
+                };
+                return Some(self.diagnostic(required_file, path, problem));
+            }
+        };
         if !metadata.is_file() {
-            return Err(self.diagnostic(required_file, path, ModelAssetProblem::NotAFile));
+            return Some(self.diagnostic(required_file, path, ModelAssetProblem::NotAFile));
         }
         if metadata.len() != required_file.bytes {
-            return Err(self.diagnostic(
+            return Some(self.diagnostic(
                 required_file,
                 path,
                 ModelAssetProblem::SizeMismatch {
@@ -936,18 +946,21 @@ impl ResolvedModelAsset {
                 },
             ));
         }
-        let actual = sha256_file(&path).map_err(|error| {
-            self.diagnostic(
-                required_file,
-                path.clone(),
-                ModelAssetProblem::Unreadable {
-                    kind: error.kind(),
-                    message: error.to_string(),
-                },
-            )
-        })?;
+        let actual = match sha256_file(&path) {
+            Ok(actual) => actual,
+            Err(error) => {
+                return Some(self.diagnostic(
+                    required_file,
+                    path,
+                    ModelAssetProblem::Unreadable {
+                        kind: error.kind(),
+                        message: error.to_string(),
+                    },
+                ));
+            }
+        };
         if !actual.eq_ignore_ascii_case(required_file.sha256) {
-            return Err(self.diagnostic(
+            return Some(self.diagnostic(
                 required_file,
                 path,
                 ModelAssetProblem::HashMismatch {
@@ -956,7 +969,7 @@ impl ResolvedModelAsset {
                 },
             ));
         }
-        Ok(())
+        None
     }
 
     fn diagnostic(

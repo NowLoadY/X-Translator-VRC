@@ -7,13 +7,14 @@ use std::net::UdpSocket;
 use std::path::PathBuf;
 use std::sync::{
     Arc,
-    atomic::{AtomicBool, Ordering},
+    atomic::{AtomicBool, AtomicU64, Ordering},
 };
 use std::thread::{self, JoinHandle};
 use std::time::{Duration, Instant};
 
 const MUTE_PATH: &str = "/avatar/parameters/MuteSelf";
 const COOLDOWN: Duration = Duration::from_millis(500);
+static NEXT_STREAM_ID: AtomicU64 = AtomicU64::new(1);
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub enum OscFormatMode {
@@ -36,6 +37,46 @@ impl OscFormatMode {
             Self::BilingualTargetFirst => "Bilingual (Target → Source)",
             Self::Inline => crate::i18n::tr(language, "Single Line (Source | Target)"),
             Self::TargetOnly => crate::i18n::tr(language, "Target Only"),
+        }
+    }
+}
+
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub enum OscMessageSeparator {
+    #[default]
+    NewLine,
+    Space,
+}
+
+impl OscMessageSeparator {
+    pub fn label(self, language: crate::i18n::UiLanguage) -> &'static str {
+        match self {
+            Self::NewLine => crate::i18n::tr(language, "New line"),
+            Self::Space => crate::i18n::tr(language, "Same line"),
+        }
+    }
+
+    pub fn layout_label(
+        self,
+        language: crate::i18n::UiLanguage,
+        target_only: bool,
+    ) -> &'static str {
+        if target_only {
+            return self.label(language);
+        }
+        crate::i18n::tr(
+            language,
+            match self {
+                Self::NewLine => "Separate",
+                Self::Space => "Merge",
+            },
+        )
+    }
+
+    const fn value(self) -> &'static str {
+        match self {
+            Self::NewLine => "\n",
+            Self::Space => " ",
         }
     }
 }
@@ -119,6 +160,8 @@ pub struct OscSettings {
     pub header_config: BannerConfig,
     pub footer_config: BannerConfig,
     pub format_mode: OscFormatMode,
+    #[serde(default)]
+    pub message_separator: OscMessageSeparator,
     pub show_speaker_number: bool,
 }
 
@@ -134,6 +177,7 @@ impl Default for OscSettings {
             header_config: BannerConfig::default(),
             footer_config: BannerConfig::default(),
             format_mode: OscFormatMode::BilingualSourceFirst,
+            message_separator: OscMessageSeparator::default(),
             show_speaker_number: false,
         }
     }
@@ -229,36 +273,9 @@ fn project_config_candidates() -> Vec<PathBuf> {
     paths
 }
 
-#[allow(dead_code)]
-pub fn format_chatbox_preview(
-    settings: &OscSettings,
-    source: &str,
-    translated: &str,
-    metrics: &crate::sys_info::SystemMetrics,
-) -> String {
-    format_chatbox_history_preview(settings, &[(source.into(), translated.into())], metrics)
-}
-
-pub fn format_chatbox_history_preview(
-    settings: &OscSettings,
-    history_items: &[(String, String)],
-    metrics: &crate::sys_info::SystemMetrics,
-) -> String {
-    let now = Instant::now();
-    let history = history_items
-        .iter()
-        .map(|(s, t)| HistoryMessage {
-            source: s.trim().into(),
-            translated: t.trim().into(),
-            speaker_id: String::new(),
-            expires_at: now + Duration::from_secs_f64(settings.history_ttl_seconds),
-        })
-        .collect::<Vec<_>>();
-    build_chatbox_text(&history, None, settings, metrics)
-}
-
 #[derive(Clone)]
 struct HistoryMessage {
+    stream_id: u64,
     source: String,
     translated: String,
     speaker_id: String,
@@ -273,6 +290,7 @@ struct QueuedMessage {
 }
 enum Command {
     Message {
+        stream_id: u64,
         source: String,
         translated: String,
         speaker_id: String,
@@ -280,17 +298,29 @@ enum Command {
         /// Optional lifetime for this message.
         ttl: Option<Duration>,
     },
+    RollStream {
+        stream_id: u64,
+        source: String,
+        translated: String,
+        speaker_id: String,
+    },
+    EndStream(u64),
     Clear,
     Update(OscSettings),
     Shutdown,
 }
 
-#[derive(Clone)]
+#[derive(Clone, Debug)]
 pub struct OscHandle {
     tx: Sender<Command>,
+    stream_id: u64,
 }
 
 impl OscHandle {
+    pub fn stream_id(&self) -> u64 {
+        self.stream_id
+    }
+
     pub fn add_message_and_send(
         &self,
         source: &str,
@@ -299,6 +329,7 @@ impl OscHandle {
         ongoing: bool,
     ) {
         let _ = self.tx.send(Command::Message {
+            stream_id: self.stream_id,
             source: source.trim().into(),
             translated: translated.trim().into(),
             speaker_id: speaker_id.trim().into(),
@@ -306,23 +337,20 @@ impl OscHandle {
             ttl: None,
         });
     }
-    #[allow(dead_code)]
-    pub fn add_message_with_ttl(
-        &self,
-        source: &str,
-        translated: &str,
-        speaker_id: &str,
-        ongoing: bool,
-        ttl: Duration,
-    ) {
-        let _ = self.tx.send(Command::Message {
+
+    pub fn end_stream(&self) {
+        let _ = self.tx.send(Command::EndStream(self.stream_id));
+    }
+
+    pub fn roll_stream(&self, source: &str, translated: &str, speaker_id: &str) {
+        let _ = self.tx.send(Command::RollStream {
+            stream_id: self.stream_id,
             source: source.trim().into(),
             translated: translated.trim().into(),
             speaker_id: speaker_id.trim().into(),
-            ongoing,
-            ttl: Some(ttl),
         });
     }
+
     pub fn clear_chatbox(&self) {
         let _ = self.tx.send(Command::Clear);
     }
@@ -384,10 +412,7 @@ impl OscManager {
     pub fn muted_state(&self) -> Arc<AtomicBool> {
         Arc::clone(&self.muted)
     }
-    #[allow(dead_code)]
-    pub fn is_muted(&self) -> bool {
-        self.muted.load(Ordering::Acquire)
-    }
+
     pub fn listener_status(&self) -> String {
         self.status.lock().listener.clone()
     }
@@ -411,6 +436,7 @@ impl OscManager {
     pub fn handle(&self) -> OscHandle {
         OscHandle {
             tx: self.tx.clone(),
+            stream_id: NEXT_STREAM_ID.fetch_add(1, Ordering::Relaxed),
         }
     }
     pub fn update_settings(&mut self, settings: OscSettings) -> Result<(), String> {
@@ -543,17 +569,18 @@ fn dispatch_loop(
 ) {
     let monitor = crate::sys_info::SystemMonitor::new();
     let mut history = Vec::new();
-    let mut live = None;
+    let mut live = Vec::new();
     let mut pending = None;
     let mut last_send = Instant::now() - COOLDOWN;
     loop {
         let wait = dispatch_wait(
             pending.as_ref(),
             last_send,
-            next_content_expiry(&history, live.as_ref()),
+            next_content_expiry(&history, &live),
         );
         match rx.recv_timeout(wait) {
             Ok(Command::Message {
+                stream_id,
                 source,
                 translated,
                 speaker_id,
@@ -563,6 +590,7 @@ fn dispatch_loop(
                 let now = Instant::now();
                 expire_chatbox_entries(&mut history, &mut live, now);
                 let entry = HistoryMessage {
+                    stream_id,
                     source,
                     translated,
                     speaker_id,
@@ -575,29 +603,71 @@ fn dispatch_loop(
                     continue;
                 }
                 if ongoing {
-                    live = Some(entry);
+                    if let Some(current) = live.iter_mut().find(|item| item.stream_id == stream_id)
+                    {
+                        *current = entry;
+                    } else {
+                        live.push(entry);
+                    }
                 } else {
-                    live = None;
+                    live.retain(|item| item.stream_id != stream_id);
                     history.push(entry);
                 }
                 let metrics = monitor.snapshot();
                 queue_message(
                     &mut pending,
                     build_queued_message(
-                        &history,
-                        live.as_ref(),
-                        &settings,
-                        &metrics,
-                        ongoing,
-                        !ongoing,
-                        !ongoing,
+                        &history, &live, &settings, &metrics, ongoing, !ongoing, !ongoing,
                     ),
                 );
             }
             Ok(Command::Message { .. }) => {}
+            Ok(Command::RollStream {
+                stream_id,
+                source,
+                translated,
+                speaker_id,
+            }) if settings.enabled => {
+                let now = Instant::now();
+                expire_chatbox_entries(&mut history, &mut live, now);
+                if let Some(index) = live.iter().position(|entry| entry.stream_id == stream_id) {
+                    history.push(live.remove(index));
+                }
+                live.push(HistoryMessage {
+                    stream_id,
+                    source,
+                    translated,
+                    speaker_id,
+                    expires_at: now + Duration::from_secs_f64(settings.history_ttl_seconds),
+                });
+                let metrics = monitor.snapshot();
+                queue_message(
+                    &mut pending,
+                    build_queued_message(&history, &live, &settings, &metrics, true, true, true),
+                );
+            }
+            Ok(Command::RollStream { .. }) => {}
+            Ok(Command::EndStream(stream_id)) => {
+                if let Some(index) = live.iter().position(|entry| entry.stream_id == stream_id) {
+                    history.push(live.remove(index));
+                    let metrics = monitor.snapshot();
+                    queue_message(
+                        &mut pending,
+                        build_queued_message(
+                            &history,
+                            &live,
+                            &settings,
+                            &metrics,
+                            !live.is_empty(),
+                            true,
+                            true,
+                        ),
+                    );
+                }
+            }
             Ok(Command::Clear) => {
                 history.clear();
-                live = None;
+                live.clear();
                 if settings.enabled {
                     queue_message(&mut pending, clear_message());
                 } else {
@@ -618,10 +688,10 @@ fn dispatch_loop(
                         &mut pending,
                         build_queued_message(
                             &history,
-                            live.as_ref(),
+                            &live,
                             &settings,
                             &metrics,
-                            live.is_some(),
+                            !live.is_empty(),
                             false,
                             true,
                         ),
@@ -643,13 +713,7 @@ fn dispatch_loop(
                     queue_message(
                         &mut pending,
                         build_queued_message(
-                            &history,
-                            live.as_ref(),
-                            &settings,
-                            &metrics,
-                            false,
-                            false,
-                            true,
+                            &history, &live, &settings, &metrics, false, false, true,
                         ),
                     );
                 }
@@ -685,6 +749,12 @@ fn clear_message() -> QueuedMessage {
 }
 
 fn send_message(settings: &OscSettings, message: &QueuedMessage, status: &Mutex<RuntimeStatus>) {
+    {
+        let mut runtime = status.lock();
+        runtime.chatbox_text.clone_from(&message.text);
+        runtime.chatbox_typing = message.typing;
+        runtime.next_message_expires_at = message.expires_at;
+    }
     let socket = match UdpSocket::bind("0.0.0.0:0") {
         Ok(socket) => socket,
         Err(error) => {
@@ -718,15 +788,11 @@ fn send_message(settings: &OscSettings, message: &QueuedMessage, status: &Mutex<
             }
         }
     }
-    let mut runtime = status.lock();
-    runtime.chatbox_text.clone_from(&message.text);
-    runtime.chatbox_typing = message.typing;
-    runtime.next_message_expires_at = message.expires_at;
 }
 
 fn build_queued_message(
     history: &[HistoryMessage],
-    live: Option<&HistoryMessage>,
+    live: &[HistoryMessage],
     settings: &OscSettings,
     metrics: &crate::sys_info::SystemMetrics,
     typing: bool,
@@ -758,13 +824,10 @@ fn dispatch_wait(
     }
 }
 
-fn next_content_expiry(
-    history: &[HistoryMessage],
-    live: Option<&HistoryMessage>,
-) -> Option<Instant> {
+fn next_content_expiry(history: &[HistoryMessage], live: &[HistoryMessage]) -> Option<Instant> {
     history
         .iter()
-        .chain(live)
+        .chain(live.iter())
         .map(|entry| entry.expires_at)
         .min()
 }
@@ -777,17 +840,15 @@ fn listener_config_changed(previous: &OscSettings, updated: &OscSettings) -> boo
 
 fn expire_chatbox_entries(
     history: &mut Vec<HistoryMessage>,
-    live: &mut Option<HistoryMessage>,
+    live: &mut Vec<HistoryMessage>,
     now: Instant,
 ) -> bool {
     let previous_len = history.len();
     history.retain(|entry| now < entry.expires_at);
     let history_changed = history.len() != previous_len;
-    let live_expired = live.as_ref().is_some_and(|entry| now >= entry.expires_at);
-    if live_expired {
-        *live = None;
-    }
-    history_changed || live_expired
+    let previous_live_len = live.len();
+    live.retain(|entry| now < entry.expires_at);
+    history_changed || live.len() != previous_live_len
 }
 
 fn clear_runtime_preview(status: &Mutex<RuntimeStatus>) {
@@ -799,11 +860,15 @@ fn clear_runtime_preview(status: &Mutex<RuntimeStatus>) {
 
 fn build_chatbox_text(
     history: &[HistoryMessage],
-    live: Option<&HistoryMessage>,
+    live: &[HistoryMessage],
     settings: &OscSettings,
     metrics: &crate::sys_info::SystemMetrics,
 ) -> String {
-    let mut entries = history.iter().chain(live).cloned().collect::<VecDeque<_>>();
+    let mut entries = history
+        .iter()
+        .chain(live.iter())
+        .cloned()
+        .collect::<VecDeque<_>>();
     while entries.len() > 9 {
         entries.pop_front();
     }
@@ -817,13 +882,7 @@ fn build_chatbox_text(
     let suffix = settings.footer_config.render_text(metrics);
 
     while let Some(first) = entries.front() {
-        let rendered_entries = entries
-            .iter()
-            .map(|e| render_entry(e, settings))
-            .filter(|s| !s.is_empty())
-            .collect::<Vec<_>>();
-
-        let combined = compose_chatbox(&prefix, &rendered_entries.join("\n"), &suffix);
+        let combined = compose_chatbox(&prefix, &render_entries(entries.iter(), settings), &suffix);
 
         if combined.chars().count() <= settings.max_text_length {
             return combined;
@@ -836,6 +895,73 @@ fn build_chatbox_text(
     }
 
     String::new()
+}
+
+fn render_entries<'a>(
+    entries: impl Iterator<Item = &'a HistoryMessage>,
+    settings: &OscSettings,
+) -> String {
+    if settings.format_mode == OscFormatMode::TargetOnly {
+        return entries
+            .map(|entry| render_entry(entry, settings))
+            .filter(|text| !text.is_empty())
+            .collect::<Vec<_>>()
+            .join(settings.message_separator.value());
+    }
+    if settings.message_separator == OscMessageSeparator::NewLine {
+        return entries
+            .map(|entry| render_entry(entry, settings))
+            .filter(|text| !text.is_empty())
+            .collect::<Vec<_>>()
+            .join(OscMessageSeparator::NewLine.value());
+    }
+
+    let mut sources = Vec::new();
+    let mut targets = Vec::new();
+    for entry in entries {
+        let source = entry.source.trim();
+        let target = entry.translated.trim();
+        let speaker = settings
+            .show_speaker_number
+            .then(|| crate::compact_speaker_label(&entry.speaker_id))
+            .flatten();
+
+        if !source.is_empty() && !target.is_empty() && source != target {
+            sources.push(with_speaker(source, speaker.as_deref()));
+            targets.push(target.to_string());
+        } else if let Some(text) = (!target.is_empty())
+            .then_some(target)
+            .or_else(|| (!source.is_empty()).then_some(source))
+        {
+            match settings.format_mode {
+                OscFormatMode::BilingualTargetFirst => {
+                    targets.push(with_speaker(text, speaker.as_deref()));
+                }
+                OscFormatMode::BilingualSourceFirst | OscFormatMode::Inline => {
+                    sources.push(with_speaker(text, speaker.as_deref()));
+                }
+                OscFormatMode::TargetOnly => unreachable!(),
+            }
+        }
+    }
+
+    let sources = sources.join(" ");
+    let targets = targets.join(" ");
+    let (first, second, separator) = match settings.format_mode {
+        OscFormatMode::BilingualTargetFirst => (targets, sources, "\n"),
+        OscFormatMode::BilingualSourceFirst => (sources, targets, "\n"),
+        OscFormatMode::Inline => (sources, targets, " | "),
+        OscFormatMode::TargetOnly => unreachable!(),
+    };
+    [first, second]
+        .into_iter()
+        .filter(|text| !text.is_empty())
+        .collect::<Vec<_>>()
+        .join(separator)
+}
+
+fn with_speaker(text: &str, speaker: Option<&str>) -> String {
+    speaker.map_or_else(|| text.to_string(), |label| format!("[{label}] {text}"))
 }
 
 fn compose_chatbox(prefix: &str, content: &str, suffix: &str) -> String {
@@ -974,11 +1100,64 @@ mod tests {
 
     fn history_message(expires_at: Instant, text: &str) -> HistoryMessage {
         HistoryMessage {
+            stream_id: 0,
             source: text.into(),
             translated: String::new(),
             speaker_id: String::new(),
             expires_at,
         }
+    }
+
+    #[test]
+    fn messages_are_compacted_by_language_and_evicted_as_pairs() {
+        let now = Instant::now();
+        let mut first = history_message(now + Duration::from_secs(10), "first source");
+        first.translated = "first target".into();
+        let mut second = history_message(now + Duration::from_secs(10), "second source");
+        second.translated = "second target".into();
+        let history = vec![first, second];
+        let metrics = crate::sys_info::SystemMetrics::default();
+        let mut settings = OscSettings {
+            format_mode: OscFormatMode::BilingualSourceFirst,
+            ..OscSettings::default()
+        };
+
+        assert_eq!(
+            build_chatbox_text(&history, &[], &settings, &metrics),
+            "first source\nfirst target\nsecond source\nsecond target"
+        );
+        settings.message_separator = OscMessageSeparator::Space;
+        assert_eq!(
+            build_chatbox_text(&history, &[], &settings, &metrics),
+            "first source second source\nfirst target second target"
+        );
+        settings.format_mode = OscFormatMode::BilingualTargetFirst;
+        assert_eq!(
+            build_chatbox_text(&history, &[], &settings, &metrics),
+            "first target second target\nfirst source second source"
+        );
+        settings.format_mode = OscFormatMode::Inline;
+        assert_eq!(
+            build_chatbox_text(&history, &[], &settings, &metrics),
+            "first source second source | first target second target"
+        );
+        settings.max_text_length = 39;
+        assert_eq!(
+            build_chatbox_text(&history, &[], &settings, &metrics),
+            "second source | second target"
+        );
+        settings.format_mode = OscFormatMode::TargetOnly;
+        settings.max_text_length = 144;
+        settings.message_separator = OscMessageSeparator::NewLine;
+        assert_eq!(
+            build_chatbox_text(&history, &[], &settings, &metrics),
+            "first target\nsecond target"
+        );
+        settings.message_separator = OscMessageSeparator::Space;
+        assert_eq!(
+            build_chatbox_text(&history, &[], &settings, &metrics),
+            "first target second target"
+        );
     }
 
     fn receive_chatbox_input(socket: &UdpSocket) -> (String, bool) {
@@ -1018,7 +1197,7 @@ mod tests {
         let started = Instant::now();
         let expires_at = started + Duration::from_secs(1);
         let mut history = vec![history_message(expires_at, "final")];
-        let mut live = Some(history_message(expires_at, "partial"));
+        let mut live = vec![history_message(expires_at, "partial")];
 
         assert!(!expire_chatbox_entries(
             &mut history,
@@ -1031,7 +1210,7 @@ mod tests {
             started + Duration::from_secs(1),
         ));
         assert!(history.is_empty());
-        assert!(live.is_none());
+        assert!(live.is_empty());
     }
 
     #[test]
@@ -1044,7 +1223,7 @@ mod tests {
         let live = history_message(started + Duration::from_secs(13), "live");
 
         assert_eq!(
-            next_content_expiry(&history, Some(&live)),
+            next_content_expiry(&history, &[live]),
             Some(started + Duration::from_secs(10)),
         );
     }
@@ -1056,12 +1235,14 @@ mod tests {
             history_message(started + Duration::from_secs(1), "old"),
             history_message(started + Duration::from_secs(3), "new"),
         ];
-        let mut live = None;
-        let mut settings = OscSettings::default();
-        settings.header_config = BannerConfig {
-            content_type: BannerContentType::CustomText,
-            custom_text: "header".into(),
-            show_device_name: false,
+        let mut live = Vec::new();
+        let settings = OscSettings {
+            header_config: BannerConfig {
+                content_type: BannerContentType::CustomText,
+                custom_text: "header".into(),
+                show_device_name: false,
+            },
+            ..OscSettings::default()
         };
         let metrics = crate::sys_info::SystemMetrics::default();
 
@@ -1071,36 +1252,38 @@ mod tests {
             started + Duration::from_secs(1),
         ));
         assert_eq!(history.len(), 1);
-        assert!(build_chatbox_text(&history, None, &settings, &metrics).contains("new"));
+        assert!(build_chatbox_text(&history, &[], &settings, &metrics).contains("new"));
 
         assert!(expire_chatbox_entries(
             &mut history,
             &mut live,
             started + Duration::from_secs(3),
         ));
-        assert!(build_chatbox_text(&history, None, &settings, &metrics).is_empty());
+        assert!(build_chatbox_text(&history, &[], &settings, &metrics).is_empty());
     }
 
     #[test]
     fn long_single_message_is_trimmed_without_silently_dropping_banners() {
         let now = Instant::now();
         let history = vec![history_message(now + Duration::from_secs(10), "0123456789")];
-        let mut settings = OscSettings::default();
-        settings.max_text_length = 12;
-        settings.header_config = BannerConfig {
-            content_type: BannerContentType::CustomText,
-            custom_text: "H".into(),
-            show_device_name: false,
-        };
-        settings.footer_config = BannerConfig {
-            content_type: BannerContentType::CustomText,
-            custom_text: "F".into(),
-            show_device_name: false,
+        let settings = OscSettings {
+            max_text_length: 12,
+            header_config: BannerConfig {
+                content_type: BannerContentType::CustomText,
+                custom_text: "H".into(),
+                show_device_name: false,
+            },
+            footer_config: BannerConfig {
+                content_type: BannerContentType::CustomText,
+                custom_text: "F".into(),
+                show_device_name: false,
+            },
+            ..OscSettings::default()
         };
 
         let text = build_chatbox_text(
             &history,
-            None,
+            &[],
             &settings,
             &crate::sys_info::SystemMetrics::default(),
         );
@@ -1137,16 +1320,19 @@ mod tests {
         receiver
             .set_read_timeout(Some(Duration::from_secs(2)))
             .unwrap();
-        let mut settings = OscSettings::default();
-        settings.ip = "127.0.0.1".into();
-        settings.send_port = receiver.local_addr().unwrap().port();
-        settings.history_ttl_seconds = 0.05;
+        let settings = OscSettings {
+            ip: "127.0.0.1".into(),
+            send_port: receiver.local_addr().unwrap().port(),
+            history_ttl_seconds: 0.05,
+            ..OscSettings::default()
+        };
         let status = Arc::new(Mutex::new(RuntimeStatus::default()));
         let worker_status = Arc::clone(&status);
         let (tx, rx) = unbounded();
         let worker = thread::spawn(move || dispatch_loop(rx, settings, worker_status));
 
         tx.send(Command::Message {
+            stream_id: 1,
             source: "hello".into(),
             translated: "你好".into(),
             speaker_id: "speaker-01".into(),
@@ -1160,6 +1346,48 @@ mod tests {
         );
         assert_eq!(receive_chatbox_input(&receiver), (String::new(), false));
         assert!(status.lock().chatbox_text.is_empty());
+
+        tx.send(Command::Shutdown).unwrap();
+        worker.join().unwrap();
+    }
+
+    #[test]
+    fn stream_rollover_displays_the_new_caption_atomically() {
+        let receiver = UdpSocket::bind("127.0.0.1:0").unwrap();
+        receiver
+            .set_read_timeout(Some(Duration::from_secs(2)))
+            .unwrap();
+        let settings = OscSettings {
+            ip: "127.0.0.1".into(),
+            send_port: receiver.local_addr().unwrap().port(),
+            ..OscSettings::default()
+        };
+        let status = Arc::new(Mutex::new(RuntimeStatus::default()));
+        let worker_status = Arc::clone(&status);
+        let (tx, rx) = unbounded();
+        let worker = thread::spawn(move || dispatch_loop(rx, settings, worker_status));
+
+        tx.send(Command::Message {
+            stream_id: 1,
+            source: "first".into(),
+            translated: "one".into(),
+            speaker_id: String::new(),
+            ongoing: true,
+            ttl: None,
+        })
+        .unwrap();
+        assert_eq!(receive_chatbox_input(&receiver).0, "first\none");
+        tx.send(Command::RollStream {
+            stream_id: 1,
+            source: "second".into(),
+            translated: "two".into(),
+            speaker_id: String::new(),
+        })
+        .unwrap();
+        assert_eq!(
+            receive_chatbox_input(&receiver).0,
+            "first\none\nsecond\ntwo"
+        );
 
         tx.send(Command::Shutdown).unwrap();
         worker.join().unwrap();

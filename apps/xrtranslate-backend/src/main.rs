@@ -37,7 +37,7 @@ use xrtranslate_engine::RouteEpoch;
 use xrtranslate_inference::{AsyncHttpClient, HttpRequest, ReqwestClient};
 use xrtranslate_protocol::{
     ActionControl, ClientControl, ErrorEvent, EventControl, Feature, LatencyMetrics, PcmFormat,
-    PcmFrame, ServerEvent, SessionReady,
+    PcmFrame, RecognitionStreamEnded, ServerEvent, SessionReady, VadActivity,
 };
 use xrtranslate_supervisor::{
     LlamaServerEndpoint, LlamaServerLauncher, LlamaServerProcess, LlamaServerProcessHandle,
@@ -46,14 +46,17 @@ use xrtranslate_supervisor::{
 use xrtranslate_vad::{FRAME_SAMPLES, SAMPLE_RATE_HZ, Utterance};
 
 use crate::{
+    language::AdaptiveLanguageRoute,
     pipeline::{
-        NativeInference, NativePipeline, RecognizedOutput, TimedUtterance, TranslationOutput,
-        resolved_model_assets, validate_input_chunk_size, validate_input_sample_rate,
+        NativeInference, NativePipeline, PipelineEvent, RecognizedOutput, TimedUtterance,
+        TranslationOutput, resolved_model_assets, validate_input_chunk_size,
+        validate_input_sample_rate,
     },
     session::{SegmentContext, SessionAdapter, WireOutput},
     terminology::{rewrite_recognition_terms, rewrite_translation_terms},
 };
 
+mod language;
 mod pipeline;
 mod session;
 mod terminology;
@@ -77,6 +80,14 @@ const OUTBOUND_MESSAGE_CAPACITY: usize = 64;
 /// multi-sentence turns overlap without monopolizing all capacity.
 const TRANSLATION_CONCURRENCY_PER_SESSION: usize = 2;
 
+#[derive(Clone, Copy)]
+struct StreamWindowContext {
+    start_ms: f64,
+    end_ms: f64,
+    revisable: bool,
+    overlap_ratio: f32,
+}
+
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 struct AudioEpoch(u64);
 
@@ -94,17 +105,30 @@ struct PipelineGeneration {
     audio_epoch: AudioEpoch,
 }
 
-struct InferenceJob {
+struct UtteranceJob {
     utterance: Utterance,
     source_start_ms: f64,
     source_end_ms: f64,
+    revisable: bool,
     generation: PipelineGeneration,
     turn_id: String,
     source_language: String,
     target_language: String,
 }
 
+enum InferenceJob {
+    Utterance(UtteranceJob),
+    StreamEnded {
+        generation: PipelineGeneration,
+        turn_id: String,
+    },
+}
+
 enum InferenceEvent {
+    WindowObserved {
+        generation: PipelineGeneration,
+        text_units: usize,
+    },
     Recognized {
         generation: PipelineGeneration,
         recognized: RecognizedOutput,
@@ -116,6 +140,10 @@ enum InferenceEvent {
         context: SegmentContext,
         output: Result<TranslationOutput, String>,
     },
+    StreamEnded {
+        generation: PipelineGeneration,
+        turn_id: String,
+    },
     Error {
         generation: PipelineGeneration,
         message: String,
@@ -125,8 +153,10 @@ enum InferenceEvent {
 impl InferenceEvent {
     const fn generation(&self) -> PipelineGeneration {
         match self {
-            Self::Recognized { generation, .. }
+            Self::WindowObserved { generation, .. }
+            | Self::Recognized { generation, .. }
             | Self::Translation { generation, .. }
+            | Self::StreamEnded { generation, .. }
             | Self::Error { generation, .. } => *generation,
         }
     }
@@ -352,6 +382,9 @@ async fn serve_session(socket: WebSocket, state: BackendState) {
                 let Some(result) = result else {
                     break;
                 };
+                if let InferenceEvent::WindowObserved { text_units, .. } = &result {
+                    pipeline.observe_text_density(*text_units);
+                }
                 if handle_inference_event(&outbound_sender, &mut session, generation, result).await.is_err() {
                     break;
                 }
@@ -395,6 +428,10 @@ async fn serve_session(socket: WebSocket, state: BackendState) {
                             sample_rate,
                             source_lang: source,
                             target_lang: target,
+                            audio_source,
+                            vad_threshold,
+                            vad_silence_ms,
+                            continuous_recognition,
                         })) => {
                             if let Err(error) = validate_input_sample_rate(sample_rate) {
                                 if send_error(&outbound_sender, error).await.is_err() {
@@ -403,6 +440,17 @@ async fn serve_session(socket: WebSocket, state: BackendState) {
                                 continue;
                             }
                             input_format = PcmFormat::mono_s16le(sample_rate);
+                            if let Err(error) = pipeline.configure_segmentation(
+                                vad_threshold,
+                                vad_silence_ms,
+                                continuous_recognition,
+                                audio_source,
+                            ) {
+                                if send_error(&outbound_sender, error).await.is_err() {
+                                    break;
+                                }
+                                continue;
+                            }
                             if let Err(error) = session.set_route(&source, &target) {
                                 if send_error(&outbound_sender, error).await.is_err() {
                                     break;
@@ -426,11 +474,9 @@ async fn serve_session(socket: WebSocket, state: BackendState) {
                                             vec![utterance],
                                             &mut next_utterance_sequence,
                                         )
-                                    {
-                                        if send_error(&outbound_sender, error).await.is_err() {
+                                        && send_error(&outbound_sender, error).await.is_err() {
                                             break;
                                         }
-                                    }
                                 }
                                 Ok(None) => {}
                                 Err(error) => {
@@ -489,6 +535,23 @@ async fn serve_session(socket: WebSocket, state: BackendState) {
                         match PcmFrame::new(audio.to_vec(), input_format) {
                             Ok(frame) => match pipeline.push_pcm(frame.as_bytes()) {
                                 Ok(utterances) => {
+                                    let mut vad_send_failed = false;
+                                    for active in pipeline.take_vad_transitions() {
+                                        if send_event(
+                                            &outbound_sender,
+                                            Some(generation),
+                                            ServerEvent::VadActivity(VadActivity { active }),
+                                        )
+                                        .await
+                                        .is_err()
+                                        {
+                                            vad_send_failed = true;
+                                            break;
+                                        }
+                                    }
+                                    if vad_send_failed {
+                                        break;
+                                    }
                                     if let Some(sender) = job_sender.as_ref()
                                         && let Err(error) = enqueue_utterances(
                                             sender,
@@ -497,11 +560,9 @@ async fn serve_session(socket: WebSocket, state: BackendState) {
                                             utterances,
                                             &mut next_utterance_sequence,
                                         )
-                                    {
-                                        if send_error(&outbound_sender, error).await.is_err() {
+                                        && send_error(&outbound_sender, error).await.is_err() {
                                             break;
                                         }
-                                    }
                                 }
                                 Err(error) => {
                                     if send_error(&outbound_sender, error).await.is_err() {
@@ -800,14 +861,31 @@ fn enqueue_utterances(
     sender: &mpsc::Sender<InferenceJob>,
     session: &SessionAdapter,
     generation: PipelineGeneration,
-    utterances: Vec<TimedUtterance>,
+    utterances: Vec<PipelineEvent>,
     next_utterance_sequence: &mut u64,
 ) -> Result<(), String> {
     debug_assert_eq!(generation.route_epoch, session.route_epoch());
+    if sender.capacity() < utterances.len() {
+        return Err(format!(
+            "native inference queue is full (capacity: {INFERENCE_QUEUE_CAPACITY}); finish the current speech before sending more audio"
+        ));
+    }
     let turn_id_prefix = session.turn_id();
     let source_language = session.source_lang().to_owned();
     let target_language = session.target_lang().to_owned();
-    for timed in utterances {
+    for event in utterances {
+        if matches!(event, PipelineEvent::StreamEnded) {
+            sender
+                .try_send(InferenceJob::StreamEnded {
+                    generation,
+                    turn_id: turn_id_prefix.clone(),
+                })
+                .map_err(inference_queue_error)?;
+            continue;
+        }
+        let PipelineEvent::Utterance(timed) = event else {
+            unreachable!()
+        };
         let turn_id = format!("{turn_id_prefix}:utterance-{next_utterance_sequence}");
         *next_utterance_sequence = (*next_utterance_sequence)
             .checked_add(1)
@@ -816,6 +894,7 @@ fn enqueue_utterances(
             utterance,
             source_start_ms,
             source_end_ms,
+            revisable,
         } = timed;
         let duration_ms = utterance.samples.len().saturating_mul(1_000) / SAMPLE_RATE_HZ as usize;
         let queued = INFERENCE_QUEUE_CAPACITY.saturating_sub(sender.capacity());
@@ -827,25 +906,28 @@ fn enqueue_utterances(
             "VAD finalized an utterance; queuing it for ASR"
         );
         sender
-            .try_send(InferenceJob {
+            .try_send(InferenceJob::Utterance(UtteranceJob {
                 utterance,
                 source_start_ms,
                 source_end_ms,
+                revisable,
                 generation,
                 turn_id,
                 source_language: source_language.clone(),
                 target_language: target_language.clone(),
-            })
-            .map_err(|error| match error {
-                mpsc::error::TrySendError::Full(_) => format!(
-                    "native inference queue is full (capacity: {INFERENCE_QUEUE_CAPACITY}); finish the current speech before sending more audio"
-                ),
-                mpsc::error::TrySendError::Closed(_) => {
-                    "native inference worker has stopped".to_owned()
-                }
-            })?;
+            }))
+            .map_err(inference_queue_error)?;
     }
     Ok(())
+}
+
+fn inference_queue_error(error: mpsc::error::TrySendError<InferenceJob>) -> String {
+    match error {
+        mpsc::error::TrySendError::Full(_) => format!(
+            "native inference queue is full (capacity: {INFERENCE_QUEUE_CAPACITY}); finish the current speech before sending more audio"
+        ),
+        mpsc::error::TrySendError::Closed(_) => "native inference worker has stopped".to_owned(),
+    }
 }
 
 async fn run_inference_worker(
@@ -858,6 +940,7 @@ async fn run_inference_worker(
     speaker_state_revision: Arc<AtomicU64>,
 ) {
     let mut previous_transcript: Option<(PipelineGeneration, String)> = None;
+    let mut adaptive_route = AdaptiveLanguageRoute::default();
     let mut diarizer: Option<xrtranslate_speaker::OnlineSpeakerDiarizer> = None;
     let speaker_min_utterance_ms = inference.speaker_min_utterance_ms().unwrap_or(0);
     let mut diarizer_generation: Option<PipelineGeneration> = Some(*generation.borrow());
@@ -877,6 +960,26 @@ async fn run_inference_worker(
         }
     };
     'jobs: while let Some(job) = jobs.recv().await {
+        let job = match job {
+            InferenceJob::Utterance(job) => job,
+            InferenceJob::StreamEnded {
+                generation: event_generation,
+                turn_id,
+            } => {
+                if *generation.borrow() == event_generation
+                    && events
+                        .send(InferenceEvent::StreamEnded {
+                            generation: event_generation,
+                            turn_id,
+                        })
+                        .await
+                        .is_err()
+                {
+                    break;
+                }
+                continue;
+            }
+        };
         if *generation.borrow() != job.generation {
             continue;
         }
@@ -887,6 +990,7 @@ async fn run_inference_worker(
             previous_transcript = None;
         }
         if diarizer_generation != Some(job.generation) {
+            adaptive_route = AdaptiveLanguageRoute::default();
             if let Some(diarizer) = &mut diarizer {
                 diarizer.reset();
             }
@@ -915,10 +1019,12 @@ async fn run_inference_worker(
             asr_tokens,
             translation_tokens,
         };
+        adaptive_route.configure(&job.source_language, &job.target_language);
+        let active_target_language = adaptive_route.active_targets(&job.target_language);
         let asr_context = match corpus_session
             .prepare_asr(&PrepareAsrRequest {
                 source_language: job.source_language.clone(),
-                target_language: job.target_language.clone(),
+                target_language: active_target_language,
                 budgets: context_budgets,
             })
             .await
@@ -942,13 +1048,27 @@ async fn run_inference_worker(
             .transcribe(
                 &job.utterance.samples,
                 &job.source_language,
+                &job.target_language,
+                &mut adaptive_route,
                 asr_context.prompt,
                 &asr_context.echo_guard,
             )
             .await
         {
             Ok(Some(recognized)) => recognized,
-            Ok(None) => continue,
+            Ok(None) => {
+                if events
+                    .send(InferenceEvent::WindowObserved {
+                        generation: job.generation,
+                        text_units: 0,
+                    })
+                    .await
+                    .is_err()
+                {
+                    break;
+                }
+                continue;
+            }
             Err(message) => {
                 if events
                     .send(InferenceEvent::Error {
@@ -963,24 +1083,48 @@ async fn run_inference_worker(
                 continue;
             }
         };
-        if overlap_frames > 0
+        if !job.revisable
+            && overlap_frames > 0
             && let Some((_, previous)) = &previous_transcript
-            && !recognized.remove_overlap_with(previous, &job.source_language)
+            && !recognized.remove_overlap_with(previous)
         {
             info!(
                 overlap_frames,
                 "ASR overlap contained no new text; suppressing duplicate result"
             );
+            if events
+                .send(InferenceEvent::WindowObserved {
+                    generation: job.generation,
+                    text_units: 0,
+                })
+                .await
+                .is_err()
+            {
+                break;
+            }
             continue;
+        }
+        if job.revisable {
+            recognized.prepare_revisable_snapshot();
         }
         if *generation.borrow() != job.generation {
             continue;
         }
+        if events
+            .send(InferenceEvent::WindowObserved {
+                generation: job.generation,
+                text_units: text_density_units(&recognized.source_text),
+            })
+            .await
+            .is_err()
+        {
+            break;
+        }
         let translation_context = match corpus_session
             .prepare_translation(&PrepareTranslationRequest {
                 asr_context_id: asr_context.context_id,
-                source_language: job.source_language.clone(),
-                target_language: job.target_language.clone(),
+                source_language: recognized.source_language.clone(),
+                target_language: recognized.target_language.clone(),
                 recognized_text: recognized.source_text.clone(),
                 segments: recognized
                     .segments
@@ -1016,10 +1160,10 @@ async fn run_inference_worker(
                 after = %source_rewrite.corrected_text,
                 "applied XR Corpus ASR terminology correction"
             );
-            recognized.apply_source_correction(
-                source_rewrite.corrected_text.clone(),
-                &job.source_language,
-            );
+            recognized.apply_source_correction(source_rewrite.corrected_text.clone());
+        }
+        if job.revisable {
+            recognized.prepare_revisable_snapshot();
         }
         for (segment, context) in recognized
             .segments
@@ -1084,17 +1228,28 @@ async fn run_inference_worker(
             String::new()
         };
         let asr_elapsed = recognized.asr_elapsed;
+        let source_language = recognized.source_language.clone();
+        let target_language = recognized.target_language.clone();
         let segments = recognized.segments.clone();
-        let non_overlapping_start_ms = (job.source_start_ms
-            + overlap_frames as f64 * FRAME_SAMPLES as f64 * 1_000.0 / f64::from(SAMPLE_RATE_HZ))
-        .min(job.source_end_ms);
+        let overlap_ms =
+            overlap_frames as f64 * FRAME_SAMPLES as f64 * 1_000.0 / f64::from(SAMPLE_RATE_HZ);
+        let non_overlapping_start_ms = if job.revisable {
+            job.source_start_ms
+        } else {
+            (job.source_start_ms + overlap_ms).min(job.source_end_ms)
+        };
+        let window_ms = (job.source_end_ms - job.source_start_ms).max(1.0);
         let segment_contexts = segment_contexts(
             &segments,
             &translation_context.segments,
             job.turn_id.clone(),
             speaker_id,
-            non_overlapping_start_ms,
-            job.source_end_ms,
+            StreamWindowContext {
+                start_ms: non_overlapping_start_ms,
+                end_ms: job.source_end_ms,
+                revisable: job.revisable,
+                overlap_ratio: (overlap_ms / window_ms) as f32,
+            },
         );
         if events
             .send(InferenceEvent::Recognized {
@@ -1111,12 +1266,12 @@ async fn run_inference_worker(
             segments
                 .into_iter()
                 .zip(segment_contexts)
-                .zip(translation_context.segments.into_iter()),
+                .zip(translation_context.segments),
         )
         .map(|((segment, segment_context), corpus_context)| {
             let inference = inference.clone();
-            let source_language = job.source_language.clone();
-            let target_language = job.target_language.clone();
+            let source_language = source_language.clone();
+            let target_language = target_language.clone();
             let source_for_terms = segment.translation_text.clone();
             let prompt_terms = corpus_context.prompt_terms.clone();
             async move {
@@ -1190,6 +1345,7 @@ async fn handle_inference_event(
         return Ok(());
     }
     match event {
+        InferenceEvent::WindowObserved { .. } => {}
         InferenceEvent::Recognized {
             generation,
             recognized,
@@ -1252,6 +1408,14 @@ async fn handle_inference_event(
                 send_session_output(writer, session, generation).await?;
             }
         }
+        InferenceEvent::StreamEnded { turn_id, .. } => {
+            send_event(
+                writer,
+                Some(current_generation),
+                ServerEvent::RecognitionStreamEnded(RecognitionStreamEnded { turn_id }),
+            )
+            .await?;
+        }
         InferenceEvent::Error {
             generation,
             message,
@@ -1263,31 +1427,52 @@ async fn handle_inference_event(
     Ok(())
 }
 
+fn text_density_units(text: &str) -> usize {
+    let mut units = 0;
+    let mut in_word = false;
+    for character in text.chars() {
+        if matches!(
+            character as u32,
+            0x3040..=0x30FF | 0x3400..=0x9FFF | 0xAC00..=0xD7AF | 0xF900..=0xFAFF
+        ) {
+            units += 1;
+            in_word = false;
+        } else if character.is_alphanumeric() || character == '\'' {
+            if !in_word {
+                units += 1;
+                in_word = true;
+            }
+        } else {
+            in_word = false;
+        }
+    }
+    units
+}
+
 fn segment_contexts(
     segments: &[xrtranslate_engine::TranslationSegmentPair],
     corpus_contexts: &[CorpusSegmentContext],
     turn_id: String,
     speaker_id: String,
-    source_start_ms: f64,
-    source_end_ms: f64,
+    window: StreamWindowContext,
 ) -> Vec<SegmentContext> {
     let weights = segments
         .iter()
         .map(|segment| segment.source_text.chars().count().max(1))
         .collect::<Vec<_>>();
     let total_weight = weights.iter().sum::<usize>().max(1) as f64;
-    let duration = (source_end_ms - source_start_ms).max(0.0);
+    let duration = (window.end_ms - window.start_ms).max(0.0);
     let mut consumed = 0usize;
     weights
         .into_iter()
         .enumerate()
         .map(|(index, weight)| {
-            let start = source_start_ms + duration * consumed as f64 / total_weight;
+            let start = window.start_ms + duration * consumed as f64 / total_weight;
             consumed += weight;
             let end = if index + 1 == segments.len() {
-                source_end_ms
+                window.end_ms
             } else {
-                source_start_ms + duration * consumed as f64 / total_weight
+                window.start_ms + duration * consumed as f64 / total_weight
             };
             let corpus_context = corpus_contexts.get(index);
             SegmentContext {
@@ -1297,6 +1482,8 @@ fn segment_contexts(
                 speaker_id: speaker_id.clone(),
                 source_start_ms: start,
                 source_end_ms: end,
+                revisable: window.revisable,
+                overlap_ratio: window.overlap_ratio,
                 activation_matches: corpus_context
                     .map(|context| context.activation_matches.clone())
                     .unwrap_or_default(),
@@ -1405,8 +1592,9 @@ async fn shutdown_signal() {
 #[cfg(test)]
 mod tests {
     use super::{
-        AudioEpoch, PipelineGeneration, apply_model_runtime, health_url, local_endpoint_port,
-        model_alias_is_advertised, models_url, outbound_is_current, segment_contexts,
+        AudioEpoch, PipelineGeneration, StreamWindowContext, apply_model_runtime, health_url,
+        local_endpoint_port, model_alias_is_advertised, models_url, outbound_is_current,
+        segment_contexts,
     };
     use xrtranslate_config::LocalModelRuntimeConfig;
     use xrtranslate_engine::{
@@ -1527,8 +1715,12 @@ mod tests {
             &[],
             "turn-7".into(),
             "speaker-02".into(),
-            1_000.0,
-            3_000.0,
+            StreamWindowContext {
+                start_ms: 1_000.0,
+                end_ms: 3_000.0,
+                revisable: false,
+                overlap_ratio: 0.0,
+            },
         );
         assert_eq!(metadata.len(), 2);
         assert_eq!(metadata[0].speaker_id, "speaker-02");

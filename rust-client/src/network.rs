@@ -14,17 +14,25 @@ use tokio_tungstenite::{
 };
 use xrtranslate_protocol::CorpusTermMatch;
 
+use crate::client_settings::CaptureSource;
+
 #[derive(Debug, Clone)]
 pub enum SessionEvent {
     Connected,
     Disconnected(String),
     Status(String),
+    VadActivity {
+        source: CaptureSource,
+        active: bool,
+    },
     Asr {
         kind: String,
         text: String,
         turn_id: String,
     },
     SourceSegment {
+        stream_id: u64,
+        continuous: bool,
         text: String,
         activation_matches: Vec<CorpusTermMatch>,
         context_matches: Vec<CorpusTermMatch>,
@@ -33,14 +41,27 @@ pub enum SessionEvent {
         source_start_ms: f64,
         source_end_ms: f64,
         segment_index: u32,
+        segment_count: u32,
+        revisable: bool,
+        overlap_ratio: f32,
     },
     Translation {
+        stream_id: u64,
+        audio_source: CaptureSource,
+        continuous: bool,
+        osc: crate::osc::OscHandle,
         source: String,
         translated: String,
         speaker_id: String,
         source_start_ms: f64,
         source_end_ms: f64,
         term_matches: Vec<CorpusTermMatch>,
+        revisable: bool,
+        overlap_ratio: f32,
+    },
+    StreamEnded {
+        stream_id: u64,
+        osc: crate::osc::OscHandle,
     },
     TtsAudio(Vec<u8>),
     BackendError(String),
@@ -60,9 +81,52 @@ enum SessionCommand {
     ResetAudioPipeline {
         source_lang: String,
         target_lang: String,
+        audio_source: CaptureSource,
+        vad_threshold: f32,
+        vad_silence_ms: u32,
+        continuous_recognition: bool,
+    },
+    UpdateAudioSegmentation {
+        vad_threshold: f32,
+        vad_silence_ms: u32,
+        continuous_recognition: bool,
+        source_lang: String,
+        target_lang: String,
     },
     SetTtsEnabled(bool),
     SetSpeakerRecognitionEnabled(bool),
+}
+
+impl SessionCommand {
+    fn continuous_recognition(&self) -> Option<bool> {
+        match self {
+            Self::UpdateAudioSegmentation {
+                continuous_recognition,
+                ..
+            }
+            | Self::ResetAudioPipeline {
+                continuous_recognition,
+                ..
+            } => Some(*continuous_recognition),
+            _ => None,
+        }
+    }
+
+    fn resets_recognition_stream(&self) -> bool {
+        matches!(
+            self,
+            Self::UpdateLanguageRoute { .. }
+                | Self::ResetAudioPipeline { .. }
+                | Self::UpdateAudioSegmentation { .. }
+        )
+    }
+
+    fn audio_source(&self) -> Option<CaptureSource> {
+        match self {
+            Self::ResetAudioPipeline { audio_source, .. } => Some(*audio_source),
+            _ => None,
+        }
+    }
 }
 
 impl SessionHandle {
@@ -93,28 +157,67 @@ impl SessionHandle {
 
     /// Reconfigure the backend audio stream after replacing the local capture
     /// source. This clears any partially accumulated VAD utterance.
-    pub fn reset_audio_pipeline(&self, source_lang: String, target_lang: String) {
+    pub fn reset_audio_pipeline(
+        &self,
+        source_lang: String,
+        target_lang: String,
+        audio_source: CaptureSource,
+        vad_threshold: f32,
+        vad_silence_ms: u32,
+        continuous_recognition: bool,
+    ) {
         let _ = self
             .command_tx
             .try_send(SessionCommand::ResetAudioPipeline {
+                source_lang,
+                target_lang,
+                audio_source,
+                vad_threshold,
+                vad_silence_ms,
+                continuous_recognition,
+            });
+    }
+
+    pub fn update_audio_segmentation(
+        &self,
+        vad_threshold: f32,
+        vad_silence_ms: u32,
+        continuous_recognition: bool,
+        source_lang: String,
+        target_lang: String,
+    ) {
+        let _ = self
+            .command_tx
+            .try_send(SessionCommand::UpdateAudioSegmentation {
+                vad_threshold,
+                vad_silence_ms,
+                continuous_recognition,
                 source_lang,
                 target_lang,
             });
     }
 }
 
+pub struct SessionConfig {
+    pub server_url: String,
+    pub source_lang: String,
+    pub target_lang: String,
+    pub speaker_recognition_enabled: bool,
+    pub muted: Arc<AtomicBool>,
+    pub mute_gate_enabled: Arc<AtomicBool>,
+    pub osc: crate::osc::OscHandle,
+    pub tts: Option<crate::audio::TtsPlayerHandle>,
+    pub egui_ctx: Option<eframe::egui::Context>,
+    pub vad_threshold: f32,
+    pub vad_silence_ms: u32,
+    pub continuous_recognition: bool,
+    pub audio_source: CaptureSource,
+}
+
 pub fn start_session(
     audio_rx: Receiver<Vec<f32>>,
     event_tx: Sender<SessionEvent>,
-    server_url: String,
-    source_lang: String,
-    target_lang: String,
-    speaker_recognition_enabled: bool,
-    muted: Arc<AtomicBool>,
-    mute_gate_enabled: Arc<AtomicBool>,
-    osc_manager: crate::osc::OscHandle,
-    tts_handle: Option<crate::audio::TtsPlayerHandle>,
-    egui_ctx: Option<eframe::egui::Context>,
+    config: SessionConfig,
 ) -> SessionHandle {
     let stop_requested = Arc::new(AtomicBool::new(false));
     let runtime_stop = Arc::clone(&stop_requested);
@@ -138,17 +241,9 @@ pub fn start_session(
             runtime.block_on(run_session(
                 audio_rx,
                 event_tx,
-                server_url,
-                source_lang,
-                target_lang,
-                speaker_recognition_enabled,
+                config,
                 runtime_stop,
-                muted,
-                mute_gate_enabled,
                 command_rx,
-                osc_manager,
-                tts_handle,
-                egui_ctx,
             ));
         })
         .expect("failed to start translation session thread");
@@ -162,18 +257,25 @@ pub fn start_session(
 async fn run_session(
     audio_rx: Receiver<Vec<f32>>,
     event_tx: Sender<SessionEvent>,
-    server_url: String,
-    source_lang: String,
-    target_lang: String,
-    speaker_recognition_enabled: bool,
+    config: SessionConfig,
     stop_requested: Arc<AtomicBool>,
-    muted: Arc<AtomicBool>,
-    mute_gate_enabled: Arc<AtomicBool>,
     mut command_rx: mpsc::Receiver<SessionCommand>,
-    osc_manager: crate::osc::OscHandle,
-    tts_handle: Option<crate::audio::TtsPlayerHandle>,
-    egui_ctx: Option<eframe::egui::Context>,
 ) {
+    let SessionConfig {
+        server_url,
+        source_lang,
+        target_lang,
+        speaker_recognition_enabled,
+        muted,
+        mute_gate_enabled,
+        osc: osc_manager,
+        tts: tts_handle,
+        egui_ctx,
+        vad_threshold,
+        vad_silence_ms,
+        mut continuous_recognition,
+        mut audio_source,
+    } = config;
     let _ = event_tx.send(SessionEvent::Status("Connecting to backend…".into()));
     let (stream, _) = match connect_async(&server_url).await {
         Ok(connection) => connection,
@@ -192,6 +294,9 @@ async fn run_session(
             "source_lang": source_lang,
             "target_lang": target_lang,
             "sample_rate": 16_000,
+            "vad_threshold": vad_threshold,
+            "vad_silence_ms": vad_silence_ms,
+            "continuous_recognition": continuous_recognition,
         }),
     )
     .await
@@ -223,6 +328,10 @@ async fn run_session(
             "sample_rate": 16_000,
             "source_lang": source_lang,
             "target_lang": target_lang,
+            "vad_threshold": vad_threshold,
+            "vad_silence_ms": vad_silence_ms,
+            "continuous_recognition": continuous_recognition,
+            "audio_source": audio_source_name(audio_source),
         }),
     )
     .await
@@ -262,7 +371,19 @@ async fn run_session(
                 }
             }
             Some(command) = command_rx.recv() => {
-                if let Err(error) = send_session_command(&mut write, command).await {
+                if command.resets_recognition_stream() {
+                    let _ = event_tx.send(SessionEvent::StreamEnded {
+                        stream_id: osc_manager.stream_id(),
+                        osc: osc_manager.clone(),
+                    });
+                }
+                if let Some(updated) = command.continuous_recognition() {
+                    continuous_recognition = updated;
+                }
+                if let Some(updated) = command.audio_source() {
+                    audio_source = updated;
+                }
+                if let Err(error) = send_session_command(&mut write, command, audio_source).await {
                     let _ = event_tx.send(SessionEvent::Error(format!("Failed to update session: {error}")));
                     return;
                 }
@@ -285,7 +406,13 @@ async fn run_session(
             }
             message = read.next() => {
                 match message {
-                    Some(Ok(Message::Text(text))) => forward_server_event(&event_tx, &text, &osc_manager),
+                    Some(Ok(Message::Text(text))) => forward_server_event(
+                        &event_tx,
+                        &text,
+                        &osc_manager,
+                        continuous_recognition,
+                        audio_source,
+                    ),
                     Some(Ok(Message::Binary(audio))) => {
                         if let Some(tts) = &tts_handle {
                             tts.play_pcm(&audio);
@@ -317,6 +444,7 @@ async fn run_session(
 async fn send_session_command<S>(
     write: &mut S,
     command: SessionCommand,
+    audio_source: CaptureSource,
 ) -> Result<(), tungstenite::Error>
 where
     S: futures::Sink<Message, Error = tungstenite::Error> + Unpin,
@@ -361,6 +489,10 @@ where
         SessionCommand::ResetAudioPipeline {
             source_lang,
             target_lang,
+            audio_source,
+            vad_threshold,
+            vad_silence_ms,
+            continuous_recognition,
         } => {
             log::info!("Resetting backend audio pipeline after capture-source switch");
             send_json(
@@ -370,10 +502,41 @@ where
                     "sample_rate": 16_000,
                     "source_lang": source_lang,
                     "target_lang": target_lang,
+                    "audio_source": audio_source_name(audio_source),
+                    "vad_threshold": vad_threshold,
+                    "vad_silence_ms": vad_silence_ms,
+                    "continuous_recognition": continuous_recognition,
                 }),
             )
             .await
         }
+        SessionCommand::UpdateAudioSegmentation {
+            vad_threshold,
+            vad_silence_ms,
+            continuous_recognition,
+            source_lang,
+            target_lang,
+        } => {
+            send_json(
+                write,
+                json!({
+                    "event": "config_audio", "sample_rate": 16_000,
+                    "source_lang": source_lang, "target_lang": target_lang,
+                    "vad_threshold": vad_threshold, "vad_silence_ms": vad_silence_ms,
+                    "continuous_recognition": continuous_recognition,
+                    "audio_source": audio_source_name(audio_source),
+                }),
+            )
+            .await
+        }
+    }
+}
+
+fn audio_source_name(source: CaptureSource) -> &'static str {
+    match source {
+        CaptureSource::Microphone => "microphone",
+        CaptureSource::SystemAudio => "system_audio",
+        CaptureSource::Both => unreachable!("Both expands into individual audio sessions"),
     }
 }
 
@@ -388,6 +551,8 @@ fn forward_server_event(
     event_tx: &Sender<SessionEvent>,
     text: &str,
     osc_manager: &crate::osc::OscHandle,
+    continuous_recognition: bool,
+    audio_source: CaptureSource,
 ) {
     let Ok(payload) = serde_json::from_str::<Value>(text) else {
         return;
@@ -396,6 +561,16 @@ fn forward_server_event(
     match payload.get("action").and_then(Value::as_str) {
         Some("session_ready") => {
             let _ = event_tx.send(SessionEvent::Status("Connected — listening".into()));
+        }
+        Some("vad_activity") => {
+            let active = data
+                .and_then(|data| data.get("active"))
+                .and_then(Value::as_bool)
+                .unwrap_or(false);
+            let _ = event_tx.send(SessionEvent::VadActivity {
+                source: audio_source,
+                active,
+            });
         }
         Some("asr_result") => {
             let kind: String = data
@@ -409,7 +584,7 @@ fn forward_server_event(
                 .unwrap_or_default()
                 .into();
 
-            if kind == "partial" && !text_val.is_empty() {
+            if kind == "partial" && !continuous_recognition && !text_val.is_empty() {
                 osc_manager.add_message_and_send(&text_val, "", "", true);
             }
 
@@ -424,7 +599,21 @@ fn forward_server_event(
             });
         }
         Some("source_segment_ready") => {
+            let Some(revisable) = data
+                .and_then(|d| d.get("revisable"))
+                .and_then(Value::as_bool)
+            else {
+                return;
+            };
+            let Some(overlap_ratio) = data
+                .and_then(|d| d.get("overlap_ratio"))
+                .and_then(Value::as_f64)
+            else {
+                return;
+            };
             let _ = event_tx.send(SessionEvent::SourceSegment {
+                stream_id: osc_manager.stream_id(),
+                continuous: continuous_recognition,
                 text: data
                     .and_then(|d| d.get("source_text"))
                     .and_then(Value::as_str)
@@ -463,6 +652,13 @@ fn forward_server_event(
                     .and_then(Value::as_u64)
                     .and_then(|value| u32::try_from(value).ok())
                     .unwrap_or(1),
+                segment_count: data
+                    .and_then(|d| d.get("segment_count"))
+                    .and_then(Value::as_u64)
+                    .and_then(|value| u32::try_from(value).ok())
+                    .unwrap_or(1),
+                revisable,
+                overlap_ratio: overlap_ratio as f32,
             });
         }
         Some("translation_ready") => {
@@ -481,10 +677,24 @@ fn forward_server_event(
                 .and_then(Value::as_str)
                 .unwrap_or_default()
                 .into();
-
-            osc_manager.add_message_and_send(&source, &translated, &speaker_id, false);
+            let Some(revisable) = data
+                .and_then(|d| d.get("revisable"))
+                .and_then(Value::as_bool)
+            else {
+                return;
+            };
+            let Some(overlap_ratio) = data
+                .and_then(|d| d.get("overlap_ratio"))
+                .and_then(Value::as_f64)
+            else {
+                return;
+            };
 
             let _ = event_tx.send(SessionEvent::Translation {
+                stream_id: osc_manager.stream_id(),
+                audio_source,
+                continuous: continuous_recognition,
+                osc: osc_manager.clone(),
                 source,
                 translated,
                 speaker_id,
@@ -501,6 +711,14 @@ fn forward_server_event(
                     .cloned()
                     .and_then(|value| serde_json::from_value(value).ok())
                     .unwrap_or_default(),
+                revisable,
+                overlap_ratio: overlap_ratio as f32,
+            });
+        }
+        Some("recognition_stream_ended") => {
+            let _ = event_tx.send(SessionEvent::StreamEnded {
+                stream_id: osc_manager.stream_id(),
+                osc: osc_manager.clone(),
             });
         }
         Some("error") => {
@@ -535,13 +753,36 @@ mod tests {
     use super::*;
 
     #[test]
+    fn vad_activity_keeps_its_audio_source() {
+        let (sender, receiver) = crossbeam_channel::unbounded();
+        let mock_osc = crate::osc::OscManager::new(crate::osc::OscSettings::default()).handle();
+        forward_server_event(
+            &sender,
+            r#"{"action":"vad_activity","data":{"active":true}}"#,
+            &mock_osc,
+            true,
+            CaptureSource::SystemAudio,
+        );
+
+        assert!(matches!(
+            receiver.try_recv().unwrap(),
+            SessionEvent::VadActivity {
+                source: CaptureSource::SystemAudio,
+                active: true
+            }
+        ));
+    }
+
+    #[test]
     fn source_segment_event_retains_speaker_and_timeline_metadata() {
         let (sender, receiver) = crossbeam_channel::unbounded();
         let mock_osc = crate::osc::OscManager::new(crate::osc::OscSettings::default()).handle();
         forward_server_event(
             &sender,
-            r#"{"action":"source_segment_ready","data":{"source_text":"hello","speaker_id":"speaker-03","source_start_ms":125.0,"source_end_ms":875.0,"segment_index":2}}"#,
+            r#"{"action":"source_segment_ready","data":{"source_text":"hello","speaker_id":"speaker-03","source_start_ms":125.0,"source_end_ms":875.0,"segment_index":2,"segment_count":2,"revisable":true,"overlap_ratio":0.34}}"#,
             &mock_osc,
+            false,
+            CaptureSource::Microphone,
         );
 
         let event = receiver.try_recv().unwrap();
@@ -573,6 +814,8 @@ mod tests {
             &sender,
             r#"{"action":"error","data":{"message":"speaker recognition is unavailable"}}"#,
             &mock_osc,
+            false,
+            CaptureSource::Microphone,
         );
 
         assert!(matches!(
@@ -587,8 +830,10 @@ mod tests {
         let mock_osc = crate::osc::OscManager::new(crate::osc::OscSettings::default()).handle();
         forward_server_event(
             &sender,
-            r#"{"action":"translation_ready","data":{"source_text":"I love Mercy.","translated_text":"我喜欢天使。","speaker_id":"","term_matches":[{"start_byte":9,"end_byte":15,"text":"天使","sources":[{"corpus_id":"games.overwatch.heroes","domain":"games","subdomain":"overwatch","title":"Overwatch Heroes"}]}]}}"#,
+            r#"{"action":"translation_ready","data":{"source_text":"I love Mercy.","translated_text":"我喜欢天使。","speaker_id":"","revisable":false,"overlap_ratio":0.0,"term_matches":[{"start_byte":9,"end_byte":15,"text":"天使","sources":[{"corpus_id":"games.overwatch.heroes","domain":"games","subdomain":"overwatch","title":"Overwatch Heroes"}]}]}}"#,
             &mock_osc,
+            false,
+            CaptureSource::Microphone,
         );
 
         let SessionEvent::Translation { term_matches, .. } = receiver.try_recv().unwrap() else {
@@ -607,8 +852,10 @@ mod tests {
         let mock_osc = crate::osc::OscManager::new(crate::osc::OscSettings::default()).handle();
         forward_server_event(
             &sender,
-            r#"{"action":"source_segment_ready","data":{"source_text":"论文写没？","activation_matches":[{"start_byte":0,"end_byte":6,"text":"论文","sources":[{"corpus_id":"education-and-science.research.common","domain":"education-and-science","subdomain":"research","title":"研究与学术交流"}]}]}}"#,
+            r#"{"action":"source_segment_ready","data":{"source_text":"论文写没？","segment_index":1,"segment_count":1,"revisable":false,"overlap_ratio":0.0,"activation_matches":[{"start_byte":0,"end_byte":6,"text":"论文","sources":[{"corpus_id":"education-and-science.research.common","domain":"education-and-science","subdomain":"research","title":"研究与学术交流"}]}]}}"#,
             &mock_osc,
+            false,
+            CaptureSource::Microphone,
         );
 
         let SessionEvent::SourceSegment {

@@ -12,12 +12,10 @@ pub fn render(app: &mut crate::XRTranslateApp, ui: &mut egui::Ui) {
                 .strong(),
         );
         ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-            let (is_active, is_error) = if app.connection_status.contains("error") {
+            let (is_active, is_error) = if app.connection_status.to_lowercase().contains("error") {
                 (false, true)
-            } else if app.is_translating {
-                (true, false)
             } else {
-                (false, false)
+                (true, false)
             };
             let status = crate::i18n::tr_dynamic(app.ui_language, &app.connection_status);
             status_badge(ui, status.as_ref(), is_active, is_error);
@@ -67,28 +65,29 @@ pub fn render(app: &mut crate::XRTranslateApp, ui: &mut egui::Ui) {
         let previous_source = app.source_lang.clone();
         let previous_target = app.target_lang.clone();
 
-        ui.horizontal(|ui| {
+        ui.horizontal_wrapped(|ui| {
             ui.label(
                 egui::RichText::new(crate::i18n::tr(app.ui_language, "Input:"))
                     .color(crate::ui::theme::text_strong())
                     .strong(),
             );
-            egui::ComboBox::from_id_salt("source_language")
-                .selected_text(language_label(app.ui_language, &app.source_lang))
-                .show_ui(ui, |ui| {
-                    ui.selectable_value(
-                        &mut app.source_lang,
-                        "auto".into(),
-                        crate::i18n::tr(app.ui_language, "Auto (bidirectional)"),
-                    );
-                    for (code, label) in LANGUAGE_OPTIONS {
-                        ui.selectable_value(
-                            &mut app.source_lang,
-                            (*code).into(),
-                            crate::i18n::tr(app.ui_language, label),
-                        );
-                    }
-                });
+            let mut source_options = vec![(
+                "auto".to_string(),
+                crate::i18n::tr(app.ui_language, "Auto (bidirectional)").to_string(),
+            )];
+            for (code, label) in LANGUAGE_OPTIONS {
+                source_options.push((
+                    (*code).to_string(),
+                    crate::i18n::tr(app.ui_language, label).to_string(),
+                ));
+            }
+            components::searchable_combobox(
+                ui,
+                "source_language",
+                language_label(app.ui_language, &app.source_lang),
+                &mut app.source_lang,
+                &source_options,
+            );
 
             ui.add_space(8.0);
             ui.label(
@@ -109,17 +108,24 @@ pub fn render(app: &mut crate::XRTranslateApp, ui: &mut egui::Ui) {
                     None => ("zh".to_string(), "en".to_string()),
                 };
 
-                egui::ComboBox::from_id_salt("target_language_a")
-                    .selected_text(language_label(app.ui_language, &a))
-                    .show_ui(ui, |ui| {
-                        for (code, label) in LANGUAGE_OPTIONS {
-                            ui.selectable_value(
-                                &mut a,
-                                (*code).into(),
-                                crate::i18n::tr(app.ui_language, label),
-                            );
-                        }
-                    });
+                let options_a: Vec<_> = LANGUAGE_OPTIONS
+                    .iter()
+                    .filter(|(code, _)| *code != b)
+                    .map(|(code, label)| {
+                        (
+                            (*code).to_string(),
+                            crate::i18n::tr(app.ui_language, label).to_string(),
+                        )
+                    })
+                    .collect();
+
+                components::searchable_combobox(
+                    ui,
+                    "target_language_a",
+                    language_label(app.ui_language, &a),
+                    &mut a,
+                    &options_a,
+                );
 
                 ui.add_space(4.0);
                 ui.label(
@@ -129,17 +135,24 @@ pub fn render(app: &mut crate::XRTranslateApp, ui: &mut egui::Ui) {
                 );
                 ui.add_space(4.0);
 
-                egui::ComboBox::from_id_salt("target_language_b")
-                    .selected_text(language_label(app.ui_language, &b))
-                    .show_ui(ui, |ui| {
-                        for (code, label) in LANGUAGE_OPTIONS {
-                            ui.selectable_value(
-                                &mut b,
-                                (*code).into(),
-                                crate::i18n::tr(app.ui_language, label),
-                            );
-                        }
-                    });
+                let options_b: Vec<_> = LANGUAGE_OPTIONS
+                    .iter()
+                    .filter(|(code, _)| *code != a)
+                    .map(|(code, label)| {
+                        (
+                            (*code).to_string(),
+                            crate::i18n::tr(app.ui_language, label).to_string(),
+                        )
+                    })
+                    .collect();
+
+                components::searchable_combobox(
+                    ui,
+                    "target_language_b",
+                    language_label(app.ui_language, &b),
+                    &mut b,
+                    &options_b,
+                );
 
                 let new_target = format!("{a},{b}");
                 if new_target != app.target_lang {
@@ -151,21 +164,22 @@ pub fn render(app: &mut crate::XRTranslateApp, ui: &mut egui::Ui) {
                         .color(crate::ui::theme::text_strong())
                         .strong(),
                 );
-                egui::ComboBox::from_id_salt("target_language")
-                    .selected_text(route_label(
-                        app.ui_language,
-                        &app.source_lang,
-                        &app.target_lang,
-                    ))
-                    .show_ui(ui, |ui| {
-                        for (code, label) in LANGUAGE_OPTIONS {
-                            ui.selectable_value(
-                                &mut app.target_lang,
-                                (*code).into(),
-                                crate::i18n::tr(app.ui_language, label),
-                            );
-                        }
-                    });
+                let target_options: Vec<_> = LANGUAGE_OPTIONS
+                    .iter()
+                    .map(|(code, label)| {
+                        (
+                            (*code).to_string(),
+                            crate::i18n::tr(app.ui_language, label).to_string(),
+                        )
+                    })
+                    .collect();
+                components::searchable_combobox(
+                    ui,
+                    "target_language",
+                    route_label(app.ui_language, &app.source_lang, &app.target_lang),
+                    &mut app.target_lang,
+                    &target_options,
+                );
             }
         });
 
@@ -191,6 +205,7 @@ pub fn render(app: &mut crate::XRTranslateApp, ui: &mut egui::Ui) {
                     CaptureSource::SystemAudio => {
                         crate::i18n::tr(app.ui_language, "System Audio (WASAPI)")
                     }
+                    CaptureSource::Both => crate::i18n::tr(app.ui_language, "Both"),
                 })
                 .show_ui(ui, |ui| {
                     ui.selectable_value(
@@ -202,6 +217,11 @@ pub fn render(app: &mut crate::XRTranslateApp, ui: &mut egui::Ui) {
                         &mut app.capture_source,
                         CaptureSource::SystemAudio,
                         crate::i18n::tr(app.ui_language, "System Audio (WASAPI)"),
+                    );
+                    ui.selectable_value(
+                        &mut app.capture_source,
+                        CaptureSource::Both,
+                        crate::i18n::tr(app.ui_language, "Both"),
                     );
                 });
             if app.capture_source != previous_source {
@@ -215,23 +235,86 @@ pub fn render(app: &mut crate::XRTranslateApp, ui: &mut egui::Ui) {
                 app.devices = app.audio_system.available_devices();
                 app.loopback_devices = app.audio_system.available_loopback_devices();
                 app.refresh_selected_input_config();
+                app.restart_level_preview();
             }
         });
 
         ui.add_space(8.0);
         render_capture_device_selector(app, ui);
 
+        ui.add_space(10.0);
+        if app.capture_source == CaptureSource::Both {
+            let avail_w = ui.available_width();
+            if avail_w < 620.0 {
+                // Responsive Single-Column Stack when window is narrow
+                egui::Frame::new()
+                    .fill(egui::Color32::from_rgb(248, 250, 252))
+                    .corner_radius(egui::CornerRadius::same(14))
+                    .stroke(egui::Stroke::new(
+                        1.0,
+                        egui::Color32::from_rgb(226, 232, 240),
+                    ))
+                    .inner_margin(egui::Margin::same(12))
+                    .show(ui, |ui| {
+                        render_input_adaptation(app, ui, CaptureSource::Microphone);
+                    });
+
+                ui.add_space(8.0);
+
+                egui::Frame::new()
+                    .fill(egui::Color32::from_rgb(248, 250, 252))
+                    .corner_radius(egui::CornerRadius::same(14))
+                    .stroke(egui::Stroke::new(
+                        1.0,
+                        egui::Color32::from_rgb(226, 232, 240),
+                    ))
+                    .inner_margin(egui::Margin::same(12))
+                    .show(ui, |ui| {
+                        render_input_adaptation(app, ui, CaptureSource::SystemAudio);
+                    });
+            } else {
+                // Dual Column layout when window width is spacious
+                ui.columns(2, |columns| {
+                    egui::Frame::new()
+                        .fill(egui::Color32::from_rgb(248, 250, 252))
+                        .corner_radius(egui::CornerRadius::same(14))
+                        .stroke(egui::Stroke::new(
+                            1.0,
+                            egui::Color32::from_rgb(226, 232, 240),
+                        ))
+                        .inner_margin(egui::Margin::same(12))
+                        .show(&mut columns[0], |ui| {
+                            render_input_adaptation(app, ui, CaptureSource::Microphone);
+                        });
+
+                    egui::Frame::new()
+                        .fill(egui::Color32::from_rgb(248, 250, 252))
+                        .corner_radius(egui::CornerRadius::same(14))
+                        .stroke(egui::Stroke::new(
+                            1.0,
+                            egui::Color32::from_rgb(226, 232, 240),
+                        ))
+                        .inner_margin(egui::Margin::same(12))
+                        .show(&mut columns[1], |ui| {
+                            render_input_adaptation(app, ui, CaptureSource::SystemAudio);
+                        });
+                });
+            }
+        } else {
+            render_input_adaptation(app, ui, app.capture_source);
+        }
+
         ui.add_space(12.0);
 
         // Integrated Frosted Action Bar
         egui::Frame::new()
-            .fill(egui::Color32::from_rgb(248, 250, 252))
-            .corner_radius(egui::CornerRadius::same(10))
+            .fill(egui::Color32::from_rgb(241, 245, 249))
+            .corner_radius(egui::CornerRadius::same(16))
             .stroke(egui::Stroke::new(
                 1.0,
                 egui::Color32::from_rgb(226, 232, 240),
             ))
-            .inner_margin(egui::Margin::symmetric(14, 10))
+            .inner_margin(egui::Margin::symmetric(16, 12))
             .show(ui, |ui| {
                 ui.horizontal(|ui| {
                     if app.is_translating {
@@ -325,26 +408,31 @@ pub fn render(app: &mut crate::XRTranslateApp, ui: &mut egui::Ui) {
                             let total = app.recognition_history.len();
                             for (i, entry) in app.recognition_history.iter().enumerate() {
                                 let is_last = i == total - 1 && app.partial_text.is_empty();
-                                ui.horizontal_wrapped(|ui| {
-                                    if let Some(speaker) =
-                                        crate::compact_speaker_label(&entry.speaker_id)
-                                    {
-                                        ui.label(
-                                            egui::RichText::new(speaker)
-                                                .color(egui::Color32::from_rgb(37, 99, 235))
-                                                .size(11.5)
-                                                .strong(),
+                                let resp = history_entry_frame()
+                                    .show(ui, |ui| {
+                                        ui.set_width(ui.available_width());
+                                        ui.horizontal_wrapped(|ui| {
+                                            if let Some(speaker) =
+                                                crate::compact_speaker_label(&entry.speaker_id)
+                                            {
+                                                ui.label(
+                                                    egui::RichText::new(speaker)
+                                                        .color(egui::Color32::from_rgb(37, 99, 235))
+                                                        .size(11.5)
+                                                        .strong(),
+                                                );
+                                            }
+                                        });
+                                        render_text_with_term_matches(
+                                            ui,
+                                            &entry.text,
+                                            &entry.activation_matches,
+                                            &entry.context_matches,
+                                            crate::ui::theme::text_normal(),
+                                            false,
                                         );
-                                    }
-                                });
-                                let resp = render_text_with_term_matches(
-                                    ui,
-                                    &entry.text,
-                                    &entry.activation_matches,
-                                    &entry.context_matches,
-                                    crate::ui::theme::text_normal(),
-                                    false,
-                                );
+                                    })
+                                    .response;
                                 if is_last {
                                     resp.scroll_to_me(Some(egui::Align::BOTTOM));
                                 }
@@ -394,14 +482,7 @@ pub fn render(app: &mut crate::XRTranslateApp, ui: &mut egui::Ui) {
                             let total = app.translations.len();
                             for (i, entry) in app.translations.iter().enumerate() {
                                 let is_last = i == total - 1;
-                                let group_resp = egui::Frame::new()
-                                    .fill(egui::Color32::from_rgb(248, 250, 252))
-                                    .corner_radius(egui::CornerRadius::same(8))
-                                    .inner_margin(egui::Margin::symmetric(10, 8))
-                                    .stroke(egui::Stroke::new(
-                                        1.0,
-                                        egui::Color32::from_rgb(226, 232, 240),
-                                    ))
+                                let group_resp = history_entry_frame()
                                     .show(ui, |ui| {
                                         ui.set_width(ui.available_width());
                                         ui.horizontal_wrapped(|ui| {
@@ -443,6 +524,17 @@ pub fn render(app: &mut crate::XRTranslateApp, ui: &mut egui::Ui) {
             },
         );
     });
+}
+
+fn history_entry_frame() -> egui::Frame {
+    egui::Frame::new()
+        .fill(egui::Color32::from_rgb(248, 250, 252))
+        .corner_radius(egui::CornerRadius::same(8))
+        .inner_margin(egui::Margin::symmetric(10, 8))
+        .stroke(egui::Stroke::new(
+            1.0,
+            egui::Color32::from_rgb(226, 232, 240),
+        ))
 }
 
 fn render_text_with_term_matches(
@@ -531,17 +623,133 @@ fn render_text_with_term_matches(
     .response
 }
 
-fn render_capture_device_selector(app: &mut crate::XRTranslateApp, ui: &mut egui::Ui) {
-    let level =
-        f32::from_bits(app.input_level.load(std::sync::atomic::Ordering::Relaxed)).clamp(0.0, 1.0);
+fn render_input_adaptation(
+    app: &mut crate::XRTranslateApp,
+    ui: &mut egui::Ui,
+    source: CaptureSource,
+) {
+    if app.capture_source == CaptureSource::Both {
+        let title = match source {
+            CaptureSource::Microphone => {
+                format!("🎤 {}", crate::i18n::tr(app.ui_language, "Microphone"))
+            }
+            CaptureSource::SystemAudio => format!(
+                "🔊 {}",
+                crate::i18n::tr(app.ui_language, "System Audio (WASAPI)")
+            ),
+            CaptureSource::Both => unreachable!(),
+        };
+        ui.label(
+            egui::RichText::new(title)
+                .color(crate::ui::theme::text_strong())
+                .size(13.5)
+                .strong(),
+        );
+        ui.add_space(4.0);
+    }
+    let language = app.ui_language;
+    let recognize_when = crate::i18n::tr(language, "Recognize when:");
+    let speak = crate::i18n::tr(language, "Speak");
+    let always = crate::i18n::tr(language, "Always");
+    let states = [
+        crate::i18n::tr(language, "Low"),
+        crate::i18n::tr(language, "Medium"),
+        crate::i18n::tr(language, "High"),
+    ];
+    let background_noise = crate::i18n::tr(language, "Background noise");
+    let pause_tolerance = crate::i18n::tr(language, "Pause tolerance");
+    let changed = {
+        let recognition = app.recognition_settings_mut(source);
+        let timing_changed = ui
+            .horizontal(|ui| {
+                ui.label(egui::RichText::new(recognize_when).strong());
+                let previous = recognition.continuous_recognition;
+                egui::ComboBox::from_id_salt(("recognition_timing", source))
+                    .selected_text(if recognition.continuous_recognition {
+                        always
+                    } else {
+                        speak
+                    })
+                    .show_ui(ui, |ui| {
+                        ui.selectable_value(&mut recognition.continuous_recognition, false, speak);
+                        ui.selectable_value(&mut recognition.continuous_recognition, true, always);
+                    });
+                recognition.continuous_recognition != previous
+            })
+            .inner;
+        let background_response = components::modern_slider_f32(
+            ui,
+            &mut recognition.background_noise,
+            0.2..=0.8,
+            0.2,
+            background_noise,
+            &states,
+        );
+        let background_changed = background_response.drag_stopped()
+            || (background_response.changed() && !background_response.dragged());
+        let pause_changed = if recognition.continuous_recognition {
+            false
+        } else {
+            let response = components::modern_slider_f32(
+                ui,
+                &mut recognition.pause_tolerance,
+                0.0..=1.0,
+                0.0,
+                pause_tolerance,
+                &states,
+            );
+            response.drag_stopped() || (response.changed() && !response.dragged())
+        };
+        timing_changed || background_changed || pause_changed
+    };
+    if changed {
+        app.set_audio_adaptation(source);
+    }
+}
+
+fn render_audio_level(
+    ui: &mut egui::Ui,
+    id: &'static str,
+    level: &std::sync::Arc<std::sync::atomic::AtomicU32>,
+    vad_active: &std::sync::Arc<std::sync::atomic::AtomicBool>,
+    visible: bool,
+) {
+    let level = f32::from_bits(level.load(std::sync::atomic::Ordering::Relaxed)).clamp(0.0, 1.0);
     let decibels = 20.0 * level.max(0.000_001).log10();
     let raw_fraction = ((decibels + 60.0) / 60.0).clamp(0.0, 1.0);
-    let animated_fraction = crate::ui::animation::AnimationSystem::smooth_audio_level(
-        ui.ctx(),
-        "input_level_meter",
-        raw_fraction,
-    );
+    let animated_fraction =
+        crate::ui::animation::AnimationSystem::smooth_audio_level(ui.ctx(), id, raw_fraction);
+    let active = vad_active.load(std::sync::atomic::Ordering::Relaxed);
 
+    if visible {
+        let (rect, _) = ui.allocate_exact_size(egui::vec2(80.0, 6.0), egui::Sense::hover());
+        ui.painter().rect_filled(
+            rect,
+            egui::CornerRadius::same(3),
+            if active {
+                egui::Color32::from_rgb(220, 252, 231) // Fresh light green mint background
+            } else {
+                egui::Color32::from_rgb(241, 245, 249)
+            },
+        );
+        if animated_fraction > 0.01 {
+            ui.painter().rect_filled(
+                egui::Rect::from_min_size(
+                    rect.min,
+                    egui::vec2(rect.width() * animated_fraction, rect.height()),
+                ),
+                egui::CornerRadius::same(3),
+                if active {
+                    egui::Color32::from_rgb(34, 197, 94) // Vibrant emerald green
+                } else {
+                    egui::Color32::from_rgb(37, 99, 235)
+                },
+            );
+        }
+    }
+}
+
+fn render_capture_device_selector(app: &mut crate::XRTranslateApp, ui: &mut egui::Ui) {
     ui.horizontal(|ui| {
         ui.label(
             egui::RichText::new(crate::i18n::tr(app.ui_language, "Device:"))
@@ -558,25 +766,22 @@ fn render_capture_device_selector(app: &mut crate::XRTranslateApp, ui: &mut egui
                     .map(|device| device.name.as_str())
                     .unwrap_or(crate::i18n::tr(app.ui_language, "Default microphone"));
 
-                egui::ComboBox::from_id_salt("mic_device_selector")
-                    .selected_text(current_name)
-                    .show_ui(ui, |ui| {
-                        ui.selectable_value(
-                            &mut app.selected_device_id,
-                            String::new(),
-                            crate::i18n::tr(app.ui_language, "Default microphone"),
-                        );
-                        for device in &app.devices {
-                            ui.selectable_value(
-                                &mut app.selected_device_id,
-                                device.id.clone(),
-                                &device.name,
-                            );
-                        }
-                    });
+                let mut mic_options = vec![(
+                    String::new(),
+                    crate::i18n::tr(app.ui_language, "Default microphone").to_string(),
+                )];
+                for device in &app.devices {
+                    mic_options.push((device.id.clone(), device.name.clone()));
+                }
 
-                if app.selected_device_id != previous_device {
-                    app.switch_capture_device(previous_device);
+                if components::searchable_combobox(
+                    ui,
+                    "mic_device_selector",
+                    current_name,
+                    &mut app.selected_device_id,
+                    &mic_options,
+                ) {
+                    app.switch_capture_device(CaptureSource::Microphone, previous_device);
                 }
             }
             CaptureSource::SystemAudio => {
@@ -591,52 +796,111 @@ fn render_capture_device_selector(app: &mut crate::XRTranslateApp, ui: &mut egui
                         "Default render output (loopback)",
                     ));
 
-                egui::ComboBox::from_id_salt("loopback_device_selector")
-                    .selected_text(current_name)
-                    .show_ui(ui, |ui| {
-                        ui.selectable_value(
-                            &mut app.selected_loopback_device_id,
-                            String::new(),
-                            crate::i18n::tr(app.ui_language, "Default render output (loopback)"),
-                        );
-                        for device in &app.loopback_devices {
-                            ui.selectable_value(
-                                &mut app.selected_loopback_device_id,
-                                device.id.clone(),
-                                &device.name,
-                            );
-                        }
-                    });
+                let mut loopback_options = vec![(
+                    String::new(),
+                    crate::i18n::tr(app.ui_language, "Default render output (loopback)")
+                        .to_string(),
+                )];
+                for device in &app.loopback_devices {
+                    loopback_options.push((device.id.clone(), device.name.clone()));
+                }
 
-                if app.selected_loopback_device_id != previous_device {
-                    app.switch_capture_device(previous_device);
+                if components::searchable_combobox(
+                    ui,
+                    "loopback_device_selector",
+                    current_name,
+                    &mut app.selected_loopback_device_id,
+                    &loopback_options,
+                ) {
+                    app.switch_capture_device(CaptureSource::SystemAudio, previous_device);
+                }
+            }
+            CaptureSource::Both => {
+                let previous_device = app.selected_device_id.clone();
+                let current_name = app
+                    .devices
+                    .iter()
+                    .find(|device| device.id == app.selected_device_id)
+                    .map(|device| device.name.as_str())
+                    .unwrap_or(crate::i18n::tr(app.ui_language, "Default microphone"));
+                let mut mic_options = vec![(
+                    String::new(),
+                    crate::i18n::tr(app.ui_language, "Default microphone").to_string(),
+                )];
+                for device in &app.devices {
+                    mic_options.push((device.id.clone(), device.name.clone()));
+                }
+
+                if components::searchable_combobox(
+                    ui,
+                    "both_mic_device_selector",
+                    current_name,
+                    &mut app.selected_device_id,
+                    &mic_options,
+                ) {
+                    app.switch_capture_device(CaptureSource::Microphone, previous_device);
                 }
             }
         }
-
         ui.add_space(8.0);
-        // Integrated subtle audio meter bar right next to the device selector
-        if app.is_translating {
-            let bar_width = 80.0;
-            let bar_height = 6.0;
-            let (rect, _) =
-                ui.allocate_exact_size(egui::vec2(bar_width, bar_height), egui::Sense::hover());
-            ui.painter().rect_filled(
-                rect,
-                egui::CornerRadius::same(3),
-                egui::Color32::from_rgb(241, 245, 249),
-            );
-            if animated_fraction > 0.01 {
-                let active_rect = egui::Rect::from_min_size(
-                    rect.min,
-                    egui::vec2(rect.width() * animated_fraction, rect.height()),
-                );
-                ui.painter().rect_filled(
-                    active_rect,
-                    egui::CornerRadius::same(3),
-                    egui::Color32::from_rgb(37, 99, 235),
-                );
-            }
-        }
+        let (meter_id, level, vad_active) = match app.capture_source {
+            CaptureSource::Microphone | CaptureSource::Both => (
+                "input_level_meter",
+                &app.input_level,
+                &app.microphone_vad_active,
+            ),
+            CaptureSource::SystemAudio => (
+                "loopback_level_meter",
+                &app.loopback_level,
+                &app.loopback_vad_active,
+            ),
+        };
+        render_audio_level(ui, meter_id, level, vad_active, true);
     });
+
+    if app.capture_source == CaptureSource::Both {
+        ui.add_space(6.0);
+        ui.horizontal(|ui| {
+            ui.label(
+                egui::RichText::new(crate::i18n::tr(app.ui_language, "System Audio (WASAPI)"))
+                    .color(crate::ui::theme::text_strong())
+                    .strong(),
+            );
+            let previous_device = app.selected_loopback_device_id.clone();
+            let current_name = app
+                .loopback_devices
+                .iter()
+                .find(|device| device.id == app.selected_loopback_device_id)
+                .map(|device| device.name.as_str())
+                .unwrap_or(crate::i18n::tr(
+                    app.ui_language,
+                    "Default render output (loopback)",
+                ));
+            let mut loopback_options = vec![(
+                String::new(),
+                crate::i18n::tr(app.ui_language, "Default render output (loopback)").to_string(),
+            )];
+            for device in &app.loopback_devices {
+                loopback_options.push((device.id.clone(), device.name.clone()));
+            }
+
+            if components::searchable_combobox(
+                ui,
+                "both_loopback_device_selector",
+                current_name,
+                &mut app.selected_loopback_device_id,
+                &loopback_options,
+            ) {
+                app.switch_capture_device(CaptureSource::SystemAudio, previous_device);
+            }
+            ui.add_space(8.0);
+            render_audio_level(
+                ui,
+                "loopback_level_meter",
+                &app.loopback_level,
+                &app.loopback_vad_active,
+                true,
+            );
+        });
+    }
 }

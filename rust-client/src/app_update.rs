@@ -33,8 +33,9 @@ pub struct AppUpdateInfo {
     pub size: u64,
 }
 
-#[derive(Clone, Debug)]
+#[derive(Clone, Debug, Default)]
 pub enum AppUpdateState {
+    #[default]
     Idle,
     Checking,
     Current,
@@ -86,12 +87,6 @@ pub struct AppUpdateManager {
     events: Option<Receiver<Event>>,
     available: Option<ReleaseAsset>,
     prepared: Option<PreparedUpdate>,
-}
-
-impl Default for AppUpdateState {
-    fn default() -> Self {
-        Self::Idle
-    }
 }
 
 impl AppUpdateManager {
@@ -526,7 +521,7 @@ fn extract_zip(archive: &Path, destination: &Path) -> Result<(), String> {
         let mut entry = zip
             .by_index(index)
             .map_err(|error| format!("Cannot read update package: {error}"))?;
-        let Some(name) = entry.enclosed_name().map(PathBuf::from) else {
+        let Some(name) = entry.enclosed_name() else {
             continue;
         };
         let output = destination.join(name);
@@ -614,11 +609,7 @@ pub fn spawn_updater(install: AppUpdateInstall) -> Result<(), String> {
         .arg(std::process::id().to_string())
         .arg("--restart")
         .current_dir(&install.target);
-    #[cfg(windows)]
-    {
-        use std::os::windows::process::CommandExt;
-        command.creation_flags(0x0800_0000);
-    }
+    crate::child_process::hide_console(&mut command);
     command
         .spawn()
         .map(|_| ())

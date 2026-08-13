@@ -27,6 +27,7 @@ zip = { version = "2.4.2", default-features = false, features = ["deflate"] }
 xrtranslate-assets = { path = "../crates/xrtranslate-assets" }
 xrtranslate-config = { path = "../crates/xrtranslate-config" }
 xrtranslate-download = { path = "../crates/xrtranslate-download" }
+xrtranslate-engine = { path = "../crates/xrtranslate-engine" }
 xrtranslate-protocol = { path = "../crates/xrtranslate-protocol" }
 
 [target.'cfg(windows)'.dependencies]

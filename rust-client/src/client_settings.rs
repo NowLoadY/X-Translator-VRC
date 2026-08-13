@@ -5,15 +5,41 @@ use crate::ui::Page;
 use serde::{Deserialize, Serialize};
 use std::path::Path;
 
-#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, Serialize, Deserialize, Default)]
 pub enum CaptureSource {
+    #[default]
     Microphone,
     SystemAudio,
+    Both,
 }
 
-impl Default for CaptureSource {
+impl CaptureSource {
+    pub const fn routes(self) -> &'static [Self] {
+        match self {
+            Self::Microphone => &[Self::Microphone],
+            Self::SystemAudio => &[Self::SystemAudio],
+            Self::Both => &[Self::Microphone, Self::SystemAudio],
+        }
+    }
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize, PartialEq)]
+pub struct RecognitionSettings {
+    #[serde(default = "default_background_noise")]
+    pub background_noise: f32,
+    #[serde(default = "default_pause_tolerance")]
+    pub pause_tolerance: f32,
+    #[serde(default)]
+    pub continuous_recognition: bool,
+}
+
+impl Default for RecognitionSettings {
     fn default() -> Self {
-        Self::Microphone
+        Self {
+            background_noise: default_background_noise(),
+            pause_tolerance: default_pause_tolerance(),
+            continuous_recognition: false,
+        }
     }
 }
 
@@ -25,6 +51,16 @@ pub struct ClientSettings {
     pub selected_device_id: String,
     #[serde(default)]
     pub selected_loopback_device_id: String,
+    #[serde(default = "default_background_noise")]
+    pub background_noise: f32,
+    #[serde(default = "default_pause_tolerance")]
+    pub pause_tolerance: f32,
+    #[serde(default)]
+    pub continuous_recognition: bool,
+    #[serde(default)]
+    pub microphone_recognition: RecognitionSettings,
+    #[serde(default)]
+    pub loopback_recognition: RecognitionSettings,
     #[serde(default = "default_source_lang")]
     pub source_lang: String,
     #[serde(default = "default_target_lang")]
@@ -64,6 +100,13 @@ fn default_target_lang() -> String {
     "zh,en".into()
 }
 
+const fn default_background_noise() -> f32 {
+    0.2
+}
+const fn default_pause_tolerance() -> f32 {
+    0.0
+}
+
 const fn default_true() -> bool {
     true
 }
@@ -86,6 +129,11 @@ impl Default for ClientSettings {
             capture_source: CaptureSource::Microphone,
             selected_device_id: String::new(),
             selected_loopback_device_id: String::new(),
+            background_noise: default_background_noise(),
+            pause_tolerance: default_pause_tolerance(),
+            continuous_recognition: false,
+            microphone_recognition: RecognitionSettings::default(),
+            loopback_recognition: RecognitionSettings::default(),
             source_lang: default_source_lang(),
             target_lang: default_target_lang(),
             tts_enabled: false,
@@ -113,6 +161,7 @@ impl ClientSettings {
             .ok()
             .and_then(|contents| serde_json::from_str::<ClientSettings>(&contents).ok())
             .unwrap_or_default();
+        settings.migrate_recognition_settings();
         // Keep lifecycle state authoritative across development and packaged launches.
         settings.apply_app_state(project_root);
         settings.normalize_feature_dependencies();
@@ -140,8 +189,30 @@ impl ClientSettings {
         }
     }
 
+    fn migrate_recognition_settings(&mut self) {
+        let defaults = RecognitionSettings::default();
+        if self.microphone_recognition == defaults && self.loopback_recognition == defaults {
+            let legacy = RecognitionSettings {
+                background_noise: self.background_noise,
+                pause_tolerance: self.pause_tolerance,
+                continuous_recognition: self.continuous_recognition,
+            };
+            self.microphone_recognition = legacy.clone();
+            self.loopback_recognition = legacy;
+        }
+    }
+
     /// Normalizes settings that share one user-facing feature.
     pub fn normalize_feature_dependencies(&mut self) {
+        self.background_noise = self.background_noise.clamp(0.2, 0.8);
+        self.pause_tolerance = self.pause_tolerance.clamp(0.0, 1.0);
+        for settings in [
+            &mut self.microphone_recognition,
+            &mut self.loopback_recognition,
+        ] {
+            settings.background_noise = settings.background_noise.clamp(0.2, 0.8);
+            settings.pause_tolerance = settings.pause_tolerance.clamp(0.0, 1.0);
+        }
         let speaker_numbers_enabled =
             self.speaker_recognition_enabled || self.osc_settings.show_speaker_number;
         self.speaker_recognition_enabled = speaker_numbers_enabled;
@@ -224,21 +295,35 @@ mod tests {
     use super::*;
 
     #[test]
+    fn recognition_defaults_prioritize_speech() {
+        let recognition = RecognitionSettings::default();
+        assert_eq!(recognition.background_noise, 0.2);
+        assert_eq!(recognition.pause_tolerance, 0.0);
+        assert!(!recognition.continuous_recognition);
+    }
+
+    #[test]
     fn test_client_settings_load_save_and_sanitize() {
         let root = std::env::temp_dir().join("xrtranslate_test_settings");
         let _ = std::fs::remove_dir_all(&root);
         let _ = std::fs::create_dir_all(&root);
 
-        let mut settings = ClientSettings::default();
-        settings.capture_source = CaptureSource::SystemAudio;
-        settings.selected_device_id = "mic-1".into();
-        settings.selected_loopback_device_id = "loopback-1".into();
-        settings.tts_enabled = true;
-        settings.speaker_recognition_enabled = true;
-        settings.source_lang = "en".into();
-        settings.sidebar_collapsed = true;
-        settings.active_page = Page::Osc;
-        settings.osc_settings.show_speaker_number = true;
+        let settings = ClientSettings {
+            capture_source: CaptureSource::SystemAudio,
+            selected_device_id: "mic-1".into(),
+            selected_loopback_device_id: "loopback-1".into(),
+            tts_enabled: true,
+            speaker_recognition_enabled: true,
+            source_lang: "en".into(),
+            sidebar_collapsed: true,
+            active_page: Page::Osc,
+            osc_settings: OscSettings {
+                show_speaker_number: true,
+                message_separator: crate::osc::OscMessageSeparator::NewLine,
+                ..OscSettings::default()
+            },
+            ..ClientSettings::default()
+        };
 
         settings.save(&root).unwrap();
 
@@ -249,9 +334,13 @@ mod tests {
         assert!(!loaded.tts_enabled);
         assert!(loaded.speaker_recognition_enabled);
         assert_eq!(loaded.source_lang, "en");
-        assert_eq!(loaded.sidebar_collapsed, true);
+        assert!(loaded.sidebar_collapsed);
         assert_eq!(loaded.active_page, Page::Osc);
-        assert_eq!(loaded.osc_settings.show_speaker_number, true);
+        assert!(loaded.osc_settings.show_speaker_number);
+        assert_eq!(
+            loaded.osc_settings.message_separator,
+            crate::osc::OscMessageSeparator::NewLine
+        );
 
         // Test sanitization with missing device
         let available_mics = vec![InputDevice {
@@ -275,9 +364,14 @@ mod tests {
         let root = std::env::temp_dir().join("xrtranslate_test_speaker_toggle_migration");
         let _ = std::fs::remove_dir_all(&root);
         std::fs::create_dir_all(root.join("runtime")).unwrap();
-        let mut settings = ClientSettings::default();
-        settings.speaker_recognition_enabled = false;
-        settings.osc_settings.show_speaker_number = true;
+        let settings = ClientSettings {
+            speaker_recognition_enabled: false,
+            osc_settings: OscSettings {
+                show_speaker_number: true,
+                ..OscSettings::default()
+            },
+            ..ClientSettings::default()
+        };
         settings.save(&root).unwrap();
 
         let loaded = ClientSettings::load(&root);
@@ -290,8 +384,10 @@ mod tests {
     fn unavailable_feature_preferences_are_disabled_on_load() {
         let root = std::env::temp_dir().join("xrtranslate_test_feature_access");
         let _ = std::fs::remove_dir_all(&root);
-        let mut settings = ClientSettings::default();
-        settings.tts_enabled = true;
+        let settings = ClientSettings {
+            tts_enabled: true,
+            ..ClientSettings::default()
+        };
         settings.save(&root).unwrap();
 
         assert!(!ClientSettings::load(&root).tts_enabled);

@@ -21,10 +21,10 @@ pub fn render_canvas(app: &crate::XRTranslateApp, ui: &mut egui::Ui) {
             };
             let lifecycle = if preview.typing {
                 Some(crate::i18n::tr(app.ui_language, "Live").to_owned())
-            } else if let Some(remaining) = preview.next_message_expires_in {
-                Some(format!("{:.1}s", remaining.as_secs_f64()))
             } else {
-                None
+                preview
+                    .next_message_expires_in
+                    .map(|remaining| format!("{:.1}s", remaining.as_secs_f64()))
             };
             let status = lifecycle.map_or_else(
                 || format!("{char_count}/{limit}"),

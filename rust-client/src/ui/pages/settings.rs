@@ -1,18 +1,13 @@
 use crate::ui::components::{self, SubNavItem, section, sub_sidebar};
 use eframe::egui;
 
-#[derive(Clone, Copy, PartialEq, Eq, Debug, Hash)]
+#[derive(Clone, Copy, PartialEq, Eq, Debug, Hash, Default)]
 pub enum SettingsSection {
+    #[default]
     GeneralAppearance,
     ServiceProviders,
     OscNetwork,
     BackendServer,
-}
-
-impl Default for SettingsSection {
-    fn default() -> Self {
-        Self::GeneralAppearance
-    }
 }
 
 pub fn render(app: &mut crate::XRTranslateApp, ui: &mut egui::Ui) {
@@ -70,13 +65,16 @@ pub fn render(app: &mut crate::XRTranslateApp, ui: &mut egui::Ui) {
                             }
                             SettingsSection::ServiceProviders => {
                                 let project_root = app.project_root();
-                                app.service_config.render(
+                                let apply = app.service_config.render(
                                     ui,
                                     &mut app.backend_manager,
                                     &mut app.model_task_manager,
                                     &project_root,
                                     app.ui_language,
                                 );
+                                if apply {
+                                    app.apply_service_configuration(Some(ui.ctx().clone()));
+                                }
                             }
                             SettingsSection::OscNetwork => {
                                 render_osc_network_section(app, ui);
@@ -312,6 +310,7 @@ fn render_osc_network_section(app: &mut crate::XRTranslateApp, ui: &mut egui::Ui
                     ui,
                     &mut app.osc_draft.history_ttl_seconds,
                     10.0..=20.0,
+                    15.0,
                     crate::i18n::tr(app.ui_language, "History TTL:"),
                     "s",
                 );

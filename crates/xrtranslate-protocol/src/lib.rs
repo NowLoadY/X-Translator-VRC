@@ -18,12 +18,25 @@ pub use xr_corpus_protocol::{CorpusRecognitionCorrection, CorpusTermMatch, Corpu
 /// once a handshake is added without changing the individual DTOs.
 pub const PROTOCOL_VERSION: u16 = 2;
 
+const fn is_false(value: &bool) -> bool {
+    !*value
+}
+
 /// The encoded sample format of every binary audio WebSocket frame.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum PcmSampleFormat {
     /// A signed, little-endian 16-bit PCM sample.
     S16Le,
+}
+
+/// Capture route for source-aware stream buffering.
+#[derive(Debug, Default, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum AudioSource {
+    #[default]
+    Microphone,
+    SystemAudio,
 }
 
 /// Metadata negotiated out-of-band for a stream of raw PCM frames.
@@ -74,7 +87,7 @@ impl PcmFrame {
         if format.channels == 0 {
             return Err(PcmFrameError::ZeroChannels);
         }
-        if bytes.len() % frame_width != 0 {
+        if !bytes.len().is_multiple_of(frame_width) {
             return Err(PcmFrameError::PartialSampleFrame {
                 bytes: bytes.len(),
                 frame_width,
@@ -160,6 +173,14 @@ pub enum EventControl {
         sample_rate: u32,
         source_lang: String,
         target_lang: String,
+        #[serde(default, skip_serializing_if = "is_default_audio_source")]
+        audio_source: AudioSource,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        vad_threshold: Option<f32>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        vad_silence_ms: Option<u32>,
+        #[serde(default, skip_serializing_if = "is_false")]
+        continuous_recognition: bool,
     },
     /// Flushes the active turn and stops session work.
     Stop,
@@ -175,16 +196,27 @@ pub enum Feature {
     SpeakerRecognition,
 }
 
+const fn is_default_audio_source(source: &AudioSource) -> bool {
+    matches!(source, AudioSource::Microphone)
+}
+
 /// JSON events sent from the backend to a WebSocket client.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(tag = "action", content = "data", rename_all = "snake_case")]
 pub enum ServerEvent {
     SessionReady(SessionReady),
+    VadActivity(VadActivity),
     AsrResult(AsrResult),
     SourceSegmentReady(SourceSegmentReady),
     TranslationReady(TranslationReady),
+    RecognitionStreamEnded(RecognitionStreamEnded),
     TtsFinished(TtsFinished),
     Error(ErrorEvent),
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct VadActivity {
+    pub active: bool,
 }
 
 /// Identifies a newly-created backend session and its initial language route.
@@ -232,6 +264,10 @@ pub struct SourceSegmentReady {
     pub speaker_id: String,
     pub source_start_ms: f64,
     pub source_end_ms: f64,
+    /// True when this segment belongs to a revisable continuous window.
+    pub revisable: bool,
+    /// Fraction of this window which repeats audio from its predecessor.
+    pub overlap_ratio: f32,
 }
 
 /// A completed translation and its latency information.
@@ -251,9 +287,20 @@ pub struct TranslationReady {
     /// Exclusive end position inside the current audio epoch.
     #[serde(default)]
     pub source_end_ms: f64,
+    /// True when this result replaces the revisable tail of a continuous stream.
+    pub revisable: bool,
+    /// Fraction of this window which repeats audio from its predecessor.
+    pub overlap_ratio: f32,
     pub clone_audio_path: String,
     pub tts_audio_path: String,
     pub metrics: LatencyMetrics,
+}
+
+/// Marks the ordered end of a continuous recognition span.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct RecognitionStreamEnded {
+    #[serde(default)]
+    pub turn_id: String,
 }
 
 /// Latency values reported to the client in milliseconds.
@@ -305,6 +352,10 @@ mod tests {
                 sample_rate: 16_000,
                 source_lang: "auto".into(),
                 target_lang: "zh,en".into(),
+                audio_source: AudioSource::Microphone,
+                vad_threshold: None,
+                vad_silence_ms: None,
+                continuous_recognition: false,
             })
         );
         assert_eq!(serde_json::to_string(&control).unwrap(), json);
@@ -333,6 +384,8 @@ mod tests {
                 "segment_index":1,
                 "segment_count":1,
                 "speaker_id":"",
+                "revisable":false,
+                "overlap_ratio":0.0,
                 "clone_audio_path":"",
                 "tts_audio_path":"",
                 "metrics":{"asr_ms":12,"mt_ms":34,"tts_ms":0}
@@ -352,6 +405,8 @@ mod tests {
                 speaker_id: String::new(),
                 source_start_ms: 0.0,
                 source_end_ms: 0.0,
+                revisable: false,
+                overlap_ratio: 0.0,
                 clone_audio_path: String::new(),
                 tts_audio_path: String::new(),
                 metrics: LatencyMetrics {
@@ -361,6 +416,26 @@ mod tests {
                 },
             })
         );
+    }
+
+    #[test]
+    fn translation_snapshot_requires_current_stream_fields() {
+        let json = r#"{
+            "action":"translation_ready",
+            "data":{
+                "source_text":"hello",
+                "translated_text":"你好",
+                "turn_id":"native-1",
+                "segment_index":1,
+                "segment_count":1,
+                "speaker_id":"",
+                "clone_audio_path":"",
+                "tts_audio_path":"",
+                "metrics":{"asr_ms":12,"mt_ms":34,"tts_ms":0}
+            }
+        }"#;
+
+        assert!(serde_json::from_str::<ServerEvent>(json).is_err());
     }
 
     #[test]

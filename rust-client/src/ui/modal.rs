@@ -7,7 +7,6 @@ pub struct ModalPage {
     pub title: String,
     pub content: String,
     pub is_code: bool,
-    pub icon: Option<String>,
 }
 
 impl ModalPage {
@@ -16,14 +15,7 @@ impl ModalPage {
             title: title.into(),
             content: content.into(),
             is_code: false,
-            icon: None,
         }
-    }
-
-    #[allow(dead_code)]
-    pub fn with_icon(mut self, icon: impl Into<String>) -> Self {
-        self.icon = Some(icon.into());
-        self
     }
 
     pub fn code(mut self) -> Self {
@@ -63,27 +55,13 @@ impl ModalDialog {
         details: Option<&str>,
     ) -> Self {
         let mut content = message.into();
-        if let Some(details) = details {
-            if !details.trim().is_empty() {
-                content.push_str("\n\n--- Detailed Log Output ---\n");
-                content.push_str(details.trim());
-            }
+        if let Some(details) = details
+            && !details.trim().is_empty()
+        {
+            content.push_str("\n\n--- Detailed Log Output ---\n");
+            content.push_str(details.trim());
         }
         let page = ModalPage::new(title, content).code();
-        Self {
-            open: true,
-            pages: vec![page],
-            current_page: 0,
-            show_ok_button: true,
-            ok_label: "OK".into(),
-            show_cancel_button: false,
-            cancel_label: "Close".into(),
-        }
-    }
-
-    #[allow(dead_code)]
-    pub fn info(title: impl Into<String>, message: impl Into<String>) -> Self {
-        let page = ModalPage::new(title, message);
         Self {
             open: true,
             pages: vec![page],
@@ -112,18 +90,34 @@ impl ModalDialog {
             return;
         }
 
-        // 1. Dimmed Backdrop Overlay
-        egui::Area::new(egui::Id::new("modal_backdrop"))
+        let backdrop_anim = crate::ui::animation::AnimationSystem::animate_bool(
+            ctx,
+            egui::Id::new("modal_backdrop_anim"),
+            self.open,
+            0.20,
+        );
+
+        // 1. Fullscreen Dimming Backdrop (Captures clicks behind modal)
+        let backdrop_response = egui::Area::new(egui::Id::new("modal_backdrop"))
             .interactable(true)
+            .order(egui::Order::Middle)
             .fixed_pos([0.0, 0.0])
             .show(ctx, |ui| {
                 let screen = ctx
                     .input(|i| i.raw.screen_rect)
                     .unwrap_or_else(|| ui.max_rect());
-                ui.allocate_rect(screen, egui::Sense::click());
+                let resp = ui.allocate_rect(screen, egui::Sense::click());
+                let alpha = (140.0 * backdrop_anim).round() as u8;
                 ui.painter()
-                    .rect_filled(screen, 0.0, Color32::from_black_alpha(140));
-            });
+                    .rect_filled(screen, 0.0, Color32::from_black_alpha(alpha));
+                resp
+            })
+            .inner;
+
+        let mut close_dialog = false;
+        if backdrop_response.clicked() {
+            close_dialog = true;
+        }
 
         if self.current_page >= self.pages.len() {
             self.current_page = 0;
@@ -132,19 +126,18 @@ impl ModalDialog {
         let total_pages = self.pages.len();
         let is_multi_page = total_pages > 1;
 
-        let mut close_dialog = false;
-
         // 2. Centered Floating Window
         egui::Window::new("modal_dialog_window")
             .title_bar(false)
             .resizable(false)
+            .order(egui::Order::Foreground)
             .anchor(egui::Align2::CENTER_CENTER, [0.0, 0.0])
             .fixed_size([540.0, 380.0])
             .frame(
                 Frame::new()
                     .fill(Color32::WHITE)
-                    .corner_radius(CornerRadius::same(14))
-                    .stroke(Stroke::new(1.0, Color32::from_gray(210)))
+                    .corner_radius(CornerRadius::same(20))
+                    .stroke(Stroke::new(1.0, Color32::from_rgb(230, 235, 246)))
                     .inner_margin(Margin::same(20)),
             )
             .show(ctx, |ui| {
@@ -160,10 +153,13 @@ impl ModalDialog {
 
                         ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
                             let close_btn = ui.add(
-                                egui::Button::new(RichText::new("X").size(12.0).strong())
-                                    .min_size(Vec2::new(24.0, 24.0))
-                                    .corner_radius(CornerRadius::same(6)),
+                                egui::Button::new(RichText::new("×").size(16.0).strong())
+                                    .min_size(Vec2::new(26.0, 26.0))
+                                    .corner_radius(CornerRadius::same(13)),
                             );
+                            if close_btn.hovered() {
+                                ui.ctx().set_cursor_icon(egui::CursorIcon::PointingHand);
+                            }
                             if close_btn.clicked() {
                                 close_dialog = true;
                             }
@@ -184,7 +180,7 @@ impl ModalDialog {
                             if page.is_code {
                                 Frame::new()
                                     .fill(Color32::from_rgb(24, 26, 38))
-                                    .corner_radius(CornerRadius::same(8))
+                                    .corner_radius(CornerRadius::same(12))
                                     .inner_margin(Margin::same(12))
                                     .show(ui, |ui| {
                                         ui.set_width(ui.available_width());
@@ -237,26 +233,24 @@ impl ModalDialog {
 
                             ui.add_space(12.0);
 
-                            if self.current_page > 0 {
-                                if crate::ui::components::animated_button(
+                            if self.current_page > 0
+                                && crate::ui::components::animated_button(
                                     ui,
                                     crate::i18n::tr(language, "Prev"),
                                 )
                                 .clicked()
-                                {
-                                    self.current_page -= 1;
-                                }
+                            {
+                                self.current_page -= 1;
                             }
 
-                            if self.current_page + 1 < total_pages {
-                                if crate::ui::components::primary_button(
+                            if self.current_page + 1 < total_pages
+                                && crate::ui::components::primary_button(
                                     ui,
                                     crate::i18n::tr(language, "Next"),
                                 )
                                 .clicked()
-                                {
-                                    self.current_page += 1;
-                                }
+                            {
+                                self.current_page += 1;
                             }
                         }
 
@@ -272,12 +266,11 @@ impl ModalDialog {
                                     close_dialog = true;
                                 }
                             }
-                            if self.show_cancel_button {
-                                if crate::ui::components::animated_button(ui, &self.cancel_label)
+                            if self.show_cancel_button
+                                && crate::ui::components::animated_button(ui, &self.cancel_label)
                                     .clicked()
-                                {
-                                    close_dialog = true;
-                                }
+                            {
+                                close_dialog = true;
                             }
                         });
                     });

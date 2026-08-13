@@ -97,12 +97,10 @@ impl BackendManager {
         };
         if manager.llama_server_path != configured_path
             && !manager.llama_server_path.trim().is_empty()
-        {
-            if let Err(error) =
+            && let Err(error) =
                 Self::write_llama_server_path(&manager.project_root, &manager.llama_server_path)
-            {
-                log::warn!("Cannot persist recovered llama-server path: {error}");
-            }
+        {
+            log::warn!("Cannot persist recovered llama-server path: {error}");
         }
         manager
     }
@@ -422,11 +420,7 @@ impl BackendManager {
         } else {
             command.stdout(Stdio::null()).stderr(Stdio::null());
         }
-        #[cfg(windows)]
-        {
-            use std::os::windows::process::CommandExt;
-            command.creation_flags(0x0800_0000);
-        }
+        crate::child_process::hide_console(&mut command);
         let mut child = command
             .spawn()
             .map_err(|error| format!("Cannot start XR Corpus: {error}"))?;
@@ -460,15 +454,7 @@ impl BackendManager {
             command.stdout(Stdio::null()).stderr(Stdio::null());
         }
 
-        // The desktop client must never allocate a Windows Terminal/conhost
-        // window when it starts the managed backend. Debug output can still
-        // be inherited when a console already exists, but this flag prevents
-        // Windows from creating a new one for the child process.
-        #[cfg(windows)]
-        {
-            use std::os::windows::process::CommandExt;
-            command.creation_flags(0x0800_0000);
-        }
+        crate::child_process::hide_console(&mut command);
         Ok((command, capture_output))
     }
 
@@ -803,103 +789,6 @@ fn preferred_llama_server_path(project_root: &std::path::Path, configured: &str)
     }
 }
 
-#[cfg(test)]
-mod tests {
-    use super::*;
-    use std::sync::atomic::{AtomicU64, Ordering};
-
-    static NEXT_TEMP: AtomicU64 = AtomicU64::new(0);
-
-    fn temp_root(label: &str) -> PathBuf {
-        let root = std::env::temp_dir().join(format!(
-            "xrtranslate-backend-{label}-{}-{}",
-            std::process::id(),
-            NEXT_TEMP.fetch_add(1, Ordering::Relaxed)
-        ));
-        std::fs::create_dir_all(&root).unwrap();
-        root
-    }
-
-    fn create_server(root: &std::path::Path) -> PathBuf {
-        let server = root
-            .join("runtime")
-            .join("llama.cpp")
-            .join("llama-server.exe");
-        std::fs::create_dir_all(server.parent().unwrap()).unwrap();
-        std::fs::write(&server, b"test").unwrap();
-        server
-    }
-
-    #[test]
-    fn relative_configured_runtime_is_resolved_from_project_root() {
-        let root = temp_root("relative");
-        let server = create_server(&root);
-        let selected = preferred_llama_server_path(&root, "runtime/llama.cpp/llama-server.exe");
-        assert_eq!(PathBuf::from(selected), server);
-        std::fs::remove_dir_all(root).unwrap();
-    }
-
-    #[test]
-    fn standard_runtime_is_recovered_when_config_is_empty_or_stale() {
-        let root = temp_root("recover");
-        let server = create_server(&root);
-        assert_eq!(
-            PathBuf::from(preferred_llama_server_path(&root, "")),
-            server
-        );
-        assert_eq!(
-            PathBuf::from(preferred_llama_server_path(
-                &root,
-                "C:/missing/llama-server.exe"
-            )),
-            server
-        );
-        std::fs::remove_dir_all(root).unwrap();
-    }
-
-    #[test]
-    fn installed_runtime_is_written_to_config_as_an_absolute_valid_path() {
-        let root = temp_root("persist");
-        let server = create_server(&root);
-        std::fs::write(&root.join("config.json"), b"{\"model_manager\":{}}").unwrap();
-
-        let persisted = BackendManager::persist_llama_server_path(&root, &server).unwrap();
-        let config: Value =
-            serde_json::from_str(&std::fs::read_to_string(root.join("config.json")).unwrap())
-                .unwrap();
-
-        assert!(persisted.is_absolute());
-        assert_eq!(
-            config["model_manager"]["llama_server_path"],
-            persisted.display().to_string()
-        );
-        std::fs::remove_dir_all(root).unwrap();
-    }
-
-    #[test]
-    fn local_service_urls_accept_http_and_websocket_schemes() {
-        assert_eq!(
-            server_address("http://127.0.0.1:7766/healthz"),
-            Some("127.0.0.1:7766")
-        );
-        assert_eq!(
-            server_address("ws://localhost:8000/ws"),
-            Some("localhost:8000")
-        );
-        assert!(is_local_server("https://[::1]:7766/healthz"));
-        assert_eq!(server_address("file:///tmp/service"), None);
-    }
-
-    #[test]
-    fn startup_error_marker_is_preferred_over_noisy_model_logs() {
-        let log = "normal model output\n[XRTRANSLATE_STARTUP_ERROR] port 8001 is already in use\nmore shutdown output";
-        assert_eq!(
-            startup_error_summary(log).as_deref(),
-            Some("port 8001 is already in use")
-        );
-    }
-}
-
 fn is_local_server(server_url: &str) -> bool {
     let address = server_address(server_url).unwrap_or_default();
     let host = if let Some(ipv6) = address.strip_prefix('[') {
@@ -1008,5 +897,102 @@ impl Drop for KillOnCloseJob {
         unsafe {
             windows_sys::Win32::Foundation::CloseHandle(self.handle);
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::sync::atomic::{AtomicU64, Ordering};
+
+    static NEXT_TEMP: AtomicU64 = AtomicU64::new(0);
+
+    fn temp_root(label: &str) -> PathBuf {
+        let root = std::env::temp_dir().join(format!(
+            "xrtranslate-backend-{label}-{}-{}",
+            std::process::id(),
+            NEXT_TEMP.fetch_add(1, Ordering::Relaxed)
+        ));
+        std::fs::create_dir_all(&root).unwrap();
+        root
+    }
+
+    fn create_server(root: &std::path::Path) -> PathBuf {
+        let server = root
+            .join("runtime")
+            .join("llama.cpp")
+            .join("llama-server.exe");
+        std::fs::create_dir_all(server.parent().unwrap()).unwrap();
+        std::fs::write(&server, b"test").unwrap();
+        server
+    }
+
+    #[test]
+    fn relative_configured_runtime_is_resolved_from_project_root() {
+        let root = temp_root("relative");
+        let server = create_server(&root);
+        let selected = preferred_llama_server_path(&root, "runtime/llama.cpp/llama-server.exe");
+        assert_eq!(PathBuf::from(selected), server);
+        std::fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn standard_runtime_is_recovered_when_config_is_empty_or_stale() {
+        let root = temp_root("recover");
+        let server = create_server(&root);
+        assert_eq!(
+            PathBuf::from(preferred_llama_server_path(&root, "")),
+            server
+        );
+        assert_eq!(
+            PathBuf::from(preferred_llama_server_path(
+                &root,
+                "C:/missing/llama-server.exe"
+            )),
+            server
+        );
+        std::fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn installed_runtime_is_written_to_config_as_an_absolute_valid_path() {
+        let root = temp_root("persist");
+        let server = create_server(&root);
+        std::fs::write(root.join("config.json"), b"{\"model_manager\":{}}").unwrap();
+
+        let persisted = BackendManager::persist_llama_server_path(&root, &server).unwrap();
+        let config: Value =
+            serde_json::from_str(&std::fs::read_to_string(root.join("config.json")).unwrap())
+                .unwrap();
+
+        assert!(persisted.is_absolute());
+        assert_eq!(
+            config["model_manager"]["llama_server_path"],
+            persisted.display().to_string()
+        );
+        std::fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn local_service_urls_accept_http_and_websocket_schemes() {
+        assert_eq!(
+            server_address("http://127.0.0.1:7766/healthz"),
+            Some("127.0.0.1:7766")
+        );
+        assert_eq!(
+            server_address("ws://localhost:8000/ws"),
+            Some("localhost:8000")
+        );
+        assert!(is_local_server("https://[::1]:7766/healthz"));
+        assert_eq!(server_address("file:///tmp/service"), None);
+    }
+
+    #[test]
+    fn startup_error_marker_is_preferred_over_noisy_model_logs() {
+        let log = "normal model output\n[XRTRANSLATE_STARTUP_ERROR] port 8001 is already in use\nmore shutdown output";
+        assert_eq!(
+            startup_error_summary(log).as_deref(),
+            Some("port 8001 is already in use")
+        );
     }
 }

@@ -1,4 +1,4 @@
-use crate::osc::{BannerConfig, BannerContentType, OscFormatMode};
+use crate::osc::{BannerConfig, BannerContentType, OscFormatMode, OscMessageSeparator};
 use crate::ui::components::{self, card};
 use eframe::egui;
 use std::sync::atomic::Ordering;
@@ -55,7 +55,7 @@ pub fn render_toolbar(app: &mut crate::XRTranslateApp, ui: &mut egui::Ui) {
                     }
 
                     ui.add_space(8.0);
-                    ui.separator();
+                    components::wavy_divider(ui, egui::Color32::from_rgb(230, 235, 246));
                     ui.add_space(8.0);
 
                     // Row 2: Text Format Selector & Speaker Number Toggle
@@ -120,6 +120,52 @@ pub fn render_toolbar(app: &mut crate::XRTranslateApp, ui: &mut egui::Ui) {
 
                     ui.add_space(8.0);
 
+                    let target_only = app.osc_draft.format_mode == OscFormatMode::TargetOnly;
+                    ui.horizontal(|ui| {
+                        ui.allocate_ui_with_layout(
+                            egui::vec2(100.0, 20.0),
+                            egui::Layout::left_to_right(egui::Align::Center),
+                            |ui| {
+                                ui.label(
+                                    egui::RichText::new(crate::i18n::tr(
+                                        app.ui_language,
+                                        if target_only {
+                                            "Between messages:"
+                                        } else {
+                                            "Message layout:"
+                                        },
+                                    ))
+                                    .strong(),
+                                );
+                            },
+                        );
+                        let response = egui::ComboBox::from_id_salt("osc_message_separator")
+                            .selected_text(
+                                app.osc_draft
+                                    .message_separator
+                                    .layout_label(app.ui_language, target_only),
+                            )
+                            .show_ui(ui, |ui| {
+                                let mut selection_changed = false;
+                                for value in
+                                    [OscMessageSeparator::NewLine, OscMessageSeparator::Space]
+                                {
+                                    selection_changed |= ui
+                                        .selectable_value(
+                                            &mut app.osc_draft.message_separator,
+                                            value,
+                                            value.layout_label(app.ui_language, target_only),
+                                        )
+                                        .changed();
+                                }
+                                selection_changed
+                            });
+                        if response.inner.unwrap_or(false) {
+                            changed = true;
+                        }
+                    });
+                    ui.add_space(8.0);
+
                     // Row 3: Header Content Selector
                     if render_banner_selector(
                         ui,
@@ -151,6 +197,7 @@ pub fn render_toolbar(app: &mut crate::XRTranslateApp, ui: &mut egui::Ui) {
                         ui,
                         &mut app.osc_draft.history_ttl_seconds,
                         10.0..=20.0,
+                        15.0,
                         "TTL:",
                         "s",
                     )

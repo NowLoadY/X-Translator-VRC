@@ -1,11 +1,20 @@
+// SPDX-FileCopyrightText: 2026 febilly
+// SPDX-FileCopyrightText: 2026 NowLoadY
+// SPDX-License-Identifier: AGPL-3.0-only
+
 //! Default native audio pipeline: Silero endpointing, Qwen3-ASR, and Hy-MT2.
 //!
 //! Every `NativePipeline` is owned by a single WebSocket session.  In
 //! particular, the Silero ONNX recurrent state must never be shared between
 //! microphone streams.  Model servers are shared out-of-process through their
 //! local llama.cpp HTTP endpoints.
+//!
+//! The continuous-mode idle gate, bounded pre-roll, and delayed release were
+//! informed by febilly's MIT-licensed Yakutan local VAD pipeline. XRTranslate
+//! retains fixed overlapping windows and runs each source in its own session.
 
 use std::{
+    collections::VecDeque,
     mem,
     path::{Path, PathBuf},
     time::{Duration, Instant},
@@ -18,17 +27,22 @@ use xrtranslate_assets::{
 use xrtranslate_config::AppConfig;
 use xrtranslate_engine::{
     TranslationSegmentPair, remove_asr_stutters, remove_transcript_overlap,
-    translation_segment_pairs_for_final_text_with_lang,
+    strip_filler_edges_for_lang, translation_segment_pairs_for_final_text_with_lang,
 };
 use xrtranslate_inference::{
-    InferenceError, Qwen3AsrAdapter, Qwen3AsrOptions, ReqwestClient, TranslationAdapter,
-    TranslationOptions, TranslationProvider, is_probable_asr_hallucination,
+    AsrTranscript, InferenceError, Qwen3AsrAdapter, Qwen3AsrOptions, ReqwestClient,
+    TranslationAdapter, TranslationOptions, TranslationProvider, is_probable_asr_hallucination,
     is_probable_translation_context_leak,
 };
+use xrtranslate_protocol::AudioSource;
 use xrtranslate_speaker::{OnlineSpeakerDiarizer, TrackerConfig};
 use xrtranslate_vad::{
     EndpointConfig, EndpointDetector, EndpointEvent, FRAME_BYTES, FRAME_SAMPLES, SAMPLE_RATE_HZ,
-    SileroVad, Utterance,
+    SileroVad, Utterance, UtteranceEndReason, decode_pcm16le_frame,
+};
+
+use crate::language::{
+    AdaptiveLanguageRoute, AutoDecision, LanguageRoute, RecoveryDecision, SupportedLanguage,
 };
 
 const SILERO_VAD_MODEL: &str = "models/silero-vad/src/silero_vad/data/silero_vad.onnx";
@@ -44,6 +58,8 @@ pub(crate) const MAX_INPUT_PCM_BYTES: usize = 256 * 1024;
 pub(crate) struct RecognizedOutput {
     pub(crate) source_text: String,
     pub(crate) segments: Vec<TranslationSegmentPair>,
+    pub(crate) source_language: String,
+    pub(crate) target_language: String,
     pub(crate) asr_elapsed: Duration,
 }
 
@@ -53,24 +69,47 @@ pub(crate) struct TimedUtterance {
     pub(crate) utterance: Utterance,
     pub(crate) source_start_ms: f64,
     pub(crate) source_end_ms: f64,
+    pub(crate) revisable: bool,
+}
+
+#[derive(Debug)]
+pub(crate) enum PipelineEvent {
+    Utterance(TimedUtterance),
+    StreamEnded,
 }
 
 impl RecognizedOutput {
-    pub(crate) fn apply_source_correction(&mut self, corrected: String, source_language: &str) {
+    pub(crate) fn apply_source_correction(&mut self, corrected: String) {
         if corrected == self.source_text {
             return;
         }
         self.source_text = corrected;
-        self.segments =
-            translation_segment_pairs_for_final_text_with_lang(&self.source_text, source_language);
+        self.segments = translation_segment_pairs_for_final_text_with_lang(
+            &self.source_text,
+            &self.source_language,
+        );
+    }
+
+    pub(crate) fn prepare_revisable_snapshot(&mut self) {
+        let cleaned = strip_filler_edges_for_lang(&self.source_text, &self.source_language);
+        self.segments = vec![TranslationSegmentPair {
+            source_text: self.source_text.clone(),
+            translation_text: if cleaned.is_empty() {
+                self.source_text.clone()
+            } else {
+                cleaned
+            },
+        }];
     }
 
     /// Removes text produced from the duplicated audio at a hard VAD boundary.
     /// Returns false when the new result contained only duplicated context.
-    pub(crate) fn remove_overlap_with(&mut self, previous: &str, source_language: &str) -> bool {
+    pub(crate) fn remove_overlap_with(&mut self, previous: &str) -> bool {
         self.source_text = remove_transcript_overlap(previous, &self.source_text);
-        self.segments =
-            translation_segment_pairs_for_final_text_with_lang(&self.source_text, source_language);
+        self.segments = translation_segment_pairs_for_final_text_with_lang(
+            &self.source_text,
+            &self.source_language,
+        );
         !self.source_text.is_empty()
     }
 }
@@ -90,9 +129,252 @@ pub(crate) struct TranslationOutput {
 pub(crate) struct NativePipeline {
     vad: SileroVad,
     endpoint: EndpointDetector,
+    endpoint_config: EndpointConfig,
+    fixed_window: Option<FixedWindow>,
     pending_pcm: Vec<u8>,
     processed_samples: u64,
+    vad_active: bool,
+    vad_transitions: Vec<bool>,
     inference: NativeInference,
+}
+
+struct FixedWindow {
+    samples: Vec<i16>,
+    pre_roll: VecDeque<i16>,
+    gate_open: bool,
+    quiet_frames: usize,
+    overlap_samples: usize,
+    has_new_activity: bool,
+    emitted: bool,
+    opening_frames: usize,
+    adaptive_context: bool,
+    expanded_context: bool,
+    sparse_results: u8,
+    dense_results: u8,
+    stream_open: bool,
+    idle_frames: usize,
+}
+
+impl FixedWindow {
+    const FIRST_WINDOW_SAMPLES: usize = 62 * FRAME_SAMPLES;
+    const WINDOW_SAMPLES: usize = 94 * FRAME_SAMPLES;
+    const EXPANDED_WINDOW_SAMPLES: usize = 126 * FRAME_SAMPLES;
+    const HOP_SAMPLES: usize = 62 * FRAME_SAMPLES;
+    const PRE_ROLL_FRAMES: usize = 6;
+    const PRE_ROLL_SAMPLES: usize = Self::PRE_ROLL_FRAMES * FRAME_SAMPLES;
+    const RELEASE_FRAMES: usize = 16;
+    const OPENING_FRAMES: usize = 3;
+    const STREAM_END_FRAMES: usize = 62;
+
+    fn new(audio_source: AudioSource) -> Self {
+        Self {
+            samples: Vec::with_capacity(Self::EXPANDED_WINDOW_SAMPLES),
+            pre_roll: VecDeque::with_capacity(Self::PRE_ROLL_SAMPLES),
+            gate_open: false,
+            quiet_frames: 0,
+            overlap_samples: 0,
+            has_new_activity: false,
+            emitted: false,
+            opening_frames: 0,
+            adaptive_context: audio_source == AudioSource::SystemAudio,
+            expanded_context: false,
+            sparse_results: 0,
+            dense_results: 0,
+            stream_open: false,
+            idle_frames: 0,
+        }
+    }
+
+    fn push(&mut self, frame: &[i16], active: bool) -> Vec<FixedWindowEvent> {
+        if !self.gate_open {
+            self.push_pre_roll(frame);
+            if !active {
+                self.opening_frames = 0;
+                if self.stream_open {
+                    self.idle_frames += 1;
+                    if self.idle_frames >= Self::STREAM_END_FRAMES {
+                        self.stream_open = false;
+                        self.idle_frames = 0;
+                        return vec![FixedWindowEvent::StreamEnded];
+                    }
+                }
+                return Vec::new();
+            }
+            self.opening_frames += 1;
+            if self.opening_frames < Self::OPENING_FRAMES {
+                return Vec::new();
+            }
+            self.gate_open = true;
+            self.stream_open = true;
+            self.idle_frames = 0;
+            self.quiet_frames = 0;
+            self.has_new_activity = true;
+            self.samples.extend(self.pre_roll.drain(..));
+        } else if active {
+            self.quiet_frames = 0;
+            self.has_new_activity = true;
+            self.samples.extend_from_slice(frame);
+        } else {
+            self.quiet_frames += 1;
+            self.samples.extend_from_slice(frame);
+        }
+
+        let required_samples = if self.emitted {
+            self.window_samples()
+        } else {
+            Self::FIRST_WINDOW_SAMPLES
+        };
+        if self.samples.len() >= required_samples {
+            return vec![FixedWindowEvent::Utterance(self.take_window())];
+        }
+        if self.quiet_frames >= Self::RELEASE_FRAMES {
+            return self.close_gate();
+        }
+        Vec::new()
+    }
+
+    fn push_pre_roll(&mut self, frame: &[i16]) {
+        if frame.len() >= Self::PRE_ROLL_SAMPLES {
+            self.pre_roll.clear();
+            self.pre_roll.extend(
+                frame[frame.len() - Self::PRE_ROLL_SAMPLES..]
+                    .iter()
+                    .copied(),
+            );
+            return;
+        }
+        let excess = self
+            .pre_roll
+            .len()
+            .saturating_add(frame.len())
+            .saturating_sub(Self::PRE_ROLL_SAMPLES);
+        if excess > 0 {
+            self.pre_roll.drain(..excess.min(self.pre_roll.len()));
+        }
+        self.pre_roll.extend(frame.iter().copied());
+    }
+
+    fn take_window(&mut self) -> Utterance {
+        let window_samples = if self.emitted {
+            self.window_samples()
+        } else {
+            Self::FIRST_WINDOW_SAMPLES
+        };
+        let previous_overlap_samples = self.overlap_samples;
+        let overlap_samples = if self.emitted {
+            self.window_samples().saturating_sub(Self::HOP_SAMPLES)
+        } else {
+            Self::WINDOW_SAMPLES - Self::HOP_SAMPLES
+        }
+        .min(window_samples.saturating_sub(FRAME_SAMPLES));
+        let hop_samples = window_samples - overlap_samples;
+        let samples = self.samples[..window_samples].to_vec();
+        self.samples.drain(..hop_samples);
+        self.overlap_samples = overlap_samples;
+        self.has_new_activity = false;
+        self.emitted = true;
+        Utterance {
+            samples,
+            pre_roll_frames: 0,
+            overlap_frames: previous_overlap_samples / FRAME_SAMPLES,
+            trailing_silence_frames: self.quiet_frames,
+            end_reason: UtteranceEndReason::MaxActiveFrames,
+        }
+    }
+
+    fn window_samples(&self) -> usize {
+        if self.expanded_context {
+            Self::EXPANDED_WINDOW_SAMPLES
+        } else {
+            Self::WINDOW_SAMPLES
+        }
+    }
+
+    fn observe_text_density(&mut self, units: usize) {
+        if !self.adaptive_context {
+            return;
+        }
+        if units <= 4 {
+            self.sparse_results = self.sparse_results.saturating_add(1);
+            self.dense_results = 0;
+            if self.sparse_results >= 2 {
+                self.expanded_context = true;
+            }
+        } else if units >= 8 {
+            self.dense_results = self.dense_results.saturating_add(1);
+            self.sparse_results = 0;
+            if self.dense_results >= 2 {
+                self.expanded_context = false;
+                let desired_overlap = Self::WINDOW_SAMPLES - Self::HOP_SAMPLES;
+                let excess = self.overlap_samples.saturating_sub(desired_overlap);
+                if excess > 0 {
+                    self.samples.drain(..excess.min(self.samples.len()));
+                    self.overlap_samples = desired_overlap;
+                }
+            }
+        } else {
+            self.sparse_results = 0;
+            self.dense_results = 0;
+        }
+    }
+
+    fn close_gate(&mut self) -> Vec<FixedWindowEvent> {
+        let mut events = Vec::with_capacity(1);
+        let idle_frames = self.quiet_frames;
+        if self.has_new_activity {
+            events.push(FixedWindowEvent::Utterance(Utterance {
+                samples: mem::take(&mut self.samples),
+                pre_roll_frames: 0,
+                overlap_frames: self.overlap_samples / FRAME_SAMPLES,
+                trailing_silence_frames: self.quiet_frames,
+                end_reason: UtteranceEndReason::Silence,
+            }));
+        }
+        self.samples.clear();
+        self.pre_roll.clear();
+        self.gate_open = false;
+        self.quiet_frames = 0;
+        self.overlap_samples = 0;
+        self.has_new_activity = false;
+        self.emitted = false;
+        self.opening_frames = 0;
+        self.idle_frames = idle_frames;
+        events
+    }
+
+    fn reset(&mut self) {
+        self.samples.clear();
+        self.pre_roll.clear();
+        self.gate_open = false;
+        self.quiet_frames = 0;
+        self.overlap_samples = 0;
+        self.has_new_activity = false;
+        self.emitted = false;
+        self.opening_frames = 0;
+        self.stream_open = false;
+        self.idle_frames = 0;
+    }
+
+    fn flush(&mut self) -> Option<Utterance> {
+        if !self.gate_open {
+            self.pre_roll.clear();
+            return None;
+        }
+        let utterance = self.has_new_activity.then(|| Utterance {
+            samples: mem::take(&mut self.samples),
+            pre_roll_frames: 0,
+            overlap_frames: self.overlap_samples / FRAME_SAMPLES,
+            trailing_silence_frames: self.quiet_frames,
+            end_reason: UtteranceEndReason::Flushed,
+        });
+        self.reset();
+        utterance
+    }
+}
+
+enum FixedWindowEvent {
+    Utterance(Utterance),
+    StreamEnded,
 }
 
 /// Cloneable, stateless network side of the native pipeline.
@@ -137,7 +419,7 @@ impl NativePipeline {
         let vad = SileroVad::from_file(&vad_path)
             .map_err(|error| format!("cannot load Silero VAD {}: {error}", vad_path.display()))?;
         let threshold = config.asr.vad_threshold as f32;
-        let endpoint = EndpointDetector::new(EndpointConfig {
+        let endpoint_config = EndpointConfig {
             speech_threshold: threshold,
             silence_frames_to_finalize: frames_for_ms(config.asr.vad_silence_ms),
             adaptive_silence_after_frames: frames_for_ms(config.asr.vad_adaptive_after_ms),
@@ -146,8 +428,8 @@ impl NativePipeline {
             pre_roll_frames: 10,
             max_active_frames: frames_for_ms(config.asr.vad_max_utterance_ms),
             max_active_overlap_frames: frames_for_ms(config.asr.vad_overlap_ms),
-        })
-        .map_err(|error| error.to_string())?;
+        };
+        let endpoint = EndpointDetector::new(endpoint_config).map_err(|error| error.to_string())?;
         let http =
             ReqwestClient::with_default_direct_timeout().map_err(|error| error.to_string())?;
         let asr = Qwen3AsrAdapter::new(http.clone(), default_route.asr_url, "qwen3-asr")
@@ -204,8 +486,12 @@ impl NativePipeline {
         Ok(Self {
             vad,
             endpoint,
+            endpoint_config,
+            fixed_window: None,
             pending_pcm: Vec::new(),
             processed_samples: 0,
+            vad_active: false,
+            vad_transitions: Vec::new(),
             inference: NativeInference {
                 asr,
                 translation,
@@ -226,10 +512,43 @@ impl NativePipeline {
     /// The network protocol does not prescribe a binary frame size.  This
     /// method therefore retains incomplete samples until a complete 512-sample
     /// Silero frame can be evaluated, rather than rejecting valid clients.
-    pub(crate) fn push_pcm(&mut self, pcm: &[u8]) -> Result<Vec<TimedUtterance>, String> {
+    pub(crate) fn push_pcm(&mut self, pcm: &[u8]) -> Result<Vec<PipelineEvent>, String> {
         validate_input_chunk_size(pcm.len())?;
         if !pcm.len().is_multiple_of(2) {
             return Err("PCM16LE audio must contain whole 16-bit samples".into());
+        }
+        if self.fixed_window.is_some() {
+            self.pending_pcm.extend_from_slice(pcm);
+            let complete_bytes = self.pending_pcm.len() / FRAME_BYTES * FRAME_BYTES;
+            let completed = self.pending_pcm.drain(..complete_bytes).collect::<Vec<_>>();
+            let mut utterances = Vec::new();
+            for frame in completed.chunks_exact(FRAME_BYTES) {
+                let probability = self
+                    .vad
+                    .infer_pcm16le(frame)
+                    .map_err(|error| error.to_string())?;
+                let samples = decode_pcm16le_frame(frame).map_err(|error| error.to_string())?;
+                self.processed_samples =
+                    self.processed_samples.saturating_add(FRAME_SAMPLES as u64);
+                let threshold = self.endpoint_config.speech_threshold;
+                let active = vad_is_active(probability, threshold);
+                self.observe_vad_activity(active);
+                let window_events = self
+                    .fixed_window
+                    .as_mut()
+                    .map(|window| window.push(&samples, active))
+                    .unwrap_or_default();
+                for event in window_events {
+                    match event {
+                        FixedWindowEvent::Utterance(utterance) => utterances
+                            .push(PipelineEvent::Utterance(self.with_timeline(utterance, 0))),
+                        FixedWindowEvent::StreamEnded => {
+                            utterances.push(PipelineEvent::StreamEnded)
+                        }
+                    }
+                }
+            }
+            return Ok(utterances);
         }
         self.pending_pcm.extend_from_slice(pcm);
 
@@ -244,20 +563,29 @@ impl NativePipeline {
                 .vad
                 .infer_pcm16le(frame)
                 .map_err(|error| error.to_string())?;
+            self.observe_vad_activity(vad_is_active(
+                probability,
+                self.endpoint_config.speech_threshold,
+            ));
             let event = self
                 .endpoint
                 .push_pcm16le(frame, probability)
                 .map_err(|error| error.to_string())?;
             self.processed_samples = self.processed_samples.saturating_add(FRAME_SAMPLES as u64);
             if let EndpointEvent::Finalized(utterance) = event {
-                utterances.push(self.with_timeline(utterance, 0));
+                utterances.push(PipelineEvent::Utterance(self.with_timeline(utterance, 0)));
             }
         }
         Ok(utterances)
     }
 
     /// Completes the current utterance when a client ends a logical turn.
-    pub(crate) fn flush(&mut self) -> Result<Option<TimedUtterance>, String> {
+    pub(crate) fn flush(&mut self) -> Result<Option<PipelineEvent>, String> {
+        if let Some(window) = &mut self.fixed_window {
+            let utterance = window.flush();
+            return Ok(utterance
+                .map(|utterance| PipelineEvent::Utterance(self.with_timeline(utterance, 0))));
+        }
         let mut trailing_padding_samples = 0;
         let mut finalized = None;
         if !self.pending_pcm.is_empty() {
@@ -282,7 +610,9 @@ impl NativePipeline {
         }
         Ok(finalized
             .or_else(|| self.endpoint.flush())
-            .map(|utterance| self.with_timeline(utterance, trailing_padding_samples)))
+            .map(|utterance| {
+                PipelineEvent::Utterance(self.with_timeline(utterance, trailing_padding_samples))
+            }))
     }
 
     /// Drops buffered audio and recurrent VAD state after a route change.
@@ -290,7 +620,49 @@ impl NativePipeline {
         self.vad.reset();
         self.endpoint.reset();
         self.pending_pcm.clear();
+        self.observe_vad_activity(false);
+        if let Some(window) = &mut self.fixed_window {
+            window.reset();
+        }
         self.processed_samples = 0;
+    }
+
+    pub(crate) fn take_vad_transitions(&mut self) -> Vec<bool> {
+        std::mem::take(&mut self.vad_transitions)
+    }
+
+    fn observe_vad_activity(&mut self, active: bool) {
+        if self.vad_active != active {
+            self.vad_active = active;
+            self.vad_transitions.push(active);
+        }
+    }
+
+    pub(crate) fn configure_segmentation(
+        &mut self,
+        vad_threshold: Option<f32>,
+        vad_silence_ms: Option<u32>,
+        continuous_recognition: bool,
+        audio_source: AudioSource,
+    ) -> Result<(), String> {
+        let mut config = self.endpoint_config;
+        if let Some(threshold) = vad_threshold {
+            config.speech_threshold = threshold;
+        }
+        if let Some(silence_ms) = vad_silence_ms {
+            config.silence_frames_to_finalize = frames_for_ms(silence_ms);
+        }
+        self.endpoint = EndpointDetector::new(config).map_err(|error| error.to_string())?;
+        self.endpoint_config = config;
+        self.fixed_window = continuous_recognition.then(|| FixedWindow::new(audio_source));
+        self.reset();
+        Ok(())
+    }
+
+    pub(crate) fn observe_text_density(&mut self, units: usize) {
+        if let Some(window) = &mut self.fixed_window {
+            window.observe_text_density(units);
+        }
     }
 
     /// Makes a request-capable handle for the session's bounded worker.
@@ -313,8 +685,13 @@ impl NativePipeline {
             utterance,
             source_start_ms: samples_to_ms(start_samples),
             source_end_ms: samples_to_ms(end_samples),
+            revisable: self.fixed_window.is_some(),
         }
     }
+}
+
+fn vad_is_active(probability: f32, threshold: f32) -> bool {
+    probability >= threshold
 }
 
 impl NativeInference {
@@ -372,6 +749,8 @@ impl NativeInference {
         &self,
         samples: &[i16],
         source_language: &str,
+        target_language: &str,
+        adaptive_route: &mut AdaptiveLanguageRoute,
         prompt_context: Option<String>,
         echo_candidates: &[String],
     ) -> Result<Option<RecognizedOutput>, String> {
@@ -381,49 +760,89 @@ impl NativeInference {
             .collect::<Vec<_>>();
         let asr_started = Instant::now();
         let max_tokens = asr_max_tokens(samples.len()).min(self.asr_max_output_tokens);
-        let mut transcript = self
-            .asr
-            .transcribe_pcm16(
-                &pcm,
-                Qwen3AsrOptions {
-                    language: asr_language(source_language),
-                    prompt_context: prompt_context.clone(),
-                    max_tokens,
-                },
-            )
-            .await
-            .map_err(|error| format!("ASR request failed: {error}"))?;
-        if is_probable_asr_hallucination(
-            &transcript.text,
-            samples.len(),
-            SAMPLE_RATE_HZ,
-            prompt_context.as_deref(),
-            echo_candidates,
-        ) {
-            warn!("ASR output failed quality checks; retrying with a minimal context-free request");
-            transcript = self
-                .asr
-                .transcribe_pcm16(
-                    &pcm,
-                    Qwen3AsrOptions {
-                        language: asr_language(source_language),
-                        prompt_context: None,
-                        max_tokens,
-                    },
-                )
-                .await
-                .map_err(|error| format!("ASR context-free retry failed: {error}"))?;
-            if is_probable_asr_hallucination(
-                &transcript.text,
-                samples.len(),
-                SAMPLE_RATE_HZ,
-                None,
-                &[],
-            ) {
-                warn!("suppressing ASR output after context-free retry failed quality checks");
-                return Ok(None);
-            }
+        adaptive_route.configure(source_language, target_language);
+        if source_language.eq_ignore_ascii_case("auto") && !adaptive_route.is_configured() {
+            return Err(
+                "Automatic input requires two different supported languages in the pair".into(),
+            );
         }
+        let prompt_context = append_prompt_hint(prompt_context, adaptive_route.prompt_hint());
+        let Some(auto_transcript) = self
+            .transcribe_attempt(
+                &pcm,
+                samples.len(),
+                asr_language(source_language),
+                prompt_context.clone(),
+                echo_candidates,
+                max_tokens,
+            )
+            .await?
+        else {
+            return Ok(None);
+        };
+        let explicit_route = explicit_language_route(source_language, target_language);
+        let (transcript, route) = if let Some(route) = explicit_route {
+            (auto_transcript, route)
+        } else {
+            match adaptive_route
+                .classify(auto_transcript.language.as_deref(), &auto_transcript.text)
+            {
+                AutoDecision::Accept(route) => (auto_transcript, route),
+                AutoDecision::Retry {
+                    language,
+                    candidate,
+                } => {
+                    warn!(
+                        detected_language =
+                            auto_transcript.language.as_deref().unwrap_or("unknown"),
+                        retry_language = language.model_name(),
+                        "ASR result needs constrained recovery"
+                    );
+                    let Some(mut forced) = self
+                        .transcribe_attempt(
+                            &pcm,
+                            samples.len(),
+                            Some(language.model_name().to_owned()),
+                            prompt_context.clone(),
+                            echo_candidates,
+                            max_tokens,
+                        )
+                        .await?
+                    else {
+                        return Ok(None);
+                    };
+                    let mut forced_language = language;
+                    if !adaptive_route.evidence(forced_language, &forced.text) {
+                        forced_language = adaptive_route.alternate(forced_language);
+                        let Some(alternate) = self
+                            .transcribe_attempt(
+                                &pcm,
+                                samples.len(),
+                                Some(forced_language.model_name().to_owned()),
+                                prompt_context.clone(),
+                                echo_candidates,
+                                max_tokens,
+                            )
+                            .await?
+                        else {
+                            return Ok(None);
+                        };
+                        forced = alternate;
+                    }
+                    match adaptive_route.recovery(forced_language, &forced.text, candidate) {
+                        RecoveryDecision::Keep(route) => (forced, route),
+                        RecoveryDecision::Switch(route) => {
+                            warn!(
+                                source_language = route.source.model_name(),
+                                target_language = route.target.model_name(),
+                                "adaptive language pair switched after repeated outside-language evidence"
+                            );
+                            (auto_transcript, route)
+                        }
+                    }
+                }
+            }
+        };
         let asr_elapsed = asr_started.elapsed();
         let source_text = remove_asr_stutters(&transcript.text);
         if source_text.is_empty() {
@@ -432,11 +851,67 @@ impl NativeInference {
         Ok(Some(RecognizedOutput {
             segments: translation_segment_pairs_for_final_text_with_lang(
                 &source_text,
-                source_language,
+                route.source.code(),
             ),
             source_text,
+            source_language: route.source.code().to_owned(),
+            target_language: route.target.code().to_owned(),
             asr_elapsed,
         }))
+    }
+
+    async fn transcribe_attempt(
+        &self,
+        pcm: &[u8],
+        sample_count: usize,
+        language: Option<String>,
+        prompt_context: Option<String>,
+        echo_candidates: &[String],
+        max_tokens: u32,
+    ) -> Result<Option<AsrTranscript>, String> {
+        let mut transcript = self
+            .asr
+            .transcribe_pcm16(
+                pcm,
+                Qwen3AsrOptions {
+                    language: language.clone(),
+                    prompt_context: prompt_context.clone(),
+                    max_tokens,
+                },
+            )
+            .await
+            .map_err(|error| format!("ASR request failed: {error}"))?;
+
+        if !is_probable_asr_hallucination(
+            &transcript.text,
+            sample_count,
+            SAMPLE_RATE_HZ,
+            prompt_context.as_deref(),
+            echo_candidates,
+        ) {
+            return Ok(Some(transcript));
+        }
+
+        warn!("ASR output failed quality checks; retrying without optional context");
+        transcript = self
+            .asr
+            .transcribe_pcm16(
+                pcm,
+                Qwen3AsrOptions {
+                    language,
+                    prompt_context: None,
+                    max_tokens,
+                },
+            )
+            .await
+            .map_err(|error| format!("ASR context-free retry failed: {error}"))?;
+        if is_probable_asr_hallucination(&transcript.text, sample_count, SAMPLE_RATE_HZ, None, &[])
+        {
+            warn!("suppressing ASR output after context-free retry failed quality checks");
+            Ok(None)
+        } else {
+            Ok(Some(transcript))
+        }
     }
 
     /// Translates one already-normalized, user-visible source segment.
@@ -447,7 +922,7 @@ impl NativeInference {
         target_language: &str,
         prompt_context: Option<String>,
     ) -> Result<TranslationOutput, String> {
-        let route = translation_route(&segment.translation_text, source_language, target_language);
+        let route = translation_route(source_language, target_language);
         let mut options = TranslationOptions::new(route.source.clone(), route.target.clone());
         options.max_tokens = self.translation_max_output_tokens;
         if self.translation_supports_prompt_context {
@@ -584,57 +1059,33 @@ fn asr_language(source_language: &str) -> Option<String> {
     (source != "auto").then(|| language_name(&source).to_owned())
 }
 
-fn translation_route(
-    transcript: &str,
-    source_language: &str,
-    target_language: &str,
-) -> TranslationRoute {
+fn explicit_language_route(source: &str, target: &str) -> Option<LanguageRoute> {
+    let source = SupportedLanguage::from_code(source)?;
+    let target = target.split(',').find_map(SupportedLanguage::from_code)?;
+    Some(LanguageRoute { source, target })
+}
+
+fn append_prompt_hint(base: Option<String>, hint: Option<String>) -> Option<String> {
+    match (base, hint) {
+        (Some(base), Some(hint)) => Some(format!("{hint}\n\n{base}")),
+        (Some(base), None) => Some(base),
+        (None, Some(hint)) => Some(hint),
+        (None, None) => None,
+    }
+}
+
+fn translation_route(source_language: &str, target_language: &str) -> TranslationRoute {
     let source = normalized_code(source_language);
-    let targets = target_language
+    let target = target_language
         .split(',')
+        .next()
         .map(normalized_code)
-        .filter(|code| !code.is_empty())
-        .collect::<Vec<_>>();
-
-    if source != "auto" {
-        return TranslationRoute {
-            source: language_name(&source).to_owned(),
-            target: language_list(&targets),
-            source_code: source,
-            target_code: (targets.len() == 1)
-                .then(|| targets[0].clone())
-                .unwrap_or_default(),
-        };
-    }
-
-    if targets.len() == 2 {
-        if let Some(detected) = detect_language(transcript, &targets) {
-            let target = targets
-                .iter()
-                .find(|candidate| candidate.as_str() != detected)
-                .expect("two distinct configured route languages");
-            return TranslationRoute {
-                source: language_name(detected).to_owned(),
-                target: language_name(target).to_owned(),
-                source_code: detected.to_owned(),
-                target_code: target.clone(),
-            };
-        }
-        return TranslationRoute {
-            source: "auto".into(),
-            target: language_list(&targets),
-            source_code: "auto".into(),
-            target_code: String::new(),
-        };
-    }
-
+        .unwrap_or_default();
     TranslationRoute {
-        source: "auto".into(),
-        target: language_list(&targets),
-        source_code: "auto".into(),
-        target_code: (targets.len() == 1)
-            .then(|| targets[0].clone())
-            .unwrap_or_default(),
+        source: language_name(&source).to_owned(),
+        target: language_name(&target).to_owned(),
+        source_code: source,
+        target_code: target,
     }
 }
 
@@ -642,108 +1093,14 @@ fn normalized_code(value: &str) -> String {
     value.trim().to_ascii_lowercase()
 }
 
-fn language_list(codes: &[String]) -> String {
-    let names = codes
-        .iter()
-        .map(|code| language_name(code).to_owned())
-        .collect::<Vec<_>>();
-    match names.as_slice() {
-        [] => "the configured target language".into(),
-        [only] => only.clone(),
-        [first, second] => format!("{first} and {second}"),
-        _ => names.join(", "),
-    }
-}
-
 fn language_name(code: &str) -> &str {
+    if let Some(language) = SupportedLanguage::from_code(code) {
+        return language.model_name();
+    }
     match code {
-        "af" => "Afrikaans",
-        "zh" => "Chinese",
-        "en" => "English",
-        "fr" => "French",
-        "pt" => "Portuguese",
-        "es" => "Spanish",
-        "ja" => "Japanese",
-        "ru" => "Russian",
-        "ko" => "Korean",
-        "th" => "Thai",
-        "it" => "Italian",
-        "de" => "German",
-        "vi" => "Vietnamese",
-        "id" => "Indonesian",
-        "pl" => "Polish",
-        "cs" => "Czech",
-        "nl" => "Dutch",
         "auto" => "automatically detected language",
         _ => code,
     }
-}
-
-fn detect_language<'a>(text: &str, candidates: &'a [String]) -> Option<&'a str> {
-    let contains = |code: &str| candidates.iter().any(|candidate| candidate == code);
-    if contains("zh") && contains("en") {
-        let cjk_units = text
-            .chars()
-            .filter(|character| ('\u{3400}'..='\u{9fff}').contains(character))
-            .count();
-        let ascii_words = ascii_word_count(text);
-        if cjk_units > 0 && ascii_words > 0 {
-            return Some(if cjk_units >= ascii_words { "zh" } else { "en" });
-        }
-    }
-    if contains("ja")
-        && text
-            .chars()
-            .any(|character| ('\u{3040}'..='\u{31ff}').contains(&character))
-    {
-        return Some("ja");
-    }
-    if contains("zh")
-        && text
-            .chars()
-            .any(|character| ('\u{3400}'..='\u{9fff}').contains(&character))
-    {
-        return Some("zh");
-    }
-    if contains("ru")
-        && text
-            .chars()
-            .any(|character| ('\u{0400}'..='\u{04ff}').contains(&character))
-    {
-        return Some("ru");
-    }
-    if contains("ko")
-        && text.chars().any(|character| {
-            ('\u{ac00}'..='\u{d7af}').contains(&character)
-                || ('\u{1100}'..='\u{11ff}').contains(&character)
-        })
-    {
-        return Some("ko");
-    }
-    if contains("en")
-        && text
-            .chars()
-            .any(|character| character.is_ascii_alphabetic())
-    {
-        return Some("en");
-    }
-    None
-}
-
-fn ascii_word_count(text: &str) -> usize {
-    let mut words = 0;
-    let mut inside_word = false;
-    for character in text.chars() {
-        if character.is_ascii_alphabetic() {
-            if !inside_word {
-                words += 1;
-                inside_word = true;
-            }
-        } else {
-            inside_word = false;
-        }
-    }
-    words
 }
 
 /// Ensures the wire stream is compatible with the initial no-resample path.
@@ -773,50 +1130,31 @@ pub(crate) fn validate_input_chunk_size(bytes: usize) -> Result<(), String> {
 #[cfg(test)]
 mod tests {
     use super::{
-        MAX_INPUT_PCM_BYTES, asr_language, frames_for_ms, is_context_window_error,
-        translation_route, validate_input_chunk_size, validate_input_sample_rate,
+        FRAME_SAMPLES, FixedWindow, FixedWindowEvent, MAX_INPUT_PCM_BYTES, UtteranceEndReason,
+        asr_language, frames_for_ms, is_context_window_error, translation_route, vad_is_active,
+        validate_input_chunk_size, validate_input_sample_rate,
     };
     use xrtranslate_inference::InferenceError;
+    use xrtranslate_protocol::AudioSource;
 
-    #[test]
-    fn automatic_bilingual_route_follows_the_recognized_script() {
-        assert_eq!(
-            translation_route("你好", "auto", "zh,en"),
-            super::TranslationRoute {
-                source: "Chinese".into(),
-                target: "English".into(),
-                source_code: "zh".into(),
-                target_code: "en".into(),
-            }
-        );
-        assert_eq!(
-            translation_route("hello", "auto", "zh,en"),
-            super::TranslationRoute {
-                source: "English".into(),
-                target: "Chinese".into(),
-                source_code: "en".into(),
-                target_code: "zh".into(),
-            }
-        );
+    fn push_active_frames(window: &mut FixedWindow, frames: usize) -> Vec<FixedWindowEvent> {
+        let frame = vec![1_i16; FRAME_SAMPLES];
+        (0..frames)
+            .flat_map(|_| window.push(&frame, true))
+            .collect()
     }
 
     #[test]
-    fn automatic_bilingual_route_uses_the_dominant_language_in_mixed_text() {
-        assert_eq!(
-            translation_route("\u{6211} also play uh Lucio", "auto", "zh,en").source_code,
-            "en"
-        );
-        assert_eq!(
-            translation_route("\u{4f60}\u{73a9} Overwatch \u{5417}", "auto", "zh,en").source_code,
-            "zh"
-        );
+    fn vad_activation_uses_only_the_model_probability() {
+        assert!(!vad_is_active(0.49, 0.5));
+        assert!(vad_is_active(0.5, 0.5));
     }
 
     #[test]
     fn explicit_language_is_used_for_asr_and_translation() {
         assert_eq!(asr_language("ja"), Some("Japanese".into()));
         assert_eq!(
-            translation_route("こんにちは", "ja", "en"),
+            translation_route("ja", "en"),
             super::TranslationRoute {
                 source: "Japanese".into(),
                 target: "English".into(),
@@ -860,5 +1198,166 @@ mod tests {
         assert_eq!(frames_for_ms(4_000), 125);
         assert_eq!(frames_for_ms(8_000), 250);
         assert_eq!(frames_for_ms(1), 1);
+    }
+
+    #[test]
+    fn fixed_windows_warm_up_then_keep_one_second_of_overlap() {
+        let mut window = FixedWindow::new(AudioSource::Microphone);
+        let FixedWindowEvent::Utterance(first) = push_active_frames(&mut window, 62)
+            .pop()
+            .expect("first fixed window")
+        else {
+            panic!("expected utterance");
+        };
+        assert_eq!(first.samples.len(), FixedWindow::FIRST_WINDOW_SAMPLES);
+        assert_eq!(first.overlap_frames, 0);
+        assert_eq!(
+            window.samples.len(),
+            FixedWindow::WINDOW_SAMPLES - FixedWindow::HOP_SAMPLES
+        );
+
+        let FixedWindowEvent::Utterance(second) = push_active_frames(&mut window, 62)
+            .pop()
+            .expect("steady fixed window")
+        else {
+            panic!("expected utterance");
+        };
+        assert_eq!(second.samples.len(), FixedWindow::WINDOW_SAMPLES);
+        assert_eq!(second.overlap_frames, 32);
+        assert_eq!(
+            window.samples.len(),
+            FixedWindow::WINDOW_SAMPLES - FixedWindow::HOP_SAMPLES
+        );
+    }
+
+    #[test]
+    fn fixed_window_ignores_idle_audio_but_keeps_bounded_pre_roll() {
+        let mut window = FixedWindow::new(AudioSource::Microphone);
+        let frame = vec![0_i16; FRAME_SAMPLES];
+        for _ in 0..100 {
+            assert!(window.push(&frame, false).is_empty());
+        }
+        assert!(window.samples.is_empty());
+        assert_eq!(window.pre_roll.len(), FixedWindow::PRE_ROLL_SAMPLES);
+    }
+
+    #[test]
+    fn fixed_window_requires_sustained_activity_to_open() {
+        let mut window = FixedWindow::new(AudioSource::Microphone);
+        let active = vec![1_i16; FRAME_SAMPLES];
+        let quiet = vec![0_i16; FRAME_SAMPLES];
+        assert!(window.push(&active, true).is_empty());
+        assert!(window.push(&quiet, false).is_empty());
+        assert!(window.push(&active, true).is_empty());
+        assert!(window.push(&active, true).is_empty());
+        assert!(!window.gate_open);
+        assert!(window.push(&active, true).is_empty());
+        assert!(window.gate_open);
+    }
+
+    #[test]
+    fn fixed_window_survives_brief_gaps_and_flushes_short_activity() {
+        let mut window = FixedWindow::new(AudioSource::Microphone);
+        let silence = vec![0_i16; FRAME_SAMPLES];
+        let speech = vec![1_i16; FRAME_SAMPLES];
+        for _ in 0..FixedWindow::PRE_ROLL_FRAMES {
+            assert!(window.push(&silence, false).is_empty());
+        }
+        for _ in 0..FixedWindow::OPENING_FRAMES {
+            assert!(window.push(&speech, true).is_empty());
+        }
+        for _ in 0..FixedWindow::RELEASE_FRAMES - 1 {
+            assert!(window.push(&silence, false).is_empty());
+        }
+        assert!(window.gate_open);
+        let events = window.push(&silence, false);
+        let FixedWindowEvent::Utterance(utterance) = &events[0] else {
+            panic!("expected utterance when the audio gate closes");
+        };
+        assert_eq!(events.len(), 1);
+        assert_eq!(utterance.end_reason, UtteranceEndReason::Silence);
+        assert_eq!(
+            utterance.samples.len(),
+            (FixedWindow::PRE_ROLL_FRAMES + FixedWindow::RELEASE_FRAMES) * FRAME_SAMPLES
+        );
+        assert!(!window.gate_open);
+    }
+
+    #[test]
+    fn fixed_window_ends_stream_without_retranscribing_overlap_only_audio() {
+        let mut window = FixedWindow::new(AudioSource::Microphone);
+        assert!(matches!(
+            push_active_frames(&mut window, 62).as_slice(),
+            [FixedWindowEvent::Utterance(_)]
+        ));
+        let silence = vec![0_i16; FRAME_SAMPLES];
+        for _ in 0..FixedWindow::STREAM_END_FRAMES - 1 {
+            assert!(window.push(&silence, false).is_empty());
+        }
+        assert!(matches!(
+            window.push(&silence, false).as_slice(),
+            [FixedWindowEvent::StreamEnded]
+        ));
+    }
+
+    #[test]
+    fn system_audio_context_expands_and_recovers_with_density_hysteresis() {
+        let mut window = FixedWindow::new(AudioSource::SystemAudio);
+        window.observe_text_density(2);
+        assert_eq!(window.window_samples(), FixedWindow::WINDOW_SAMPLES);
+        window.observe_text_density(3);
+        assert_eq!(
+            window.window_samples(),
+            FixedWindow::EXPANDED_WINDOW_SAMPLES
+        );
+        window.observe_text_density(9);
+        assert_eq!(
+            window.window_samples(),
+            FixedWindow::EXPANDED_WINDOW_SAMPLES
+        );
+        window.observe_text_density(10);
+        assert_eq!(window.window_samples(), FixedWindow::WINDOW_SAMPLES);
+    }
+
+    #[test]
+    fn shrinking_expanded_context_trims_old_overlap_without_underflow() {
+        let mut window = FixedWindow::new(AudioSource::SystemAudio);
+        assert!(matches!(
+            push_active_frames(&mut window, 62).as_slice(),
+            [FixedWindowEvent::Utterance(_)]
+        ));
+        window.observe_text_density(2);
+        window.observe_text_density(3);
+        assert!(matches!(
+            push_active_frames(&mut window, 94).as_slice(),
+            [FixedWindowEvent::Utterance(_)]
+        ));
+        assert_eq!(window.overlap_samples, 64 * FRAME_SAMPLES);
+
+        window.observe_text_density(9);
+        window.observe_text_density(10);
+        assert_eq!(window.overlap_samples, 32 * FRAME_SAMPLES);
+        assert!(matches!(
+            push_active_frames(&mut window, 62).as_slice(),
+            [FixedWindowEvent::Utterance(_)]
+        ));
+    }
+
+    #[test]
+    fn expanded_context_keeps_the_warm_window_advancing() {
+        let mut window = FixedWindow::new(AudioSource::SystemAudio);
+        window.observe_text_density(2);
+        window.observe_text_density(3);
+        assert_eq!(
+            window.window_samples(),
+            FixedWindow::EXPANDED_WINDOW_SAMPLES
+        );
+        let events = push_active_frames(&mut window, 62);
+        let [FixedWindowEvent::Utterance(utterance)] = events.as_slice() else {
+            panic!("expected warm utterance");
+        };
+        assert_eq!(utterance.samples.len(), FixedWindow::FIRST_WINDOW_SAMPLES);
+        assert_eq!(window.overlap_samples, 32 * FRAME_SAMPLES);
+        assert_eq!(window.samples.len(), 32 * FRAME_SAMPLES);
     }
 }

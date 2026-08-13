@@ -12,6 +12,7 @@ use std::sync::{
 mod app_update;
 mod audio;
 mod backend;
+mod child_process;
 mod client_settings;
 mod feature_access;
 mod i18n;
@@ -24,19 +25,24 @@ mod overlay_manager;
 mod overlay_native;
 mod runtime_install;
 mod service_config;
+mod streaming;
 mod sys_info;
 mod ui;
 pub mod version;
 
 use audio::{AudioSystem, InputConfigInfo, InputDevice};
-use client_settings::{CaptureSource, ClientSettings};
+use client_settings::{CaptureSource, ClientSettings, RecognitionSettings};
 use i18n::UiLanguage;
-use network::{SessionEvent, SessionHandle, start_session};
+use network::{SessionConfig, SessionEvent, SessionHandle, start_session};
 use osc::{OscManager, OscSettings};
 use ui::{NavigationState, Page};
 
+const STREAM_TEXT_LIMIT: usize = 4_096;
+
 #[derive(Clone, Debug, PartialEq)]
 struct RecognitionHistoryEntry {
+    stream_id: Option<u64>,
+    live: bool,
     text: String,
     turn_id: String,
     speaker_id: String,
@@ -44,6 +50,17 @@ struct RecognitionHistoryEntry {
     source_end_ms: f64,
     activation_matches: Vec<xrtranslate_protocol::CorpusTermMatch>,
     context_matches: Vec<xrtranslate_protocol::CorpusTermMatch>,
+    revisable: bool,
+    overlap_ratio: f32,
+    revision: Option<crate::streaming::RevisableText>,
+}
+
+struct PendingRecognitionWindow {
+    stream_id: u64,
+    continuous: bool,
+    turn_id: String,
+    segment_count: u32,
+    segments: Vec<(u32, RecognitionHistoryEntry)>,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -54,12 +71,388 @@ struct PendingFinalAsr {
 
 #[derive(Clone, Debug, PartialEq)]
 struct TranslationHistoryEntry {
+    stream_id: Option<u64>,
+    audio_source: CaptureSource,
+    live: bool,
     source: String,
     translated: String,
     speaker_id: String,
     source_start_ms: f64,
     source_end_ms: f64,
     term_matches: Vec<xrtranslate_protocol::CorpusTermMatch>,
+    revisable: bool,
+    overlap_ratio: f32,
+    source_revision: Option<crate::streaming::RevisableText>,
+    translated_revision: Option<crate::streaming::RevisableText>,
+}
+
+struct StreamMerge {
+    entry: TranslationHistoryEntry,
+    rolled_over: bool,
+    changed: bool,
+}
+
+fn collect_recognition_window(
+    pending: &mut Vec<PendingRecognitionWindow>,
+    stream_id: u64,
+    continuous: bool,
+    segment_index: u32,
+    segment_count: u32,
+    entry: RecognitionHistoryEntry,
+) -> Option<RecognitionHistoryEntry> {
+    let turn_id = entry.turn_id.clone();
+    let index = pending
+        .iter()
+        .position(|window| window.stream_id == stream_id && window.turn_id == turn_id)
+        .unwrap_or_else(|| {
+            if pending.len() >= 32 {
+                pending.remove(0);
+            }
+            pending.push(PendingRecognitionWindow {
+                stream_id,
+                continuous,
+                turn_id,
+                segment_count: segment_count.max(1),
+                segments: Vec::new(),
+            });
+            pending.len() - 1
+        });
+    let window = &mut pending[index];
+    window.segment_count = window.segment_count.max(segment_count.max(1));
+    if let Some((_, existing)) = window
+        .segments
+        .iter_mut()
+        .find(|(index, _)| *index == segment_index)
+    {
+        *existing = entry;
+    } else {
+        window.segments.push((segment_index, entry));
+    }
+    if window.segments.len() < window.segment_count as usize {
+        return None;
+    }
+
+    let mut window = pending.remove(index);
+    window.segments.sort_by_key(|(index, _)| *index);
+    let (_, first) = window.segments.first()?.clone();
+    let mut combined = RecognitionHistoryEntry {
+        stream_id: window.continuous.then_some(window.stream_id),
+        live: window.continuous,
+        text: String::new(),
+        source_start_ms: first.source_start_ms,
+        source_end_ms: first.source_end_ms,
+        activation_matches: Vec::new(),
+        context_matches: Vec::new(),
+        revision: None,
+        ..first
+    };
+    for (_, segment) in window.segments {
+        let position = crate::streaming::append_segment(&mut combined.text, &segment.text);
+        crate::streaming::append_term_matches(
+            &mut combined.activation_matches,
+            &segment.activation_matches,
+            position,
+        );
+        crate::streaming::append_term_matches(
+            &mut combined.context_matches,
+            &segment.context_matches,
+            position,
+        );
+        if !segment.speaker_id.is_empty() {
+            combined.speaker_id = segment.speaker_id;
+        }
+        combined.source_start_ms = combined.source_start_ms.min(segment.source_start_ms);
+        combined.source_end_ms = combined.source_end_ms.max(segment.source_end_ms);
+    }
+    Some(combined)
+}
+
+fn merge_stream_recognition(
+    history: &mut Vec<RecognitionHistoryEntry>,
+    stream_id: u64,
+    mut fragment: RecognitionHistoryEntry,
+) {
+    retain_recognition_tail(&mut fragment);
+    let Some(current) = history
+        .iter_mut()
+        .rfind(|entry| entry.stream_id == Some(stream_id) && entry.live)
+    else {
+        initialize_recognition_revision(&mut fragment);
+        history.push(fragment);
+        return;
+    };
+
+    let stable = current
+        .revision
+        .as_ref()
+        .map(crate::streaming::RevisableText::stable_text)
+        .filter(|text| !text.is_empty())
+        .unwrap_or(&current.text);
+    if crate::streaming::should_roll_caption(
+        stable,
+        current.source_start_ms,
+        fragment.source_end_ms,
+    ) {
+        let handoff = current.revision.as_ref().map_or_else(
+            || {
+                crate::streaming::handoff_text(
+                    &current.text,
+                    &fragment.text,
+                    fragment.overlap_ratio,
+                )
+            },
+            |revision| revision.handoff(&fragment.text, fragment.overlap_ratio),
+        );
+        if !handoff.text.trim().is_empty() {
+            current.live = false;
+            fragment.text = handoff.text;
+            fragment.activation_matches =
+                trimmed_term_matches(&fragment.activation_matches, handoff.source_start);
+            fragment.context_matches =
+                trimmed_term_matches(&fragment.context_matches, handoff.source_start);
+            initialize_recognition_revision(&mut fragment);
+            history.push(fragment);
+            return;
+        }
+    }
+
+    if fragment.revisable {
+        let update = current
+            .revision
+            .get_or_insert_with(|| crate::streaming::RevisableText::new(&current.text))
+            .update(&fragment.text, fragment.overlap_ratio);
+        merge_revision_matches(
+            &mut current.activation_matches,
+            &fragment.activation_matches,
+            update.hypothesis_start,
+        );
+        merge_revision_matches(
+            &mut current.context_matches,
+            &fragment.context_matches,
+            update.hypothesis_start,
+        );
+        current.text = update.text;
+    } else {
+        let position = crate::streaming::append_text(&mut current.text, &fragment.text);
+        crate::streaming::append_term_matches(
+            &mut current.activation_matches,
+            &fragment.activation_matches,
+            position,
+        );
+        crate::streaming::append_term_matches(
+            &mut current.context_matches,
+            &fragment.context_matches,
+            position,
+        );
+    }
+    if !fragment.speaker_id.is_empty() {
+        current.speaker_id = fragment.speaker_id;
+    }
+    current.source_start_ms = current.source_start_ms.min(fragment.source_start_ms);
+    current.source_end_ms = current.source_end_ms.max(fragment.source_end_ms);
+    retain_recognition_tail(current);
+}
+
+fn initialize_recognition_revision(entry: &mut RecognitionHistoryEntry) {
+    if entry.revisable {
+        entry.revision = Some(crate::streaming::RevisableText::new(&entry.text));
+    }
+}
+
+fn merge_stream_translation(
+    history: &mut Vec<TranslationHistoryEntry>,
+    stream_id: u64,
+    mut fragment: TranslationHistoryEntry,
+) -> StreamMerge {
+    crate::streaming::retain_tail(&mut fragment.source, None, STREAM_TEXT_LIMIT);
+    crate::streaming::retain_tail(
+        &mut fragment.translated,
+        Some(&mut fragment.term_matches),
+        STREAM_TEXT_LIMIT,
+    );
+    let Some(current) = history
+        .iter_mut()
+        .rfind(|entry| entry.stream_id == Some(stream_id) && entry.live)
+    else {
+        initialize_revision(&mut fragment);
+        history.push(fragment.clone());
+        return StreamMerge {
+            entry: fragment,
+            rolled_over: false,
+            changed: true,
+        };
+    };
+
+    let stable_source = current
+        .source_revision
+        .as_ref()
+        .map(crate::streaming::RevisableText::stable_text)
+        .filter(|text| !text.is_empty())
+        .unwrap_or(&current.source);
+    if crate::streaming::should_roll_caption(
+        stable_source,
+        current.source_start_ms,
+        fragment.source_end_ms,
+    ) {
+        let source = current.source_revision.as_ref().map_or_else(
+            || {
+                crate::streaming::handoff_text(
+                    &current.source,
+                    &fragment.source,
+                    fragment.overlap_ratio,
+                )
+            },
+            |revision| revision.handoff(&fragment.source, fragment.overlap_ratio),
+        );
+        if !source.text.trim().is_empty() {
+            let translated = current.translated_revision.as_ref().map_or_else(
+                || {
+                    crate::streaming::handoff_text(
+                        &current.translated,
+                        &fragment.translated,
+                        fragment.overlap_ratio,
+                    )
+                },
+                |revision| revision.handoff(&fragment.translated, fragment.overlap_ratio),
+            );
+            current.live = false;
+            fragment.source = source.text;
+            fragment.translated = translated.text;
+            fragment.term_matches =
+                trimmed_term_matches(&fragment.term_matches, translated.source_start);
+            initialize_revision(&mut fragment);
+            history.push(fragment.clone());
+            return StreamMerge {
+                entry: fragment,
+                rolled_over: true,
+                changed: true,
+            };
+        }
+    }
+
+    let (source_changed, translated_changed) = if fragment.revisable {
+        let old_source = current.source.clone();
+        let old_translated = current.translated.clone();
+        let source = current
+            .source_revision
+            .get_or_insert_with(|| crate::streaming::RevisableText::new(&current.source))
+            .update(&fragment.source, fragment.overlap_ratio);
+        let translated = current
+            .translated_revision
+            .get_or_insert_with(|| crate::streaming::RevisableText::new(&current.translated))
+            .update(&fragment.translated, fragment.overlap_ratio);
+        current.source = source.text;
+        current.translated = translated.text;
+        merge_revision_matches(
+            &mut current.term_matches,
+            &fragment.term_matches,
+            translated.hypothesis_start,
+        );
+        (
+            current.source != old_source,
+            current.translated != old_translated,
+        )
+    } else {
+        let source_changed =
+            crate::streaming::append_text(&mut current.source, &fragment.source).is_some();
+        let translated_offset =
+            crate::streaming::append_text(&mut current.translated, &fragment.translated);
+        let translated_changed = translated_offset.is_some();
+        crate::streaming::append_term_matches(
+            &mut current.term_matches,
+            &fragment.term_matches,
+            translated_offset,
+        );
+        (source_changed, translated_changed)
+    };
+    crate::streaming::retain_tail(&mut current.source, None, STREAM_TEXT_LIMIT);
+    crate::streaming::retain_tail(
+        &mut current.translated,
+        Some(&mut current.term_matches),
+        STREAM_TEXT_LIMIT,
+    );
+    if !fragment.speaker_id.is_empty() {
+        current.speaker_id = fragment.speaker_id;
+    }
+    current.source_start_ms = current.source_start_ms.min(fragment.source_start_ms);
+    current.source_end_ms = current.source_end_ms.max(fragment.source_end_ms);
+    StreamMerge {
+        entry: current.clone(),
+        rolled_over: false,
+        changed: source_changed || translated_changed,
+    }
+}
+
+fn initialize_revision(entry: &mut TranslationHistoryEntry) {
+    if entry.revisable {
+        entry.source_revision = Some(crate::streaming::RevisableText::new(&entry.source));
+        entry.translated_revision = Some(crate::streaming::RevisableText::new(&entry.translated));
+    }
+}
+
+fn shifted_term_matches(
+    matches: &[xrtranslate_protocol::CorpusTermMatch],
+    offset: usize,
+) -> Vec<xrtranslate_protocol::CorpusTermMatch> {
+    let Ok(offset) = u32::try_from(offset) else {
+        return Vec::new();
+    };
+    matches
+        .iter()
+        .cloned()
+        .filter_map(|mut term| {
+            term.start_byte = term.start_byte.checked_add(offset)?;
+            term.end_byte = term.end_byte.checked_add(offset)?;
+            Some(term)
+        })
+        .collect()
+}
+
+fn trimmed_term_matches(
+    matches: &[xrtranslate_protocol::CorpusTermMatch],
+    source_start: usize,
+) -> Vec<xrtranslate_protocol::CorpusTermMatch> {
+    let Ok(source_start) = u32::try_from(source_start) else {
+        return Vec::new();
+    };
+    matches
+        .iter()
+        .cloned()
+        .filter_map(|mut term| {
+            if term.start_byte < source_start {
+                return None;
+            }
+            term.start_byte = term.start_byte.checked_sub(source_start)?;
+            term.end_byte = term.end_byte.checked_sub(source_start)?;
+            Some(term)
+        })
+        .collect()
+}
+
+fn merge_revision_matches(
+    current: &mut Vec<xrtranslate_protocol::CorpusTermMatch>,
+    incoming: &[xrtranslate_protocol::CorpusTermMatch],
+    hypothesis_start: usize,
+) {
+    let Ok(stable_end) = u32::try_from(hypothesis_start) else {
+        current.clear();
+        return;
+    };
+    current.retain(|term| term.end_byte <= stable_end);
+    current.extend(shifted_term_matches(incoming, hypothesis_start));
+}
+
+fn retain_recognition_tail(entry: &mut RecognitionHistoryEntry) {
+    let original_len = entry.text.len();
+    crate::streaming::retain_tail(
+        &mut entry.text,
+        Some(&mut entry.activation_matches),
+        STREAM_TEXT_LIMIT,
+    );
+    let removed = original_len.saturating_sub(entry.text.len());
+    if removed > 0 {
+        entry.context_matches = trimmed_term_matches(&entry.context_matches, removed);
+    }
 }
 
 const LANGUAGE_OPTIONS: &[(&str, &str)] = &[
@@ -103,11 +496,16 @@ struct XRTranslateApp {
     loopback_devices: Vec<InputDevice>,
     selected_loopback_device_id: String,
     capture_source: CaptureSource,
+    microphone_recognition: RecognitionSettings,
+    loopback_recognition: RecognitionSettings,
     selected_input_config: Option<InputConfigInfo>,
     is_translating: bool,
-    audio_tx: Option<Sender<Vec<f32>>>,
+    audio_txs: Vec<Sender<Vec<f32>>>,
     input_level: Arc<AtomicU32>,
-    session: Option<SessionHandle>,
+    loopback_level: Arc<AtomicU32>,
+    microphone_vad_active: Arc<AtomicBool>,
+    loopback_vad_active: Arc<AtomicBool>,
+    sessions: Vec<SessionHandle>,
     event_tx: Sender<SessionEvent>,
     connection_status: String,
     partial_text: String,
@@ -149,6 +547,7 @@ struct SharedSessionState {
     connection_status: String,
     partial_text: String,
     pending_final_asr: Vec<PendingFinalAsr>,
+    pending_recognition_windows: Vec<PendingRecognitionWindow>,
     recognition_history: Vec<RecognitionHistoryEntry>,
     translations: Vec<TranslationHistoryEntry>,
     last_error: Option<String>,
@@ -175,6 +574,7 @@ impl Default for XRTranslateApp {
             CaptureSource::SystemAudio => audio_system
                 .loopback_config(&settings.selected_loopback_device_id)
                 .ok(),
+            CaptureSource::Both => audio_system.input_config(&settings.selected_device_id).ok(),
         };
 
         let shared_session_state = Arc::new(Mutex::new(SharedSessionState {
@@ -187,6 +587,10 @@ impl Default for XRTranslateApp {
             Arc::new(AtomicUsize::new(settings.floating_subtitles_max_count));
         let overlay_font_size_atomic =
             Arc::new(AtomicU32::new(settings.floating_subtitles_font_size as u32));
+        let microphone_vad_active = Arc::new(AtomicBool::new(false));
+        let loopback_vad_active = Arc::new(AtomicBool::new(false));
+        let input_level = Arc::new(AtomicU32::new(0.0_f32.to_bits()));
+        let loopback_level = Arc::new(AtomicU32::new(0.0_f32.to_bits()));
 
         // Background session event pump thread
         let shared_state_clone = Arc::clone(&shared_session_state);
@@ -194,6 +598,8 @@ impl Default for XRTranslateApp {
         let overlay_enabled_clone = Arc::clone(&overlay_enabled_atomic);
         let overlay_max_count_clone = Arc::clone(&overlay_max_count_atomic);
         let overlay_font_size_clone = Arc::clone(&overlay_font_size_atomic);
+        let microphone_vad_active_clone = Arc::clone(&microphone_vad_active);
+        let loopback_vad_active_clone = Arc::clone(&loopback_vad_active);
         let rx = event_rx.clone();
 
         std::thread::Builder::new()
@@ -208,8 +614,26 @@ impl Default for XRTranslateApp {
                         SessionEvent::Disconnected(reason) => {
                             state.connection_status = reason;
                             state.is_translating = false;
+                            for entry in &mut state.translations {
+                                entry.live = false;
+                            }
+                            for entry in &mut state.recognition_history {
+                                entry.live = false;
+                            }
+                            state.pending_recognition_windows.clear();
+                            microphone_vad_active_clone.store(false, Ordering::Relaxed);
+                            loopback_vad_active_clone.store(false, Ordering::Relaxed);
                         }
                         SessionEvent::Status(status) => state.connection_status = status,
+                        SessionEvent::VadActivity { source, active } => match source {
+                            CaptureSource::Microphone => {
+                                microphone_vad_active_clone.store(active, Ordering::Relaxed)
+                            }
+                            CaptureSource::SystemAudio => {
+                                loopback_vad_active_clone.store(active, Ordering::Relaxed)
+                            }
+                            CaptureSource::Both => {}
+                        },
                         SessionEvent::Asr {
                             kind,
                             text,
@@ -231,6 +655,8 @@ impl Default for XRTranslateApp {
                                     });
                                 if !is_duplicate {
                                     state.recognition_history.push(RecognitionHistoryEntry {
+                                        stream_id: None,
+                                        live: false,
                                         text: text.clone(),
                                         turn_id,
                                         speaker_id: String::new(),
@@ -238,6 +664,9 @@ impl Default for XRTranslateApp {
                                         source_end_ms: 0.0,
                                         activation_matches: Vec::new(),
                                         context_matches: Vec::new(),
+                                        revisable: false,
+                                        overlap_ratio: 0.0,
+                                        revision: None,
                                     });
                                     if state.recognition_history.len() > 100 {
                                         state.recognition_history.remove(0);
@@ -251,6 +680,8 @@ impl Default for XRTranslateApp {
                             };
                         }
                         SessionEvent::SourceSegment {
+                            stream_id,
+                            continuous,
                             text,
                             activation_matches,
                             context_matches,
@@ -259,6 +690,9 @@ impl Default for XRTranslateApp {
                             source_start_ms,
                             source_end_ms,
                             segment_index,
+                            segment_count,
+                            revisable,
+                            overlap_ratio,
                         } => {
                             if text.is_empty() {
                                 continue;
@@ -295,6 +729,8 @@ impl Default for XRTranslateApp {
                                 }
                             }
                             let entry = RecognitionHistoryEntry {
+                                stream_id: continuous.then_some(stream_id),
+                                live: continuous,
                                 text,
                                 turn_id,
                                 speaker_id,
@@ -302,33 +738,114 @@ impl Default for XRTranslateApp {
                                 source_end_ms,
                                 activation_matches,
                                 context_matches,
+                                revisable,
+                                overlap_ratio,
+                                revision: None,
                             };
-                            if state.recognition_history.last() != Some(&entry) {
-                                state.recognition_history.push(entry);
+                            let complete = collect_recognition_window(
+                                &mut state.pending_recognition_windows,
+                                stream_id,
+                                continuous,
+                                segment_index,
+                                segment_count,
+                                entry,
+                            );
+                            if let Some(entry) = complete {
+                                if continuous {
+                                    merge_stream_recognition(
+                                        &mut state.recognition_history,
+                                        stream_id,
+                                        entry,
+                                    );
+                                } else if state.recognition_history.last() != Some(&entry) {
+                                    state.recognition_history.push(entry);
+                                }
                                 if state.recognition_history.len() > 100 {
                                     state.recognition_history.remove(0);
                                 }
                             }
                         }
                         SessionEvent::Translation {
+                            stream_id,
+                            audio_source,
+                            continuous,
+                            osc,
                             source,
                             translated,
                             speaker_id,
                             source_start_ms,
                             source_end_ms,
                             term_matches,
+                            revisable,
+                            overlap_ratio,
                         } => {
-                            state.translations.push(TranslationHistoryEntry {
+                            let fragment = TranslationHistoryEntry {
+                                stream_id: continuous.then_some(stream_id),
+                                audio_source,
+                                live: continuous,
                                 source,
                                 translated,
                                 speaker_id,
                                 source_start_ms,
                                 source_end_ms,
                                 term_matches,
-                            });
+                                revisable,
+                                overlap_ratio,
+                                source_revision: None,
+                                translated_revision: None,
+                            };
+                            if continuous {
+                                let merged = merge_stream_translation(
+                                    &mut state.translations,
+                                    stream_id,
+                                    fragment,
+                                );
+                                if merged.rolled_over {
+                                    osc.roll_stream(
+                                        &merged.entry.source,
+                                        &merged.entry.translated,
+                                        &merged.entry.speaker_id,
+                                    );
+                                } else if merged.changed {
+                                    osc.add_message_and_send(
+                                        &merged.entry.source,
+                                        &merged.entry.translated,
+                                        &merged.entry.speaker_id,
+                                        true,
+                                    );
+                                }
+                            } else {
+                                osc.add_message_and_send(
+                                    &fragment.source,
+                                    &fragment.translated,
+                                    &fragment.speaker_id,
+                                    false,
+                                );
+                                state.translations.push(fragment);
+                            }
                             if state.translations.len() > 100 {
                                 state.translations.remove(0);
                             }
+                        }
+                        SessionEvent::StreamEnded { stream_id, osc } => {
+                            if let Some(entry) = state
+                                .translations
+                                .iter_mut()
+                                .rfind(|entry| entry.stream_id == Some(stream_id) && entry.live)
+                            {
+                                entry.live = false;
+                            }
+                            if let Some(entry) = state
+                                .recognition_history
+                                .iter_mut()
+                                .rfind(|entry| entry.stream_id == Some(stream_id) && entry.live)
+                            {
+                                entry.live = false;
+                            }
+                            state
+                                .pending_recognition_windows
+                                .retain(|window| window.stream_id != stream_id);
+                            osc.end_stream();
                         }
                         SessionEvent::TtsAudio(_audio) => {}
                         SessionEvent::BackendError(error) => {
@@ -349,7 +866,20 @@ impl Default for XRTranslateApp {
                         let start = total.saturating_sub(max_items);
                         let visible = state.translations[start..]
                             .iter()
-                            .map(|t| (t.source.clone(), t.translated.clone()))
+                            .map(|translation| overlay_ipc::OverlayEntry {
+                                source: translation.source.clone(),
+                                translated: translation.translated.clone(),
+                                live: translation.live,
+                                vad_active: match translation.audio_source {
+                                    CaptureSource::Microphone => {
+                                        microphone_vad_active_clone.load(Ordering::Relaxed)
+                                    }
+                                    CaptureSource::SystemAudio => {
+                                        loopback_vad_active_clone.load(Ordering::Relaxed)
+                                    }
+                                    CaptureSource::Both => false,
+                                },
+                            })
                             .collect();
 
                         let overlay_state = overlay_ipc::OverlayState {
@@ -361,6 +891,8 @@ impl Default for XRTranslateApp {
                             } else {
                                 Some(state.partial_text.clone())
                             },
+                            vad_active: microphone_vad_active_clone.load(Ordering::Relaxed)
+                                || loopback_vad_active_clone.load(Ordering::Relaxed),
                         };
 
                         if let Ok(mut mgr) = overlay_mgr_clone.lock() {
@@ -371,18 +903,23 @@ impl Default for XRTranslateApp {
             })
             .expect("failed to spawn session-event-pump thread");
 
-        Self {
+        let mut app = Self {
             audio_system,
             devices,
             selected_device_id: settings.selected_device_id,
             loopback_devices,
             selected_loopback_device_id: settings.selected_loopback_device_id,
             capture_source: settings.capture_source,
+            microphone_recognition: settings.microphone_recognition,
+            loopback_recognition: settings.loopback_recognition,
             selected_input_config,
             is_translating: false,
-            audio_tx: None,
-            input_level: Arc::new(AtomicU32::new(0.0_f32.to_bits())),
-            session: None,
+            audio_txs: Vec::new(),
+            input_level,
+            loopback_level,
+            microphone_vad_active,
+            loopback_vad_active,
+            sessions: Vec::new(),
             event_tx,
             connection_status: "Ready".into(),
             partial_text: String::new(),
@@ -422,7 +959,9 @@ impl Default for XRTranslateApp {
             overlay_enabled_atomic,
             overlay_max_count_atomic,
             overlay_font_size_atomic,
-        }
+        };
+        app.restart_level_preview();
+        app
     }
 }
 
@@ -436,6 +975,11 @@ impl XRTranslateApp {
             capture_source: self.capture_source,
             selected_device_id: self.selected_device_id.clone(),
             selected_loopback_device_id: self.selected_loopback_device_id.clone(),
+            background_noise: self.microphone_recognition.background_noise,
+            pause_tolerance: self.microphone_recognition.pause_tolerance,
+            continuous_recognition: self.microphone_recognition.continuous_recognition,
+            microphone_recognition: self.microphone_recognition.clone(),
+            loopback_recognition: self.loopback_recognition.clone(),
             source_lang: self.source_lang.clone(),
             target_lang: self.target_lang.clone(),
             tts_enabled: self.tts_enabled,
@@ -538,34 +1082,72 @@ impl XRTranslateApp {
         }
     }
 
+    pub(crate) fn apply_service_configuration(&mut self, ctx: Option<eframe::egui::Context>) {
+        let resume_translation = self.is_translating;
+        if resume_translation {
+            self.stop();
+        }
+        self.backend_start_deadline = None;
+        self.backend_manager.shutdown();
+        if resume_translation {
+            self.start(ctx);
+        } else {
+            self.set_connection_status("Ready");
+        }
+    }
+
     fn start_session(&mut self, ctx: Option<eframe::egui::Context>) {
-        let (audio_tx, audio_rx) = unbounded();
-        match self.start_selected_capture(audio_tx.clone()) {
+        let routes = self.capture_source.routes();
+        let channels = routes
+            .iter()
+            .map(|_| unbounded::<Vec<f32>>())
+            .collect::<Vec<_>>();
+        let audio_txs = channels
+            .iter()
+            .map(|(tx, _)| tx.clone())
+            .collect::<Vec<_>>();
+        match self.start_selected_capture(routes, &audio_txs) {
             Ok(()) => {
-                let tts_handle = crate::feature_access::is_available(
-                    crate::feature_access::Feature::TtsPlayback,
-                )
-                .then(|| self.audio_system.tts_handle())
-                .flatten();
-                let session = start_session(
-                    audio_rx,
-                    self.event_tx.clone(),
-                    self.server_url.clone(),
-                    self.source_lang.clone(),
-                    self.target_lang.clone(),
-                    self.speaker_recognition_enabled,
-                    self.osc_manager.muted_state(),
-                    Arc::clone(&self.mute_self_pauses_translation),
-                    self.osc_manager.handle(),
-                    tts_handle,
-                    ctx,
-                );
-                if crate::feature_access::is_available(crate::feature_access::Feature::TtsPlayback)
-                {
-                    session.set_tts_enabled(self.tts_enabled);
-                }
-                self.session = Some(session);
-                self.audio_tx = Some(audio_tx);
+                self.sessions = channels
+                    .iter()
+                    .zip(routes.iter())
+                    .map(|((_, audio_rx), source)| {
+                        let recognition = self.recognition_settings(*source).clone();
+                        let tts_handle = crate::feature_access::is_available(
+                            crate::feature_access::Feature::TtsPlayback,
+                        )
+                        .then(|| self.audio_system.tts_handle())
+                        .flatten();
+                        let session = start_session(
+                            audio_rx.clone(),
+                            self.event_tx.clone(),
+                            SessionConfig {
+                                server_url: self.server_url.clone(),
+                                source_lang: self.source_lang.clone(),
+                                target_lang: self.target_lang.clone(),
+                                speaker_recognition_enabled: self.speaker_recognition_enabled,
+                                muted: self.osc_manager.muted_state(),
+                                mute_gate_enabled: Arc::clone(&self.mute_self_pauses_translation),
+                                osc: self.osc_manager.handle(),
+                                tts: tts_handle,
+                                egui_ctx: ctx.clone(),
+                                vad_threshold: vad_threshold_for_background_noise(
+                                    recognition.background_noise,
+                                ),
+                                vad_silence_ms: pause_tolerance_to_ms(recognition.pause_tolerance),
+                                continuous_recognition: recognition.continuous_recognition,
+                                audio_source: *source,
+                            },
+                        );
+                        if crate::feature_access::is_available(
+                            crate::feature_access::Feature::TtsPlayback,
+                        ) {
+                            session.set_tts_enabled(self.tts_enabled);
+                        }
+                        session
+                    })
+                    .collect();
+                self.audio_txs = audio_txs;
                 self.is_translating = true;
                 self.connection_status = "Connecting...".into();
                 self.last_error = None;
@@ -577,13 +1159,17 @@ impl XRTranslateApp {
                     state.connection_status = "Connecting...".into();
                     state.partial_text.clear();
                     state.pending_final_asr.clear();
+                    state.pending_recognition_windows.clear();
                     state.recognition_history.clear();
                     state.translations.clear();
                     state.last_error = None;
                     state.is_translating = true;
                 }
             }
-            Err(error) => self.set_startup_error("Audio input failed", error),
+            Err(error) => {
+                self.set_startup_error("Audio input failed", error);
+                self.restart_level_preview();
+            }
         }
     }
 
@@ -625,6 +1211,7 @@ impl XRTranslateApp {
             CaptureSource::SystemAudio => self
                 .audio_system
                 .loopback_config(&self.selected_loopback_device_id),
+            CaptureSource::Both => self.audio_system.input_config(&self.selected_device_id),
         };
         match result {
             Ok(config) => {
@@ -638,48 +1225,99 @@ impl XRTranslateApp {
         }
     }
 
-    fn start_selected_capture(&mut self, audio_tx: Sender<Vec<f32>>) -> Result<(), String> {
+    fn start_selected_capture(
+        &mut self,
+        routes: &[CaptureSource],
+        audio_txs: &[Sender<Vec<f32>>],
+    ) -> Result<(), String> {
         self.input_level.store(0.0_f32.to_bits(), Ordering::Relaxed);
-        match self.capture_source {
-            CaptureSource::Microphone => self.audio_system.start_capture(
-                &self.selected_device_id,
-                audio_tx,
-                Arc::clone(&self.input_level),
-            ),
-            CaptureSource::SystemAudio => self.audio_system.start_loopback_capture(
-                &self.selected_loopback_device_id,
-                audio_tx,
-                Arc::clone(&self.input_level),
-            ),
+        self.loopback_level
+            .store(0.0_f32.to_bits(), Ordering::Relaxed);
+        self.microphone_vad_active.store(false, Ordering::Relaxed);
+        self.loopback_vad_active.store(false, Ordering::Relaxed);
+        self.audio_system.stop();
+        for (source, audio_tx) in routes.iter().zip(audio_txs) {
+            let result = match source {
+                CaptureSource::Microphone => self.audio_system.start_capture(
+                    &self.selected_device_id,
+                    audio_tx.clone(),
+                    Arc::clone(&self.input_level),
+                ),
+                CaptureSource::SystemAudio => self.audio_system.start_loopback_capture(
+                    &self.selected_loopback_device_id,
+                    audio_tx.clone(),
+                    Arc::clone(&self.loopback_level),
+                ),
+                CaptureSource::Both => unreachable!("Both expands into individual capture routes"),
+            };
+            if let Err(error) = result {
+                self.audio_system.stop();
+                return Err(error);
+            }
+        }
+        Ok(())
+    }
+
+    fn restart_level_preview(&mut self) {
+        if self.is_translating {
+            return;
+        }
+        self.audio_system.stop();
+        self.input_level.store(0.0_f32.to_bits(), Ordering::Relaxed);
+        self.loopback_level
+            .store(0.0_f32.to_bits(), Ordering::Relaxed);
+        self.microphone_vad_active.store(false, Ordering::Relaxed);
+        self.loopback_vad_active.store(false, Ordering::Relaxed);
+
+        for source in self.capture_source.routes() {
+            let result = match source {
+                CaptureSource::Microphone => self
+                    .audio_system
+                    .start_level_preview(&self.selected_device_id, Arc::clone(&self.input_level)),
+                CaptureSource::SystemAudio => self.audio_system.start_loopback_level_preview(
+                    &self.selected_loopback_device_id,
+                    Arc::clone(&self.loopback_level),
+                ),
+                CaptureSource::Both => unreachable!("Both expands into individual routes"),
+            };
+            if let Err(error) = result {
+                self.audio_system.stop();
+                self.last_error = Some(format!("Audio level preview failed: {error}"));
+                return;
+            }
         }
     }
 
-    fn switch_capture_device(&mut self, previous_device_id: String) {
+    fn switch_capture_device(&mut self, source: CaptureSource, previous_device_id: String) {
         self.refresh_selected_input_config();
         self.save_settings();
         if !self.is_translating {
+            self.restart_level_preview();
             return;
         }
 
-        let Some(audio_tx) = self.audio_tx.clone() else {
+        if self.audio_txs.is_empty() {
             self.last_error = Some("Active audio channel is unavailable".into());
             return;
-        };
-        match self.start_selected_capture(audio_tx.clone()) {
+        }
+        let routes = self.capture_source.routes();
+        let audio_txs = self.audio_txs.clone();
+        match self.start_selected_capture(routes, &audio_txs) {
             Ok(()) => {
                 self.connection_status = "Connected - microphone switched".into();
                 self.last_error = None;
             }
             Err(error) => {
-                match self.capture_source {
+                match source {
                     CaptureSource::Microphone => self.selected_device_id = previous_device_id,
                     CaptureSource::SystemAudio => {
                         self.selected_loopback_device_id = previous_device_id
                     }
+                    CaptureSource::Both => unreachable!("Device selectors use concrete routes"),
                 }
                 self.refresh_selected_input_config();
                 self.save_settings();
-                let rollback_error = self.start_selected_capture(audio_tx).err();
+                let rollback_error = self.start_selected_capture(routes, &audio_txs).err();
                 self.last_error = Some(match rollback_error {
                     Some(rollback_error) => format!(
                         "Could not switch audio device: {error}; could not restore previous device: {rollback_error}"
@@ -696,13 +1334,28 @@ impl XRTranslateApp {
         self.refresh_selected_input_config();
         self.save_settings();
         if !self.is_translating {
+            self.restart_level_preview();
             return;
         }
-        let Some(audio_tx) = self.audio_tx.clone() else {
+        if self.capture_source.routes().len() != previous_source.routes().len() {
+            // Recreate sessions when the route count changes.
+            for session in &self.sessions {
+                session.stop();
+            }
+            self.sessions.clear();
+            self.audio_txs.clear();
+            self.audio_system.stop();
+            self.is_translating = false;
+            self.start_session(None);
+            return;
+        }
+        if self.audio_txs.is_empty() {
             self.last_error = Some("Active audio channel is unavailable".into());
             return;
-        };
-        if let Err(error) = self.start_selected_capture(audio_tx) {
+        }
+        let routes = self.capture_source.routes();
+        let audio_txs = self.audio_txs.clone();
+        if let Err(error) = self.start_selected_capture(routes, &audio_txs) {
             self.capture_source = previous_source;
             self.refresh_selected_input_config();
             self.save_settings();
@@ -710,8 +1363,16 @@ impl XRTranslateApp {
         } else {
             self.connection_status = "Connected - audio source switched".into();
             self.last_error = None;
-            if let Some(session) = &self.session {
-                session.reset_audio_pipeline(self.source_lang.clone(), self.target_lang.clone());
+            for (session, source) in self.sessions.iter().zip(routes) {
+                let recognition = self.recognition_settings(*source);
+                session.reset_audio_pipeline(
+                    self.source_lang.clone(),
+                    self.target_lang.clone(),
+                    *source,
+                    vad_threshold_for_background_noise(recognition.background_noise),
+                    pause_tolerance_to_ms(recognition.pause_tolerance),
+                    recognition.continuous_recognition,
+                );
             }
         }
     }
@@ -723,7 +1384,7 @@ impl XRTranslateApp {
             self.target_lang = "en".into();
         }
         self.save_settings();
-        if let Some(session) = &self.session {
+        for session in &self.sessions {
             session.update_language_route(self.source_lang.clone(), self.target_lang.clone());
         }
     }
@@ -735,7 +1396,7 @@ impl XRTranslateApp {
         if !self.tts_enabled {
             self.audio_system.clear_tts_playback();
         }
-        if let Some(session) = &self.session {
+        for session in &self.sessions {
             session.set_tts_enabled(self.tts_enabled);
         }
     }
@@ -746,7 +1407,7 @@ impl XRTranslateApp {
             && crate::feature_access::is_available(crate::feature_access::Feature::SpeakerNumbers);
         self.speaker_recognition_enabled = enabled;
         self.osc_draft.show_speaker_number = enabled;
-        if let Some(session) = &self.session {
+        for session in &self.sessions {
             session.set_speaker_recognition_enabled(enabled);
         }
         match self.osc_manager.update_settings(self.osc_draft.clone()) {
@@ -772,6 +1433,44 @@ impl XRTranslateApp {
         self.save_settings();
     }
 
+    fn recognition_settings(&self, source: CaptureSource) -> &RecognitionSettings {
+        match source {
+            CaptureSource::Microphone => &self.microphone_recognition,
+            CaptureSource::SystemAudio => &self.loopback_recognition,
+            CaptureSource::Both => unreachable!("Both has one profile per route"),
+        }
+    }
+
+    fn recognition_settings_mut(&mut self, source: CaptureSource) -> &mut RecognitionSettings {
+        match source {
+            CaptureSource::Microphone => &mut self.microphone_recognition,
+            CaptureSource::SystemAudio => &mut self.loopback_recognition,
+            CaptureSource::Both => unreachable!("Both has one profile per route"),
+        }
+    }
+
+    fn set_audio_adaptation(&mut self, source: CaptureSource) {
+        let recognition = self.recognition_settings_mut(source);
+        recognition.background_noise = recognition.background_noise.clamp(0.2, 0.8);
+        recognition.pause_tolerance = recognition.pause_tolerance.clamp(0.0, 1.0);
+        self.save_settings();
+        let recognition = self.recognition_settings(source).clone();
+        let session_index = self
+            .capture_source
+            .routes()
+            .iter()
+            .position(|route| *route == source);
+        if let Some(session) = session_index.and_then(|index| self.sessions.get(index)) {
+            session.update_audio_segmentation(
+                vad_threshold_for_background_noise(recognition.background_noise),
+                pause_tolerance_to_ms(recognition.pause_tolerance),
+                recognition.continuous_recognition,
+                self.source_lang.clone(),
+                self.target_lang.clone(),
+            );
+        }
+    }
+
     pub(crate) fn clear_history(&mut self) {
         self.translations.clear();
         self.recognition_history.clear();
@@ -781,18 +1480,21 @@ impl XRTranslateApp {
             state.recognition_history.clear();
             state.partial_text.clear();
             state.pending_final_asr.clear();
+            state.pending_recognition_windows.clear();
         }
         self.osc_manager.clear_chatbox();
     }
 
     fn stop(&mut self) {
-        if let Some(session) = &self.session {
+        for session in &self.sessions {
             session.stop();
         }
-        self.session = None;
+        self.sessions.clear();
         self.audio_system.stop();
-        self.audio_tx = None;
+        self.audio_txs.clear();
         self.input_level.store(0.0_f32.to_bits(), Ordering::Relaxed);
+        self.loopback_level
+            .store(0.0_f32.to_bits(), Ordering::Relaxed);
         self.osc_manager.clear_chatbox();
         self.is_translating = false;
         self.connection_status = "Stopped".into();
@@ -801,6 +1503,7 @@ impl XRTranslateApp {
             state.connection_status = "Stopped".into();
             state.is_translating = false;
         }
+        self.restart_level_preview();
     }
 
     fn poll_session_events(&mut self) {
@@ -853,6 +1556,14 @@ impl XRTranslateApp {
             }
         }
     }
+}
+
+fn pause_tolerance_to_ms(value: f32) -> u32 {
+    (240.0 + value.clamp(0.0, 1.0) * 960.0).round() as u32
+}
+
+fn vad_threshold_for_background_noise(value: f32) -> f32 {
+    value.clamp(0.2, 0.8)
 }
 
 fn compact_speaker_label(speaker_id: &str) -> Option<String> {
@@ -918,6 +1629,8 @@ impl eframe::App for XRTranslateApp {
                     ui,
                     &mut self.navigation,
                     &mut self.modal_dialog,
+                    &mut self.first_run,
+                    &mut self.onboarding_page,
                     self.ui_language,
                     eased_expand,
                 );
@@ -935,6 +1648,7 @@ impl eframe::App for XRTranslateApp {
                     .inner_margin(egui::Margin::symmetric(24, 20)),
             )
             .show(ui, |ui| {
+                ui::components::sparse_dot_background(ui);
                 egui::ScrollArea::vertical()
                     .id_salt("main_scroll_area")
                     .auto_shrink([false, false])
@@ -978,7 +1692,8 @@ fn main() -> eframe::Result<()> {
 
     let options = eframe::NativeOptions {
         viewport: egui::ViewportBuilder::default()
-            .with_inner_size([960.0, 680.0])
+            .with_inner_size([1080.0, 720.0])
+            .with_min_inner_size([880.0, 600.0])
             .with_icon(
                 eframe::icon_data::from_png_bytes(include_bytes!(
                     "../resources/branding/xrtranslate-logo.png"
@@ -1043,7 +1758,54 @@ fn configure_cjk_fonts(ctx: &egui::Context) {
 
 #[cfg(test)]
 mod tests {
-    use super::compact_speaker_label;
+    use super::{
+        CaptureSource, PendingRecognitionWindow, RecognitionHistoryEntry, TranslationHistoryEntry,
+        collect_recognition_window, compact_speaker_label, merge_stream_recognition,
+        merge_stream_translation, vad_threshold_for_background_noise,
+    };
+
+    fn fragment(stream_id: u64, source: &str, translated: &str) -> TranslationHistoryEntry {
+        TranslationHistoryEntry {
+            stream_id: Some(stream_id),
+            audio_source: CaptureSource::Microphone,
+            live: true,
+            source: source.into(),
+            translated: translated.into(),
+            speaker_id: String::new(),
+            source_start_ms: 0.0,
+            source_end_ms: 1.0,
+            term_matches: Vec::new(),
+            revisable: false,
+            overlap_ratio: 0.0,
+            source_revision: None,
+            translated_revision: None,
+        }
+    }
+
+    fn snapshot(stream_id: u64, source: &str, translated: &str) -> TranslationHistoryEntry {
+        TranslationHistoryEntry {
+            revisable: true,
+            overlap_ratio: 0.34,
+            ..fragment(stream_id, source, translated)
+        }
+    }
+
+    fn recognition_snapshot(stream_id: u64, turn_id: &str, text: &str) -> RecognitionHistoryEntry {
+        RecognitionHistoryEntry {
+            stream_id: Some(stream_id),
+            live: true,
+            text: text.into(),
+            turn_id: turn_id.into(),
+            speaker_id: String::new(),
+            source_start_ms: 0.0,
+            source_end_ms: 1_000.0,
+            activation_matches: Vec::new(),
+            context_matches: Vec::new(),
+            revisable: true,
+            overlap_ratio: 0.34,
+            revision: None,
+        }
+    }
 
     #[test]
     fn compact_speaker_labels_are_stable_and_human_readable() {
@@ -1054,5 +1816,147 @@ mod tests {
             Some("S?")
         );
         assert_eq!(compact_speaker_label(""), None);
+    }
+
+    #[test]
+    fn noisier_environment_uses_a_stricter_vad_threshold() {
+        let quiet = vad_threshold_for_background_noise(0.2);
+        let medium = vad_threshold_for_background_noise(0.5);
+        let noisy = vad_threshold_for_background_noise(0.8);
+
+        assert!(quiet < medium);
+        assert!(medium < noisy);
+    }
+
+    #[test]
+    fn streaming_translation_updates_each_audio_source_in_place() {
+        let mut history = Vec::new();
+        merge_stream_translation(&mut history, 1, fragment(1, "Hello", "你好"));
+        merge_stream_translation(&mut history, 2, fragment(2, "Music", "音乐"));
+        let microphone =
+            merge_stream_translation(&mut history, 1, fragment(1, "world", "你好世界"));
+
+        assert_eq!(history.len(), 2);
+        assert_eq!(microphone.entry.source, "Hello world");
+        assert_eq!(microphone.entry.translated, "你好世界");
+        assert_eq!(history[1].source, "Music");
+    }
+
+    #[test]
+    fn streaming_translation_rolls_a_finished_caption_into_history() {
+        let mut history = Vec::new();
+        let mut first = fragment(
+            1,
+            "This is a complete first sentence with enough stable words to roll cleanly.",
+            "这是完整的第一句。",
+        );
+        first.source_end_ms = 4_000.0;
+        merge_stream_translation(&mut history, 1, first);
+        let mut next = fragment(1, "Next", "下一句");
+        next.source_start_ms = 4_000.0;
+        next.source_end_ms = 5_000.0;
+        let update = merge_stream_translation(&mut history, 1, next);
+
+        assert!(update.rolled_over);
+        assert_eq!(history.len(), 2);
+        assert!(!history[0].live);
+        assert!(history[1].live);
+    }
+
+    #[test]
+    fn revisable_windows_replace_the_unstable_tail() {
+        let mut history = Vec::new();
+        merge_stream_translation(
+            &mut history,
+            1,
+            snapshot(1, "we walk across the central street", "我们走过中央大街"),
+        );
+        let update = merge_stream_translation(
+            &mut history,
+            1,
+            snapshot(1, "the central station and turn left", "中央车站然后左转"),
+        );
+
+        assert_eq!(
+            update.entry.source,
+            "we walk across the central station and turn left"
+        );
+        assert_eq!(update.entry.translated, "我们走过中央车站然后左转");
+        assert_eq!(history.len(), 1);
+    }
+
+    #[test]
+    fn provisional_window_punctuation_does_not_roll_a_live_caption() {
+        let mut history = Vec::new();
+        let mut first = snapshot(1, "A short provisional sentence.", "一个临时短句。");
+        first.source_end_ms = 2_000.0;
+        merge_stream_translation(&mut history, 1, first);
+
+        let mut next = snapshot(1, "provisional sentence continues here", "临时短句仍在继续");
+        next.source_start_ms = 1_000.0;
+        next.source_end_ms = 5_000.0;
+        let update = merge_stream_translation(&mut history, 1, next);
+
+        assert!(!update.rolled_over);
+        assert_eq!(history.len(), 1);
+    }
+
+    #[test]
+    fn caption_rollover_consumes_the_shared_window_prefix() {
+        let mut history = Vec::new();
+        let mut first = snapshot(
+            1,
+            "I frown, but you use it to end the sentence with a period.",
+            "I frown, but you use it to end the sentence with a period.",
+        );
+        first.source_end_ms = 4_000.0;
+        merge_stream_translation(&mut history, 1, first);
+
+        let mut next = snapshot(
+            1,
+            "use it to end the sentence with a period. I can only say I admit it.",
+            "use it to end the sentence with a period. I can only say I admit it.",
+        );
+        next.source_start_ms = 2_500.0;
+        next.source_end_ms = 5_500.0;
+        let update = merge_stream_translation(&mut history, 1, next);
+
+        assert!(update.rolled_over);
+        assert_eq!(history.len(), 2);
+        assert_eq!(history[1].source, "I can only say I admit it.");
+        assert_eq!(history[1].translated, "I can only say I admit it.");
+    }
+
+    #[test]
+    fn recognition_window_combines_all_segments_before_display() {
+        let mut pending = Vec::<PendingRecognitionWindow>::new();
+        let second = recognition_snapshot(7, "turn-1", "我的台词全念一遍。");
+        let first = recognition_snapshot(7, "turn-1", "准备好的台词。");
+
+        assert!(collect_recognition_window(&mut pending, 7, true, 2, 2, second).is_none());
+        let combined = collect_recognition_window(&mut pending, 7, true, 1, 2, first).unwrap();
+
+        assert_eq!(combined.text, "准备好的台词。我的台词全念一遍。");
+        assert!(pending.is_empty());
+    }
+
+    #[test]
+    fn recognition_history_revises_the_shared_audio_window_in_place() {
+        let mut history = Vec::new();
+        merge_stream_recognition(
+            &mut history,
+            7,
+            recognition_snapshot(7, "turn-1", "你停在了这条我们熟悉的街。"),
+        );
+        let mut next = recognition_snapshot(7, "turn-2", "熟悉的街。然后继续向前走。");
+        next.source_start_ms = 1_000.0;
+        next.source_end_ms = 3_000.0;
+        merge_stream_recognition(&mut history, 7, next);
+
+        assert_eq!(history.len(), 1);
+        assert_eq!(
+            history[0].text,
+            "你停在了这条我们熟悉的街。然后继续向前走。"
+        );
     }
 }

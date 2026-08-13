@@ -125,7 +125,7 @@ impl ServiceConfigEditor {
         model_tasks: &mut crate::model_install::NativeModelTaskManager,
         project_root: &std::path::Path,
         language: crate::i18n::UiLanguage,
-    ) {
+    ) -> bool {
         use crate::ui::components::{self, section};
         use eframe::egui;
 
@@ -137,12 +137,13 @@ impl ServiceConfigEditor {
         );
         ui.add_space(14.0);
 
-        if model_tasks.needs_discovery() {
-            if let Err(error) = model_tasks.discover_existing(project_root.to_path_buf()) {
-                self.message = Some(error);
-            }
+        if model_tasks.needs_discovery()
+            && let Err(error) = model_tasks.discover_existing(project_root.to_path_buf())
+        {
+            self.message = Some(error);
         }
 
+        let mut apply_runtime_config = false;
         for cat_idx in 0..self.categories.len() {
             let category_title = crate::i18n::tr(language, self.categories[cat_idx].title);
             let category_key = self.categories[cat_idx].key;
@@ -254,11 +255,13 @@ impl ServiceConfigEditor {
                                             ui,
                                             backend,
                                             model_tasks,
-                                            project_root,
-                                            language,
-                                            category_key,
-                                            &provider_name,
-                                            model_asset.as_deref(),
+                                            ProviderModelAction {
+                                                project_root,
+                                                language,
+                                                category_key,
+                                                provider_name: &provider_name,
+                                                model_asset: model_asset.as_deref(),
+                                            },
                                         ) {
                                             self.message = Some(message);
                                         }
@@ -349,11 +352,13 @@ impl ServiceConfigEditor {
                                 ui,
                                 backend,
                                 model_tasks,
-                                project_root,
-                                language,
-                                category_key,
-                                &provider_name,
-                                model_asset.as_deref(),
+                                ProviderModelAction {
+                                    project_root,
+                                    language,
+                                    category_key,
+                                    provider_name: &provider_name,
+                                    model_asset: model_asset.as_deref(),
+                                },
                             ) {
                                 self.message = Some(message);
                             }
@@ -419,23 +424,18 @@ impl ServiceConfigEditor {
             if save.clicked() {
                 match self.save() {
                     Ok(()) => {
-                        // Apply runtime changes on the next translation session.
-                        backend.shutdown();
+                        apply_runtime_config = true;
                         self.message = Some(
-                            crate::i18n::tr(
-                                language,
-                                "Saved. Start translation again to apply model settings.",
-                            )
-                            .to_owned(),
+                            crate::i18n::tr(language, "Saved. Applying model settings.").to_owned(),
                         )
                     }
                     Err(error) => self.message = Some(error),
                 }
             }
-            if components::animated_button(ui, crate::i18n::tr(language, "Reload")).clicked() {
-                if let Err(error) = self.reload() {
-                    self.message = Some(error);
-                }
+            if components::animated_button(ui, crate::i18n::tr(language, "Reload")).clicked()
+                && let Err(error) = self.reload()
+            {
+                self.message = Some(error);
             }
             if self.dirty {
                 ui.label(
@@ -453,6 +453,7 @@ impl ServiceConfigEditor {
                     .size(12.0),
             );
         }
+        apply_runtime_config
     }
 
     fn save(&mut self) -> Result<(), String> {
@@ -509,34 +510,38 @@ fn provider_model_asset(provider: &ProviderCard) -> Option<String> {
 /// Renders the same model lifecycle control inside every provider card that
 /// declares a `model_asset`. The provider configuration, rather than a model
 /// name in the UI, decides which package is offered.
+struct ProviderModelAction<'a> {
+    project_root: &'a std::path::Path,
+    language: crate::i18n::UiLanguage,
+    category_key: &'a str,
+    provider_name: &'a str,
+    model_asset: Option<&'a str>,
+}
+
 fn render_provider_model_action(
     ui: &mut eframe::egui::Ui,
     backend: &mut crate::backend::BackendManager,
     model_tasks: &mut crate::model_install::NativeModelTaskManager,
-    project_root: &std::path::Path,
-    language: crate::i18n::UiLanguage,
-    category_key: &str,
-    provider_name: &str,
-    model_asset: Option<&str>,
+    request: ProviderModelAction<'_>,
 ) -> Option<String> {
     use crate::model_install::{NativeModelTaskState, model_package_for_config_key};
     use eframe::egui;
 
-    let Some(model_asset) = model_asset else {
+    let Some(model_asset) = request.model_asset else {
         return crate::ui::components::animated_button(
             ui,
-            crate::i18n::tr(language, "Check model files"),
+            crate::i18n::tr(request.language, "Check model files"),
         )
         .clicked()
-        .then(
-            || match backend.check_model_files(category_key, provider_name) {
+        .then(|| {
+            match backend.check_model_files(request.category_key, request.provider_name) {
                 Ok(message) => message,
                 Err(error) => error,
-            },
-        );
+            }
+        });
     };
 
-    let package = match model_package_for_config_key(project_root, model_asset) {
+    let package = match model_package_for_config_key(request.project_root, model_asset) {
         Ok(package) => package,
         Err(error) => return Some(error),
     };
@@ -552,11 +557,11 @@ fn render_provider_model_action(
         "Download"
     };
     let action_label = if present {
-        crate::i18n::tr(language, action).to_owned()
+        crate::i18n::tr(request.language, action).to_owned()
     } else {
         format!(
             "{} · {}",
-            crate::i18n::tr(language, action),
+            crate::i18n::tr(request.language, action),
             components::format_file_size(package.download_bytes),
         )
     };
@@ -566,7 +571,7 @@ fn render_provider_model_action(
         .clicked();
     if clicked {
         return model_tasks
-            .install(project_root.to_path_buf(), package.id)
+            .install(request.project_root.to_path_buf(), package.id)
             .err();
     }
 
@@ -606,7 +611,7 @@ fn render_provider_model_action(
     };
     if let Some(status) = status {
         ui.label(
-            egui::RichText::new(crate::i18n::tr(language, status))
+            egui::RichText::new(crate::i18n::tr(request.language, status))
                 .size(11.0)
                 .color(if ready {
                     egui::Color32::from_rgb(5, 150, 105)

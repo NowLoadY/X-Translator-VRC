@@ -31,6 +31,10 @@ impl Default for Qwen3AsrOptions {
 /// A completed Qwen3-ASR transcription.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct AsrTranscript {
+    /// Language label emitted by Qwen3-ASR. Forced requests retain their
+    /// requested language even though llama.cpp only returns generated suffix
+    /// tokens and therefore omits the prefilled language marker.
+    pub language: Option<String>,
     pub text: String,
 }
 
@@ -106,8 +110,10 @@ impl<C: AsyncHttpClient> Qwen3AsrAdapter<C> {
             options.max_tokens,
         );
         let completion = self.chat.chat_completion(payload).await?;
-        let text = clean_asr_text(&completion.text);
-        Ok(AsrTranscript { text })
+        Ok(parse_asr_transcript(
+            &completion.text,
+            normalized_optional(&options.language),
+        ))
     }
 }
 
@@ -209,11 +215,22 @@ fn is_logographic_or_syllabic(character: char) -> bool {
     )
 }
 
-fn clean_asr_text(text: &str) -> String {
-    let text = text
-        .rsplit_once("<asr_text>")
-        .map_or(text, |(_, transcript)| transcript);
-    remove_completion_markers(text)
+fn parse_asr_transcript(text: &str, forced_language: Option<&str>) -> AsrTranscript {
+    let (detected_language, transcript) = text.rsplit_once("<asr_text>").map_or_else(
+        || (None, text),
+        |(metadata, transcript)| {
+            let language = metadata
+                .trim()
+                .strip_prefix("language ")
+                .map(str::trim)
+                .filter(|language| !language.is_empty() && !language.eq_ignore_ascii_case("none"));
+            (language, transcript)
+        },
+    );
+    AsrTranscript {
+        language: detected_language.or(forced_language).map(str::to_owned),
+        text: remove_completion_markers(transcript),
+    }
 }
 
 #[cfg(test)]
@@ -271,6 +288,7 @@ mod tests {
             .unwrap();
 
         assert_eq!(result.text, "Hello");
+        assert_eq!(result.language.as_deref(), Some("English"));
         let http = adapter.chat.into_inner();
         let request = http.requests.lock().unwrap().pop().unwrap();
         assert_eq!(request.method, "POST");
@@ -336,7 +354,24 @@ mod tests {
     fn qwen3_marker_only_output_becomes_an_empty_transcript() {
         // A silent audio smoke test on llama.cpp returns this prefix without
         // transcript content. It must not become an OSC subtitle.
-        assert_eq!(clean_asr_text("language None<asr_text>"), "");
+        assert_eq!(
+            parse_asr_transcript("language None<asr_text>", None),
+            AsrTranscript {
+                language: None,
+                text: String::new(),
+            }
+        );
+    }
+
+    #[test]
+    fn forced_language_is_retained_when_completion_only_contains_text() {
+        assert_eq!(
+            parse_asr_transcript("こんにちは", Some("Japanese")),
+            AsrTranscript {
+                language: Some("Japanese".into()),
+                text: "こんにちは".into(),
+            }
+        );
     }
 
     #[test]

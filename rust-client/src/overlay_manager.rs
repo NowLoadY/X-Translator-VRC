@@ -35,7 +35,7 @@ impl OverlayManager {
         };
 
         info!("Starting overlay process...");
-        let mut child = match Command::new(exe)
+        let mut child = match crate::child_process::hide_console(&mut Command::new(exe))
             .arg("--overlay")
             .stdin(Stdio::piped())
             .stdout(Stdio::piped())
@@ -94,14 +94,13 @@ impl OverlayManager {
     }
 
     pub fn send_state(&mut self, state: &OverlayState) {
-        if let Some(stdin) = &mut self.stdin {
-            if let Ok(json) = serde_json::to_string(state) {
-                if let Err(e) = writeln!(stdin, "{}", json) {
-                    warn!("Failed to write to overlay stdin: {}", e);
-                    // Child probably died, clean up
-                    self.stop();
-                }
-            }
+        if let Some(stdin) = &mut self.stdin
+            && let Ok(json) = serde_json::to_string(state)
+            && let Err(e) = writeln!(stdin, "{}", json)
+        {
+            warn!("Failed to write to overlay stdin: {}", e);
+            // Child probably died, clean up
+            self.stop();
         }
     }
 

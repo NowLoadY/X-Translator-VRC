@@ -85,7 +85,7 @@ pub fn run_native_overlay() {
             let hwnd = HWND(hwnd_raw as *mut _);
             let stdin = std::io::stdin();
             let reader = BufReader::new(stdin.lock());
-            for line in reader.lines().flatten() {
+            for line in reader.lines().map_while(|line| line.ok()) {
                 if let Ok(new_state) = serde_json::from_str::<OverlayState>(&line) {
                     if let Ok(mut state_guard) = STATE.lock() {
                         *state_guard = Some(new_state);
@@ -114,6 +114,7 @@ struct RenderResources {
     render_target: Option<ID2D1HwndRenderTarget>,
     brush_header_bg: Option<ID2D1SolidColorBrush>,
     brush_card_bg: Option<ID2D1SolidColorBrush>,
+    brush_active_card_bg: Option<ID2D1SolidColorBrush>,
     brush_live_bg: Option<ID2D1SolidColorBrush>,
     brush_text_white: Option<ID2D1SolidColorBrush>,
     brush_text_gray: Option<ID2D1SolidColorBrush>,
@@ -137,6 +138,7 @@ impl RenderResources {
                 render_target: None,
                 brush_header_bg: None,
                 brush_card_bg: None,
+                brush_active_card_bg: None,
                 brush_live_bg: None,
                 brush_text_white: None,
                 brush_text_gray: None,
@@ -196,10 +198,19 @@ impl RenderResources {
             )?;
             let brush_card_bg = target.CreateSolidColorBrush(
                 &D2D1_COLOR_F {
-                    r: 0.10,
-                    g: 0.11,
-                    b: 0.14,
+                    r: 0.14,
+                    g: 0.15,
+                    b: 0.18,
                     a: 0.85,
+                },
+                None,
+            )?;
+            let brush_active_card_bg = target.CreateSolidColorBrush(
+                &D2D1_COLOR_F {
+                    r: 0.10,
+                    g: 0.24,
+                    b: 0.16,
+                    a: 0.88,
                 },
                 None,
             )?;
@@ -284,6 +295,7 @@ impl RenderResources {
             self.render_target = Some(target);
             self.brush_header_bg = Some(brush_header_bg);
             self.brush_card_bg = Some(brush_card_bg);
+            self.brush_active_card_bg = Some(brush_active_card_bg);
             self.brush_live_bg = Some(brush_live_bg);
             self.brush_text_white = Some(brush_text_white);
             self.brush_text_gray = Some(brush_text_gray);
@@ -308,22 +320,21 @@ unsafe extern "system" fn wnd_proc(
 ) -> LRESULT {
     match msg {
         WM_CREATE => {
-            if let Ok(res) = RenderResources::new() {
-                if let Ok(mut guard) = RESOURCES.lock() {
-                    *guard = Some(res);
-                }
+            if let Ok(res) = RenderResources::new()
+                && let Ok(mut guard) = RESOURCES.lock()
+            {
+                *guard = Some(res);
             }
             LRESULT(0)
         }
         WM_SIZE => {
-            if let Ok(mut guard) = RESOURCES.lock() {
-                if let Some(res) = guard.as_mut() {
-                    if let Some(target) = &res.render_target {
-                        let width = (lparam.0 & 0xFFFF) as u32;
-                        let height = ((lparam.0 >> 16) & 0xFFFF) as u32;
-                        let _ = unsafe { target.Resize(&D2D_SIZE_U { width, height }) };
-                    }
-                }
+            if let Ok(mut guard) = RESOURCES.lock()
+                && let Some(res) = guard.as_mut()
+                && let Some(target) = &res.render_target
+            {
+                let width = (lparam.0 & 0xFFFF) as u32;
+                let height = ((lparam.0 >> 16) & 0xFFFF) as u32;
+                let _ = unsafe { target.Resize(&D2D_SIZE_U { width, height }) };
             }
             LRESULT(0)
         }
@@ -382,7 +393,7 @@ fn handle_click(hwnd: HWND, x: f32, y: f32) {
     let width = (rect.right - rect.left) as f32;
 
     // Header buttons (Y: 4..28)
-    if y >= 4.0 && y <= 28.0 {
+    if (4.0..=28.0).contains(&y) {
         // Close button (Top right: width-28 .. width-8)
         if x >= width - 28.0 && x <= width - 8.0 {
             send_event(&OverlayEvent::CloseRequested);
@@ -394,26 +405,23 @@ fn handle_click(hwnd: HWND, x: f32, y: f32) {
 
         // Plus button (Top right: width-60 .. width-40)
         if x >= width - 60.0 && x <= width - 40.0 {
-            if let Ok(state_guard) = STATE.lock() {
-                if let Some(state) = state_guard.as_ref() {
-                    if state.max_items < 10 {
-                        send_event(&OverlayEvent::MaxCountChanged(state.max_items + 1));
-                    }
-                }
+            if let Ok(state_guard) = STATE.lock()
+                && let Some(state) = state_guard.as_ref()
+                && state.max_items < 10
+            {
+                send_event(&OverlayEvent::MaxCountChanged(state.max_items + 1));
             }
             return;
         }
 
         // Minus button (Top right: width-110 .. width-90)
-        if x >= width - 110.0 && x <= width - 90.0 {
-            if let Ok(state_guard) = STATE.lock() {
-                if let Some(state) = state_guard.as_ref() {
-                    if state.max_items > 1 {
-                        send_event(&OverlayEvent::MaxCountChanged(state.max_items - 1));
-                    }
-                }
-            }
-            return;
+        if x >= width - 110.0
+            && x <= width - 90.0
+            && let Ok(state_guard) = STATE.lock()
+            && let Some(state) = state_guard.as_ref()
+            && state.max_items > 1
+        {
+            send_event(&OverlayEvent::MaxCountChanged(state.max_items - 1));
         }
     }
 }
@@ -464,14 +472,14 @@ fn adjust_window_height_if_needed(hwnd: HWND) {
         if state.visible_entries.is_empty() && state.partial_text.is_none() {
             curr_y += 36.0 + 6.0;
         } else {
-            for (src, translated) in &state.visible_entries {
+            for entry in &state.visible_entries {
                 let h_src = if let Some(format) = &res.text_format_sub {
-                    measure_text_height(&res.dwrite_factory, src, format, max_text_w)
+                    measure_text_height(&res.dwrite_factory, &entry.source, format, max_text_w)
                 } else {
                     0.0
                 };
                 let h_trans = if let Some(format) = &res.text_format_body {
-                    measure_text_height(&res.dwrite_factory, translated, format, max_text_w)
+                    measure_text_height(&res.dwrite_factory, &entry.translated, format, max_text_w)
                 } else {
                     0.0
                 };
@@ -497,7 +505,7 @@ fn adjust_window_height_if_needed(hwnd: HWND) {
             }
         }
 
-        ((curr_y + 8.0) as i32).max(120).min(900)
+        ((curr_y + 8.0) as i32).clamp(120, 900)
     };
 
     unsafe {
@@ -743,7 +751,12 @@ fn draw_overlay(hwnd: HWND) {
                     radiusX: 8.0,
                     radiusY: 8.0,
                 };
-                if let Some(brush) = &res.brush_card_bg {
+                let card_brush = if state.vad_active {
+                    &res.brush_active_card_bg
+                } else {
+                    &res.brush_card_bg
+                };
+                if let Some(brush) = card_brush {
                     target.FillRoundedRectangle(&card_rect, brush);
                 }
                 if let (Some(brush_txt), Some(format)) = (&res.brush_text_sub, &res.text_format_sub)
@@ -766,9 +779,14 @@ fn draw_overlay(hwnd: HWND) {
                 let _ = card_h;
             } else {
                 // Render finished history items with dynamic DirectWrite height calculation
-                for (src, translated) in &state.visible_entries {
+                for entry in &state.visible_entries {
                     let layout_src = if let Some(format) = &res.text_format_sub {
-                        measure_and_create_layout(&res.dwrite_factory, src, format, max_text_w)
+                        measure_and_create_layout(
+                            &res.dwrite_factory,
+                            &entry.source,
+                            format,
+                            max_text_w,
+                        )
                     } else {
                         None
                     };
@@ -776,7 +794,7 @@ fn draw_overlay(hwnd: HWND) {
                     let layout_trans = if let Some(format) = &res.text_format_body {
                         measure_and_create_layout(
                             &res.dwrite_factory,
-                            translated,
+                            &entry.translated,
                             format,
                             max_text_w,
                         )
@@ -807,7 +825,12 @@ fn draw_overlay(hwnd: HWND) {
                         radiusY: 8.0,
                     };
 
-                    if let Some(brush) = &res.brush_card_bg {
+                    let card_brush = if entry.vad_active && entry.live {
+                        &res.brush_active_card_bg
+                    } else {
+                        &res.brush_card_bg
+                    };
+                    if let Some(brush) = card_brush {
                         target.FillRoundedRectangle(&card_rect, brush);
                     }
 
@@ -867,7 +890,12 @@ fn draw_overlay(hwnd: HWND) {
                         radiusY: 8.0,
                     };
 
-                    if let Some(brush) = &res.brush_live_bg {
+                    let live_brush = if state.vad_active {
+                        &res.brush_active_card_bg
+                    } else {
+                        &res.brush_live_bg
+                    };
+                    if let Some(brush) = live_brush {
                         target.FillRoundedRectangle(&card_rect, brush);
                     }
 
