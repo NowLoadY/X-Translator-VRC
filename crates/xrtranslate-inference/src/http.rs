@@ -54,6 +54,9 @@ impl ReqwestClient {
     pub fn new(timeout: Duration) -> Result<Self, TransportError> {
         reqwest::Client::builder()
             .timeout(timeout)
+            .pool_idle_timeout(Duration::from_secs(3))
+            .tcp_keepalive(Duration::from_secs(5))
+            .tcp_nodelay(true)
             .build()
             .map(|client| Self { client })
             .map_err(|error| TransportError::new("client", error.to_string()))
@@ -70,6 +73,9 @@ impl ReqwestClient {
         reqwest::Client::builder()
             .no_proxy()
             .timeout(timeout)
+            .pool_idle_timeout(Duration::from_secs(3))
+            .tcp_keepalive(Duration::from_secs(5))
+            .tcp_nodelay(true)
             .build()
             .map(|client| Self { client })
             .map_err(|error| TransportError::new("client", error.to_string()))
@@ -96,23 +102,42 @@ impl AsyncHttpClient for ReqwestClient {
     async fn execute(&self, request: HttpRequest) -> Result<HttpResponse, TransportError> {
         let method = Method::from_bytes(request.method.as_bytes())
             .map_err(|error| TransportError::new("method", error.to_string()))?;
-        let mut builder = self
-            .client
-            .request(method, &request.url)
-            .json(&request.body);
-        for (name, value) in request.headers {
-            builder = builder.header(name, value);
+
+        const MAX_ATTEMPTS: usize = 3;
+        let mut last_error = None;
+
+        for attempt in 0..MAX_ATTEMPTS {
+            let mut builder = self.client.request(method.clone(), &request.url);
+            if !request.body.is_null() {
+                builder = builder.json(&request.body);
+            }
+            for (name, value) in &request.headers {
+                builder = builder.header(name, value);
+            }
+
+            match builder.send().await {
+                Ok(response) => {
+                    let status = response.status().as_u16();
+                    let body = response
+                        .text()
+                        .await
+                        .map_err(|error| TransportError::new("response_body", error.to_string()))?;
+                    return Ok(HttpResponse { status, body });
+                }
+                Err(error) => {
+                    let kind = request_error_kind(&error);
+                    let should_retry = attempt + 1 < MAX_ATTEMPTS
+                        && (error.is_connect() || error.is_request());
+                    last_error = Some(TransportError::new(kind, error.to_string()));
+                    if !should_retry {
+                        break;
+                    }
+                    tokio::time::sleep(Duration::from_millis(25 * (1 << attempt))).await;
+                }
+            }
         }
-        let response = builder
-            .send()
-            .await
-            .map_err(|error| TransportError::new(request_error_kind(&error), error.to_string()))?;
-        let status = response.status().as_u16();
-        let body = response
-            .text()
-            .await
-            .map_err(|error| TransportError::new("response_body", error.to_string()))?;
-        Ok(HttpResponse { status, body })
+
+        Err(last_error.unwrap_or_else(|| TransportError::new("transport", "request failed")))
     }
 }
 
@@ -125,5 +150,42 @@ fn request_error_kind(error: &reqwest::Error) -> &'static str {
         "request"
     } else {
         "http"
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+    use tokio::net::TcpListener;
+
+    #[tokio::test]
+    async fn reqwest_retries_on_connection_reset_or_drop() {
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let port = listener.local_addr().unwrap().port();
+        let url = format!("http://127.0.0.1:{port}/test");
+
+        tokio::spawn(async move {
+            if let Ok((mut socket, _)) = listener.accept().await {
+                let mut buf = [0u8; 1024];
+                let _ = socket.read(&mut buf).await;
+                drop(socket);
+            }
+            if let Ok((mut socket, _)) = listener.accept().await {
+                let mut buf = [0u8; 1024];
+                let _ = socket.read(&mut buf).await;
+                let response = "HTTP/1.1 200 OK\r\nContent-Length: 15\r\nContent-Type: application/json\r\n\r\n{\"status\":\"ok\"}";
+                let _ = socket.write_all(response.as_bytes()).await;
+            }
+        });
+
+        let client = ReqwestClient::new_direct(Duration::from_secs(5)).unwrap();
+        let response = client
+            .execute(HttpRequest::post_json(url, serde_json::json!({"test": 1})))
+            .await
+            .unwrap();
+
+        assert_eq!(response.status, 200);
+        assert_eq!(response.body, "{\"status\":\"ok\"}");
     }
 }
