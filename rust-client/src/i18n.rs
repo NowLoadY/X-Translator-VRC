@@ -105,6 +105,13 @@ pub fn tr_dynamic<'a>(language: UiLanguage, english: &'a str) -> Cow<'a, str> {
 
 /// Consolidated single-source-of-truth dictionary: `(English Key, Chinese (zh), Japanese (ja), Korean (ko), Russian (ru))`
 const DICTIONARY: &[(&str, &str, &str, &str, &str)] = &[
+    (
+        "Meeting notes",
+        "会议记录",
+        "会議記録",
+        "회의 기록",
+        "Протоколы встреч",
+    ),
     ("Level", "级别", "レベル", "등급", "Уровень"),
     ("normal", "普通", "標準", "일반", "обычный"),
     ("big", "大型", "大", "대형", "большой"),

@@ -1,0 +1,266 @@
+//! Ordered, non-blocking ingestion of host session events.
+//!
+//! The host event pump must stay responsive, so SQLite work is serialized on
+//! this plugin-owned worker. Finish/fail commands share the same queue as
+//! segment upserts, guaranteeing that terminal state is committed only after
+//! all previously observed transcript events.
+
+use super::controller::SharedMeetingCapture;
+use crossbeam_channel::{Sender, unbounded};
+use rust_client::{MeetingStore, NewSegment, SegmentSource};
+use std::sync::Arc;
+
+#[derive(Clone, Copy, Debug)]
+pub enum MeetingSegmentSource {
+    Microphone,
+    SystemAudio,
+}
+
+#[derive(Clone, Debug)]
+pub struct MeetingSegmentEvent {
+    pub source: MeetingSegmentSource,
+    pub turn_id: String,
+    pub segment_index: u32,
+    pub source_text: String,
+    pub translated_text: Option<String>,
+    pub raw_speaker_id: String,
+    pub source_start_ms: f64,
+    pub source_end_ms: f64,
+    pub is_final: bool,
+}
+
+enum Command {
+    Segment(MeetingSegmentEvent),
+    FinishActive,
+    FailActive(String),
+    #[cfg(test)]
+    Flush(Sender<()>),
+}
+
+#[derive(Clone)]
+pub struct MeetingEventSink {
+    tx: Sender<Command>,
+    active: SharedMeetingCapture,
+}
+
+impl MeetingEventSink {
+    pub fn start(store: Arc<MeetingStore>, active: SharedMeetingCapture) -> Self {
+        let (tx, rx) = unbounded();
+        let worker_active = Arc::clone(&active);
+        std::thread::Builder::new()
+            .name("meeting-event-store".into())
+            .spawn(move || {
+                while let Ok(command) = rx.recv() {
+                    match command {
+                        Command::Segment(event) => persist_segment(&store, &worker_active, event),
+                        Command::FinishActive => finish_active(&store, &worker_active),
+                        Command::FailActive(error) => fail_active(&store, &worker_active, error),
+                        #[cfg(test)]
+                        Command::Flush(done) => {
+                            let _ = done.send(());
+                        }
+                    }
+                }
+            })
+            .expect("failed to start meeting event store");
+        Self { tx, active }
+    }
+
+    pub fn persist(&self, event: MeetingSegmentEvent) {
+        let _ = self.tx.send(Command::Segment(event));
+    }
+
+    pub fn finish_active(&self) {
+        let _ = self.tx.send(Command::FinishActive);
+    }
+
+    pub fn fail_active(&self, error: impl Into<String>) {
+        let _ = self.tx.send(Command::FailActive(error.into()));
+    }
+
+    pub fn active_is_imported(&self) -> bool {
+        self.active
+            .lock()
+            .ok()
+            .and_then(|capture| capture.as_ref().map(|capture| capture.imported_audio))
+            .unwrap_or(false)
+    }
+
+    #[cfg(test)]
+    fn flush(&self) {
+        let (done_tx, done_rx) = crossbeam_channel::bounded(1);
+        self.tx.send(Command::Flush(done_tx)).unwrap();
+        done_rx.recv().unwrap();
+    }
+}
+
+fn persist_segment(
+    store: &MeetingStore,
+    active: &SharedMeetingCapture,
+    event: MeetingSegmentEvent,
+) {
+    let capture = active.lock().ok().and_then(|capture| capture.clone());
+    let Some(capture) = capture else {
+        return;
+    };
+    let source = if capture.imported_audio {
+        SegmentSource::ImportedAudio
+    } else {
+        match event.source {
+            MeetingSegmentSource::Microphone => SegmentSource::Microphone,
+            MeetingSegmentSource::SystemAudio => SegmentSource::SystemAudio,
+        }
+    };
+    let source_key = if capture.imported_audio {
+        "import"
+    } else {
+        match event.source {
+            MeetingSegmentSource::Microphone => "mic",
+            MeetingSegmentSource::SystemAudio => "system",
+        }
+    };
+    let speaker_token = (!event.raw_speaker_id.trim().is_empty())
+        .then(|| format!("{source_key}:{}", event.raw_speaker_id.trim()));
+    let external_key = format!(
+        "{}:{source_key}:{}:{}:{}",
+        capture.recognition_run_id,
+        if event.turn_id.is_empty() {
+            "turn"
+        } else {
+            &event.turn_id
+        },
+        event.source_start_ms.max(0.0).round() as i64,
+        event.segment_index,
+    );
+    let segment = NewSegment {
+        meeting_id: capture.meeting_id.clone(),
+        external_key,
+        topic_id: capture.topic_id.clone(),
+        original_text: event.source_text,
+        translated_text: event.translated_text,
+        start_ms: capture.timeline_offset_ms + event.source_start_ms.max(0.0).round() as i64,
+        end_ms: capture.timeline_offset_ms
+            + event.source_end_ms.max(event.source_start_ms).round() as i64,
+        source,
+        recognition_run_id: capture.recognition_run_id.clone(),
+        speaker_token: speaker_token.clone(),
+        is_final: event.is_final,
+    };
+    if let Err(error) = store.upsert_segment(segment) {
+        log::error!("Could not persist meeting segment: {error}");
+        return;
+    }
+    if let Some(token) = speaker_token {
+        let suggested = speaker_label(&event.raw_speaker_id)
+            .map(|label| format!("{label} · automatic"))
+            .unwrap_or_else(|| "Automatic speaker".into());
+        if let Err(error) = store.assign_speaker_token(
+            &capture.meeting_id,
+            &capture.recognition_run_id,
+            &token,
+            &suggested,
+        ) {
+            log::error!("Could not persist provisional speaker: {error}");
+        }
+    }
+}
+
+fn finish_active(store: &MeetingStore, active: &SharedMeetingCapture) {
+    let Ok(mut capture) = active.lock() else {
+        return;
+    };
+    if let Some(current) = capture.as_ref()
+        && let Err(error) = store.end_meeting(&current.meeting_id)
+    {
+        log::error!("Could not finish meeting: {error}");
+    }
+    *capture = None;
+}
+
+fn fail_active(store: &MeetingStore, active: &SharedMeetingCapture, error: String) {
+    let Ok(mut capture) = active.lock() else {
+        return;
+    };
+    if let Some(current) = capture.as_ref()
+        && let Err(store_error) = store.fail_meeting(&current.meeting_id, error)
+    {
+        log::error!("Could not mark failed meeting: {store_error}");
+    }
+    *capture = None;
+}
+
+fn speaker_label(speaker_id: &str) -> Option<String> {
+    let speaker_id = speaker_id.trim();
+    if speaker_id.is_empty() {
+        return None;
+    }
+    let numeric = speaker_id
+        .rsplit(['-', '_'])
+        .next()
+        .and_then(|value| value.parse::<u32>().ok());
+    Some(numeric.map_or_else(|| "S?".into(), |number| format!("S{number}")))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::super::controller::ActiveMeetingCapture;
+    use super::*;
+    use rust_client::{MeetingStatus, NewMeeting};
+    use std::sync::Mutex;
+
+    #[test]
+    fn speaker_labels_stay_compact() {
+        assert_eq!(speaker_label("speaker-02").as_deref(), Some("S2"));
+        assert_eq!(speaker_label("unknown").as_deref(), Some("S?"));
+        assert_eq!(speaker_label(""), None);
+    }
+
+    #[test]
+    fn finish_is_ordered_after_queued_segments() {
+        let store = Arc::new(MeetingStore::open_in_memory().unwrap());
+        let bundle = store
+            .create_meeting(NewMeeting::live(
+                "Ordered",
+                Some("default".into()),
+                "en",
+                "zh",
+            ))
+            .unwrap();
+        store.start_meeting(&bundle.meeting.id).unwrap();
+        let active = Arc::new(Mutex::new(Some(ActiveMeetingCapture {
+            meeting_id: bundle.meeting.id.clone(),
+            topic_id: bundle.topics[0].id.clone(),
+            recognition_run_id: "run-1".into(),
+            timeline_offset_ms: 0,
+            imported_audio: false,
+        })));
+        let sink = MeetingEventSink::start(Arc::clone(&store), Arc::clone(&active));
+        sink.persist(MeetingSegmentEvent {
+            source: MeetingSegmentSource::Microphone,
+            turn_id: "turn-1".into(),
+            segment_index: 1,
+            source_text: "hello".into(),
+            translated_text: Some("你好".into()),
+            raw_speaker_id: "speaker-01".into(),
+            source_start_ms: 0.0,
+            source_end_ms: 500.0,
+            is_final: true,
+        });
+        sink.finish_active();
+        sink.flush();
+
+        assert!(active.lock().unwrap().is_none());
+        assert_eq!(
+            store.get_meeting(&bundle.meeting.id).unwrap().status,
+            MeetingStatus::Ended
+        );
+        assert_eq!(
+            store
+                .open_meeting(&bundle.meeting.id)
+                .unwrap()
+                .segments
+                .len(),
+            1
+        );
+    }
+}

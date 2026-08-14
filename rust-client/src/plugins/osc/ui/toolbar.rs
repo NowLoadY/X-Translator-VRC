@@ -1,24 +1,29 @@
-use crate::osc::{BannerConfig, BannerContentType, OscFormatMode, OscMessageSeparator};
+use super::super::runtime::{BannerConfig, BannerContentType, OscFormatMode, OscMessageSeparator};
 use crate::ui::components::{self, card};
 use eframe::egui;
-use std::sync::atomic::Ordering;
 
-pub fn render_toolbar(app: &mut crate::XRTranslateApp, ui: &mut egui::Ui) {
+pub fn render_toolbar(
+    plugin: &mut super::super::OscPlugin,
+    ui: &mut egui::Ui,
+    language: crate::i18n::UiLanguage,
+    mute_gate_enabled: bool,
+    actions: &mut Vec<super::OscUiAction>,
+) {
     let mut changed = false;
 
     card(ui, |ui| {
         components::feature_ui(
             ui,
             crate::feature_access::Feature::OscChatbox,
-            app.ui_language,
+            language,
             |ui| {
                 ui.vertical(|ui| {
                     ui.horizontal(|ui| {
                         if components::feature_checkbox(
                             ui,
                             crate::feature_access::Feature::OscChatbox,
-                            app.ui_language,
-                            &mut app.osc_draft.enabled,
+                            language,
+                            &mut plugin.draft_mut().enabled,
                             "OSC",
                         )
                         .changed()
@@ -27,30 +32,27 @@ pub fn render_toolbar(app: &mut crate::XRTranslateApp, ui: &mut egui::Ui) {
                         }
 
                         ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                            if components::animated_button(
-                                ui,
-                                crate::i18n::tr(app.ui_language, "Clear"),
-                            )
-                            .clicked()
+                            if components::animated_button(ui, crate::i18n::tr(language, "Clear"))
+                                .clicked()
                             {
-                                app.clear_history();
+                                plugin.clear_chatbox();
+                                actions.push(super::OscUiAction::ClearHostHistory);
                             }
                         });
                     });
 
                     ui.add_space(8.0);
-                    let mut mute_gate_enabled =
-                        app.mute_self_pauses_translation.load(Ordering::Acquire);
+                    let mut mute_gate_enabled = mute_gate_enabled;
                     if components::feature_checkbox(
                         ui,
                         crate::feature_access::Feature::MuteSync,
-                        app.ui_language,
+                        language,
                         &mut mute_gate_enabled,
-                        crate::i18n::tr(app.ui_language, "Pause while muted"),
+                        crate::i18n::tr(language, "Pause while muted"),
                     )
                     .changed()
                     {
-                        app.set_mute_self_pauses_translation(mute_gate_enabled);
+                        actions.push(super::OscUiAction::SetMuteGateEnabled(mute_gate_enabled));
                     }
 
                     ui.add_space(8.0);
@@ -63,37 +65,34 @@ pub fn render_toolbar(app: &mut crate::XRTranslateApp, ui: &mut egui::Ui) {
                             egui::Layout::left_to_right(egui::Align::Center),
                             |ui| {
                                 ui.label(
-                                    egui::RichText::new(crate::i18n::tr(
-                                        app.ui_language,
-                                        "Format:",
-                                    ))
-                                    .strong(),
+                                    egui::RichText::new(crate::i18n::tr(language, "Format:"))
+                                        .strong(),
                                 );
                             },
                         );
 
                         let format_resp = egui::ComboBox::from_id_salt("osc_format_mode")
-                            .selected_text(app.osc_draft.format_mode.label(app.ui_language))
+                            .selected_text(plugin.draft().format_mode.label(language))
                             .show_ui(ui, |ui| {
                                 let r1 = ui.selectable_value(
-                                    &mut app.osc_draft.format_mode,
+                                    &mut plugin.draft_mut().format_mode,
                                     OscFormatMode::BilingualSourceFirst,
-                                    OscFormatMode::BilingualSourceFirst.label(app.ui_language),
+                                    OscFormatMode::BilingualSourceFirst.label(language),
                                 );
                                 let r2 = ui.selectable_value(
-                                    &mut app.osc_draft.format_mode,
+                                    &mut plugin.draft_mut().format_mode,
                                     OscFormatMode::BilingualTargetFirst,
-                                    OscFormatMode::BilingualTargetFirst.label(app.ui_language),
+                                    OscFormatMode::BilingualTargetFirst.label(language),
                                 );
                                 let r3 = ui.selectable_value(
-                                    &mut app.osc_draft.format_mode,
+                                    &mut plugin.draft_mut().format_mode,
                                     OscFormatMode::Inline,
-                                    OscFormatMode::Inline.label(app.ui_language),
+                                    OscFormatMode::Inline.label(language),
                                 );
                                 let r4 = ui.selectable_value(
-                                    &mut app.osc_draft.format_mode,
+                                    &mut plugin.draft_mut().format_mode,
                                     OscFormatMode::TargetOnly,
-                                    OscFormatMode::TargetOnly.label(app.ui_language),
+                                    OscFormatMode::TargetOnly.label(language),
                                 );
                                 r1.changed() || r2.changed() || r3.changed() || r4.changed()
                             });
@@ -102,23 +101,28 @@ pub fn render_toolbar(app: &mut crate::XRTranslateApp, ui: &mut egui::Ui) {
                         }
 
                         ui.add_space(16.0);
-                        let mut speaker_number_enabled = app.osc_draft.show_speaker_number;
+                        let mut speaker_number_enabled = plugin.draft().show_speaker_number;
                         if components::feature_checkbox(
                             ui,
                             crate::feature_access::Feature::SpeakerNumbers,
-                            app.ui_language,
+                            language,
                             &mut speaker_number_enabled,
-                            crate::i18n::tr(app.ui_language, "Speaker numbers"),
+                            crate::i18n::tr(language, "Speaker numbers"),
                         )
                         .changed()
                         {
-                            app.set_osc_speaker_number_enabled(speaker_number_enabled);
+                            plugin.draft_mut().show_speaker_number = speaker_number_enabled;
+                            let _ = plugin.apply_draft();
+                            actions.push(super::OscUiAction::SetSpeakerRecognitionEnabled(
+                                speaker_number_enabled,
+                            ));
+                            actions.push(super::OscUiAction::SaveSettings);
                         }
                     });
 
                     ui.add_space(8.0);
 
-                    let target_only = app.osc_draft.format_mode == OscFormatMode::TargetOnly;
+                    let target_only = plugin.draft().format_mode == OscFormatMode::TargetOnly;
                     ui.horizontal(|ui| {
                         ui.allocate_ui_with_layout(
                             egui::vec2(100.0, 20.0),
@@ -126,7 +130,7 @@ pub fn render_toolbar(app: &mut crate::XRTranslateApp, ui: &mut egui::Ui) {
                             |ui| {
                                 ui.label(
                                     egui::RichText::new(crate::i18n::tr(
-                                        app.ui_language,
+                                        language,
                                         if target_only {
                                             "Between messages:"
                                         } else {
@@ -139,9 +143,10 @@ pub fn render_toolbar(app: &mut crate::XRTranslateApp, ui: &mut egui::Ui) {
                         );
                         let response = egui::ComboBox::from_id_salt("osc_message_separator")
                             .selected_text(
-                                app.osc_draft
+                                plugin
+                                    .draft()
                                     .message_separator
-                                    .layout_label(app.ui_language, target_only),
+                                    .layout_label(language, target_only),
                             )
                             .show_ui(ui, |ui| {
                                 let mut selection_changed = false;
@@ -150,9 +155,9 @@ pub fn render_toolbar(app: &mut crate::XRTranslateApp, ui: &mut egui::Ui) {
                                 {
                                     selection_changed |= ui
                                         .selectable_value(
-                                            &mut app.osc_draft.message_separator,
+                                            &mut plugin.draft_mut().message_separator,
                                             value,
-                                            value.layout_label(app.ui_language, target_only),
+                                            value.layout_label(language, target_only),
                                         )
                                         .changed();
                                 }
@@ -166,10 +171,10 @@ pub fn render_toolbar(app: &mut crate::XRTranslateApp, ui: &mut egui::Ui) {
 
                     if render_banner_selector(
                         ui,
-                        crate::i18n::tr(app.ui_language, "Header:"),
+                        crate::i18n::tr(language, "Header:"),
                         "header_type_combo",
-                        &mut app.osc_draft.header_config,
-                        app.ui_language,
+                        &mut plugin.draft_mut().header_config,
+                        language,
                     ) {
                         changed = true;
                     }
@@ -178,10 +183,10 @@ pub fn render_toolbar(app: &mut crate::XRTranslateApp, ui: &mut egui::Ui) {
 
                     if render_banner_selector(
                         ui,
-                        crate::i18n::tr(app.ui_language, "Footer:"),
+                        crate::i18n::tr(language, "Footer:"),
                         "footer_type_combo",
-                        &mut app.osc_draft.footer_config,
-                        app.ui_language,
+                        &mut plugin.draft_mut().footer_config,
+                        language,
                     ) {
                         changed = true;
                     }
@@ -190,7 +195,7 @@ pub fn render_toolbar(app: &mut crate::XRTranslateApp, ui: &mut egui::Ui) {
 
                     if components::modern_slider_f64(
                         ui,
-                        &mut app.osc_draft.history_ttl_seconds,
+                        &mut plugin.draft_mut().history_ttl_seconds,
                         10.0..=20.0,
                         15.0,
                         "TTL:",
@@ -206,8 +211,8 @@ pub fn render_toolbar(app: &mut crate::XRTranslateApp, ui: &mut egui::Ui) {
     });
 
     if changed {
-        let _ = app.osc_manager.update_settings(app.osc_draft.clone());
-        app.save_settings();
+        actions.push(super::OscUiAction::SettingsApplied(plugin.apply_draft()));
+        actions.push(super::OscUiAction::SaveSettings);
     }
 }
 

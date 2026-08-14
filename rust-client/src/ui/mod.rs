@@ -5,14 +5,52 @@ pub mod pages;
 pub mod theme;
 
 use eframe::egui::{self, Align, Color32, CornerRadius, Frame, Layout, Margin, RichText, Stroke};
-use serde::{Deserialize, Serialize};
+use serde::{Deserialize, Deserializer, Serialize, Serializer, de};
 
-#[derive(Clone, Copy, PartialEq, Eq, Debug, Hash, Default, Serialize, Deserialize)]
+#[derive(Clone, Copy, PartialEq, Eq, Debug, Hash, Default)]
 pub enum Page {
     #[default]
     Translation,
-    Osc,
+    Plugin(crate::plugins::PluginId),
     Settings,
+}
+
+impl Serialize for Page {
+    fn serialize<S>(&self, serializer: S) -> Result<S::Ok, S::Error>
+    where
+        S: Serializer,
+    {
+        match self {
+            Self::Translation => serializer.serialize_str("Translation"),
+            Self::Settings => serializer.serialize_str("Settings"),
+            Self::Plugin(id) => serializer.serialize_str(&format!("plugin:{}", id.as_str())),
+        }
+    }
+}
+
+impl<'de> Deserialize<'de> for Page {
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: Deserializer<'de>,
+    {
+        let value = String::deserialize(deserializer)?;
+        match value.as_str() {
+            "Translation" | "translation" => Ok(Self::Translation),
+            "Settings" | "settings" => Ok(Self::Settings),
+            // Compatibility with the former derived enum representation.
+            "Osc" | "osc" => Ok(Self::Plugin(crate::plugins::PluginId::OSC)),
+            "Meeting" | "meeting" => Ok(Self::Plugin(crate::plugins::PluginId::MEETING)),
+            _ if value.starts_with("plugin:") => Ok(value
+                .strip_prefix("plugin:")
+                .and_then(crate::plugins::PluginId::parse)
+                .map(Self::Plugin)
+                // A settings file can outlive the build that supplied a
+                // plugin. Preserve the rest of the settings and use a safe
+                // core route instead of rejecting the whole document.
+                .unwrap_or(Self::Translation)),
+            _ => Err(de::Error::custom(format!("unknown page: {value}"))),
+        }
+    }
 }
 
 pub struct NavigationState {
@@ -26,6 +64,32 @@ impl Default for NavigationState {
             collapsed: false,
             page: Page::Translation,
         }
+    }
+}
+
+#[cfg(test)]
+mod page_tests {
+    use super::Page;
+    use crate::plugins::PluginId;
+
+    #[test]
+    fn plugin_pages_have_stable_readable_serialization() {
+        assert_eq!(
+            serde_json::to_string(&Page::Plugin(PluginId::OSC)).unwrap(),
+            r#""plugin:osc""#
+        );
+    }
+
+    #[test]
+    fn legacy_plugin_page_names_still_load() {
+        assert_eq!(
+            serde_json::from_str::<Page>(r#""Osc""#).unwrap(),
+            Page::Plugin(PluginId::OSC)
+        );
+        assert_eq!(
+            serde_json::from_str::<Page>(r#""Meeting""#).unwrap(),
+            Page::Plugin(PluginId::MEETING)
+        );
     }
 }
 
@@ -859,6 +923,7 @@ fn onboarding_model_card(
 pub fn render_sidebar(
     ui: &mut egui::Ui,
     navigation: &mut NavigationState,
+    plugin_preferences: &crate::plugins::PluginPreferences,
     modal_dialog: &mut modal::ModalDialog,
     first_run: &mut bool,
     onboarding_page: &mut usize,
@@ -868,7 +933,6 @@ pub fn render_sidebar(
     use egui::include_image;
 
     let icon_tr = include_image!("../../resources/icons/translation.svg");
-    let icon_osc = include_image!("../../resources/icons/osc.svg");
     let icon_settings = include_image!("../../resources/icons/settings.svg");
     let icon_guide = include_image!("../../resources/icons/guide.svg");
     let icon_expand = include_image!("../../resources/icons/chevron-right.svg");
@@ -928,15 +992,25 @@ pub fn render_sidebar(
             expand_factor,
         );
         ui.add_space(4.0);
-        nav_item_animated(
-            ui,
-            navigation,
-            Page::Osc,
-            icon_osc,
-            crate::i18n::tr(language, "VRChat OSC"),
-            expand_factor,
-        );
-        ui.add_space(4.0);
+        let mut plugin_descriptors = crate::plugins::PluginRegistry::builtin()
+            .descriptors()
+            .iter()
+            .collect::<Vec<_>>();
+        plugin_descriptors.sort_by_key(|descriptor| descriptor.navigation_order);
+        for descriptor in plugin_descriptors {
+            if !plugin_preferences.is_enabled(descriptor.id) {
+                continue;
+            }
+            nav_item_animated(
+                ui,
+                navigation,
+                Page::Plugin(descriptor.id),
+                descriptor.icon.image_source(),
+                crate::i18n::tr(language, descriptor.title_key),
+                expand_factor,
+            );
+            ui.add_space(4.0);
+        }
         nav_item_animated(
             ui,
             navigation,
@@ -981,11 +1055,22 @@ fn sidebar_text_button(
     expand_factor: f32,
 ) -> bool {
     let id = ui.make_persistent_id(id_source);
-    let hovered = ui.memory(|memory| memory.data.get_temp::<bool>(id.with("hover_state")).unwrap_or(false));
-    let active = ui.memory(|memory| memory.data.get_temp::<bool>(id.with("active_state")).unwrap_or(false));
+    let hovered = ui.memory(|memory| {
+        memory
+            .data
+            .get_temp::<bool>(id.with("hover_state"))
+            .unwrap_or(false)
+    });
+    let active = ui.memory(|memory| {
+        memory
+            .data
+            .get_temp::<bool>(id.with("active_state"))
+            .unwrap_or(false)
+    });
 
     let hover = animation::AnimationSystem::animate_bool(ui.ctx(), id.with("hover"), hovered, 0.15);
-    let active_factor = animation::AnimationSystem::animate_bool(ui.ctx(), id.with("active"), active, 0.08);
+    let active_factor =
+        animation::AnimationSystem::animate_bool(ui.ctx(), id.with("active"), active, 0.08);
 
     let bg_fill = animation::AnimationSystem::lerp_color(
         animation::AnimationSystem::lerp_color(
@@ -1033,8 +1118,13 @@ fn sidebar_text_button(
             .on_hover_text(crate::i18n::tr(language, label));
     }
     ui.memory_mut(|memory| {
-        memory.data.insert_temp(id.with("hover_state"), response.hovered());
-        memory.data.insert_temp(id.with("active_state"), response.is_pointer_button_down_on());
+        memory
+            .data
+            .insert_temp(id.with("hover_state"), response.hovered());
+        memory.data.insert_temp(
+            id.with("active_state"),
+            response.is_pointer_button_down_on(),
+        );
     });
     if response.hovered() {
         ui.ctx().set_cursor_icon(egui::CursorIcon::PointingHand);
@@ -1070,8 +1160,16 @@ fn nav_item_animated(
     let is_selected = navigation.page == page;
     let id = ui.make_persistent_id(label);
 
-    let is_hovered = ui.memory(|m| m.data.get_temp::<bool>(id.with("hover_state")).unwrap_or(false));
-    let is_active = ui.memory(|m| m.data.get_temp::<bool>(id.with("active_state")).unwrap_or(false));
+    let is_hovered = ui.memory(|m| {
+        m.data
+            .get_temp::<bool>(id.with("hover_state"))
+            .unwrap_or(false)
+    });
+    let is_active = ui.memory(|m| {
+        m.data
+            .get_temp::<bool>(id.with("active_state"))
+            .unwrap_or(false)
+    });
 
     let hover_factor = animation::AnimationSystem::animate_bool(
         ui.ctx(),
@@ -1167,8 +1265,12 @@ fn nav_item_animated(
     }
 
     ui.memory_mut(|m| {
-        m.data.insert_temp(id.with("hover_state"), response.hovered());
-        m.data.insert_temp(id.with("active_state"), response.is_pointer_button_down_on());
+        m.data
+            .insert_temp(id.with("hover_state"), response.hovered());
+        m.data.insert_temp(
+            id.with("active_state"),
+            response.is_pointer_button_down_on(),
+        );
     });
 
     if response.clicked() {
@@ -1188,8 +1290,16 @@ fn guide_button_animated(
     expand_factor: f32,
 ) {
     let guide_id = ui.make_persistent_id("sidebar_guide_btn");
-    let is_hovered = ui.memory(|m| m.data.get_temp::<bool>(guide_id.with("hover_state")).unwrap_or(false));
-    let is_active = ui.memory(|m| m.data.get_temp::<bool>(guide_id.with("active_state")).unwrap_or(false));
+    let is_hovered = ui.memory(|m| {
+        m.data
+            .get_temp::<bool>(guide_id.with("hover_state"))
+            .unwrap_or(false)
+    });
+    let is_active = ui.memory(|m| {
+        m.data
+            .get_temp::<bool>(guide_id.with("active_state"))
+            .unwrap_or(false)
+    });
 
     let hover_factor = animation::AnimationSystem::animate_bool(
         ui.ctx(),
@@ -1258,8 +1368,12 @@ fn guide_button_animated(
     }
 
     ui.memory_mut(|m| {
-        m.data.insert_temp(guide_id.with("hover_state"), response.hovered());
-        m.data.insert_temp(guide_id.with("active_state"), response.is_pointer_button_down_on());
+        m.data
+            .insert_temp(guide_id.with("hover_state"), response.hovered());
+        m.data.insert_temp(
+            guide_id.with("active_state"),
+            response.is_pointer_button_down_on(),
+        );
     });
 
     if response.hovered() {

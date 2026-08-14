@@ -306,8 +306,20 @@ pub fn render(app: &mut crate::XRTranslateApp, ui: &mut egui::Ui) {
         components::action_card(ui, |ui| {
             ui.horizontal(|ui| {
                 if app.is_translating {
-                    if danger_button(ui, crate::i18n::tr(app.ui_language, "Stop Translation"))
-                        .clicked()
+                    if app.meeting_session_active() {
+                        if components::primary_button(ui, "Open meeting controls").clicked() {
+                            app.open_meeting_plugin();
+                        }
+                        ui.label(
+                            egui::RichText::new("A meeting owns the active audio session")
+                                .color(crate::ui::theme::text_weak())
+                                .size(11.5),
+                        );
+                    } else if danger_button(
+                        ui,
+                        crate::i18n::tr(app.ui_language, "Stop Translation"),
+                    )
+                    .clicked()
                     {
                         app.stop();
                     }

@@ -3,7 +3,7 @@ use futures::{SinkExt, StreamExt};
 use serde_json::{Value, json};
 use std::sync::{
     Arc,
-    atomic::{AtomicBool, Ordering},
+    atomic::{AtomicBool, AtomicU64, Ordering},
 };
 use std::thread;
 use std::time::Duration;
@@ -12,9 +12,38 @@ use tokio_tungstenite::{
     connect_async,
     tungstenite::{self, Message},
 };
-use xrtranslate_protocol::CorpusTermMatch;
+use xrtranslate_protocol::{CorpusTermMatch, DrainReason, ServerEvent as ProtocolServerEvent};
 
 use crate::client_settings::CaptureSource;
+
+static NEXT_STREAM_ID: AtomicU64 = AtomicU64::new(1);
+
+/// A host-provided gate that can suppress outbound audio without coupling the
+/// translation session to the plugin that owns the external state.
+#[derive(Clone, Debug)]
+pub struct ExternalAudioGate {
+    pub active: Arc<AtomicBool>,
+    pub enabled: Arc<AtomicBool>,
+}
+
+impl ExternalAudioGate {
+    pub fn new(active: Arc<AtomicBool>, enabled: Arc<AtomicBool>) -> Self {
+        Self { active, enabled }
+    }
+
+    fn blocks_audio(&self) -> bool {
+        self.enabled.load(Ordering::Acquire) && self.active.load(Ordering::Acquire)
+    }
+}
+
+impl Default for ExternalAudioGate {
+    fn default() -> Self {
+        Self {
+            active: Arc::new(AtomicBool::new(false)),
+            enabled: Arc::new(AtomicBool::new(false)),
+        }
+    }
+}
 
 #[derive(Debug, Clone)]
 pub enum SessionEvent {
@@ -26,13 +55,18 @@ pub enum SessionEvent {
         active: bool,
     },
     Asr {
+        stream_id: u64,
+        continuous: bool,
+        publish_to_host_outputs: bool,
         kind: String,
         text: String,
         turn_id: String,
     },
     SourceSegment {
         stream_id: u64,
+        audio_source: CaptureSource,
         continuous: bool,
+        publish_to_host_outputs: bool,
         text: String,
         activation_matches: Vec<CorpusTermMatch>,
         context_matches: Vec<CorpusTermMatch>,
@@ -49,9 +83,12 @@ pub enum SessionEvent {
         stream_id: u64,
         audio_source: CaptureSource,
         continuous: bool,
-        osc: crate::osc::OscHandle,
+        publish_to_host_outputs: bool,
         source: String,
         translated: String,
+        turn_id: String,
+        segment_index: u32,
+        segment_count: u32,
         speaker_id: String,
         source_start_ms: f64,
         source_end_ms: f64,
@@ -61,7 +98,7 @@ pub enum SessionEvent {
     },
     StreamEnded {
         stream_id: u64,
-        osc: crate::osc::OscHandle,
+        publish_to_host_outputs: bool,
     },
     TtsAudio(Vec<u8>),
     BackendError(String),
@@ -70,6 +107,7 @@ pub enum SessionEvent {
 
 pub struct SessionHandle {
     stop_requested: Arc<AtomicBool>,
+    paused: Arc<AtomicBool>,
     command_tx: mpsc::Sender<SessionCommand>,
 }
 
@@ -95,6 +133,9 @@ enum SessionCommand {
     },
     SetTtsEnabled(bool),
     SetSpeakerRecognitionEnabled(bool),
+    Pause,
+    Resume,
+    Finish,
 }
 
 impl SessionCommand {
@@ -130,8 +171,39 @@ impl SessionCommand {
 }
 
 impl SessionHandle {
+    /// Gracefully finishes the session. Kept as the compatibility entrypoint
+    /// used by the existing translation UI.
     pub fn stop(&self) {
-        self.stop_requested.store(true, Ordering::Release);
+        self.finish();
+    }
+
+    /// Flushes the current VAD turn while retaining the live WebSocket,
+    /// timeline, and backend speaker state.
+    pub fn pause(&self) {
+        if self.stop_requested.load(Ordering::Acquire) {
+            return;
+        }
+        self.paused.store(true, Ordering::Release);
+        if self.command_tx.try_send(SessionCommand::Pause).is_err() {
+            self.paused.store(false, Ordering::Release);
+        }
+    }
+
+    pub fn resume(&self) {
+        if self.stop_requested.load(Ordering::Acquire) {
+            return;
+        }
+        let _ = self.command_tx.try_send(SessionCommand::Resume);
+    }
+
+    /// Ends audio input and waits for the backend's ordered drain
+    /// acknowledgement before closing the WebSocket.
+    pub fn finish(&self) {
+        if self.stop_requested.swap(true, Ordering::AcqRel) {
+            return;
+        }
+        self.paused.store(true, Ordering::Release);
+        let _ = self.command_tx.try_send(SessionCommand::Finish);
     }
 
     pub fn update_language_route(&self, source_lang: String, target_lang: String) {
@@ -203,15 +275,20 @@ pub struct SessionConfig {
     pub source_lang: String,
     pub target_lang: String,
     pub speaker_recognition_enabled: bool,
-    pub muted: Arc<AtomicBool>,
-    pub mute_gate_enabled: Arc<AtomicBool>,
-    pub osc: crate::osc::OscHandle,
+    pub external_audio_gate: ExternalAudioGate,
+    /// Controls presentation in the host translation UI and external caption
+    /// plugins. Domain plugins still receive the typed segment stream.
+    pub publish_to_host_outputs: bool,
     pub tts: Option<crate::audio::TtsPlayerHandle>,
     pub egui_ctx: Option<eframe::egui::Context>,
     pub vad_threshold: f32,
     pub vad_silence_ms: u32,
     pub continuous_recognition: bool,
     pub audio_source: CaptureSource,
+    /// Finish only after every locally queued audio frame has reached the
+    /// websocket writer. This is required for file import and graceful live
+    /// capture shutdown, where a producer disconnect marks end-of-input.
+    pub finish_when_audio_ends: bool,
 }
 
 pub fn start_session(
@@ -219,8 +296,11 @@ pub fn start_session(
     event_tx: Sender<SessionEvent>,
     config: SessionConfig,
 ) -> SessionHandle {
+    let stream_id = NEXT_STREAM_ID.fetch_add(1, Ordering::Relaxed);
     let stop_requested = Arc::new(AtomicBool::new(false));
     let runtime_stop = Arc::clone(&stop_requested);
+    let paused = Arc::new(AtomicBool::new(false));
+    let runtime_paused = Arc::clone(&paused);
     // Bound pending configuration updates.
     let (command_tx, command_rx) = mpsc::channel(16);
     thread::Builder::new()
@@ -243,13 +323,16 @@ pub fn start_session(
                 event_tx,
                 config,
                 runtime_stop,
+                runtime_paused,
                 command_rx,
+                stream_id,
             ));
         })
         .expect("failed to start translation session thread");
 
     SessionHandle {
         stop_requested,
+        paused,
         command_tx,
     }
 }
@@ -259,22 +342,24 @@ async fn run_session(
     event_tx: Sender<SessionEvent>,
     config: SessionConfig,
     stop_requested: Arc<AtomicBool>,
+    paused: Arc<AtomicBool>,
     mut command_rx: mpsc::Receiver<SessionCommand>,
+    stream_id: u64,
 ) {
     let SessionConfig {
         server_url,
         source_lang,
         target_lang,
         speaker_recognition_enabled,
-        muted,
-        mute_gate_enabled,
-        osc: osc_manager,
+        external_audio_gate,
+        publish_to_host_outputs,
         tts: tts_handle,
         egui_ctx,
         vad_threshold,
         vad_silence_ms,
         mut continuous_recognition,
         mut audio_source,
+        finish_when_audio_ends,
     } = config;
     let _ = event_tx.send(SessionEvent::Status("Connecting to backend…".into()));
     let (stream, _) = match connect_async(&server_url).await {
@@ -345,12 +430,18 @@ async fn run_session(
 
     let (pcm_tx, mut pcm_rx) = mpsc::channel::<Vec<u8>>(32);
     let producer_stop = Arc::clone(&stop_requested);
+    let producer_paused = Arc::clone(&paused);
     thread::spawn(move || {
         while !producer_stop.load(Ordering::Acquire) {
             match audio_rx.recv_timeout(Duration::from_millis(100)) {
                 Ok(samples) => {
+                    if producer_paused.load(Ordering::Acquire) {
+                        continue;
+                    }
                     let pcm = f32_to_pcm16le(samples);
-                    let _ = pcm_tx.try_send(pcm);
+                    if pcm_tx.blocking_send(pcm).is_err() {
+                        break;
+                    }
                 }
                 Err(crossbeam_channel::RecvTimeoutError::Timeout) => {}
                 Err(crossbeam_channel::RecvTimeoutError::Disconnected) => break,
@@ -359,22 +450,29 @@ async fn run_session(
     });
 
     let mut turn_started = false;
+    let mut finish_sent = false;
+    let mut pcm_input_closed = false;
     let mut ticker = tokio::time::interval(Duration::from_millis(100));
     loop {
         tokio::select! {
             _ = ticker.tick() => {
                 if stop_requested.load(Ordering::Acquire) {
-                    let _ = send_json(&mut write, json!({"event": "stop"})).await;
-                    let _ = write.close().await;
-                    let _ = event_tx.send(SessionEvent::Disconnected("Stopped".into()));
-                    break;
+                    if !finish_sent {
+                        if let Err(error) = send_json(&mut write, json!({"event": "finish"})).await {
+                            let _ = event_tx.send(SessionEvent::Error(format!("Failed to finish session: {error}")));
+                            break;
+                        }
+                        finish_sent = true;
+                    }
                 }
             }
             Some(command) = command_rx.recv() => {
+                let is_finish = matches!(&command, SessionCommand::Finish);
+                let is_resume = matches!(&command, SessionCommand::Resume);
                 if command.resets_recognition_stream() {
                     let _ = event_tx.send(SessionEvent::StreamEnded {
-                        stream_id: osc_manager.stream_id(),
-                        osc: osc_manager.clone(),
+                        stream_id,
+                        publish_to_host_outputs,
                     });
                 }
                 if let Some(updated) = command.continuous_recognition() {
@@ -383,13 +481,37 @@ async fn run_session(
                 if let Some(updated) = command.audio_source() {
                     audio_source = updated;
                 }
+                if is_finish && finish_sent {
+                    continue;
+                }
                 if let Err(error) = send_session_command(&mut write, command, audio_source).await {
                     let _ = event_tx.send(SessionEvent::Error(format!("Failed to update session: {error}")));
                     return;
                 }
+                if is_finish {
+                    finish_sent = true;
+                }
+                if is_resume {
+                    paused.store(false, Ordering::Release);
+                    let _ = event_tx.send(SessionEvent::Status("Connected — listening".into()));
+                }
             }
-            Some(pcm) = pcm_rx.recv() => {
-                if mute_gate_enabled.load(Ordering::Acquire) && muted.load(Ordering::Acquire) {
+            pcm = pcm_rx.recv(), if !pcm_input_closed => {
+                let Some(pcm) = pcm else {
+                    pcm_input_closed = true;
+                    if finish_when_audio_ends && !finish_sent {
+                        if let Err(error) = send_json(&mut write, json!({"event": "input_ended"})).await {
+                            let _ = event_tx.send(SessionEvent::Error(format!("Failed to finish audio input: {error}")));
+                            break;
+                        }
+                        finish_sent = true;
+                    }
+                    continue;
+                };
+                if paused.load(Ordering::Acquire) || finish_sent {
+                    continue;
+                }
+                if external_audio_gate.blocks_audio() {
                     continue;
                 }
                 if !turn_started {
@@ -406,13 +528,28 @@ async fn run_session(
             }
             message = read.next() => {
                 match message {
-                    Some(Ok(Message::Text(text))) => forward_server_event(
-                        &event_tx,
-                        &text,
-                        &osc_manager,
-                        continuous_recognition,
-                        audio_source,
-                    ),
+                    Some(Ok(Message::Text(text))) => {
+                        let drained = pipeline_drain_reason(&text);
+                        forward_server_event(
+                            &event_tx,
+                            &text,
+                            stream_id,
+                            continuous_recognition,
+                            publish_to_host_outputs,
+                            audio_source,
+                        );
+                        if let Some(reason) = drained {
+                            if reason == DrainReason::Paused {
+                                if paused.load(Ordering::Acquire) {
+                                    let _ = event_tx.send(SessionEvent::Status("Paused".into()));
+                                }
+                            } else {
+                                let _ = write.close().await;
+                                let _ = event_tx.send(SessionEvent::Disconnected("Finished".into()));
+                                break;
+                            }
+                        }
+                    }
                     Some(Ok(Message::Binary(audio))) => {
                         if let Some(tts) = &tts_handle {
                             tts.play_pcm(&audio);
@@ -420,13 +557,11 @@ async fn run_session(
                         let _ = event_tx.send(SessionEvent::TtsAudio(audio.to_vec()));
                     }
                     Some(Ok(Message::Close(_))) | None => {
-                        osc_manager.clear_chatbox();
                         let _ = event_tx.send(SessionEvent::Disconnected("Backend closed the connection".into()));
                         if let Some(ctx) = &egui_ctx { ctx.request_repaint(); }
                         break;
                     }
                     Some(Err(error)) => {
-                        osc_manager.clear_chatbox();
                         let _ = event_tx.send(SessionEvent::Error(format!("Backend connection failed: {error}")));
                         if let Some(ctx) = &egui_ctx { ctx.request_repaint(); }
                         break;
@@ -529,6 +664,9 @@ where
             )
             .await
         }
+        SessionCommand::Pause => send_json(write, json!({"event": "pause"})).await,
+        SessionCommand::Resume => send_json(write, json!({"event": "resume"})).await,
+        SessionCommand::Finish => send_json(write, json!({"event": "finish"})).await,
     }
 }
 
@@ -547,11 +685,19 @@ where
     write.send(Message::Text(value.to_string().into())).await
 }
 
+fn pipeline_drain_reason(text: &str) -> Option<DrainReason> {
+    match serde_json::from_str::<ProtocolServerEvent>(text).ok()? {
+        ProtocolServerEvent::PipelineDrained(drained) => Some(drained.reason),
+        _ => None,
+    }
+}
+
 fn forward_server_event(
     event_tx: &Sender<SessionEvent>,
     text: &str,
-    osc_manager: &crate::osc::OscHandle,
+    stream_id: u64,
     continuous_recognition: bool,
+    publish_to_host_outputs: bool,
     audio_source: CaptureSource,
 ) {
     let Ok(payload) = serde_json::from_str::<Value>(text) else {
@@ -584,11 +730,10 @@ fn forward_server_event(
                 .unwrap_or_default()
                 .into();
 
-            if kind == "partial" && !continuous_recognition && !text_val.is_empty() {
-                osc_manager.add_message_and_send(&text_val, "", "", true);
-            }
-
             let _ = event_tx.send(SessionEvent::Asr {
+                stream_id,
+                continuous: continuous_recognition,
+                publish_to_host_outputs,
                 kind,
                 text: text_val,
                 turn_id: data
@@ -612,8 +757,10 @@ fn forward_server_event(
                 return;
             };
             let _ = event_tx.send(SessionEvent::SourceSegment {
-                stream_id: osc_manager.stream_id(),
+                stream_id,
+                audio_source,
                 continuous: continuous_recognition,
+                publish_to_host_outputs,
                 text: data
                     .and_then(|d| d.get("source_text"))
                     .and_then(Value::as_str)
@@ -691,12 +838,27 @@ fn forward_server_event(
             };
 
             let _ = event_tx.send(SessionEvent::Translation {
-                stream_id: osc_manager.stream_id(),
+                stream_id,
                 audio_source,
                 continuous: continuous_recognition,
-                osc: osc_manager.clone(),
+                publish_to_host_outputs,
                 source,
                 translated,
+                turn_id: data
+                    .and_then(|d| d.get("turn_id"))
+                    .and_then(Value::as_str)
+                    .unwrap_or_default()
+                    .into(),
+                segment_index: data
+                    .and_then(|d| d.get("segment_index"))
+                    .and_then(Value::as_u64)
+                    .and_then(|value| u32::try_from(value).ok())
+                    .unwrap_or(1),
+                segment_count: data
+                    .and_then(|d| d.get("segment_count"))
+                    .and_then(Value::as_u64)
+                    .and_then(|value| u32::try_from(value).ok())
+                    .unwrap_or(1),
                 speaker_id,
                 source_start_ms: data
                     .and_then(|d| d.get("source_start_ms"))
@@ -717,8 +879,8 @@ fn forward_server_event(
         }
         Some("recognition_stream_ended") => {
             let _ = event_tx.send(SessionEvent::StreamEnded {
-                stream_id: osc_manager.stream_id(),
-                osc: osc_manager.clone(),
+                stream_id,
+                publish_to_host_outputs,
             });
         }
         Some("error") => {
@@ -753,13 +915,67 @@ mod tests {
     use super::*;
 
     #[test]
+    fn pipeline_drain_reason_distinguishes_pause_from_terminal_eof() {
+        assert_eq!(
+            pipeline_drain_reason(r#"{"action":"pipeline_drained","data":{"reason":"paused"}}"#),
+            Some(DrainReason::Paused)
+        );
+        assert_eq!(
+            pipeline_drain_reason(
+                r#"{"action":"pipeline_drained","data":{"reason":"input_ended"}}"#
+            ),
+            Some(DrainReason::InputEnded)
+        );
+        assert_eq!(
+            pipeline_drain_reason(r#"{"action":"vad_activity","data":{"active":false}}"#),
+            None
+        );
+    }
+
+    #[test]
+    fn external_audio_gate_requires_both_enablement_and_active_state() {
+        let gate = ExternalAudioGate::default();
+        assert!(!gate.blocks_audio());
+        gate.active.store(true, Ordering::Release);
+        assert!(!gate.blocks_audio());
+        gate.enabled.store(true, Ordering::Release);
+        assert!(gate.blocks_audio());
+    }
+
+    #[test]
+    fn asr_event_retains_stream_and_continuous_metadata() {
+        let (sender, receiver) = crossbeam_channel::unbounded();
+        forward_server_event(
+            &sender,
+            r#"{"action":"asr_result","data":{"type":"partial","text":"hello","turn_id":"turn-1"}}"#,
+            41,
+            true,
+            true,
+            CaptureSource::Microphone,
+        );
+
+        assert!(matches!(
+            receiver.try_recv().unwrap(),
+            SessionEvent::Asr {
+                stream_id: 41,
+                continuous: true,
+                publish_to_host_outputs: true,
+                kind,
+                text,
+                turn_id,
+            } if kind == "partial" && text == "hello" && turn_id == "turn-1"
+        ));
+    }
+
+    #[test]
     fn vad_activity_keeps_its_audio_source() {
         let (sender, receiver) = crossbeam_channel::unbounded();
-        let mock_osc = crate::osc::OscManager::new(crate::osc::OscSettings::default()).handle();
+        let stream_id = 42;
         forward_server_event(
             &sender,
             r#"{"action":"vad_activity","data":{"active":true}}"#,
-            &mock_osc,
+            stream_id,
+            true,
             true,
             CaptureSource::SystemAudio,
         );
@@ -776,17 +992,19 @@ mod tests {
     #[test]
     fn source_segment_event_retains_speaker_and_timeline_metadata() {
         let (sender, receiver) = crossbeam_channel::unbounded();
-        let mock_osc = crate::osc::OscManager::new(crate::osc::OscSettings::default()).handle();
+        let stream_id = 42;
         forward_server_event(
             &sender,
             r#"{"action":"source_segment_ready","data":{"source_text":"hello","speaker_id":"speaker-03","source_start_ms":125.0,"source_end_ms":875.0,"segment_index":2,"segment_count":2,"revisable":true,"overlap_ratio":0.34}}"#,
-            &mock_osc,
+            stream_id,
             false,
+            true,
             CaptureSource::Microphone,
         );
 
         let event = receiver.try_recv().unwrap();
         let SessionEvent::SourceSegment {
+            stream_id,
             text,
             activation_matches,
             speaker_id,
@@ -798,6 +1016,7 @@ mod tests {
         else {
             panic!("expected source-segment event");
         };
+        assert_eq!(stream_id, 42);
         assert_eq!(text, "hello");
         assert!(activation_matches.is_empty());
         assert_eq!(speaker_id, "speaker-03");
@@ -809,12 +1028,13 @@ mod tests {
     #[test]
     fn backend_feature_errors_are_nonfatal_session_events() {
         let (sender, receiver) = crossbeam_channel::unbounded();
-        let mock_osc = crate::osc::OscManager::new(crate::osc::OscSettings::default()).handle();
+        let stream_id = 42;
         forward_server_event(
             &sender,
             r#"{"action":"error","data":{"message":"speaker recognition is unavailable"}}"#,
-            &mock_osc,
+            stream_id,
             false,
+            true,
             CaptureSource::Microphone,
         );
 
@@ -827,12 +1047,13 @@ mod tests {
     #[test]
     fn translation_event_retains_term_provenance() {
         let (sender, receiver) = crossbeam_channel::unbounded();
-        let mock_osc = crate::osc::OscManager::new(crate::osc::OscSettings::default()).handle();
+        let stream_id = 42;
         forward_server_event(
             &sender,
             r#"{"action":"translation_ready","data":{"source_text":"I love Mercy.","translated_text":"我喜欢天使。","speaker_id":"","revisable":false,"overlap_ratio":0.0,"term_matches":[{"start_byte":9,"end_byte":15,"text":"天使","sources":[{"corpus_id":"games.overwatch.heroes","domain":"games","subdomain":"overwatch","title":"Overwatch Heroes"}]}]}}"#,
-            &mock_osc,
+            stream_id,
             false,
+            true,
             CaptureSource::Microphone,
         );
 
@@ -849,12 +1070,13 @@ mod tests {
     #[test]
     fn source_segment_event_retains_activation_provenance() {
         let (sender, receiver) = crossbeam_channel::unbounded();
-        let mock_osc = crate::osc::OscManager::new(crate::osc::OscSettings::default()).handle();
+        let stream_id = 42;
         forward_server_event(
             &sender,
             r#"{"action":"source_segment_ready","data":{"source_text":"论文写没？","segment_index":1,"segment_count":1,"revisable":false,"overlap_ratio":0.0,"activation_matches":[{"start_byte":0,"end_byte":6,"text":"论文","sources":[{"corpus_id":"education-and-science.research.common","domain":"education-and-science","subdomain":"research","title":"研究与学术交流"}]}]}}"#,
-            &mock_osc,
+            stream_id,
             false,
+            true,
             CaptureSource::Microphone,
         );
 

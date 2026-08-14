@@ -67,8 +67,16 @@ pub fn speaker_badge(ui: &mut Ui, speaker: &str) {
 
 pub fn swap_capsule_button(ui: &mut Ui, enabled: bool) -> egui::Response {
     let id = ui.make_persistent_id("lang_swap_capsule");
-    let is_hovered = ui.memory(|m| m.data.get_temp::<bool>(id.with("hover_state")).unwrap_or(false));
-    let is_active = ui.memory(|m| m.data.get_temp::<bool>(id.with("active_state")).unwrap_or(false));
+    let is_hovered = ui.memory(|m| {
+        m.data
+            .get_temp::<bool>(id.with("hover_state"))
+            .unwrap_or(false)
+    });
+    let is_active = ui.memory(|m| {
+        m.data
+            .get_temp::<bool>(id.with("active_state"))
+            .unwrap_or(false)
+    });
 
     let hover_factor = crate::ui::animation::AnimationSystem::animate_bool(
         ui.ctx(),
@@ -100,9 +108,15 @@ pub fn swap_capsule_button(ui: &mut Ui, enabled: bool) -> egui::Response {
     let active_fill = Color32::from_rgb(235, 242, 254);
 
     let fill = if enabled {
-        let base = crate::ui::animation::AnimationSystem::lerp_color(rest_fill, hover_fill, hover_factor);
-        let base = crate::ui::animation::AnimationSystem::lerp_color(base, active_fill, active_factor);
-        crate::ui::animation::AnimationSystem::lerp_color(base, Color32::from_rgb(230, 240, 255), click_factor)
+        let base =
+            crate::ui::animation::AnimationSystem::lerp_color(rest_fill, hover_fill, hover_factor);
+        let base =
+            crate::ui::animation::AnimationSystem::lerp_color(base, active_fill, active_factor);
+        crate::ui::animation::AnimationSystem::lerp_color(
+            base,
+            Color32::from_rgb(230, 240, 255),
+            click_factor,
+        )
     } else {
         Color32::from_rgb(245, 248, 252)
     };
@@ -113,7 +127,11 @@ pub fn swap_capsule_button(ui: &mut Ui, enabled: bool) -> egui::Response {
             Color32::from_rgb(37, 99, 235),
             hover_factor,
         );
-        crate::ui::animation::AnimationSystem::lerp_color(base, Color32::from_rgb(29, 78, 216), active_factor)
+        crate::ui::animation::AnimationSystem::lerp_color(
+            base,
+            Color32::from_rgb(29, 78, 216),
+            active_factor,
+        )
     } else {
         Color32::from_rgb(148, 163, 184)
     };
@@ -122,7 +140,11 @@ pub fn swap_capsule_button(ui: &mut Ui, enabled: bool) -> egui::Response {
     let hover_stroke = Stroke::new(1.0, Color32::from_rgb(203, 213, 225));
     let active_stroke = Stroke::new(1.0, Color32::from_rgb(148, 163, 184));
     let stroke_color = if enabled {
-        let base = crate::ui::animation::AnimationSystem::lerp_color(rest_stroke.color, hover_stroke.color, hover_factor);
+        let base = crate::ui::animation::AnimationSystem::lerp_color(
+            rest_stroke.color,
+            hover_stroke.color,
+            hover_factor,
+        );
         crate::ui::animation::AnimationSystem::lerp_color(base, active_stroke.color, active_factor)
     } else {
         rest_stroke.color
@@ -148,7 +170,11 @@ pub fn swap_capsule_button(ui: &mut Ui, enabled: bool) -> egui::Response {
     };
 
     let shadow = if enabled {
-        let base = crate::ui::animation::AnimationSystem::lerp_shadow(rest_shadow, hover_shadow, hover_factor);
+        let base = crate::ui::animation::AnimationSystem::lerp_shadow(
+            rest_shadow,
+            hover_shadow,
+            hover_factor,
+        );
         crate::ui::animation::AnimationSystem::lerp_shadow(base, active_shadow, active_factor)
     } else {
         egui::Shadow::NONE
@@ -180,7 +206,8 @@ pub fn swap_capsule_button(ui: &mut Ui, enabled: bool) -> egui::Response {
 
     ui.memory_mut(|m| {
         m.data.insert_temp(id.with("hover_state"), resp.hovered());
-        m.data.insert_temp(id.with("active_state"), resp.is_pointer_button_down_on());
+        m.data
+            .insert_temp(id.with("active_state"), resp.is_pointer_button_down_on());
     });
     if resp.hovered() && enabled {
         ui.ctx().set_cursor_icon(egui::CursorIcon::PointingHand);
@@ -372,8 +399,16 @@ pub fn format_file_size(bytes: u64) -> String {
 
 pub fn animated_button_enabled(ui: &mut Ui, text: &str, enabled: bool) -> egui::Response {
     let id = ui.make_persistent_id(text);
-    let is_hovered = ui.memory(|m| m.data.get_temp::<bool>(id.with("hover_state")).unwrap_or(false));
-    let is_active = ui.memory(|m| m.data.get_temp::<bool>(id.with("active_state")).unwrap_or(false));
+    let is_hovered = ui.memory(|m| {
+        m.data
+            .get_temp::<bool>(id.with("hover_state"))
+            .unwrap_or(false)
+    });
+    let is_active = ui.memory(|m| {
+        m.data
+            .get_temp::<bool>(id.with("active_state"))
+            .unwrap_or(false)
+    });
 
     let hover_factor = crate::ui::animation::AnimationSystem::animate_bool(
         ui.ctx(),
@@ -405,9 +440,15 @@ pub fn animated_button_enabled(ui: &mut Ui, text: &str, enabled: bool) -> egui::
     let active_fill = Color32::from_rgb(235, 241, 250);
 
     let fill = if enabled {
-        let base = crate::ui::animation::AnimationSystem::lerp_color(rest_fill, hover_fill, hover_factor);
-        let base = crate::ui::animation::AnimationSystem::lerp_color(base, active_fill, active_factor);
-        crate::ui::animation::AnimationSystem::lerp_color(base, Color32::from_rgb(230, 240, 255), click_factor)
+        let base =
+            crate::ui::animation::AnimationSystem::lerp_color(rest_fill, hover_fill, hover_factor);
+        let base =
+            crate::ui::animation::AnimationSystem::lerp_color(base, active_fill, active_factor);
+        crate::ui::animation::AnimationSystem::lerp_color(
+            base,
+            Color32::from_rgb(230, 240, 255),
+            click_factor,
+        )
     } else {
         Color32::from_rgb(241, 245, 249)
     };
@@ -424,9 +465,21 @@ pub fn animated_button_enabled(ui: &mut Ui, text: &str, enabled: bool) -> egui::
     let click_stroke = Stroke::new(1.0, Color32::from_rgb(147, 197, 253));
 
     let stroke = if enabled {
-        let base = crate::ui::animation::AnimationSystem::lerp_color(rest_stroke.color, hover_stroke.color, hover_factor);
-        let base = crate::ui::animation::AnimationSystem::lerp_color(base, active_stroke.color, active_factor);
-        let color = crate::ui::animation::AnimationSystem::lerp_color(base, click_stroke.color, click_factor);
+        let base = crate::ui::animation::AnimationSystem::lerp_color(
+            rest_stroke.color,
+            hover_stroke.color,
+            hover_factor,
+        );
+        let base = crate::ui::animation::AnimationSystem::lerp_color(
+            base,
+            active_stroke.color,
+            active_factor,
+        );
+        let color = crate::ui::animation::AnimationSystem::lerp_color(
+            base,
+            click_stroke.color,
+            click_factor,
+        );
         Stroke::new(1.0, color)
     } else {
         Stroke::new(1.0, Color32::from_rgb(226, 232, 240))
@@ -452,7 +505,11 @@ pub fn animated_button_enabled(ui: &mut Ui, text: &str, enabled: bool) -> egui::
     };
 
     let shadow = if enabled {
-        let base = crate::ui::animation::AnimationSystem::lerp_shadow(rest_shadow, hover_shadow, hover_factor);
+        let base = crate::ui::animation::AnimationSystem::lerp_shadow(
+            rest_shadow,
+            hover_shadow,
+            hover_factor,
+        );
         crate::ui::animation::AnimationSystem::lerp_shadow(base, active_shadow, active_factor)
     } else {
         egui::Shadow::NONE
@@ -488,7 +545,8 @@ pub fn animated_button_enabled(ui: &mut Ui, text: &str, enabled: bool) -> egui::
 
     ui.memory_mut(|m| {
         m.data.insert_temp(id.with("hover_state"), resp.hovered());
-        m.data.insert_temp(id.with("active_state"), resp.is_pointer_button_down_on());
+        m.data
+            .insert_temp(id.with("active_state"), resp.is_pointer_button_down_on());
     });
     if resp.hovered() && enabled {
         ui.ctx().set_cursor_icon(egui::CursorIcon::PointingHand);
@@ -502,8 +560,16 @@ pub fn primary_button(ui: &mut Ui, text: &str) -> egui::Response {
 
 pub fn primary_button_enabled(ui: &mut Ui, text: &str, enabled: bool) -> egui::Response {
     let id = ui.make_persistent_id(text);
-    let is_hovered = ui.memory(|m| m.data.get_temp::<bool>(id.with("hover_state")).unwrap_or(false));
-    let is_active = ui.memory(|m| m.data.get_temp::<bool>(id.with("active_state")).unwrap_or(false));
+    let is_hovered = ui.memory(|m| {
+        m.data
+            .get_temp::<bool>(id.with("hover_state"))
+            .unwrap_or(false)
+    });
+    let is_active = ui.memory(|m| {
+        m.data
+            .get_temp::<bool>(id.with("active_state"))
+            .unwrap_or(false)
+    });
 
     let hover_factor = crate::ui::animation::AnimationSystem::animate_bool(
         ui.ctx(),
@@ -523,7 +589,8 @@ pub fn primary_button_enabled(ui: &mut Ui, text: &str, enabled: bool) -> egui::R
     let active_fill = Color32::from_rgb(29, 78, 216);
 
     let fill = if enabled {
-        let base = crate::ui::animation::AnimationSystem::lerp_color(rest_fill, hover_fill, hover_factor);
+        let base =
+            crate::ui::animation::AnimationSystem::lerp_color(rest_fill, hover_fill, hover_factor);
         crate::ui::animation::AnimationSystem::lerp_color(base, active_fill, active_factor)
     } else {
         Color32::from_rgb(219, 234, 254)
@@ -555,7 +622,11 @@ pub fn primary_button_enabled(ui: &mut Ui, text: &str, enabled: bool) -> egui::R
     };
 
     let shadow = if enabled {
-        let base = crate::ui::animation::AnimationSystem::lerp_shadow(rest_shadow, hover_shadow, hover_factor);
+        let base = crate::ui::animation::AnimationSystem::lerp_shadow(
+            rest_shadow,
+            hover_shadow,
+            hover_factor,
+        );
         crate::ui::animation::AnimationSystem::lerp_shadow(base, active_shadow, active_factor)
     } else {
         egui::Shadow::NONE
@@ -584,7 +655,8 @@ pub fn primary_button_enabled(ui: &mut Ui, text: &str, enabled: bool) -> egui::R
 
     ui.memory_mut(|m| {
         m.data.insert_temp(id.with("hover_state"), resp.hovered());
-        m.data.insert_temp(id.with("active_state"), resp.is_pointer_button_down_on());
+        m.data
+            .insert_temp(id.with("active_state"), resp.is_pointer_button_down_on());
     });
     if resp.hovered() && enabled {
         ui.ctx().set_cursor_icon(egui::CursorIcon::PointingHand);
@@ -681,8 +753,16 @@ pub fn danger_button(ui: &mut Ui, text: &str) -> egui::Response {
 
 pub fn danger_button_enabled(ui: &mut Ui, text: &str, enabled: bool) -> egui::Response {
     let id = ui.make_persistent_id(text);
-    let is_hovered = ui.memory(|m| m.data.get_temp::<bool>(id.with("hover_state")).unwrap_or(false));
-    let is_active = ui.memory(|m| m.data.get_temp::<bool>(id.with("active_state")).unwrap_or(false));
+    let is_hovered = ui.memory(|m| {
+        m.data
+            .get_temp::<bool>(id.with("hover_state"))
+            .unwrap_or(false)
+    });
+    let is_active = ui.memory(|m| {
+        m.data
+            .get_temp::<bool>(id.with("active_state"))
+            .unwrap_or(false)
+    });
 
     let hover_factor = crate::ui::animation::AnimationSystem::animate_bool(
         ui.ctx(),
@@ -702,7 +782,8 @@ pub fn danger_button_enabled(ui: &mut Ui, text: &str, enabled: bool) -> egui::Re
     let active_fill = Color32::from_rgb(185, 28, 28);
 
     let fill = if enabled {
-        let base = crate::ui::animation::AnimationSystem::lerp_color(rest_fill, hover_fill, hover_factor);
+        let base =
+            crate::ui::animation::AnimationSystem::lerp_color(rest_fill, hover_fill, hover_factor);
         crate::ui::animation::AnimationSystem::lerp_color(base, active_fill, active_factor)
     } else {
         Color32::from_rgb(254, 202, 202)
@@ -730,7 +811,11 @@ pub fn danger_button_enabled(ui: &mut Ui, text: &str, enabled: bool) -> egui::Re
     };
 
     let shadow = if enabled {
-        let base = crate::ui::animation::AnimationSystem::lerp_shadow(rest_shadow, hover_shadow, hover_factor);
+        let base = crate::ui::animation::AnimationSystem::lerp_shadow(
+            rest_shadow,
+            hover_shadow,
+            hover_factor,
+        );
         crate::ui::animation::AnimationSystem::lerp_shadow(base, active_shadow, active_factor)
     } else {
         egui::Shadow::NONE
@@ -759,7 +844,8 @@ pub fn danger_button_enabled(ui: &mut Ui, text: &str, enabled: bool) -> egui::Re
 
     ui.memory_mut(|m| {
         m.data.insert_temp(id.with("hover_state"), resp.hovered());
-        m.data.insert_temp(id.with("active_state"), resp.is_pointer_button_down_on());
+        m.data
+            .insert_temp(id.with("active_state"), resp.is_pointer_button_down_on());
     });
     if resp.hovered() && enabled {
         ui.ctx().set_cursor_icon(egui::CursorIcon::PointingHand);
@@ -771,8 +857,16 @@ pub fn pill_toggle(ui: &mut Ui, checked: &mut bool) -> egui::Response {
     let id = ui
         .make_persistent_id("pill_toggle")
         .with(checked as *const bool);
-    let is_hovered = ui.memory(|m| m.data.get_temp::<bool>(id.with("hover_state")).unwrap_or(false));
-    let is_active = ui.memory(|m| m.data.get_temp::<bool>(id.with("active_state")).unwrap_or(false));
+    let is_hovered = ui.memory(|m| {
+        m.data
+            .get_temp::<bool>(id.with("hover_state"))
+            .unwrap_or(false)
+    });
+    let is_active = ui.memory(|m| {
+        m.data
+            .get_temp::<bool>(id.with("active_state"))
+            .unwrap_or(false)
+    });
 
     let hover_factor = crate::ui::animation::AnimationSystem::animate_bool(
         ui.ctx(),
@@ -850,8 +944,12 @@ pub fn pill_toggle(ui: &mut Ui, checked: &mut bool) -> egui::Response {
     }
 
     ui.memory_mut(|m| {
-        m.data.insert_temp(id.with("hover_state"), response.hovered());
-        m.data.insert_temp(id.with("active_state"), response.is_pointer_button_down_on());
+        m.data
+            .insert_temp(id.with("hover_state"), response.hovered());
+        m.data.insert_temp(
+            id.with("active_state"),
+            response.is_pointer_button_down_on(),
+        );
     });
     if response.hovered() {
         ui.ctx().set_cursor_icon(egui::CursorIcon::PointingHand);
@@ -1047,8 +1145,16 @@ pub fn sub_sidebar<T: Copy + PartialEq>(
                     let is_selected = *selected == item.id;
                     let id = ui.make_persistent_id(item.label);
 
-                    let is_hovered = ui.memory(|m| m.data.get_temp::<bool>(id.with("hover_state")).unwrap_or(false));
-                    let is_active = ui.memory(|m| m.data.get_temp::<bool>(id.with("active_state")).unwrap_or(false));
+                    let is_hovered = ui.memory(|m| {
+                        m.data
+                            .get_temp::<bool>(id.with("hover_state"))
+                            .unwrap_or(false)
+                    });
+                    let is_active = ui.memory(|m| {
+                        m.data
+                            .get_temp::<bool>(id.with("active_state"))
+                            .unwrap_or(false)
+                    });
 
                     let select_factor = crate::ui::animation::AnimationSystem::animate_bool(
                         ui.ctx(),
@@ -1147,7 +1253,8 @@ pub fn sub_sidebar<T: Copy + PartialEq>(
 
                     ui.memory_mut(|m| {
                         m.data.insert_temp(id.with("hover_state"), resp.hovered());
-                        m.data.insert_temp(id.with("active_state"), resp.is_pointer_button_down_on());
+                        m.data
+                            .insert_temp(id.with("active_state"), resp.is_pointer_button_down_on());
                     });
 
                     if resp.clicked() {
@@ -1316,8 +1423,16 @@ fn slider_state_label<'a>(
 
 pub fn reset_button(ui: &mut Ui, id_salt: &str) -> egui::Response {
     let id = ui.make_persistent_id("slider_reset_btn").with(id_salt);
-    let is_hovered = ui.memory(|m| m.data.get_temp::<bool>(id.with("hover_state")).unwrap_or(false));
-    let is_active = ui.memory(|m| m.data.get_temp::<bool>(id.with("active_state")).unwrap_or(false));
+    let is_hovered = ui.memory(|m| {
+        m.data
+            .get_temp::<bool>(id.with("hover_state"))
+            .unwrap_or(false)
+    });
+    let is_active = ui.memory(|m| {
+        m.data
+            .get_temp::<bool>(id.with("active_state"))
+            .unwrap_or(false)
+    });
 
     let hover_factor = crate::ui::animation::AnimationSystem::animate_bool(
         ui.ctx(),
@@ -1354,18 +1469,30 @@ pub fn reset_button(ui: &mut Ui, id_salt: &str) -> egui::Response {
     let active_fill = Color32::from_rgb(235, 241, 250);
     let spin_fill = Color32::from_rgb(239, 246, 255);
 
-    let base_fill = crate::ui::animation::AnimationSystem::lerp_color(rest_fill, hover_fill, hover_factor);
-    let fill = crate::ui::animation::AnimationSystem::lerp_color(base_fill, active_fill, active_factor);
-    let fill = crate::ui::animation::AnimationSystem::lerp_color(fill, spin_fill, spin_accent_factor);
+    let base_fill =
+        crate::ui::animation::AnimationSystem::lerp_color(rest_fill, hover_fill, hover_factor);
+    let fill =
+        crate::ui::animation::AnimationSystem::lerp_color(base_fill, active_fill, active_factor);
+    let fill =
+        crate::ui::animation::AnimationSystem::lerp_color(fill, spin_fill, spin_accent_factor);
 
     let rest_stroke = Color32::from_rgb(226, 232, 240);
     let hover_stroke = Color32::from_rgb(203, 213, 225);
     let active_stroke = Color32::from_rgb(148, 163, 184);
     let spin_stroke = Color32::from_rgb(147, 197, 253);
 
-    let stroke_color = crate::ui::animation::AnimationSystem::lerp_color(rest_stroke, hover_stroke, hover_factor);
-    let stroke_color = crate::ui::animation::AnimationSystem::lerp_color(stroke_color, active_stroke, active_factor);
-    let stroke_color = crate::ui::animation::AnimationSystem::lerp_color(stroke_color, spin_stroke, spin_accent_factor);
+    let stroke_color =
+        crate::ui::animation::AnimationSystem::lerp_color(rest_stroke, hover_stroke, hover_factor);
+    let stroke_color = crate::ui::animation::AnimationSystem::lerp_color(
+        stroke_color,
+        active_stroke,
+        active_factor,
+    );
+    let stroke_color = crate::ui::animation::AnimationSystem::lerp_color(
+        stroke_color,
+        spin_stroke,
+        spin_accent_factor,
+    );
 
     let rest_shadow = egui::Shadow {
         offset: [0, 2],
@@ -1387,13 +1514,21 @@ pub fn reset_button(ui: &mut Ui, id_salt: &str) -> egui::Response {
     };
 
     let shadow = {
-        let s = crate::ui::animation::AnimationSystem::lerp_shadow(rest_shadow, hover_shadow, hover_factor);
+        let s = crate::ui::animation::AnimationSystem::lerp_shadow(
+            rest_shadow,
+            hover_shadow,
+            hover_factor,
+        );
         crate::ui::animation::AnimationSystem::lerp_shadow(s, active_shadow, active_factor)
     };
 
     let icon_rest_tint = crate::ui::theme::text_strong();
     let icon_spin_tint = Color32::from_rgb(37, 99, 235);
-    let icon_tint = crate::ui::animation::AnimationSystem::lerp_color(icon_rest_tint, icon_spin_tint, spin_accent_factor);
+    let icon_tint = crate::ui::animation::AnimationSystem::lerp_color(
+        icon_rest_tint,
+        icon_spin_tint,
+        spin_accent_factor,
+    );
 
     let mut image = egui::Image::new(egui::include_image!("../../resources/icons/reset.svg"))
         .fit_to_exact_size(Vec2::splat(13.0))
@@ -1424,7 +1559,8 @@ pub fn reset_button(ui: &mut Ui, id_salt: &str) -> egui::Response {
 
     ui.memory_mut(|m| {
         m.data.insert_temp(id.with("hover_state"), resp.hovered());
-        m.data.insert_temp(id.with("active_state"), resp.is_pointer_button_down_on());
+        m.data
+            .insert_temp(id.with("active_state"), resp.is_pointer_button_down_on());
     });
     if resp.hovered() {
         ui.ctx().set_cursor_icon(egui::CursorIcon::PointingHand);

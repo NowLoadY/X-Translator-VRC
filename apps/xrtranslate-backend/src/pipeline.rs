@@ -604,13 +604,15 @@ impl NativePipeline {
     pub(crate) fn flush(&mut self) -> Result<Option<PipelineEvent>, String> {
         if let Some(window) = &mut self.fixed_window {
             let utterance = window.flush();
-            return Ok(utterance.map(|utterance| {
+            let event = utterance.map(|utterance| {
                 let topic_turn_sequence = self
                     .fixed_window
                     .as_ref()
                     .map(|window| window.current_topic_turn_sequence);
                 PipelineEvent::Utterance(self.with_timeline(utterance, 0, topic_turn_sequence))
-            }));
+            });
+            self.observe_vad_activity(false);
+            return Ok(event);
         }
         let mut trailing_padding_samples = 0;
         let mut finalized = None;
@@ -634,7 +636,7 @@ impl NativePipeline {
                 .processed_samples
                 .saturating_add(received_samples as u64);
         }
-        Ok(finalized
+        let event = finalized
             .or_else(|| self.endpoint.flush())
             .map(|utterance| {
                 PipelineEvent::Utterance(self.with_timeline(
@@ -642,7 +644,9 @@ impl NativePipeline {
                     trailing_padding_samples,
                     None,
                 ))
-            }))
+            });
+        self.observe_vad_activity(false);
+        Ok(event)
     }
 
     /// Drops buffered audio and recurrent VAD state after a route change.

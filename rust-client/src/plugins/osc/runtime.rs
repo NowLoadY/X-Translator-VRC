@@ -7,15 +7,13 @@ use std::net::UdpSocket;
 use std::path::PathBuf;
 use std::sync::{
     Arc,
-    atomic::{AtomicBool, AtomicU64, Ordering},
+    atomic::{AtomicBool, Ordering},
 };
 use std::thread::{self, JoinHandle};
 use std::time::{Duration, Instant};
 
 const MUTE_PATH: &str = "/avatar/parameters/MuteSelf";
 const COOLDOWN: Duration = Duration::from_millis(500);
-static NEXT_STREAM_ID: AtomicU64 = AtomicU64::new(1);
-
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub enum OscFormatMode {
     BilingualSourceFirst, // Source \n Target
@@ -120,7 +118,7 @@ impl Default for BannerConfig {
 }
 
 impl BannerConfig {
-    pub fn render_text(&self, metrics: &crate::sys_info::SystemMetrics) -> String {
+    pub fn render_text(&self, metrics: &super::sys_info::SystemMetrics) -> String {
         match self.content_type {
             BannerContentType::None => String::new(),
             BannerContentType::CustomText => self.custom_text.trim().to_string(),
@@ -313,23 +311,19 @@ enum Command {
 #[derive(Clone, Debug)]
 pub struct OscHandle {
     tx: Sender<Command>,
-    stream_id: u64,
 }
 
 impl OscHandle {
-    pub fn stream_id(&self) -> u64 {
-        self.stream_id
-    }
-
-    pub fn add_message_and_send(
+    pub fn add_message_for_stream(
         &self,
+        stream_id: u64,
         source: &str,
         translated: &str,
         speaker_id: &str,
         ongoing: bool,
     ) {
         let _ = self.tx.send(Command::Message {
-            stream_id: self.stream_id,
+            stream_id,
             source: source.trim().into(),
             translated: translated.trim().into(),
             speaker_id: speaker_id.trim().into(),
@@ -338,13 +332,19 @@ impl OscHandle {
         });
     }
 
-    pub fn end_stream(&self) {
-        let _ = self.tx.send(Command::EndStream(self.stream_id));
+    pub fn end_stream_for(&self, stream_id: u64) {
+        let _ = self.tx.send(Command::EndStream(stream_id));
     }
 
-    pub fn roll_stream(&self, source: &str, translated: &str, speaker_id: &str) {
+    pub fn roll_stream_for(
+        &self,
+        stream_id: u64,
+        source: &str,
+        translated: &str,
+        speaker_id: &str,
+    ) {
         let _ = self.tx.send(Command::RollStream {
-            stream_id: self.stream_id,
+            stream_id,
             source: source.trim().into(),
             translated: translated.trim().into(),
             speaker_id: speaker_id.trim().into(),
@@ -436,7 +436,6 @@ impl OscManager {
     pub fn handle(&self) -> OscHandle {
         OscHandle {
             tx: self.tx.clone(),
-            stream_id: NEXT_STREAM_ID.fetch_add(1, Ordering::Relaxed),
         }
     }
     pub fn update_settings(&mut self, settings: OscSettings) -> Result<(), String> {
@@ -567,7 +566,7 @@ fn dispatch_loop(
     mut settings: OscSettings,
     status: Arc<Mutex<RuntimeStatus>>,
 ) {
-    let monitor = crate::sys_info::SystemMonitor::new();
+    let monitor = super::sys_info::SystemMonitor::new();
     let mut history = Vec::new();
     let mut live = Vec::new();
     let mut pending = None;
@@ -794,7 +793,7 @@ fn build_queued_message(
     history: &[HistoryMessage],
     live: &[HistoryMessage],
     settings: &OscSettings,
-    metrics: &crate::sys_info::SystemMetrics,
+    metrics: &super::sys_info::SystemMetrics,
     typing: bool,
     notify: bool,
     final_priority: bool,
@@ -862,7 +861,7 @@ fn build_chatbox_text(
     history: &[HistoryMessage],
     live: &[HistoryMessage],
     settings: &OscSettings,
-    metrics: &crate::sys_info::SystemMetrics,
+    metrics: &super::sys_info::SystemMetrics,
 ) -> String {
     let mut entries = history
         .iter()
@@ -923,7 +922,7 @@ fn render_entries<'a>(
         let target = entry.translated.trim();
         let speaker = settings
             .show_speaker_number
-            .then(|| crate::compact_speaker_label(&entry.speaker_id))
+            .then(|| compact_speaker_label(&entry.speaker_id))
             .flatten();
 
         if !source.is_empty() && !target.is_empty() && source != target {
@@ -962,6 +961,22 @@ fn render_entries<'a>(
 
 fn with_speaker(text: &str, speaker: Option<&str>) -> String {
     speaker.map_or_else(|| text.to_string(), |label| format!("[{label}] {text}"))
+}
+
+fn compact_speaker_label(speaker_id: &str) -> Option<String> {
+    let value = speaker_id.trim();
+    if value.is_empty() {
+        return None;
+    }
+    let suffix = value.strip_prefix("speaker-").unwrap_or(value);
+    if suffix.eq_ignore_ascii_case("unknown") {
+        return Some("S?".into());
+    }
+    let sequence = suffix.trim_start_matches('0');
+    Some(format!(
+        "S{}",
+        if sequence.is_empty() { "0" } else { sequence }
+    ))
 }
 
 fn compose_chatbox(prefix: &str, content: &str, suffix: &str) -> String {
@@ -1018,7 +1033,7 @@ fn render_entry(entry: &HistoryMessage, settings: &OscSettings) -> String {
     }
 
     if settings.show_speaker_number
-        && let Some(label) = crate::compact_speaker_label(&entry.speaker_id)
+        && let Some(label) = compact_speaker_label(&entry.speaker_id)
     {
         format!("[{label}] {core_text}")
     } else {
@@ -1116,7 +1131,7 @@ mod tests {
         let mut second = history_message(now + Duration::from_secs(10), "second source");
         second.translated = "second target".into();
         let history = vec![first, second];
-        let metrics = crate::sys_info::SystemMetrics::default();
+        let metrics = super::super::sys_info::SystemMetrics::default();
         let mut settings = OscSettings {
             format_mode: OscFormatMode::BilingualSourceFirst,
             ..OscSettings::default()
@@ -1244,7 +1259,7 @@ mod tests {
             },
             ..OscSettings::default()
         };
-        let metrics = crate::sys_info::SystemMetrics::default();
+        let metrics = super::super::sys_info::SystemMetrics::default();
 
         assert!(expire_chatbox_entries(
             &mut history,
@@ -1285,7 +1300,7 @@ mod tests {
             &history,
             &[],
             &settings,
-            &crate::sys_info::SystemMetrics::default(),
+            &super::super::sys_info::SystemMetrics::default(),
         );
         assert_eq!(text, "H\n23456789\nF");
         assert_eq!(text.chars().count(), settings.max_text_length);

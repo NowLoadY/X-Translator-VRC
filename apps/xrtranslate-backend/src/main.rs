@@ -36,8 +36,9 @@ use xrtranslate_config::{AppConfig, LocalModelRuntimeConfig};
 use xrtranslate_engine::RouteEpoch;
 use xrtranslate_inference::{AsyncHttpClient, HttpRequest, ReqwestClient};
 use xrtranslate_protocol::{
-    ActionControl, ClientControl, ErrorEvent, EventControl, Feature, LatencyMetrics, PcmFormat,
-    PcmFrame, RecognitionStreamEnded, ServerEvent, SessionReady, VadActivity,
+    ActionControl, ClientControl, DrainReason, ErrorEvent, EventControl, Feature, LatencyMetrics,
+    PcmFormat, PcmFrame, PipelineDrained, RecognitionStreamEnded, ServerEvent, SessionReady,
+    VadActivity,
 };
 use xrtranslate_supervisor::{
     LlamaServerEndpoint, LlamaServerLauncher, LlamaServerProcess, LlamaServerProcessHandle,
@@ -123,6 +124,12 @@ enum InferenceJob {
         generation: PipelineGeneration,
         turn_id: String,
     },
+    /// An ordered fence. The worker emits the matching event only after every
+    /// inference job queued before it has completed.
+    Drain {
+        generation: PipelineGeneration,
+        reason: DrainReason,
+    },
 }
 
 enum InferenceEvent {
@@ -145,6 +152,10 @@ enum InferenceEvent {
         generation: PipelineGeneration,
         turn_id: String,
     },
+    Drained {
+        generation: PipelineGeneration,
+        reason: DrainReason,
+    },
     Error {
         generation: PipelineGeneration,
         message: String,
@@ -158,8 +169,26 @@ impl InferenceEvent {
             | Self::Recognized { generation, .. }
             | Self::Translation { generation, .. }
             | Self::StreamEnded { generation, .. }
+            | Self::Drained { generation, .. }
             | Self::Error { generation, .. } => *generation,
         }
+    }
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum SessionInputState {
+    Running,
+    Paused,
+    Draining,
+}
+
+impl SessionInputState {
+    const fn accepts_audio(self) -> bool {
+        matches!(self, Self::Running)
+    }
+
+    const fn accepts_controls(self) -> bool {
+        !matches!(self, Self::Draining)
     }
 }
 
@@ -359,7 +388,8 @@ async fn serve_session(socket: WebSocket, state: BackendState) {
         Arc::clone(&speaker_state_revision),
     ));
     let mut job_sender = Some(job_sender);
-    let mut stopping = false;
+    let mut input_state = SessionInputState::Running;
+    let mut graceful_shutdown = false;
     let mut next_utterance_sequence = 1_u64;
 
     if send_event(
@@ -383,14 +413,34 @@ async fn serve_session(socket: WebSocket, state: BackendState) {
                 let Some(result) = result else {
                     break;
                 };
+                let drained = match &result {
+                    InferenceEvent::Drained { reason, .. } => Some(*reason),
+                    _ => None,
+                };
                 if let InferenceEvent::WindowObserved { text_units, .. } = &result {
                     pipeline.observe_text_density(*text_units);
                 }
                 if handle_inference_event(&outbound_sender, &mut session, generation, result).await.is_err() {
                     break;
                 }
+                if let Some(reason) = drained {
+                    if send_event(
+                        &outbound_sender,
+                        Some(generation),
+                        ServerEvent::PipelineDrained(PipelineDrained { reason }),
+                    )
+                    .await
+                    .is_err()
+                    {
+                        break;
+                    }
+                    if reason != DrainReason::Paused {
+                        graceful_shutdown = true;
+                        break;
+                    }
+                }
             }
-            frame = reader.next(), if !stopping => {
+            frame = reader.next(), if input_state.accepts_controls() => {
                 let Some(frame) = frame else {
                     break;
                 };
@@ -464,30 +514,89 @@ async fn serve_session(socket: WebSocket, state: BackendState) {
                             generation_sender.send_replace(generation);
                             info!(%session_id, source_lang = session.source_lang(), target_lang = session.target_lang(), sample_rate, "audio configured");
                         }
-                        Ok(ClientControl::Event(EventControl::Stop)) => {
-                            match pipeline.flush() {
-                                Ok(Some(utterance)) => {
-                                    if let Some(sender) = job_sender.as_ref()
-                                        && let Err(error) = enqueue_utterances(
-                                            sender,
-                                            &session,
-                                            generation,
-                                            vec![utterance],
-                                            &mut next_utterance_sequence,
-                                        )
-                                        && send_error(&outbound_sender, error).await.is_err() {
-                                            break;
-                                        }
-                                }
-                                Ok(None) => {}
-                                Err(error) => {
+                        Ok(ClientControl::Event(EventControl::Pause)) => {
+                            if input_state == SessionInputState::Running {
+                                let Some(sender) = job_sender.as_ref() else { break };
+                                if let Err(error) = queue_pipeline_drain(
+                                    &mut pipeline,
+                                    sender,
+                                    &session,
+                                    generation,
+                                    DrainReason::Paused,
+                                    &mut next_utterance_sequence,
+                                )
+                                .await
+                                {
                                     if send_error(&outbound_sender, error).await.is_err() {
                                         break;
                                     }
                                 }
+                                let mut send_failed = false;
+                                for active in pipeline.take_vad_transitions() {
+                                    if send_event(
+                                        &outbound_sender,
+                                        Some(generation),
+                                        ServerEvent::VadActivity(VadActivity { active }),
+                                    )
+                                    .await
+                                    .is_err()
+                                    {
+                                        send_failed = true;
+                                        break;
+                                    }
+                                }
+                                if send_failed {
+                                    break;
+                                }
+                                input_state = SessionInputState::Paused;
+                            }
+                        }
+                        Ok(ClientControl::Event(EventControl::Resume)) => {
+                            if input_state == SessionInputState::Paused {
+                                input_state = SessionInputState::Running;
+                            }
+                        }
+                        Ok(ClientControl::Event(control @ (EventControl::Finish | EventControl::InputEnded | EventControl::Stop))) => {
+                            let reason = match control {
+                                EventControl::Finish => DrainReason::Finished,
+                                EventControl::InputEnded => DrainReason::InputEnded,
+                                EventControl::Stop => DrainReason::Stopped,
+                                _ => unreachable!(),
+                            };
+                            let Some(sender) = job_sender.as_ref() else { break };
+                            if let Err(error) = queue_pipeline_drain(
+                                &mut pipeline,
+                                sender,
+                                &session,
+                                generation,
+                                reason,
+                                &mut next_utterance_sequence,
+                            )
+                            .await
+                            {
+                                if send_error(&outbound_sender, error).await.is_err() {
+                                    break;
+                                }
+                            }
+                            let mut send_failed = false;
+                            for active in pipeline.take_vad_transitions() {
+                                if send_event(
+                                    &outbound_sender,
+                                    Some(generation),
+                                    ServerEvent::VadActivity(VadActivity { active }),
+                                )
+                                .await
+                                .is_err()
+                                {
+                                    send_failed = true;
+                                    break;
+                                }
+                            }
+                            if send_failed {
+                                break;
                             }
                             job_sender.take();
-                            stopping = true;
+                            input_state = SessionInputState::Draining;
                         }
                         Ok(ClientControl::Action(ActionControl::ToggleFeature { feature, enabled })) => {
                             match feature {
@@ -527,6 +636,9 @@ async fn serve_session(socket: WebSocket, state: BackendState) {
                         }
                     },
                     Message::Binary(audio) => {
+                        if !input_state.accepts_audio() {
+                            continue;
+                        }
                         if let Err(error) = validate_input_chunk_size(audio.len()) {
                             if send_error(&outbound_sender, error).await.is_err() {
                                 break;
@@ -595,12 +707,12 @@ async fn serve_session(socket: WebSocket, state: BackendState) {
     }
 
     job_sender.take();
-    if !stopping {
+    if !graceful_shutdown {
         worker.abort();
     }
     let _ = worker.await;
     drop(outbound_sender);
-    if stopping {
+    if graceful_shutdown {
         if tokio::time::timeout(Duration::from_secs(2), &mut writer_task)
             .await
             .is_err()
@@ -866,22 +978,34 @@ fn enqueue_utterances(
     next_utterance_sequence: &mut u64,
 ) -> Result<(), String> {
     debug_assert_eq!(generation.route_epoch, session.route_epoch());
-    if sender.capacity() < utterances.len() {
+    let jobs = inference_jobs(session, generation, utterances, next_utterance_sequence)?;
+    if sender.capacity() < jobs.len() {
         return Err(format!(
             "native inference queue is full (capacity: {INFERENCE_QUEUE_CAPACITY}); finish the current speech before sending more audio"
         ));
     }
+    for job in jobs {
+        sender.try_send(job).map_err(inference_queue_error)?;
+    }
+    Ok(())
+}
+
+fn inference_jobs(
+    session: &SessionAdapter,
+    generation: PipelineGeneration,
+    utterances: Vec<PipelineEvent>,
+    next_utterance_sequence: &mut u64,
+) -> Result<Vec<InferenceJob>, String> {
     let turn_id_prefix = session.turn_id();
     let source_language = session.source_lang().to_owned();
     let target_language = session.target_lang().to_owned();
+    let mut jobs = Vec::with_capacity(utterances.len());
     for event in utterances {
         if matches!(event, PipelineEvent::StreamEnded) {
-            sender
-                .try_send(InferenceJob::StreamEnded {
-                    generation,
-                    turn_id: turn_id_prefix.clone(),
-                })
-                .map_err(inference_queue_error)?;
+            jobs.push(InferenceJob::StreamEnded {
+                generation,
+                turn_id: turn_id_prefix.clone(),
+            });
             continue;
         }
         let PipelineEvent::Utterance(timed) = event else {
@@ -903,29 +1027,61 @@ fn enqueue_utterances(
             |sequence| format!("{turn_id_prefix}:generation-{generation:?}:speech-{sequence}"),
         );
         let duration_ms = utterance.samples.len().saturating_mul(1_000) / SAMPLE_RATE_HZ as usize;
-        let queued = INFERENCE_QUEUE_CAPACITY.saturating_sub(sender.capacity());
         info!(
             duration_ms,
             overlap_frames = utterance.overlap_frames,
             end_reason = ?utterance.end_reason,
-            queued,
             "VAD finalized an utterance; queuing it for ASR"
         );
-        sender
-            .try_send(InferenceJob::Utterance(UtteranceJob {
-                utterance,
-                source_start_ms,
-                source_end_ms,
-                revisable,
-                generation,
-                turn_id,
-                topic_turn_id,
-                source_language: source_language.clone(),
-                target_language: target_language.clone(),
-            }))
-            .map_err(inference_queue_error)?;
+        jobs.push(InferenceJob::Utterance(UtteranceJob {
+            utterance,
+            source_start_ms,
+            source_end_ms,
+            revisable,
+            generation,
+            turn_id,
+            topic_turn_id,
+            source_language: source_language.clone(),
+            target_language: target_language.clone(),
+        }));
     }
-    Ok(())
+    Ok(jobs)
+}
+
+/// Flushes the current VAD turn and places an ordered fence behind all queued
+/// model work. Unlike live ingestion, this waits for bounded queue capacity so
+/// a pause or EOF cannot silently discard its final utterance.
+async fn queue_pipeline_drain(
+    pipeline: &mut NativePipeline,
+    sender: &mpsc::Sender<InferenceJob>,
+    session: &SessionAdapter,
+    generation: PipelineGeneration,
+    reason: DrainReason,
+    next_utterance_sequence: &mut u64,
+) -> Result<(), String> {
+    let flush_error = match pipeline.flush() {
+        Ok(Some(utterance)) => {
+            for job in inference_jobs(
+                session,
+                generation,
+                vec![utterance],
+                next_utterance_sequence,
+            )? {
+                sender
+                    .send(job)
+                    .await
+                    .map_err(|_| "native inference worker has stopped".to_owned())?;
+            }
+            None
+        }
+        Ok(None) => None,
+        Err(error) => Some(error),
+    };
+    sender
+        .send(InferenceJob::Drain { generation, reason })
+        .await
+        .map_err(|_| "native inference worker has stopped".to_owned())?;
+    flush_error.map_or(Ok(()), Err)
 }
 
 fn inference_queue_error(error: mpsc::error::TrySendError<InferenceJob>) -> String {
@@ -978,6 +1134,23 @@ async fn run_inference_worker(
                         .send(InferenceEvent::StreamEnded {
                             generation: event_generation,
                             turn_id,
+                        })
+                        .await
+                        .is_err()
+                {
+                    break;
+                }
+                continue;
+            }
+            InferenceJob::Drain {
+                generation: event_generation,
+                reason,
+            } => {
+                if *generation.borrow() == event_generation
+                    && events
+                        .send(InferenceEvent::Drained {
+                            generation: event_generation,
+                            reason,
                         })
                         .await
                         .is_err()
@@ -1424,6 +1597,7 @@ async fn handle_inference_event(
             )
             .await?;
         }
+        InferenceEvent::Drained { .. } => {}
         InferenceEvent::Error {
             generation,
             message,
@@ -1600,15 +1774,25 @@ async fn shutdown_signal() {
 #[cfg(test)]
 mod tests {
     use super::{
-        AudioEpoch, PipelineGeneration, StreamWindowContext, apply_model_runtime, health_url,
-        local_endpoint_port, model_alias_is_advertised, models_url, outbound_is_current,
-        segment_contexts,
+        AudioEpoch, PipelineGeneration, SessionInputState, StreamWindowContext,
+        apply_model_runtime, health_url, local_endpoint_port, model_alias_is_advertised,
+        models_url, outbound_is_current, segment_contexts,
     };
     use xrtranslate_config::LocalModelRuntimeConfig;
     use xrtranslate_engine::{
         EngineConfig, Language, LanguageRoute, SessionEngine, TranslationSegmentPair,
     };
     use xrtranslate_supervisor::LlamaServerSpec;
+
+    #[test]
+    fn paused_sessions_keep_controls_but_reject_binary_audio() {
+        assert!(SessionInputState::Running.accepts_audio());
+        assert!(SessionInputState::Running.accepts_controls());
+        assert!(!SessionInputState::Paused.accepts_audio());
+        assert!(SessionInputState::Paused.accepts_controls());
+        assert!(!SessionInputState::Draining.accepts_audio());
+        assert!(!SessionInputState::Draining.accepts_controls());
+    }
 
     #[test]
     fn per_request_context_is_multiplied_by_parallel_slots() {

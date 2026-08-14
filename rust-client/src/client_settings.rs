@@ -1,6 +1,9 @@
 use crate::audio::InputDevice;
 use crate::i18n::UiLanguage;
-use crate::osc::OscSettings;
+#[cfg(test)]
+use crate::plugins::PluginId;
+use crate::plugins::osc::runtime::OscSettings;
+use crate::plugins::{PluginPreferences, PluginRegistry};
 use crate::ui::Page;
 use serde::{Deserialize, Serialize};
 use std::path::Path;
@@ -82,6 +85,8 @@ pub struct ClientSettings {
     pub download_proxy_url: String,
     #[serde(default = "OscSettings::from_project_config")]
     pub osc_settings: OscSettings,
+    #[serde(default, rename = "plugins", alias = "plugin_preferences")]
+    pub plugin_preferences: PluginPreferences,
     #[serde(default)]
     pub active_page: Page,
     #[serde(default)]
@@ -146,6 +151,7 @@ impl Default for ClientSettings {
             server_url: default_server_url(),
             download_proxy_url: String::new(),
             osc_settings: OscSettings::from_project_config(),
+            plugin_preferences: PluginPreferences::default(),
             active_page: Page::default(),
             sidebar_collapsed: false,
             floating_subtitles_enabled: false,
@@ -168,6 +174,9 @@ impl ClientSettings {
         // Keep lifecycle state authoritative across development and packaged launches.
         settings.apply_app_state(project_root);
         settings.normalize_feature_dependencies();
+        let registry = PluginRegistry::builtin();
+        registry.initialize_preferences(&mut settings.plugin_preferences);
+        registry.normalize_active_page(&settings.plugin_preferences, &mut settings.active_page);
         settings
     }
 
@@ -274,7 +283,11 @@ impl ClientSettings {
         let directory = project_root.join("runtime");
         let _ = std::fs::create_dir_all(&directory);
         let path = directory.join("rust-client-settings.json");
-        let contents = serde_json::to_string_pretty(self).map_err(|e| e.to_string())?;
+        let mut normalized = self.clone();
+        let registry = PluginRegistry::builtin();
+        registry.initialize_preferences(&mut normalized.plugin_preferences);
+        registry.normalize_active_page(&normalized.plugin_preferences, &mut normalized.active_page);
+        let contents = serde_json::to_string_pretty(&normalized).map_err(|e| e.to_string())?;
         std::fs::write(&path, format!("{contents}\n")).map_err(|e| e.to_string())?;
 
         let app_state_path = directory.join("app_state.json");
@@ -320,10 +333,10 @@ mod tests {
             source_lang: "en".into(),
             download_proxy_url: "socks5://127.0.0.1:1080".into(),
             sidebar_collapsed: true,
-            active_page: Page::Osc,
+            active_page: Page::Plugin(PluginId::OSC),
             osc_settings: OscSettings {
                 show_speaker_number: true,
-                message_separator: crate::osc::OscMessageSeparator::NewLine,
+                message_separator: crate::plugins::osc::runtime::OscMessageSeparator::NewLine,
                 ..OscSettings::default()
             },
             ..ClientSettings::default()
@@ -340,11 +353,11 @@ mod tests {
         assert_eq!(loaded.source_lang, "en");
         assert_eq!(loaded.download_proxy_url, "socks5://127.0.0.1:1080");
         assert!(loaded.sidebar_collapsed);
-        assert_eq!(loaded.active_page, Page::Osc);
+        assert_eq!(loaded.active_page, Page::Plugin(PluginId::OSC));
         assert!(loaded.osc_settings.show_speaker_number);
         assert_eq!(
             loaded.osc_settings.message_separator,
-            crate::osc::OscMessageSeparator::NewLine
+            crate::plugins::osc::runtime::OscMessageSeparator::NewLine
         );
 
         // Test sanitization with missing device
@@ -396,6 +409,23 @@ mod tests {
         settings.save(&root).unwrap();
 
         assert!(!ClientSettings::load(&root).tts_enabled);
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn disabled_plugin_page_falls_back_to_translation() {
+        let root = std::env::temp_dir().join("xrtranslate_test_disabled_plugin_route");
+        let _ = std::fs::remove_dir_all(&root);
+        let mut preferences = PluginPreferences::default();
+        preferences.set_enabled(PluginId::MEETING, false);
+        let settings = ClientSettings {
+            active_page: Page::Plugin(PluginId::MEETING),
+            plugin_preferences: preferences,
+            ..ClientSettings::default()
+        };
+        settings.save(&root).unwrap();
+
+        assert_eq!(ClientSettings::load(&root).active_page, Page::Translation);
         let _ = std::fs::remove_dir_all(root);
     }
 

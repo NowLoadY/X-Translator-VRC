@@ -6,7 +6,7 @@ pub enum SettingsSection {
     #[default]
     GeneralAppearance,
     ServiceProviders,
-    OscNetwork,
+    Plugins,
     BackendServer,
 }
 
@@ -31,9 +31,9 @@ pub fn render(app: &mut crate::XRTranslateApp, ui: &mut egui::Ui) {
             label: crate::i18n::tr(app.ui_language, "Service Providers"),
         },
         SubNavItem {
-            id: SettingsSection::OscNetwork,
+            id: SettingsSection::Plugins,
             icon: "",
-            label: crate::i18n::tr(app.ui_language, "VRChat OSC"),
+            label: crate::i18n::tr(app.ui_language, "Plugins"),
         },
         SubNavItem {
             id: SettingsSection::BackendServer,
@@ -74,8 +74,8 @@ pub fn render(app: &mut crate::XRTranslateApp, ui: &mut egui::Ui) {
                                     app.apply_service_configuration(Some(ui.ctx().clone()));
                                 }
                             }
-                            SettingsSection::OscNetwork => {
-                                render_osc_network_section(app, ui);
+                            SettingsSection::Plugins => {
+                                render_plugins_section(app, ui);
                             }
                             SettingsSection::BackendServer => {
                                 render_server_section(app, ui);
@@ -288,72 +288,75 @@ fn render_server_section(app: &mut crate::XRTranslateApp, ui: &mut egui::Ui) {
     });
 }
 
-fn render_osc_network_section(app: &mut crate::XRTranslateApp, ui: &mut egui::Ui) {
-    section(ui, crate::i18n::tr(app.ui_language, "OSC Network"), |ui| {
-        components::feature_ui(
-            ui,
-            crate::feature_access::Feature::OscChatbox,
-            app.ui_language,
-            |ui| {
-                ui.horizontal_wrapped(|ui| {
-                    ui.label(crate::i18n::tr(app.ui_language, "Status:"));
-                    let status = app.osc_manager.listener_status();
-                    ui.label(
-                        egui::RichText::new(status)
-                            .color(crate::ui::theme::text_weak())
-                            .size(12.0),
-                    );
-                });
+fn render_plugins_section(app: &mut crate::XRTranslateApp, ui: &mut egui::Ui) {
+    let language = app.ui_language;
+    ui.label(
+        egui::RichText::new(crate::i18n::tr(language, "Plugins"))
+            .size(18.0)
+            .color(crate::ui::theme::text_strong())
+            .strong(),
+    );
+    ui.label(
+        egui::RichText::new(crate::i18n::tr(
+            language,
+            "Choose which optional tools appear in the sidebar.",
+        ))
+        .size(12.0)
+        .color(crate::ui::theme::text_weak()),
+    );
+    ui.add_space(12.0);
 
-                ui.add_space(10.0);
+    for descriptor in crate::plugins::PluginRegistry::builtin().descriptors() {
+        let mut enabled = app.plugin_enabled(descriptor.id);
+        let disable_reason = enabled
+            .then(|| app.plugin_disable_block_reason(descriptor.id))
+            .flatten();
 
-                ui.horizontal_wrapped(|ui| {
-                    ui.label("IP:");
-                    ui.add(egui::TextEdit::singleline(&mut app.osc_draft.ip).desired_width(110.0));
-
-                    ui.add_space(16.0);
-                    ui.label(crate::i18n::tr(app.ui_language, "Send Port:"));
-                    ui.add(egui::DragValue::new(&mut app.osc_draft.send_port).range(1..=u16::MAX));
-
-                    ui.add_space(16.0);
-                    ui.label(crate::i18n::tr(app.ui_language, "Listen Port:"));
-                    ui.add(
-                        egui::DragValue::new(&mut app.osc_draft.listen_port).range(1..=u16::MAX),
-                    );
-                });
-
-                ui.add_space(10.0);
-
-                ui.horizontal_wrapped(|ui| {
-                    ui.label(crate::i18n::tr(app.ui_language, "Limit:"));
-                    ui.add(
-                        egui::DragValue::new(&mut app.osc_draft.max_text_length).range(1..=10_000),
-                    );
-                });
-
-                ui.add_space(10.0);
-
-                components::modern_slider_f64(
-                    ui,
-                    &mut app.osc_draft.history_ttl_seconds,
-                    10.0..=20.0,
-                    15.0,
-                    crate::i18n::tr(app.ui_language, "History TTL:"),
-                    "s",
+        components::card(ui, |ui| {
+            ui.horizontal(|ui| {
+                ui.add(
+                    egui::Image::new(descriptor.icon.image_source())
+                        .fit_to_exact_size(egui::vec2(18.0, 18.0))
+                        .tint(crate::ui::theme::text_strong()),
                 );
-
-                ui.add_space(12.0);
-
-                if components::animated_button(ui, crate::i18n::tr(app.ui_language, "Apply"))
-                    .clicked()
-                {
-                    match app.osc_manager.update_settings(app.osc_draft.clone()) {
-                        Ok(()) => app.last_error = None,
-                        Err(error) => app.last_error = Some(error),
+                ui.vertical(|ui| {
+                    let response = ui
+                        .add_enabled_ui(disable_reason.is_none(), |ui| {
+                            components::toggle_with_label(
+                                ui,
+                                &mut enabled,
+                                crate::i18n::tr(language, descriptor.title_key),
+                            )
+                        })
+                        .inner;
+                    if response.changed() {
+                        app.set_plugin_enabled(descriptor.id, enabled);
                     }
-                    app.save_settings();
-                }
-            },
-        );
-    });
+                    ui.label(
+                        egui::RichText::new(crate::i18n::tr(language, descriptor.description_key))
+                            .size(11.5)
+                            .color(crate::ui::theme::text_weak()),
+                    );
+                    if let Some(reason) = disable_reason {
+                        ui.label(
+                            egui::RichText::new(reason)
+                                .size(11.5)
+                                .color(egui::Color32::from_rgb(180, 83, 9)),
+                        );
+                    }
+                });
+            });
+
+            if enabled
+                && descriptor.settings_contribution
+                    == crate::plugins::PluginSettingsContribution::Plugin
+            {
+                ui.add_space(10.0);
+                ui.separator();
+                ui.add_space(10.0);
+                app.render_plugin_settings(descriptor.id, ui);
+            }
+        });
+        ui.add_space(10.0);
+    }
 }

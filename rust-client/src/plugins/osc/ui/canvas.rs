@@ -1,16 +1,20 @@
 use crate::ui::components::card;
 use eframe::egui;
 
-pub fn render_canvas(app: &crate::XRTranslateApp, ui: &mut egui::Ui) {
+pub fn render_canvas(
+    plugin: &super::super::OscPlugin,
+    ui: &mut egui::Ui,
+    language: crate::i18n::UiLanguage,
+) {
     let canvas_height = (ui.available_height() - 10.0).max(220.0);
 
     card(ui, |ui| {
         ui.set_min_height(canvas_height - 32.0);
 
-        let preview = app.osc_manager.chatbox_preview();
+        let preview = plugin.manager().chatbox_preview();
         let is_empty = preview.text.trim().is_empty();
         let char_count = preview.text.chars().count();
-        let limit = app.osc_draft.max_text_length;
+        let limit = plugin.draft().max_text_length;
 
         ui.with_layout(egui::Layout::right_to_left(egui::Align::TOP), |ui| {
             let (bg_color, text_color) = if char_count > limit {
@@ -25,7 +29,7 @@ pub fn render_canvas(app: &crate::XRTranslateApp, ui: &mut egui::Ui) {
                 )
             };
             let lifecycle = if preview.typing {
-                Some(crate::i18n::tr(app.ui_language, "Live").to_owned())
+                Some(crate::i18n::tr(language, "Live").to_owned())
             } else {
                 preview
                     .next_message_expires_in
@@ -70,7 +74,7 @@ pub fn render_canvas(app: &crate::XRTranslateApp, ui: &mut egui::Ui) {
                         ui.set_max_width(380.0);
                         if is_empty {
                             ui.label(
-                                egui::RichText::new(crate::i18n::tr(app.ui_language, "Empty"))
+                                egui::RichText::new(crate::i18n::tr(language, "Empty"))
                                     .family(egui::FontFamily::Monospace)
                                     .color(egui::Color32::from_rgb(100, 116, 139))
                                     .size(13.0)

@@ -3,6 +3,9 @@ name = "rust-client"
 version.workspace = true
 edition.workspace = true
 
+[lib]
+path = "src/plugins/meeting/store.rs"
+
 [dependencies]
 cpal = "0.18.1"
 crossbeam-channel = "0.5.16"
@@ -17,12 +20,15 @@ rfd = "0.17.2"
 rubato = "4.0.0"
 audioadapter-buffers = "4.0.0"
 rosc = "0.11.4"
+rusqlite = { version = "0.37.0", features = ["bundled"] }
 serde = { version = "1.0.229", features = ["derive"] }
 serde_json = "1.0.151"
 sha2 = "0.10.9"
+symphonia = { version = "0.5.5", default-features = false, features = ["aac", "alac", "flac", "isomp4", "mp3", "ogg", "pcm", "vorbis", "wav"] }
 tokio = { version = "1.53.1", features = ["full"] }
 tokio-tungstenite = "0.30.0"
 tungstenite = "0.30.0"
+uuid = { version = "1.18.1", features = ["v4"] }
 zip = { version = "2.4.2", default-features = false, features = ["deflate"] }
 xrtranslate-assets = { path = "../crates/xrtranslate-assets" }
 xrtranslate-config = { path = "../crates/xrtranslate-config" }

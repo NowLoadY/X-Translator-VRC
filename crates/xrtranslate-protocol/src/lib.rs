@@ -16,7 +16,7 @@ pub use xr_corpus_protocol::{CorpusRecognitionCorrection, CorpusTermMatch, Corpu
 /// The legacy Python backend does not exchange this number on the wire yet.
 /// It is exported so the Rust client and backend can reject incompatible peers
 /// once a handshake is added without changing the individual DTOs.
-pub const PROTOCOL_VERSION: u16 = 2;
+pub const PROTOCOL_VERSION: u16 = 3;
 
 const fn is_false(value: &bool) -> bool {
     !*value
@@ -182,7 +182,18 @@ pub enum EventControl {
         #[serde(default, skip_serializing_if = "is_false")]
         continuous_recognition: bool,
     },
-    /// Flushes the active turn and stops session work.
+    /// Flushes the active turn and temporarily rejects further binary audio.
+    /// The WebSocket, timeline, and speaker state remain alive.
+    Pause,
+    /// Allows binary audio to enter a paused pipeline again.
+    Resume,
+    /// Flushes the active turn and gracefully finishes this session after all
+    /// queued inference results have been emitted.
+    Finish,
+    /// Signals that a finite input (for example, an imported audio file) has
+    /// reached EOF. Its drain behavior is the same as [`Self::Finish`].
+    InputEnded,
+    /// Legacy graceful-finish spelling retained for older clients.
     Stop,
     /// Marks the beginning of microphone audio for a logical turn.
     TurnStarted { turn_id: String },
@@ -210,8 +221,26 @@ pub enum ServerEvent {
     SourceSegmentReady(SourceSegmentReady),
     TranslationReady(TranslationReady),
     RecognitionStreamEnded(RecognitionStreamEnded),
+    PipelineDrained(PipelineDrained),
     TtsFinished(TtsFinished),
     Error(ErrorEvent),
+}
+
+/// Confirms that every inference result preceding a pause or terminal input
+/// boundary has been placed on the ordered WebSocket output queue.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub struct PipelineDrained {
+    pub reason: DrainReason,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum DrainReason {
+    Paused,
+    Finished,
+    InputEnded,
+    /// A drain requested through the legacy `stop` control.
+    Stopped,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -371,6 +400,33 @@ mod tests {
             serde_json::to_string(&control).unwrap(),
             r#"{"action":"toggle_feature","feature":"speaker_recognition","enabled":true}"#
         );
+    }
+
+    #[test]
+    fn meeting_lifecycle_controls_have_stable_wire_shapes() {
+        for (event, expected) in [
+            (EventControl::Pause, r#"{"event":"pause"}"#),
+            (EventControl::Resume, r#"{"event":"resume"}"#),
+            (EventControl::Finish, r#"{"event":"finish"}"#),
+            (EventControl::InputEnded, r#"{"event":"input_ended"}"#),
+            (EventControl::Stop, r#"{"event":"stop"}"#),
+        ] {
+            let control = ClientControl::Event(event);
+            assert_eq!(serde_json::to_string(&control).unwrap(), expected);
+        }
+    }
+
+    #[test]
+    fn pipeline_drained_reports_why_the_boundary_was_requested() {
+        let event = ServerEvent::PipelineDrained(PipelineDrained {
+            reason: DrainReason::InputEnded,
+        });
+        let json = serde_json::to_string(&event).unwrap();
+        assert_eq!(
+            json,
+            r#"{"action":"pipeline_drained","data":{"reason":"input_ended"}}"#
+        );
+        assert_eq!(serde_json::from_str::<ServerEvent>(&json).unwrap(), event);
     }
 
     #[test]
