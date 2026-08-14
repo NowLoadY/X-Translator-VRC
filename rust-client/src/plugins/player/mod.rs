@@ -35,6 +35,7 @@ pub enum VideoPlayerAction {
     #[default]
     None,
     StartTranslation(PlayerTranslationRequest),
+    StopTranslation,
 }
 
 pub struct VideoPlayerPlugin {

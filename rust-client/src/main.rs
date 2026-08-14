@@ -25,6 +25,7 @@ mod overlay_native;
 mod plugins;
 mod runtime_install;
 mod service_config;
+pub mod session_coordinator;
 mod streaming;
 mod ui;
 pub mod version;
@@ -39,6 +40,7 @@ use plugins::meeting::{
 };
 use plugins::osc::{OscPageContext, OscPlugin, OscUiAction};
 use plugins::{PluginId, PluginPreferences, PluginRegistry, PluginScrollPolicy};
+use session_coordinator::TranslationSessionOwner;
 use ui::{NavigationState, Page};
 
 const STREAM_TEXT_LIMIT: usize = 4_096;
@@ -527,6 +529,7 @@ struct XRTranslateApp {
     loopback_recognition: RecognitionSettings,
     selected_input_config: Option<InputConfigInfo>,
     is_translating: bool,
+    pub(crate) session_owner: TranslationSessionOwner,
     audio_txs: Vec<Sender<Vec<f32>>>,
     input_level: Arc<AtomicU32>,
     loopback_level: Arc<AtomicU32>,
@@ -682,17 +685,17 @@ impl Default for XRTranslateApp {
                             state.pending_recognition_windows.clear();
                             microphone_vad_active_clone.store(false, Ordering::Relaxed);
                             loopback_vad_active_clone.store(false, Ordering::Relaxed);
-                            let previous_remaining = terminal_meeting_disconnect
-                                .then(|| {
-                                    meeting_sessions_remaining_for_events
-                                        .fetch_update(
-                                            Ordering::AcqRel,
-                                            Ordering::Acquire,
-                                            |value| value.checked_sub(1),
-                                        )
-                                        .unwrap_or(0)
-                                })
-                                .unwrap_or(0);
+                            let previous_remaining = if terminal_meeting_disconnect {
+                                meeting_sessions_remaining_for_events
+                                    .fetch_update(
+                                        Ordering::AcqRel,
+                                        Ordering::Acquire,
+                                        |value| value.checked_sub(1),
+                                    )
+                                    .unwrap_or(0)
+                            } else {
+                                0
+                            };
                             let last_meeting_session = previous_remaining == 1;
                             if terminal_meeting_disconnect && last_meeting_session {
                                 let should_finish = meeting_event_sink.active_is_imported()
@@ -1053,6 +1056,7 @@ impl Default for XRTranslateApp {
             loopback_recognition: settings.loopback_recognition,
             selected_input_config,
             is_translating: false,
+            session_owner: TranslationSessionOwner::None,
             audio_txs: Vec::new(),
             input_level,
             loopback_level,
@@ -1133,12 +1137,28 @@ impl XRTranslateApp {
         }
     }
 
+    pub(crate) fn open_video_player_plugin(&mut self) {
+        if self.plugin_enabled(PluginId::VIDEO_PLAYER) {
+            self.navigation.page = Page::Plugin(PluginId::VIDEO_PLAYER);
+            self.save_settings();
+        }
+    }
+
     pub(crate) fn plugin_disable_block_reason(&self, id: PluginId) -> Option<String> {
         match id {
             PluginId::MEETING => self
                 .meeting_plugin
                 .disable_block_reason()
                 .map(str::to_owned),
+            PluginId::VIDEO_PLAYER => {
+                if self.session_owner.is_video_player()
+                    || self.player_plugin.controller.active_task_id.is_some()
+                {
+                    Some("Stop the active video playback before disabling this plugin".into())
+                } else {
+                    None
+                }
+            }
             PluginId::OSC => None,
             _ => None,
         }
@@ -1242,33 +1262,41 @@ impl XRTranslateApp {
     ) {
         match action {
             plugins::player::VideoPlayerAction::None => {}
-            plugins::player::VideoPlayerAction::StartTranslation(request) => match request {
-                plugins::player::PlayerTranslationRequest::ImportMediaFile {
-                    path,
-                    source_language,
-                    target_language,
-                    recognition,
-                } => {
-                    self.start_audio_file_translation(
+            plugins::player::VideoPlayerAction::StopTranslation => {
+                self.stop();
+            }
+            plugins::player::VideoPlayerAction::StartTranslation(request) => {
+                if self.is_translating {
+                    self.stop();
+                }
+                match request {
+                    plugins::player::PlayerTranslationRequest::ImportMediaFile {
                         path,
                         source_language,
                         target_language,
                         recognition,
-                        plugins::meeting::audio_file::AudioImportPacing::AsFastAsPossible,
-                        Some(ctx),
-                    );
+                    } => {
+                        self.start_audio_file_translation(
+                            path,
+                            source_language,
+                            target_language,
+                            recognition,
+                            plugins::meeting::audio_file::AudioImportPacing::AsFastAsPossible,
+                            Some(ctx),
+                        );
+                    }
+                    plugins::player::PlayerTranslationRequest::LiveStream {
+                        source_language,
+                        target_language,
+                        recognition,
+                    } => {
+                        self.source_lang = source_language;
+                        self.target_lang = target_language;
+                        self.loopback_recognition = recognition;
+                        self.start(Some(ctx));
+                    }
                 }
-                plugins::player::PlayerTranslationRequest::LiveStream {
-                    source_language,
-                    target_language,
-                    recognition,
-                } => {
-                    self.source_lang = source_language;
-                    self.target_lang = target_language;
-                    self.loopback_recognition = recognition;
-                    self.start(Some(ctx));
-                }
-            },
+            }
         }
     }
 
@@ -1338,6 +1366,9 @@ impl XRTranslateApp {
                 self.sessions = vec![session];
                 self.host_audio_import = Some(import);
                 self.audio_txs.clear();
+                self.session_owner = TranslationSessionOwner::VideoPlayer {
+                    task_id: self.player_plugin.controller.active_task_id.clone().unwrap_or_default(),
+                };
                 self.is_translating = true;
                 if let Ok(mut state) = self.shared_session_state.lock() {
                     state.translations.clear();
@@ -1365,6 +1396,9 @@ impl XRTranslateApp {
         match action {
             MeetingAction::None => {}
             MeetingAction::CreateAndStart(request) => {
+                if self.is_translating && !self.session_owner.is_meeting() {
+                    self.stop();
+                }
                 self.source_lang = request.source_language.clone();
                 self.target_lang = request.target_language.clone();
                 if let MeetingInputRequest::Live { source, .. } = &request.input {
@@ -1385,6 +1419,9 @@ impl XRTranslateApp {
                 }
             }
             MeetingAction::Continue(id) => {
+                if self.is_translating && !self.session_owner.is_meeting() {
+                    self.stop();
+                }
                 let resumed_in_place = self
                     .meeting_plugin
                     .controller
@@ -1415,6 +1452,9 @@ impl XRTranslateApp {
                 self.export_open_meeting_markdown();
             }
             MeetingAction::Reprocess(request) => {
+                if self.is_translating && !self.session_owner.is_meeting() {
+                    self.stop();
+                }
                 if self
                     .meeting_plugin
                     .controller
@@ -1646,6 +1686,14 @@ impl XRTranslateApp {
                 self.sessions = vec![session];
                 self.meeting_plugin.audio_import = Some(import);
                 self.audio_txs.clear();
+                self.session_owner = TranslationSessionOwner::Meeting {
+                    meeting_id: self
+                        .meeting_plugin
+                        .controller
+                        .active_meeting_id()
+                        .unwrap_or_default(),
+                    is_imported: true,
+                };
                 self.is_translating = true;
                 self.set_connection_status("Processing imported audio");
             }
@@ -1668,10 +1716,20 @@ impl XRTranslateApp {
     }
 
     pub(crate) fn apply_service_configuration(&mut self, ctx: Option<eframe::egui::Context>) {
-        if self.meeting_session_active() {
+        if self.session_owner.is_meeting()
+            || self.meeting_plugin.controller.active_meeting_id().is_some()
+        {
             self.meeting_plugin.controller.error =
                 Some("Finish the active meeting before changing service configuration".into());
             self.navigation.page = Page::Plugin(PluginId::MEETING);
+            return;
+        }
+        if self.session_owner.is_video_player()
+            || self.player_plugin.controller.active_task_id.is_some()
+        {
+            self.player_plugin.controller.error =
+                Some("Stop the active video task before changing service configuration".into());
+            self.navigation.page = Page::Plugin(PluginId::VIDEO_PLAYER);
             return;
         }
         let resume_translation = self.is_translating;
@@ -1721,6 +1779,20 @@ impl XRTranslateApp {
                     self.meeting_sessions_remaining
                         .store(routes.len(), Ordering::Release);
                     self.meeting_end_requested.store(false, Ordering::Release);
+                    self.session_owner = TranslationSessionOwner::Meeting {
+                        meeting_id: self
+                            .meeting_plugin
+                            .controller
+                            .active_meeting_id()
+                            .unwrap_or_default(),
+                        is_imported: false,
+                    };
+                } else if let Some(task_id) = self.player_plugin.controller.active_task_id.clone() {
+                    self.session_owner = TranslationSessionOwner::VideoPlayer { task_id };
+                } else {
+                    self.session_owner = TranslationSessionOwner::MainLive {
+                        capture_source: self.capture_source,
+                    };
                 }
                 self.sessions = session_channels
                     .iter()
@@ -2361,10 +2433,15 @@ impl XRTranslateApp {
             let _ = worker.join();
         }
         self.meeting_plugin.audio_import = None;
-        // Closing every capture sender lets each session drain its local PCM
-        // queue before it sends `input_ended`. Dropping the handles here does
-        // not terminate their worker threads; they close after the backend's
-        // PipelineDrained acknowledgement.
+        self.meeting_plugin.pending_audio_import = None;
+        self.host_audio_import = None;
+        self.pending_audio_import = None;
+        self.backend_start_deadline = None;
+        // Closing every capture sender and finishing sessions ensures background
+        // import/network threads drain and exit cleanly.
+        for session in &self.sessions {
+            session.finish();
+        }
         self.sessions.clear();
         if let Some(recording) = self.meeting_plugin.meeting_recording.take()
             && let Err(error) = recording.finalize()
@@ -2376,6 +2453,7 @@ impl XRTranslateApp {
         self.loopback_level
             .store(0.0_f32.to_bits(), Ordering::Relaxed);
         self.osc_plugin.clear_chatbox();
+        self.session_owner = TranslationSessionOwner::None;
         self.is_translating = false;
         self.connection_status = "Stopped".into();
 
@@ -2538,6 +2616,9 @@ fn spawn_meeting_audio_router(
 
 impl XRTranslateApp {
     fn sync_player_subtitles(&mut self) {
+        if !self.session_owner.is_video_player() {
+            return;
+        }
         let active_task_id = self.player_plugin.controller.active_task_id.clone();
         let Some(active_id) = active_task_id else {
             return;
@@ -2720,20 +2801,20 @@ impl eframe::App for XRTranslateApp {
 fn configure_dll_search_paths() {
     use windows::Win32::System::LibraryLoader::SetDllDirectoryW;
     use windows::core::HSTRING;
-    if let Ok(exe_path) = std::env::current_exe() {
-        if let Some(exe_dir) = exe_path.parent() {
-            let res_bin = exe_dir.join("resources").join("bin");
-            if res_bin.is_dir() {
-                let _ = unsafe { SetDllDirectoryW(&HSTRING::from(res_bin.as_os_str())) };
-                return;
-            }
+    if let Ok(exe_path) = std::env::current_exe()
+        && let Some(exe_dir) = exe_path.parent()
+    {
+        let res_bin = exe_dir.join("resources").join("bin");
+        if res_bin.is_dir() {
+            let _ = unsafe { SetDllDirectoryW(&HSTRING::from(res_bin.as_os_str())) };
+            return;
         }
     }
     let local_res_bin = std::path::Path::new("rust-client/resources/bin");
-    if local_res_bin.is_dir() {
-        if let Ok(abs) = local_res_bin.canonicalize() {
-            let _ = unsafe { SetDllDirectoryW(&HSTRING::from(abs.as_os_str())) };
-        }
+    if local_res_bin.is_dir()
+        && let Ok(abs) = local_res_bin.canonicalize()
+    {
+        let _ = unsafe { SetDllDirectoryW(&HSTRING::from(abs.as_os_str())) };
     }
 }
 

@@ -218,12 +218,18 @@ fn render_library(
                         );
                     }
                 }
+            } else {
+                action = VideoPlayerAction::StopTranslation;
             }
         }
     }
 
     if let Some(id) = task_to_delete {
+        let was_active = controller.active_task_id.as_deref() == Some(&id);
         controller.delete_task(&id);
+        if was_active {
+            action = VideoPlayerAction::StopTranslation;
+        }
     }
 
     if let Some(srt) = srt_to_export {
@@ -552,6 +558,7 @@ fn render_create(
                         ui.add_space(8.0);
                         if components::animated_button(ui, tr(language, "Back to Library")).clicked() {
                             controller.open_library();
+                            action = VideoPlayerAction::StopTranslation;
                         }
                     });
                 });
@@ -567,12 +574,13 @@ fn render_player(
     language: crate::i18n::UiLanguage,
     ui: &mut egui::Ui,
 ) -> VideoPlayerAction {
-    let action = VideoPlayerAction::None;
+    let mut action = VideoPlayerAction::None;
 
     if !controller.fullscreen_mode {
         ui.horizontal(|ui| {
             if components::animated_button(ui, tr(language, "Back to Library")).clicked() {
                 controller.open_library();
+                action = VideoPlayerAction::StopTranslation;
             }
 
             ui.add_space(8.0);
@@ -597,6 +605,7 @@ fn render_player(
             ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
                 if components::animated_button(ui, tr(language, "New Video")).clicked() {
                     controller.open_create();
+                    action = VideoPlayerAction::StopTranslation;
                 }
 
                 if controller.subtitles.count() > 0

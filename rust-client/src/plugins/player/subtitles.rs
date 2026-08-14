@@ -61,13 +61,17 @@ impl SubtitleTimeline {
         if !self.enabled {
             return None;
         }
+        // Subtitle lead-in time: display subtitles slightly ahead of speech onset
+        // (~250ms advance) to match natural human reading rhythm and visual perception.
+        const SUBTITLE_LEAD_IN_MS: i64 = 150;
+        let query_ms = current_ms + SUBTITLE_LEAD_IN_MS;
         self.cues.iter().find(|cue| {
             let effective_end = if cue.end_ms <= cue.start_ms {
                 cue.start_ms + 3000
             } else {
                 cue.end_ms.max(cue.start_ms + 2000)
             };
-            current_ms >= cue.start_ms && current_ms <= effective_end
+            query_ms >= cue.start_ms && current_ms <= effective_end
         })
     }
 
@@ -128,7 +132,12 @@ mod tests {
         });
         assert_eq!(timeline.count(), 1);
         assert_eq!(timeline.cues().len(), 1);
+        // With 250ms lead-in, cue starting at 1000ms is visible from 750ms through 3000ms
+        assert!(timeline.active_cue_at(740).is_none());
+        assert!(timeline.active_cue_at(750).is_some());
         assert!(timeline.active_cue_at(2000).is_some());
+        assert!(timeline.active_cue_at(3000).is_some());
+        assert!(timeline.active_cue_at(3001).is_none());
         let srt = timeline.export_srt();
         assert!(srt.contains("Hello world"));
         assert!(srt.contains("你好世界"));

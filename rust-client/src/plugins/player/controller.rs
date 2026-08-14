@@ -91,6 +91,8 @@ impl VideoPlayerController {
         }
         let _ = self.store.save_to_dir(&self.storage_dir);
         self.route = VideoPlayerRoute::Library;
+        self.active_task_id = None;
+        self.current_source = None;
         if let Some(host) = &self.native_host {
             host.hide();
         }
@@ -102,6 +104,8 @@ impl VideoPlayerController {
         }
         let _ = self.store.save_to_dir(&self.storage_dir);
         self.route = VideoPlayerRoute::Create;
+        self.active_task_id = None;
+        self.current_source = None;
         self.draft_title.clear();
         self.draft_source.clear();
         self.draft_source_lang = "auto".into();
@@ -364,8 +368,9 @@ impl VideoPlayerController {
 
 fn parse_srt_to_timeline(srt_content: &str) -> SubtitleTimeline {
     let mut timeline = SubtitleTimeline::new();
-    let blocks: Vec<&str> = srt_content.split("\n\n").collect();
-    for (idx, block) in blocks.iter().enumerate() {
+    let normalized = srt_content.replace("\r\n", "\n");
+    let blocks = normalized.split("\n\n");
+    for (idx, block) in blocks.enumerate() {
         let lines: Vec<&str> = block.lines().map(|l| l.trim()).filter(|l| !l.is_empty()).collect();
         if lines.len() >= 2 {
             let time_line = if lines[0].contains("-->") { lines[0] } else { lines[1] };
@@ -374,7 +379,7 @@ fn parse_srt_to_timeline(srt_content: &str) -> SubtitleTimeline {
             if times.len() == 2 && text_start < lines.len() {
                 let start_ms = parse_srt_time(times[0].trim());
                 let end_ms = parse_srt_time(times[1].trim());
-                let text_lines: Vec<&str> = lines[text_start..].to_vec();
+                let text_lines = &lines[text_start..];
 
                 let mut speaker_name = None;
                 let mut first_line = text_lines[0].to_string();
@@ -455,5 +460,41 @@ mod tests {
         assert_eq!(tl.count(), 2);
         assert_eq!(tl.cues()[0].start_ms, 1000);
         assert_eq!(tl.cues()[0].end_ms, 3500);
+    }
+
+    #[test]
+    fn test_controller_lifecycle_cleanup() {
+        let mut controller = VideoPlayerController::default();
+        let task = VideoTask::new(
+            "Test Video".into(),
+            MediaSource::LocalFile(PathBuf::from("test.mp4")),
+            "ja".into(),
+            "zh".into(),
+            VideoSubtitleMode::RealtimeTranslation,
+            crate::client_settings::RecognitionSettings {
+                background_noise: 0.15,
+                pause_tolerance: 0.5,
+                continuous_recognition: false,
+            },
+        );
+        let task_id = task.id.clone();
+        controller.store.add_or_update(task);
+        controller.active_task_id = Some(task_id.clone());
+        controller.current_source = Some(MediaSource::LocalFile(PathBuf::from("test.mp4")));
+        controller.route = VideoPlayerRoute::Player;
+
+        // Returning to library should clear active task and source
+        controller.open_library();
+        assert_eq!(controller.route, VideoPlayerRoute::Library);
+        assert!(controller.active_task_id.is_none());
+        assert!(controller.current_source.is_none());
+
+        // Re-activating and deleting task
+        controller.active_task_id = Some(task_id.clone());
+        controller.current_source = Some(MediaSource::LocalFile(PathBuf::from("test.mp4")));
+        controller.delete_task(&task_id);
+        assert!(controller.active_task_id.is_none());
+        assert!(controller.current_source.is_none());
+        assert!(controller.store.get(&task_id).is_none());
     }
 }
