@@ -648,7 +648,7 @@ fn render_input_adaptation(
             ui,
             &mut recognition.background_noise,
             0.05..=0.8,
-            0.2,
+            0.30,
             vad_sensitivity,
             &[],
         );
@@ -661,7 +661,7 @@ fn render_input_adaptation(
                 ui,
                 &mut recognition.pause_tolerance,
                 0.0..=1.0,
-                0.0,
+                0.40,
                 pause_tolerance,
                 &[],
             );

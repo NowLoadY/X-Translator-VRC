@@ -108,10 +108,10 @@ fn default_target_lang() -> String {
 }
 
 const fn default_background_noise() -> f32 {
-    0.2
+    0.30
 }
 const fn default_pause_tolerance() -> f32 {
-    0.0
+    0.40
 }
 
 const fn default_true() -> bool {
@@ -313,8 +313,8 @@ mod tests {
     #[test]
     fn recognition_defaults_prioritize_speech() {
         let recognition = RecognitionSettings::default();
-        assert_eq!(recognition.background_noise, 0.2);
-        assert_eq!(recognition.pause_tolerance, 0.0);
+        assert_eq!(recognition.background_noise, 0.30);
+        assert_eq!(recognition.pause_tolerance, 0.40);
         assert!(!recognition.continuous_recognition);
     }
 

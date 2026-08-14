@@ -101,10 +101,10 @@
     "enabled": true,
     "intra_threads": 2,
     "max_speakers": 8,
-    "min_utterance_ms": 500,
+    "min_utterance_ms": 750,
     "model_path": "models/3D-Speaker-ERes2NetV2/speaker_embedding.onnx",
-    "same_speaker_hysteresis": 0.04,
-    "similarity_threshold": 0.62
+    "same_speaker_hysteresis": 0.1,
+    "similarity_threshold": 0.52
   },
   "storage": {
     "log_dir": "runtime/logs",

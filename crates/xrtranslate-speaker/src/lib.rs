@@ -7,7 +7,13 @@
 
 #![forbid(unsafe_code)]
 
-use std::{error::Error, f32::consts::PI, fmt, path::Path};
+use std::{
+    error::Error,
+    f32::consts::PI,
+    fmt,
+    path::Path,
+    time::{Duration, Instant},
+};
 
 use ndarray::Array3;
 use ort::{session::Session, value::Value};
@@ -143,8 +149,8 @@ impl TrackerConfig {
 impl Default for TrackerConfig {
     fn default() -> Self {
         Self {
-            similarity_threshold: 0.62,
-            same_speaker_hysteresis: 0.04,
+            similarity_threshold: 0.52,
+            same_speaker_hysteresis: 0.10,
             max_speakers: 8,
         }
     }
@@ -275,8 +281,352 @@ impl OnlineSpeakerDiarizer {
         self.tracker.assign(&embedding)
     }
 
+    pub fn tracker(&self) -> &OnlineSpeakerTracker {
+        &self.tracker
+    }
+
+    pub fn tracker_mut(&mut self) -> &mut OnlineSpeakerTracker {
+        &mut self.tracker
+    }
+
+    pub fn model_mut(&mut self) -> &mut SpeakerEmbeddingModel {
+        &mut self.model
+    }
+
     pub fn reset(&mut self) {
         self.tracker.reset();
+    }
+}
+
+/// Dynamic rate limiter that regulates speaker inference frequency to prevent latency accumulation.
+#[derive(Clone, Debug, PartialEq)]
+pub struct AdaptiveSpeakerThrottle {
+    min_step_samples: usize,
+    max_step_samples: usize,
+    current_step_samples: usize,
+    avg_inference_duration: Duration,
+    target_duty_cycle: f32,
+    healthy_cycles: usize,
+    circuit_broken: bool,
+}
+
+impl AdaptiveSpeakerThrottle {
+    pub const DEFAULT_MIN_STEP_MS: u32 = 300;
+    pub const DEFAULT_MAX_STEP_MS: u32 = 1000;
+    pub const DEFAULT_TARGET_DUTY_CYCLE: f32 = 0.30;
+    pub const CIRCUIT_BREAKER_THRESHOLD_MS: u64 = 350;
+
+    pub fn new(sample_rate_hz: u32) -> Self {
+        let min_step = (sample_rate_hz as f64 * (Self::DEFAULT_MIN_STEP_MS as f64 / 1000.0)) as usize;
+        let max_step = (sample_rate_hz as f64 * (Self::DEFAULT_MAX_STEP_MS as f64 / 1000.0)) as usize;
+        Self {
+            min_step_samples: min_step.max(1),
+            max_step_samples: max_step.max(min_step),
+            current_step_samples: min_step.max(1),
+            avg_inference_duration: Duration::from_millis(10),
+            target_duty_cycle: Self::DEFAULT_TARGET_DUTY_CYCLE,
+            healthy_cycles: 0,
+            circuit_broken: false,
+        }
+    }
+
+    pub fn with_limits(
+        min_step_samples: usize,
+        max_step_samples: usize,
+        target_duty_cycle: f32,
+    ) -> Self {
+        let min_step = min_step_samples.max(1);
+        let max_step = max_step_samples.max(min_step);
+        Self {
+            min_step_samples: min_step,
+            max_step_samples: max_step,
+            current_step_samples: min_step,
+            avg_inference_duration: Duration::from_millis(10),
+            target_duty_cycle: target_duty_cycle.clamp(0.05, 0.90),
+            healthy_cycles: 0,
+            circuit_broken: false,
+        }
+    }
+
+    pub fn current_step_samples(&self) -> usize {
+        self.current_step_samples
+    }
+
+    pub fn avg_inference_duration(&self) -> Duration {
+        self.avg_inference_duration
+    }
+
+    pub fn is_circuit_broken(&self) -> bool {
+        self.circuit_broken
+    }
+
+    pub fn record_inference_duration(&mut self, elapsed: Duration) {
+        let elapsed_secs = elapsed.as_secs_f32();
+        let old_avg = self.avg_inference_duration.as_secs_f32();
+        let new_avg = old_avg * 0.75 + elapsed_secs * 0.25;
+        self.avg_inference_duration = Duration::from_secs_f32(new_avg);
+
+        if elapsed.as_millis() > Self::CIRCUIT_BREAKER_THRESHOLD_MS as u128
+            && self.avg_inference_duration.as_millis() > Self::CIRCUIT_BREAKER_THRESHOLD_MS as u128
+        {
+            self.circuit_broken = true;
+            return;
+        } else {
+            self.circuit_broken = false;
+        }
+
+        // T_ideal = T_infer / target_duty_cycle
+        let ideal_interval_secs = new_avg / self.target_duty_cycle;
+        let ideal_step_samples = (ideal_interval_secs * (SAMPLE_RATE_HZ as f32)) as usize;
+
+        if ideal_step_samples > self.current_step_samples {
+            // High load: immediate backoff
+            self.current_step_samples = ideal_step_samples
+                .min(self.max_step_samples)
+                .max(self.min_step_samples);
+            self.healthy_cycles = 0;
+        } else {
+            // Healthy load: gradual recovery
+            self.healthy_cycles = self.healthy_cycles.saturating_add(1);
+            if self.healthy_cycles >= 4 && self.current_step_samples > self.min_step_samples {
+                let step_reduction = (SAMPLE_RATE_HZ as f32 * 0.05) as usize; // 50ms reduction
+                self.current_step_samples = self
+                    .current_step_samples
+                    .saturating_sub(step_reduction)
+                    .max(self.min_step_samples);
+                self.healthy_cycles = 0;
+            }
+        }
+    }
+
+    pub fn reset(&mut self) {
+        self.current_step_samples = self.min_step_samples;
+        self.healthy_cycles = 0;
+        self.circuit_broken = false;
+    }
+}
+
+/// Configuration for streaming speaker segmenter.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct StreamingDiarizerConfig {
+    pub tracker: TrackerConfig,
+    /// Analysis window duration in samples (e.g. 800ms = 12800 samples at 16kHz)
+    pub window_samples: usize,
+    /// Minimum initial speech samples before evaluating speaker identity (e.g. 500ms = 8000 samples)
+    pub min_speech_samples: usize,
+    /// Number of consecutive different speaker observations required to trigger a cut
+    pub consecutive_confirmations: usize,
+    /// Target duty cycle for the adaptive throttle
+    pub target_duty_cycle: f32,
+}
+
+impl Default for StreamingDiarizerConfig {
+    fn default() -> Self {
+        Self {
+            tracker: TrackerConfig::default(),
+            window_samples: (SAMPLE_RATE_HZ as f32 * 0.8) as usize, // 800ms
+            min_speech_samples: (SAMPLE_RATE_HZ as f32 * 0.5) as usize, // 500ms
+            consecutive_confirmations: 2,
+            target_duty_cycle: 0.30,
+        }
+    }
+}
+
+/// Event emitted by [`StreamingSpeakerSegmenter`].
+#[derive(Clone, Debug, PartialEq)]
+pub enum StreamingSpeakerEvent {
+    /// Speech continues with currently assigned speaker.
+    Continues {
+        speaker_id: String,
+    },
+    /// A speaker change was detected. Returns the samples for the previous speaker turn,
+    /// the speaker IDs, and the cut offset.
+    SpeakerCut {
+        finalized_samples: Vec<i16>,
+        previous_speaker: String,
+        new_speaker: String,
+        cut_sample_offset: usize,
+    },
+}
+
+/// Online streaming speaker segmenter that runs during active speech turns,
+/// monitors speaker identity via sliding window, and triggers forced utterance
+/// segmentation on detected speaker changes.
+#[derive(Debug)]
+pub struct StreamingSpeakerSegmenter {
+    diarizer: OnlineSpeakerDiarizer,
+    throttle: AdaptiveSpeakerThrottle,
+    config: StreamingDiarizerConfig,
+    active_samples: Vec<i16>,
+    current_speaker_id: Option<String>,
+    pending_speaker_id: Option<String>,
+    consecutive_pending_count: usize,
+    samples_since_last_evaluation: usize,
+    total_turn_samples: usize,
+}
+
+impl StreamingSpeakerSegmenter {
+    pub fn from_diarizer(diarizer: OnlineSpeakerDiarizer, config: StreamingDiarizerConfig) -> Self {
+        let throttle = AdaptiveSpeakerThrottle::with_limits(
+            (SAMPLE_RATE_HZ as f32 * 0.3) as usize,
+            (SAMPLE_RATE_HZ as f32 * 1.0) as usize,
+            config.target_duty_cycle,
+        );
+        Self {
+            diarizer,
+            throttle,
+            config,
+            active_samples: Vec::with_capacity(config.window_samples * 2),
+            current_speaker_id: None,
+            pending_speaker_id: None,
+            consecutive_pending_count: 0,
+            samples_since_last_evaluation: 0,
+            total_turn_samples: 0,
+        }
+    }
+
+    pub fn from_file(
+        model_path: impl AsRef<Path>,
+        intra_threads: usize,
+        config: StreamingDiarizerConfig,
+    ) -> Result<Self, SpeakerError> {
+        let diarizer = OnlineSpeakerDiarizer::from_file(model_path, intra_threads, config.tracker)?;
+        Ok(Self::from_diarizer(diarizer, config))
+    }
+
+    pub fn throttle(&self) -> &AdaptiveSpeakerThrottle {
+        &self.throttle
+    }
+
+    pub fn throttle_mut(&mut self) -> &mut AdaptiveSpeakerThrottle {
+        &mut self.throttle
+    }
+
+    pub fn current_speaker_id(&self) -> Option<&str> {
+        self.current_speaker_id.as_deref()
+    }
+
+    pub fn active_sample_count(&self) -> usize {
+        self.active_samples.len()
+    }
+
+    /// Feed active speech samples into the streaming segmenter.
+    pub fn push_speech_samples(
+        &mut self,
+        samples: &[i16],
+    ) -> Result<Option<StreamingSpeakerEvent>, SpeakerError> {
+        self.active_samples.extend_from_slice(samples);
+        self.samples_since_last_evaluation =
+            self.samples_since_last_evaluation.saturating_add(samples.len());
+        self.total_turn_samples = self.total_turn_samples.saturating_add(samples.len());
+
+        // Circuit breaker: skip online slice evaluation under extreme load, fallback to whole turn
+        if self.throttle.is_circuit_broken() {
+            return Ok(self
+                .current_speaker_id
+                .as_ref()
+                .map(|id| StreamingSpeakerEvent::Continues {
+                    speaker_id: id.clone(),
+                }));
+        }
+
+        let step_threshold = self.throttle.current_step_samples();
+        if self.active_samples.len() < self.config.min_speech_samples
+            || self.samples_since_last_evaluation < step_threshold
+        {
+            return Ok(None);
+        }
+
+        self.samples_since_last_evaluation = 0;
+
+        let window_len = self.config.window_samples.min(self.active_samples.len());
+        let window_start = self.active_samples.len().saturating_sub(window_len);
+        let window = &self.active_samples[window_start..];
+
+        let start_time = Instant::now();
+        let assignment = self.diarizer.identify(window)?;
+        let elapsed = start_time.elapsed();
+        self.throttle.record_inference_duration(elapsed);
+
+        if self.current_speaker_id.is_none() {
+            self.current_speaker_id = Some(assignment.speaker_id.clone());
+            return Ok(Some(StreamingSpeakerEvent::Continues {
+                speaker_id: assignment.speaker_id,
+            }));
+        }
+
+        let current = self.current_speaker_id.as_ref().unwrap();
+        if assignment.speaker_id == *current {
+            self.pending_speaker_id = None;
+            self.consecutive_pending_count = 0;
+            return Ok(Some(StreamingSpeakerEvent::Continues {
+                speaker_id: assignment.speaker_id,
+            }));
+        }
+
+        // New speaker candidate observed
+        if self.pending_speaker_id.as_deref() == Some(&assignment.speaker_id) {
+            self.consecutive_pending_count = self.consecutive_pending_count.saturating_add(1);
+        } else {
+            self.pending_speaker_id = Some(assignment.speaker_id.clone());
+            self.consecutive_pending_count = 1;
+        }
+
+        if self.consecutive_pending_count >= self.config.consecutive_confirmations {
+            let step_back = step_threshold * self.consecutive_pending_count;
+            let cut_offset = self.active_samples.len().saturating_sub(step_back);
+            let min_cut = self.config.min_speech_samples.min(self.active_samples.len());
+            let safe_cut = cut_offset.max(min_cut / 2).min(self.active_samples.len());
+
+            let finalized_samples = self.active_samples[..safe_cut].to_vec();
+            let remaining_samples = self.active_samples[safe_cut..].to_vec();
+            self.active_samples = remaining_samples;
+
+            let previous_speaker = self.current_speaker_id.take().unwrap();
+            self.current_speaker_id = Some(assignment.speaker_id.clone());
+            self.pending_speaker_id = None;
+            self.consecutive_pending_count = 0;
+            self.samples_since_last_evaluation = 0;
+
+            return Ok(Some(StreamingSpeakerEvent::SpeakerCut {
+                finalized_samples,
+                previous_speaker,
+                new_speaker: assignment.speaker_id,
+                cut_sample_offset: safe_cut,
+            }));
+        }
+
+        Ok(None)
+    }
+
+    /// Completes the speech turn and returns the finalized speaker ID along with remaining samples.
+    pub fn finalize_speech(&mut self) -> Option<(Vec<i16>, String)> {
+        if self.active_samples.is_empty() {
+            self.reset_turn();
+            return None;
+        }
+        let samples = std::mem::take(&mut self.active_samples);
+        let speaker_id = self
+            .current_speaker_id
+            .take()
+            .unwrap_or_else(|| "speaker-01".to_string());
+        self.reset_turn();
+        Some((samples, speaker_id))
+    }
+
+    pub fn reset_turn(&mut self) {
+        self.active_samples.clear();
+        self.current_speaker_id = None;
+        self.pending_speaker_id = None;
+        self.consecutive_pending_count = 0;
+        self.samples_since_last_evaluation = 0;
+        self.total_turn_samples = 0;
+    }
+
+    pub fn reset(&mut self) {
+        self.reset_turn();
+        self.diarizer.reset();
+        self.throttle.reset();
     }
 }
 
@@ -521,6 +871,46 @@ mod tests {
         let first = tracker.assign(&[0.0, 1.0]).unwrap();
         assert_eq!(first.speaker_id, "speaker-01");
         assert_eq!(tracker.speaker_count(), 1);
+    }
+
+    #[test]
+    fn throttle_backs_off_under_heavy_load_and_recovers_when_healthy() {
+        let mut throttle = AdaptiveSpeakerThrottle::new(SAMPLE_RATE_HZ);
+        assert_eq!(throttle.current_step_samples(), 4800); // 300ms
+
+        // Fast inference (10ms) keeps minimum 300ms step
+        throttle.record_inference_duration(Duration::from_millis(10));
+        assert_eq!(throttle.current_step_samples(), 4800);
+
+        // Heavy inference (150ms) -> ideal interval = 150ms / 0.3 = 500ms = 8000 samples
+        // EMA starts moving up
+        for _ in 0..10 {
+            throttle.record_inference_duration(Duration::from_millis(150));
+        }
+        assert!(throttle.current_step_samples() >= 7500);
+
+        // When load drops to 10ms, recovery occurs after healthy cycles
+        for _ in 0..30 {
+            throttle.record_inference_duration(Duration::from_millis(10));
+        }
+        assert_eq!(throttle.current_step_samples(), 4800);
+    }
+
+    #[test]
+    fn throttle_trips_circuit_breaker_on_excessive_latency() {
+        let mut throttle = AdaptiveSpeakerThrottle::new(SAMPLE_RATE_HZ);
+        assert!(!throttle.is_circuit_broken());
+
+        // Extreme latency (> 350ms)
+        for _ in 0..10 {
+            throttle.record_inference_duration(Duration::from_millis(400));
+        }
+        assert!(throttle.is_circuit_broken());
+
+        // Reset clears circuit breaker
+        throttle.reset();
+        assert!(!throttle.is_circuit_broken());
+        assert_eq!(throttle.current_step_samples(), 4800);
     }
 
     #[test]

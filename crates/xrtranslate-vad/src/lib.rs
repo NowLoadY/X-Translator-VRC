@@ -452,6 +452,8 @@ pub enum UtteranceEndReason {
     AdaptiveSilence,
     /// Active speech reached [`EndpointConfig::max_active_frames`].
     MaxActiveFrames,
+    /// A change in speaker voiceprint forced early segmentation.
+    SpeakerChange,
     /// The owner explicitly flushed the detector, for example at turn end.
     Flushed,
 }
@@ -652,6 +654,16 @@ impl EndpointDetector {
             .map(|active| active.into_utterance(UtteranceEndReason::Flushed))
     }
 
+    /// Forces an active utterance to finalize because a speaker voiceprint change was detected.
+    /// Retains overlap frames for the incoming speaker turn.
+    pub fn split_on_speaker_change(&mut self) -> Option<Utterance> {
+        if self.active.is_some() {
+            Some(self.finalize_active(UtteranceEndReason::SpeakerChange))
+        } else {
+            None
+        }
+    }
+
     /// Discards active speech and retained pre-roll without emitting an utterance.
     pub fn reset(&mut self) {
         self.pre_roll.clear();
@@ -665,7 +677,9 @@ impl EndpointDetector {
             .take()
             .expect("finalization requires an active utterance");
         self.hard_split_overlap.clear();
-        if reason == UtteranceEndReason::MaxActiveFrames {
+        if reason == UtteranceEndReason::MaxActiveFrames
+            || reason == UtteranceEndReason::SpeakerChange
+        {
             let retained = self
                 .config
                 .max_active_overlap_frames
@@ -1031,5 +1045,37 @@ mod tests {
         assert_eq!(next.overlap_frames, 0);
         assert_eq!(next.pre_roll_frames, 2);
         assert_eq!(next.samples[0], 5);
+    }
+
+    #[test]
+    fn speaker_change_split_finalizes_and_carries_overlap() {
+        let config = EndpointConfig {
+            speech_threshold: 0.5,
+            silence_frames_to_finalize: 3,
+            adaptive_silence_after_frames: 10,
+            adaptive_silence_frames_to_finalize: 3,
+            pre_roll_frames: 1,
+            max_active_frames: 100,
+            max_active_overlap_frames: 2,
+        };
+        let mut detector = EndpointDetector::new(config).unwrap();
+        detector.push(&frame(0), 0.1).unwrap(); // populate pre_roll
+        detector.push(&frame(1), 0.9).unwrap();
+        detector.push(&frame(2), 0.9).unwrap();
+        detector.push(&frame(3), 0.9).unwrap();
+
+        let split = detector
+            .split_on_speaker_change()
+            .expect("active speech must finalize on speaker change");
+        assert_eq!(split.end_reason, UtteranceEndReason::SpeakerChange);
+        assert_eq!(split.samples.len(), 4 * FRAME_SAMPLES); // 1 pre_roll + 3 speech
+
+        // Next speech frame begins incoming speaker turn with carried overlap
+        detector.push(&frame(4), 0.9).unwrap();
+        let next = detector.flush().unwrap();
+        assert_eq!(next.overlap_frames, 2);
+        assert_eq!(next.samples[0], 2);
+        assert_eq!(next.samples[FRAME_SAMPLES], 3);
+        assert_eq!(next.samples[2 * FRAME_SAMPLES], 4);
     }
 }

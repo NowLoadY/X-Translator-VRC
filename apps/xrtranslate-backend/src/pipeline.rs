@@ -35,10 +35,13 @@ use xrtranslate_inference::{
     is_probable_translation_context_leak,
 };
 use xrtranslate_protocol::AudioSource;
-use xrtranslate_speaker::{OnlineSpeakerDiarizer, TrackerConfig};
+use xrtranslate_speaker::{
+    OnlineSpeakerDiarizer, StreamingDiarizerConfig, StreamingSpeakerEvent,
+    StreamingSpeakerSegmenter, TrackerConfig,
+};
 use xrtranslate_vad::{
-    EndpointConfig, EndpointDetector, EndpointEvent, FRAME_BYTES, FRAME_SAMPLES, SAMPLE_RATE_HZ,
-    SileroVad, Utterance, UtteranceEndReason, decode_pcm16le_frame,
+    EndpointConfig, EndpointDetector, EndpointEvent, EndpointState, FRAME_BYTES, FRAME_SAMPLES,
+    SAMPLE_RATE_HZ, SileroVad, Utterance, UtteranceEndReason, decode_pcm16le_frame,
 };
 
 use crate::language::{
@@ -71,6 +74,7 @@ pub(crate) struct TimedUtterance {
     pub(crate) source_end_ms: f64,
     pub(crate) revisable: bool,
     pub(crate) topic_turn_sequence: Option<u64>,
+    pub(crate) speaker_id: Option<String>,
 }
 
 #[derive(Debug)]
@@ -131,6 +135,7 @@ pub(crate) struct NativePipeline {
     vad: SileroVad,
     endpoint: EndpointDetector,
     endpoint_config: EndpointConfig,
+    streaming_speaker: Option<StreamingSpeakerSegmenter>,
     fixed_window: Option<FixedWindow>,
     pending_pcm: Vec<u8>,
     processed_samples: u64,
@@ -493,10 +498,31 @@ impl NativePipeline {
             None
         };
 
+        let streaming_speaker = if let Some(speaker_cfg) = &speaker {
+            let streaming_cfg = StreamingDiarizerConfig {
+                tracker: speaker_cfg.tracker,
+                window_samples: (SAMPLE_RATE_HZ as f32 * 0.8) as usize,
+                min_speech_samples: (SAMPLE_RATE_HZ as f32
+                    * (speaker_cfg.min_utterance_ms as f32 / 1000.0))
+                    .max(4800.0) as usize,
+                consecutive_confirmations: 2,
+                target_duty_cycle: 0.30,
+            };
+            StreamingSpeakerSegmenter::from_file(
+                &speaker_cfg.model_path,
+                speaker_cfg.intra_threads,
+                streaming_cfg,
+            )
+            .ok()
+        } else {
+            None
+        };
+
         Ok(Self {
             vad,
             endpoint,
             endpoint_config,
+            streaming_speaker,
             fixed_window: None,
             pending_pcm: Vec::new(),
             processed_samples: 0,
@@ -559,6 +585,7 @@ impl NativePipeline {
                                 utterance,
                                 0,
                                 topic_turn_sequence,
+                                None,
                             )))
                         }
                         FixedWindowEvent::StreamEnded => {
@@ -582,18 +609,52 @@ impl NativePipeline {
                 .vad
                 .infer_pcm16le(frame)
                 .map_err(|error| error.to_string())?;
-            self.observe_vad_activity(vad_is_active(
+            let active = vad_is_active(
                 probability,
                 self.endpoint_config.speech_threshold,
-            ));
+            );
+            self.observe_vad_activity(active);
+            let samples = decode_pcm16le_frame(frame).map_err(|error| error.to_string())?;
+
+            let is_in_speech =
+                active || matches!(self.endpoint.state(), EndpointState::Speaking { .. });
+
+            if let Some(streaming) = &mut self.streaming_speaker {
+                if is_in_speech {
+                    match streaming.push_speech_samples(&samples) {
+                        Ok(Some(StreamingSpeakerEvent::SpeakerCut {
+                            previous_speaker, ..
+                        })) => {
+                            if let Some(cut_utterance) = self.endpoint.split_on_speaker_change() {
+                                utterances.push(PipelineEvent::Utterance(self.with_timeline(
+                                    cut_utterance,
+                                    0,
+                                    None,
+                                    Some(previous_speaker),
+                                )));
+                            }
+                        }
+                        Ok(_) => {}
+                        Err(error) => {
+                            warn!("streaming speaker recognition error: {error}");
+                        }
+                    }
+                }
+            }
+
             let event = self
                 .endpoint
-                .push_pcm16le(frame, probability)
+                .push(&samples, probability)
                 .map_err(|error| error.to_string())?;
             self.processed_samples = self.processed_samples.saturating_add(FRAME_SAMPLES as u64);
             if let EndpointEvent::Finalized(utterance) = event {
+                let speaker_id = if let Some(streaming) = &mut self.streaming_speaker {
+                    streaming.finalize_speech().map(|(_, id)| id)
+                } else {
+                    None
+                };
                 utterances.push(PipelineEvent::Utterance(
-                    self.with_timeline(utterance, 0, None),
+                    self.with_timeline(utterance, 0, None, speaker_id),
                 ));
             }
         }
@@ -609,7 +670,7 @@ impl NativePipeline {
                     .fixed_window
                     .as_ref()
                     .map(|window| window.current_topic_turn_sequence);
-                PipelineEvent::Utterance(self.with_timeline(utterance, 0, topic_turn_sequence))
+                PipelineEvent::Utterance(self.with_timeline(utterance, 0, topic_turn_sequence, None))
             });
             self.observe_vad_activity(false);
             return Ok(event);
@@ -636,6 +697,11 @@ impl NativePipeline {
                 .processed_samples
                 .saturating_add(received_samples as u64);
         }
+        let speaker_id = if let Some(streaming) = &mut self.streaming_speaker {
+            streaming.finalize_speech().map(|(_, id)| id)
+        } else {
+            None
+        };
         let event = finalized
             .or_else(|| self.endpoint.flush())
             .map(|utterance| {
@@ -643,6 +709,7 @@ impl NativePipeline {
                     utterance,
                     trailing_padding_samples,
                     None,
+                    speaker_id,
                 ))
             });
         self.observe_vad_activity(false);
@@ -657,6 +724,9 @@ impl NativePipeline {
         self.observe_vad_activity(false);
         if let Some(window) = &mut self.fixed_window {
             window.reset();
+        }
+        if let Some(streaming) = &mut self.streaming_speaker {
+            streaming.reset();
         }
         self.processed_samples = 0;
     }
@@ -709,6 +779,7 @@ impl NativePipeline {
         utterance: Utterance,
         trailing_padding_samples: usize,
         topic_turn_sequence: Option<u64>,
+        speaker_id: Option<String>,
     ) -> TimedUtterance {
         let real_samples = utterance
             .samples
@@ -722,6 +793,7 @@ impl NativePipeline {
             source_end_ms: samples_to_ms(end_samples),
             revisable: self.fixed_window.is_some(),
             topic_turn_sequence,
+            speaker_id,
         }
     }
 }
@@ -1166,9 +1238,9 @@ pub(crate) fn validate_input_chunk_size(bytes: usize) -> Result<(), String> {
 #[cfg(test)]
 mod tests {
     use super::{
-        FRAME_SAMPLES, FixedWindow, FixedWindowEvent, MAX_INPUT_PCM_BYTES, UtteranceEndReason,
-        asr_language, frames_for_ms, is_context_window_error, translation_route, vad_is_active,
-        validate_input_chunk_size, validate_input_sample_rate,
+        FRAME_SAMPLES, FixedWindow, FixedWindowEvent, MAX_INPUT_PCM_BYTES, TimedUtterance,
+        Utterance, UtteranceEndReason, asr_language, frames_for_ms, is_context_window_error,
+        translation_route, vad_is_active, validate_input_chunk_size, validate_input_sample_rate,
     };
     use xrtranslate_inference::InferenceError;
     use xrtranslate_protocol::AudioSource;
@@ -1403,5 +1475,27 @@ mod tests {
         assert_eq!(utterance.samples.len(), FixedWindow::FIRST_WINDOW_SAMPLES);
         assert_eq!(window.overlap_samples, 32 * FRAME_SAMPLES);
         assert_eq!(window.samples.len(), 32 * FRAME_SAMPLES);
+    }
+
+    #[test]
+    fn timed_utterance_preserves_streaming_speaker_id_and_end_reason() {
+        let utterance = Utterance {
+            samples: vec![0; 512 * 4],
+            pre_roll_frames: 1,
+            overlap_frames: 0,
+            trailing_silence_frames: 0,
+            end_reason: UtteranceEndReason::SpeakerChange,
+        };
+        let timed = TimedUtterance {
+            utterance,
+            source_start_ms: 0.0,
+            source_end_ms: 128.0,
+            revisable: false,
+            topic_turn_sequence: None,
+            speaker_id: Some("speaker-01".to_string()),
+        };
+        assert_eq!(timed.utterance.end_reason, UtteranceEndReason::SpeakerChange);
+        assert_eq!(timed.speaker_id.as_deref(), Some("speaker-01"));
+        assert_eq!(timed.source_end_ms, 128.0);
     }
 }

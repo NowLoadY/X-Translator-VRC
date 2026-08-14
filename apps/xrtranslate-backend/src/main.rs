@@ -113,6 +113,7 @@ struct UtteranceJob {
     topic_turn_id: String,
     source_language: String,
     target_language: String,
+    speaker_id: Option<String>,
 }
 
 enum InferenceJob {
@@ -1013,6 +1014,7 @@ fn inference_jobs(
             source_end_ms,
             revisable,
             topic_turn_sequence,
+            speaker_id,
         } = timed;
         let turn_id = format!("{turn_id_prefix}:utterance-{next_utterance_sequence}");
         *next_utterance_sequence = (*next_utterance_sequence)
@@ -1039,6 +1041,7 @@ fn inference_jobs(
             topic_turn_id,
             source_language: source_language.clone(),
             target_language: target_language.clone(),
+            speaker_id,
         }));
     }
     Ok(jobs)
@@ -1359,7 +1362,9 @@ async fn run_inference_worker(
             speaker_load_failed = false;
         }
         let duration_ms = job.source_end_ms - job.source_start_ms;
-        let speaker_id = if speaker_enabled && duration_ms >= f64::from(speaker_min_utterance_ms) {
+        let speaker_id = if let Some(assigned) = job.speaker_id {
+            assigned
+        } else if speaker_enabled && duration_ms >= f64::from(speaker_min_utterance_ms) {
             if diarizer.is_none() && !speaker_load_failed {
                 match tokio::task::block_in_place(|| inference.speaker_diarizer()) {
                     Ok(loaded) => diarizer = loaded,

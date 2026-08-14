@@ -743,16 +743,16 @@ const fn default_log_retained_files() -> usize {
     2
 }
 const fn default_speaker_similarity_threshold() -> f64 {
-    0.62
+    0.52
 }
 const fn default_same_speaker_hysteresis() -> f64 {
-    0.04
+    0.10
 }
 const fn default_max_speakers() -> usize {
     8
 }
 const fn default_speaker_min_utterance_ms() -> u32 {
-    500
+    750
 }
 const fn default_speaker_intra_threads() -> usize {
     2
@@ -796,7 +796,7 @@ mod tests {
         assert_eq!(config.asr.vad_overlap_ms, 256);
         assert!(config.speaker.enabled);
         assert_eq!(config.speaker.max_speakers, 8);
-        assert_eq!(config.speaker.min_utterance_ms, 500);
+        assert_eq!(config.speaker.min_utterance_ms, 750);
         assert!(config.prompt_context.enabled);
         assert_eq!(config.prompt_context.max_entries, 6);
         assert_eq!(config.prompt_context.asr_max_chars, 800);
