@@ -121,6 +121,7 @@ pub struct RecordingChunk {
 
 /// A failed non-blocking enqueue. The original chunk is returned to the caller.
 #[derive(Debug)]
+#[allow(dead_code)]
 pub struct TryAppendError {
     pub kind: TryAppendErrorKind,
     pub chunk: RecordingChunk,
@@ -157,11 +158,6 @@ impl RecordingConfig {
             directory: directory.into(),
             queue_capacity: 128,
         }
-    }
-
-    pub fn with_queue_capacity(mut self, queue_capacity: usize) -> Self {
-        self.queue_capacity = queue_capacity;
-        self
     }
 }
 
@@ -270,14 +266,6 @@ impl MeetingRecording {
 
     pub fn sink(&self) -> RecordingSink {
         self.sink.clone()
-    }
-
-    pub fn try_append(
-        &self,
-        track: RecordingTrack,
-        samples: Vec<f32>,
-    ) -> std::result::Result<(), TryAppendError> {
-        self.sink.try_append(track, samples)
     }
 
     /// Flushes both tracks and calls `sync_data`, creating a durable checkpoint.
@@ -759,9 +747,11 @@ mod tests {
         let directory = TestDirectory::new("finalize");
         let recording = MeetingRecording::start(RecordingConfig::new(&directory.0)).unwrap();
         recording
+            .sink()
             .try_append(RecordingTrack::Microphone, vec![-1.0, 0.0, 1.0])
             .unwrap();
         recording
+            .sink()
             .try_append(RecordingTrack::SystemAudio, vec![0.5, f32::NAN])
             .unwrap();
 
@@ -792,6 +782,7 @@ mod tests {
         let directory = TestDirectory::new("resume");
         let recording = MeetingRecording::start(RecordingConfig::new(&directory.0)).unwrap();
         recording
+            .sink()
             .try_append(RecordingTrack::Microphone, vec![0.1, 0.2])
             .unwrap();
         let checkpoint = recording.stop_without_finalizing().unwrap();
@@ -804,6 +795,7 @@ mod tests {
 
         let resumed = MeetingRecording::start(RecordingConfig::new(&directory.0)).unwrap();
         resumed
+            .sink()
             .try_append(RecordingTrack::Microphone, vec![0.3])
             .unwrap();
         resumed.stop_without_finalizing().unwrap();

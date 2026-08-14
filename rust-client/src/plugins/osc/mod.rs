@@ -33,25 +33,12 @@ impl OscPlugin {
         &self.manager
     }
 
-    pub fn manager_mut(&mut self) -> &mut OscManager {
-        &mut self.manager
-    }
-
     pub fn draft(&self) -> &OscSettings {
         &self.draft
     }
 
     pub fn draft_mut(&mut self) -> &mut OscSettings {
         &mut self.draft
-    }
-
-    pub const fn host_enabled(&self) -> bool {
-        self.host_enabled
-    }
-
-    pub fn replace_draft(&mut self, draft: OscSettings) -> Result<(), String> {
-        self.draft = draft;
-        self.apply_draft()
     }
 
     pub fn apply_draft(&mut self) -> Result<(), String> {
@@ -118,7 +105,7 @@ mod tests {
         };
         let mut plugin = OscPlugin::new(draft, false);
 
-        assert!(!plugin.host_enabled());
+        assert!(!plugin.host_enabled);
         assert!(plugin.draft().enabled);
         plugin.activate().unwrap();
         plugin.deactivate().unwrap();

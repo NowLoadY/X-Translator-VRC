@@ -842,7 +842,7 @@ mod tests {
             gguf.translation_url,
             "http://127.0.0.1:8002/v1/chat/completions"
         );
-        assert_eq!(gguf.asr_runtime.context_window_tokens, 2_048);
+        assert_eq!(gguf.asr_runtime.context_window_tokens, 3_200);
         assert_eq!(gguf.asr_runtime.max_tokens, 128);
         assert_eq!(gguf.asr_runtime.parallel_slots, 1);
         assert_eq!(gguf.translation_runtime.context_window_tokens, 2_048);

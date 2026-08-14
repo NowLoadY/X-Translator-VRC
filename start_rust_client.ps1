@@ -56,6 +56,22 @@ if ($LASTEXITCODE -ne 0) {
     exit $LASTEXITCODE
 }
 
+$targetSubdir = if ($Release) { 'release' } else { 'debug' }
+$targetBinDir = Join-Path $projectRoot "target\$targetSubdir"
+$resourceBinDir = Join-Path $projectRoot 'rust-client\resources\bin'
+
+if (Test-Path -LiteralPath $resourceBinDir) {
+    if (-not (Test-Path -LiteralPath $targetBinDir)) {
+        New-Item -ItemType Directory -Path $targetBinDir -Force | Out-Null
+    }
+    Get-ChildItem -Path $resourceBinDir -Filter "*.dll" | ForEach-Object {
+        $destFile = Join-Path $targetBinDir $_.Name
+        if (-not (Test-Path -LiteralPath $destFile)) {
+            Copy-Item -LiteralPath $_.FullName -Destination $destFile -Force
+        }
+    }
+}
+
 $runArguments = @('run', '--manifest-path', $manifestPath)
 if ($Release) {
     $runArguments += '--release'

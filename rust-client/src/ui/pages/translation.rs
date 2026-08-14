@@ -1,5 +1,5 @@
 use crate::ui::components::{self, danger_button, section, status_badge};
-use crate::{CaptureSource, LANGUAGE_OPTIONS, language_label, route_label};
+use crate::{CaptureSource, LANGUAGE_OPTIONS, language_label};
 use eframe::egui;
 
 pub fn render(app: &mut crate::XRTranslateApp, ui: &mut egui::Ui) {
@@ -79,13 +79,21 @@ pub fn render(app: &mut crate::XRTranslateApp, ui: &mut egui::Ui) {
                     crate::i18n::tr(app.ui_language, label).to_string(),
                 ));
             }
-            components::searchable_combobox(
+            if components::searchable_combobox(
                 ui,
                 "source_language",
                 language_label(app.ui_language, &app.source_lang),
                 &mut app.source_lang,
                 &source_options,
-            );
+            ) && app.source_lang != "auto"
+                && app.target_lang == app.source_lang
+            {
+                app.target_lang = if app.source_lang == "zh" {
+                    "en".to_string()
+                } else {
+                    "zh".to_string()
+                };
+            }
 
             if app.source_lang == "auto" {
                 ui.add_space(8.0);
@@ -94,61 +102,14 @@ pub fn render(app: &mut crate::XRTranslateApp, ui: &mut egui::Ui) {
                         .color(crate::ui::theme::text_strong())
                         .strong(),
                 );
-                let (mut a, mut b) = match app.target_lang.split_once(',') {
-                    Some((x, y)) => (x.to_string(), y.to_string()),
-                    None => ("zh".to_string(), "en".to_string()),
-                };
-
-                let options_a: Vec<_> = LANGUAGE_OPTIONS
-                    .iter()
-                    .filter(|(code, _)| *code != b)
-                    .map(|(code, label)| {
-                        (
-                            (*code).to_string(),
-                            crate::i18n::tr(app.ui_language, label).to_string(),
-                        )
-                    })
-                    .collect();
-
-                components::searchable_combobox(
+                components::target_language_pair_selector(
                     ui,
-                    "target_language_a",
-                    language_label(app.ui_language, &a),
-                    &mut a,
-                    &options_a,
+                    "translation_page",
+                    &app.source_lang,
+                    &mut app.target_lang,
+                    app.ui_language,
+                    |code, lang| language_label(lang, code).to_string(),
                 );
-
-                ui.add_space(4.0);
-                ui.label(
-                    egui::RichText::new("↔")
-                        .color(crate::ui::theme::text_weak())
-                        .strong(),
-                );
-                ui.add_space(4.0);
-
-                let options_b: Vec<_> = LANGUAGE_OPTIONS
-                    .iter()
-                    .filter(|(code, _)| *code != a)
-                    .map(|(code, label)| {
-                        (
-                            (*code).to_string(),
-                            crate::i18n::tr(app.ui_language, label).to_string(),
-                        )
-                    })
-                    .collect();
-
-                components::searchable_combobox(
-                    ui,
-                    "target_language_b",
-                    language_label(app.ui_language, &b),
-                    &mut b,
-                    &options_b,
-                );
-
-                let new_target = format!("{a},{b}");
-                if new_target != app.target_lang {
-                    app.target_lang = new_target;
-                }
             } else {
                 ui.add_space(4.0);
                 if components::swap_capsule_button(ui, true).clicked() {
@@ -163,21 +124,13 @@ pub fn render(app: &mut crate::XRTranslateApp, ui: &mut egui::Ui) {
                         .color(crate::ui::theme::text_strong())
                         .strong(),
                 );
-                let target_options: Vec<_> = LANGUAGE_OPTIONS
-                    .iter()
-                    .map(|(code, label)| {
-                        (
-                            (*code).to_string(),
-                            crate::i18n::tr(app.ui_language, label).to_string(),
-                        )
-                    })
-                    .collect();
-                components::searchable_combobox(
+                components::target_language_pair_selector(
                     ui,
-                    "target_language",
-                    route_label(app.ui_language, &app.source_lang, &app.target_lang),
+                    "translation_page",
+                    &app.source_lang,
                     &mut app.target_lang,
-                    &target_options,
+                    app.ui_language,
+                    |code, lang| language_label(lang, code).to_string(),
                 );
             }
         });
@@ -639,12 +592,7 @@ fn render_input_adaptation(
     let recognize_when = crate::i18n::tr(language, "Recognize when:");
     let speak = crate::i18n::tr(language, "Speak");
     let always = crate::i18n::tr(language, "Always");
-    let states = [
-        crate::i18n::tr(language, "Low"),
-        crate::i18n::tr(language, "Medium"),
-        crate::i18n::tr(language, "High"),
-    ];
-    let background_noise = crate::i18n::tr(language, "Background noise");
+    let vad_sensitivity = crate::i18n::tr(language, "VAD Sensitivity");
     let pause_tolerance = crate::i18n::tr(language, "Pause tolerance");
     let changed = {
         let recognition = app.recognition_settings_mut(source);
@@ -668,10 +616,10 @@ fn render_input_adaptation(
         let background_response = components::modern_slider_f32(
             ui,
             &mut recognition.background_noise,
-            0.2..=0.8,
+            0.05..=0.8,
             0.2,
-            background_noise,
-            &states,
+            vad_sensitivity,
+            &[],
         );
         let background_changed = background_response.drag_stopped()
             || (background_response.changed() && !background_response.dragged());
@@ -684,7 +632,7 @@ fn render_input_adaptation(
                 0.0..=1.0,
                 0.0,
                 pause_tolerance,
-                &states,
+                &[],
             );
             response.drag_stopped() || (response.changed() && !response.dragged())
         };

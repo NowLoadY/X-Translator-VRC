@@ -1,0 +1,459 @@
+use super::{
+    backend::{window::NativeVideoHost, MediaBackend, MediaSource, PlaybackStatus},
+    subtitles::{SubtitleCue, SubtitleTimeline},
+    task::{VideoSubtitleMode, VideoTask, VideoTaskStore},
+};
+use std::path::PathBuf;
+use std::time::Instant;
+
+#[derive(Clone, Debug, PartialEq, Eq, Default)]
+pub enum VideoPlayerRoute {
+    #[default]
+    Library,
+    Create,
+    Player,
+}
+
+pub struct VideoPlayerController {
+    pub route: VideoPlayerRoute,
+    pub store: VideoTaskStore,
+    pub storage_dir: PathBuf,
+    pub active_task_id: Option<String>,
+    pub current_source: Option<MediaSource>,
+    pub backend: Option<Box<dyn MediaBackend>>,
+    pub native_host: Option<NativeVideoHost>,
+    pub subtitles: SubtitleTimeline,
+    pub show_subtitles: bool,
+    pub fullscreen_mode: bool,
+    pub error: Option<String>,
+    pub muted: bool,
+    pub volume: f32,
+
+    pub search_query: String,
+    pub draft_title: String,
+    pub draft_source: String,
+    pub draft_source_lang: String,
+    pub draft_target_lang: String,
+    pub draft_subtitle_mode: VideoSubtitleMode,
+    pub draft_recognition: crate::client_settings::RecognitionSettings,
+
+    pub last_hover_instant: Option<Instant>,
+    pub last_save_instant: Instant,
+}
+
+impl Default for VideoPlayerController {
+    fn default() -> Self {
+        let storage_dir = PathBuf::from("runtime");
+        let store = VideoTaskStore::load_from_dir(&storage_dir);
+        let backend: Option<Box<dyn MediaBackend>> = match super::backend::mpv::MpvBackend::new() {
+            Ok(b) => Some(Box::new(b)),
+            Err(e) => {
+                log::error!("Failed to initialize MPV backend: {}", e);
+                None
+            }
+        };
+
+        Self {
+            route: VideoPlayerRoute::Library,
+            store,
+            storage_dir,
+            active_task_id: None,
+            current_source: None,
+            backend,
+            native_host: None,
+            subtitles: SubtitleTimeline::new(),
+            show_subtitles: true,
+            fullscreen_mode: false,
+            error: None,
+            muted: false,
+            volume: 1.0,
+            search_query: String::new(),
+            draft_title: String::new(),
+            draft_source: String::new(),
+            draft_source_lang: "auto".into(),
+            draft_target_lang: "zh".into(),
+            draft_subtitle_mode: VideoSubtitleMode::RealtimeTranslation,
+            draft_recognition: crate::client_settings::RecognitionSettings {
+                background_noise: 0.15,
+                pause_tolerance: 0.5,
+                continuous_recognition: false,
+            },
+            last_hover_instant: Some(Instant::now()),
+            last_save_instant: Instant::now(),
+        }
+    }
+}
+
+impl VideoPlayerController {
+    pub fn open_library(&mut self) {
+        if let Some(backend) = &mut self.backend {
+            backend.stop();
+        }
+        let _ = self.store.save_to_dir(&self.storage_dir);
+        self.route = VideoPlayerRoute::Library;
+        if let Some(host) = &self.native_host {
+            host.hide();
+        }
+    }
+
+    pub fn open_create(&mut self) {
+        if let Some(backend) = &mut self.backend {
+            backend.stop();
+        }
+        let _ = self.store.save_to_dir(&self.storage_dir);
+        self.route = VideoPlayerRoute::Create;
+        self.draft_title.clear();
+        self.draft_source.clear();
+        self.draft_source_lang = "auto".into();
+        self.draft_target_lang = "zh".into();
+        self.draft_subtitle_mode = VideoSubtitleMode::RealtimeTranslation;
+        self.draft_recognition = crate::client_settings::RecognitionSettings {
+            background_noise: 0.15,
+            pause_tolerance: 0.5,
+            continuous_recognition: false,
+        };
+        self.error = None;
+        if let Some(host) = &self.native_host {
+            host.hide();
+        }
+    }
+
+    pub fn start_draft_task(&mut self) -> Result<String, String> {
+        let input = self.draft_source.trim();
+        if input.is_empty() {
+            return Err("Please enter a video stream URL or select a local file".into());
+        }
+
+        let (source, default_title) = if input.starts_with("http://")
+            || input.starts_with("https://")
+            || input.starts_with("rtsp://")
+            || input.starts_with("rtmp://")
+        {
+            let title = input
+                .split('?')
+                .next()
+                .unwrap_or(input)
+                .split('/')
+                .last()
+                .filter(|s| !s.is_empty())
+                .unwrap_or("Network Stream")
+                .to_string();
+            (MediaSource::NetworkStream(input.to_string()), title)
+        } else {
+            let path = PathBuf::from(input);
+            if !path.is_file() {
+                return Err("Local video file does not exist or URL is invalid".into());
+            }
+            let title = path
+                .file_name()
+                .map(|s| s.to_string_lossy().to_string())
+                .unwrap_or_else(|| "Local Video".into());
+            (MediaSource::LocalFile(path), title)
+        };
+
+        let title = if self.draft_title.trim().is_empty() {
+            default_title
+        } else {
+            self.draft_title.trim().to_string()
+        };
+
+        let mut task = VideoTask::new(
+            title,
+            source.clone(),
+            self.draft_source_lang.clone(),
+            self.draft_target_lang.clone(),
+            self.draft_subtitle_mode.clone(),
+            self.draft_recognition.clone(),
+        );
+
+        if let VideoSubtitleMode::ImportedSrt(srt_path) = &self.draft_subtitle_mode {
+            if let Ok(content) = std::fs::read_to_string(srt_path) {
+                task.subtitles = parse_srt_to_timeline(&content);
+            }
+        }
+
+        let task_id = task.id.clone();
+        self.store.add_or_update(task);
+        let _ = self.store.save_to_dir(&self.storage_dir);
+
+        self.play_task(&task_id)?;
+        Ok(task_id)
+    }
+
+    pub fn play_task(&mut self, task_id: &str) -> Result<(), String> {
+        let task = self.store.get(task_id).ok_or("Task not found")?.clone();
+        self.active_task_id = Some(task_id.to_string());
+        self.current_source = Some(task.source.clone());
+        self.subtitles = task.subtitles.clone();
+        self.route = VideoPlayerRoute::Player;
+        self.error = None;
+
+        if let Some(backend) = &mut self.backend {
+            match &task.source {
+                MediaSource::LocalFile(path) => {
+                    backend.load_local_file(path.clone())?;
+                }
+                MediaSource::NetworkStream(url) => {
+                    backend.load_stream_url(url.clone())?;
+                }
+            }
+        } else {
+            return Err("Media backend is not available".into());
+        }
+
+        if let Some(t) = self.store.get_mut(task_id) {
+            let now = std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap_or_default()
+                .as_secs();
+            t.last_played_sec = now;
+        }
+        let _ = self.store.save_to_dir(&self.storage_dir);
+        Ok(())
+    }
+
+    pub fn delete_task(&mut self, task_id: &str) {
+        if self.active_task_id.as_deref() == Some(task_id) {
+            if let Some(backend) = &mut self.backend {
+                backend.stop();
+            }
+            if let Some(host) = &self.native_host {
+                host.hide();
+            }
+            self.active_task_id = None;
+            self.current_source = None;
+            self.route = VideoPlayerRoute::Library;
+        }
+        self.store.delete(task_id);
+        let _ = self.store.save_to_dir(&self.storage_dir);
+    }
+
+    pub fn toggle_play(&mut self) {
+        if self.current_source.is_none() {
+            return;
+        }
+        if let Some(backend) = &mut self.backend {
+            if backend.get_status() == PlaybackStatus::Playing {
+                backend.pause();
+            } else {
+                backend.play();
+            }
+        }
+    }
+
+    pub fn toggle_mute(&mut self) {
+        self.muted = !self.muted;
+        if let Some(backend) = &mut self.backend {
+            backend.set_mute(self.muted);
+        }
+    }
+
+    pub fn set_volume(&mut self, volume: f32) {
+        self.volume = volume;
+        if let Some(backend) = &mut self.backend {
+            backend.set_volume(volume);
+        }
+    }
+
+    pub fn toggle_fullscreen(&mut self) {
+        self.fullscreen_mode = !self.fullscreen_mode;
+    }
+
+    pub fn note_mouse_motion(&mut self) {
+        let should_trigger = self.last_hover_instant.map_or(true, |inst| inst.elapsed().as_secs_f32() > 3.0);
+        self.last_hover_instant = Some(Instant::now());
+        if should_trigger {
+            if let Some(src) = &self.current_source {
+                if let Some(backend) = &mut self.backend {
+                    backend.show_osd_title(&src.display_title());
+                }
+            }
+        }
+    }
+
+    pub fn tick(&mut self) {
+        if let Some(backend) = &mut self.backend {
+            backend.tick();
+
+            if self.show_subtitles && self.current_source.is_some() && backend.get_status() == PlaybackStatus::Playing {
+                let current_time_ms = backend.get_time_ms();
+                if let Some(cue) = self.subtitles.active_cue_at(current_time_ms) {
+                    let text = if let Some(trans) = &cue.translated_text {
+                        if trans != &cue.original_text && !trans.trim().is_empty() {
+                            format!("{}\n{}", cue.original_text, trans)
+                        } else {
+                            cue.original_text.clone()
+                        }
+                    } else {
+                        cue.original_text.clone()
+                    };
+                    backend.set_osd_subtitle(&text);
+                } else {
+                    backend.set_osd_subtitle("");
+                }
+            } else {
+                backend.set_osd_subtitle("");
+            }
+        }
+
+        if let Some(active_id) = &self.active_task_id {
+            let dur = self.get_duration_ms();
+            if dur > 0 {
+                if let Some(task) = self.store.get_mut(active_id) {
+                    task.duration_ms = dur;
+                    task.subtitles = self.subtitles.clone();
+                }
+                if self.last_save_instant.elapsed().as_secs() >= 5 {
+                    self.last_save_instant = Instant::now();
+                    let _ = self.store.save_to_dir(&self.storage_dir);
+                }
+            }
+        }
+    }
+
+    pub fn get_time_ms(&self) -> i64 {
+        self.backend.as_ref().map(|b| b.get_time_ms()).unwrap_or(0)
+    }
+
+    pub fn get_duration_ms(&self) -> i64 {
+        self.backend.as_ref().map(|b| b.get_duration_ms()).unwrap_or(0)
+    }
+
+    pub fn get_status(&self) -> PlaybackStatus {
+        self.backend.as_ref().map(|b| b.get_status()).unwrap_or(PlaybackStatus::Stopped)
+    }
+
+    pub fn get_diagnostics(&self) -> super::backend::PlayerDiagnostics {
+        self.backend
+            .as_ref()
+            .map(|b| b.get_diagnostics())
+            .unwrap_or_default()
+    }
+
+    pub fn ingest_live_caption(
+        &mut self,
+        id: String,
+        start_ms: i64,
+        end_ms: i64,
+        speaker: Option<String>,
+        orig: String,
+        trans: Option<String>,
+    ) {
+        let changed = self.subtitles.add_cue(SubtitleCue {
+            id,
+            start_ms,
+            end_ms,
+            speaker_name: speaker,
+            original_text: orig,
+            translated_text: trans,
+        });
+
+        if changed {
+            if let Some(task_id) = &self.active_task_id {
+                if let Some(task) = self.store.get_mut(task_id) {
+                    task.subtitles = self.subtitles.clone();
+                }
+                if self.last_save_instant.elapsed() >= std::time::Duration::from_secs(3) {
+                    let _ = self.store.save_to_dir(&self.storage_dir);
+                    self.last_save_instant = std::time::Instant::now();
+                }
+            }
+        }
+    }
+}
+
+fn parse_srt_to_timeline(srt_content: &str) -> SubtitleTimeline {
+    let mut timeline = SubtitleTimeline::new();
+    let blocks: Vec<&str> = srt_content.split("\n\n").collect();
+    for (idx, block) in blocks.iter().enumerate() {
+        let lines: Vec<&str> = block.lines().map(|l| l.trim()).filter(|l| !l.is_empty()).collect();
+        if lines.len() >= 2 {
+            let time_line = if lines[0].contains("-->") { lines[0] } else { lines[1] };
+            let text_start = if lines[0].contains("-->") { 1 } else { 2 };
+            let times: Vec<&str> = time_line.split("-->").collect();
+            if times.len() == 2 && text_start < lines.len() {
+                let start_ms = parse_srt_time(times[0].trim());
+                let end_ms = parse_srt_time(times[1].trim());
+                let text_lines: Vec<&str> = lines[text_start..].to_vec();
+
+                let mut speaker_name = None;
+                let mut first_line = text_lines[0].to_string();
+
+                if first_line.starts_with('[') {
+                    if let Some(close_bracket) = first_line.find(']') {
+                        let speaker = first_line[1..close_bracket].trim().to_string();
+                        if !speaker.is_empty() {
+                            speaker_name = Some(speaker);
+                            first_line = first_line[close_bracket + 1..].trim().to_string();
+                        }
+                    }
+                }
+
+                let (original_text, translated_text) = if text_lines.len() >= 2 {
+                    let second_line = text_lines[1..].join("\n");
+                    if first_line.is_empty() {
+                        (second_line, None)
+                    } else if second_line == first_line {
+                        (first_line, None)
+                    } else {
+                        (first_line, Some(second_line))
+                    }
+                } else {
+                    (first_line, None)
+                };
+
+                timeline.add_cue(SubtitleCue {
+                    id: format!("srt_{}", idx),
+                    start_ms,
+                    end_ms,
+                    speaker_name,
+                    original_text,
+                    translated_text,
+                });
+            }
+        }
+    }
+    timeline
+}
+
+fn parse_srt_time(s: &str) -> i64 {
+    let binding = s.replace(',', ".");
+    let parts: Vec<&str> = binding.split(':').collect();
+    if parts.len() == 3 {
+        let h: f64 = parts[0].parse().unwrap_or(0.0);
+        let m: f64 = parts[1].parse().unwrap_or(0.0);
+        let s: f64 = parts[2].parse().unwrap_or(0.0);
+        ((h * 3600.0 + m * 60.0 + s) * 1000.0) as i64
+    } else {
+        0
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn controller_interplugin_export_and_ingest() {
+        let mut controller = VideoPlayerController::default();
+        assert_eq!(controller.volume, 1.0);
+        controller.ingest_live_caption(
+            "test_1".into(),
+            500,
+            2500,
+            Some("Speaker".into()),
+            "Hello".into(),
+            Some("你好".into()),
+        );
+        assert_eq!(controller.subtitles.cues().len(), 1);
+    }
+
+    #[test]
+    fn test_parse_srt() {
+        let srt = "1\n00:00:01,000 --> 00:00:03,500\nHello World\n\n2\n00:00:04,000 --> 00:00:06,000\nSecond line";
+        let tl = parse_srt_to_timeline(srt);
+        assert_eq!(tl.count(), 2);
+        assert_eq!(tl.cues()[0].start_ms, 1000);
+        assert_eq!(tl.cues()[0].end_ms, 3500);
+    }
+}

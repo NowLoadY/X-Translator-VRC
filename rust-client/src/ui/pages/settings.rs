@@ -292,19 +292,20 @@ fn render_plugins_section(app: &mut crate::XRTranslateApp, ui: &mut egui::Ui) {
     let language = app.ui_language;
     ui.label(
         egui::RichText::new(crate::i18n::tr(language, "Plugins"))
-            .size(18.0)
+            .size(20.0)
             .color(crate::ui::theme::text_strong())
             .strong(),
     );
+    ui.add_space(2.0);
     ui.label(
         egui::RichText::new(crate::i18n::tr(
             language,
             "Choose which optional tools appear in the sidebar.",
         ))
-        .size(12.0)
+        .size(12.5)
         .color(crate::ui::theme::text_weak()),
     );
-    ui.add_space(12.0);
+    ui.add_space(16.0);
 
     for descriptor in crate::plugins::PluginRegistry::builtin().descriptors() {
         let mut enabled = app.plugin_enabled(descriptor.id);
@@ -313,50 +314,71 @@ fn render_plugins_section(app: &mut crate::XRTranslateApp, ui: &mut egui::Ui) {
             .flatten();
 
         components::card(ui, |ui| {
-            ui.horizontal(|ui| {
-                ui.add(
-                    egui::Image::new(descriptor.icon.image_source())
-                        .fit_to_exact_size(egui::vec2(18.0, 18.0))
-                        .tint(crate::ui::theme::text_strong()),
-                );
-                ui.vertical(|ui| {
-                    let response = ui
-                        .add_enabled_ui(disable_reason.is_none(), |ui| {
-                            components::toggle_with_label(
-                                ui,
-                                &mut enabled,
-                                crate::i18n::tr(language, descriptor.title_key),
-                            )
-                        })
-                        .inner;
-                    if response.changed() {
-                        app.set_plugin_enabled(descriptor.id, enabled);
-                    }
-                    ui.label(
-                        egui::RichText::new(crate::i18n::tr(language, descriptor.description_key))
-                            .size(11.5)
-                            .color(crate::ui::theme::text_weak()),
-                    );
-                    if let Some(reason) = disable_reason {
-                        ui.label(
-                            egui::RichText::new(reason)
-                                .size(11.5)
-                                .color(egui::Color32::from_rgb(180, 83, 9)),
-                        );
-                    }
-                });
-            });
+            ui.vertical(|ui| {
+                ui.horizontal(|ui| {
+                    egui::Frame::new()
+                        .fill(egui::Color32::from_rgb(238, 242, 255))
+                        .corner_radius(egui::CornerRadius::same(10))
+                        .inner_margin(egui::Margin::same(8))
+                        .show(ui, |ui| {
+                            ui.add(
+                                egui::Image::new(descriptor.icon.image_source())
+                                    .fit_to_exact_size(egui::vec2(20.0, 20.0))
+                                    .tint(egui::Color32::from_rgb(59, 130, 246)),
+                            );
+                        });
 
-            if enabled
-                && descriptor.settings_contribution
-                    == crate::plugins::PluginSettingsContribution::Plugin
-            {
-                ui.add_space(10.0);
-                ui.separator();
-                ui.add_space(10.0);
-                app.render_plugin_settings(descriptor.id, ui);
-            }
+                    ui.add_space(10.0);
+
+                    ui.vertical(|ui| {
+                        ui.label(
+                            egui::RichText::new(crate::i18n::tr(language, descriptor.title_key))
+                                .size(14.5)
+                                .color(crate::ui::theme::text_strong())
+                                .strong(),
+                        );
+                        ui.add_space(2.0);
+                        ui.label(
+                            egui::RichText::new(crate::i18n::tr(
+                                language,
+                                descriptor.description_key,
+                            ))
+                            .size(12.0)
+                            .color(crate::ui::theme::text_weak()),
+                        );
+                        if let Some(reason) = &disable_reason {
+                            ui.add_space(2.0);
+                            ui.label(
+                                egui::RichText::new(reason)
+                                    .size(11.5)
+                                    .color(egui::Color32::from_rgb(220, 38, 38)),
+                            );
+                        }
+                    });
+
+                    ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                        let response = ui
+                            .add_enabled_ui(disable_reason.is_none(), |ui| {
+                                components::pill_toggle(ui, &mut enabled)
+                            })
+                            .inner;
+                        if response.changed() {
+                            app.set_plugin_enabled(descriptor.id, enabled);
+                        }
+                    });
+                });
+
+                if enabled
+                    && descriptor.settings_contribution
+                        == crate::plugins::PluginSettingsContribution::Plugin
+                {
+                    ui.add_space(14.0);
+                    components::wavy_divider(ui, egui::Color32::from_rgb(226, 232, 240));
+                    ui.add_space(14.0);
+                    app.render_plugin_settings(descriptor.id, ui);
+                }
+            });
         });
-        ui.add_space(10.0);
+        ui.add_space(12.0);
     }
 }

@@ -88,6 +88,7 @@ pub enum SessionEvent {
         translated: String,
         turn_id: String,
         segment_index: u32,
+        #[allow(dead_code)]
         segment_count: u32,
         speaker_id: String,
         source_start_ms: f64,

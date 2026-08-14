@@ -459,7 +459,7 @@ fn retain_recognition_tail(entry: &mut RecognitionHistoryEntry) {
     }
 }
 
-const LANGUAGE_OPTIONS: &[(&str, &str)] = &[
+pub const LANGUAGE_OPTIONS: &[(&str, &str)] = &[
     ("zh", "Chinese"),
     ("en", "English"),
     ("fr", "French"),
@@ -489,9 +489,7 @@ fn language_label(ui_language: UiLanguage, code: &str) -> &'static str {
         .unwrap_or_else(|| i18n::tr(ui_language, "Unknown language"))
 }
 
-fn route_label(ui_language: UiLanguage, _source: &str, target: &str) -> &'static str {
-    language_label(ui_language, target)
-}
+
 
 fn capture_source_to_meeting(source: CaptureSource) -> MeetingAudioSource {
     match source {
@@ -552,6 +550,9 @@ struct XRTranslateApp {
     speaker_recognition_enabled: bool,
     osc_plugin: OscPlugin,
     meeting_plugin: MeetingPlugin,
+    player_plugin: plugins::player::VideoPlayerPlugin,
+    host_audio_import: Option<plugins::meeting::audio_file::AudioImportHandle>,
+    pending_audio_import: Option<(std::path::PathBuf, RecognitionSettings, plugins::meeting::audio_file::AudioImportPacing)>,
     plugin_preferences: PluginPreferences,
     service_config: service_config::ServiceConfigEditor,
     backend_manager: backend::BackendManager,
@@ -609,6 +610,7 @@ impl Default for XRTranslateApp {
             settings.plugin_preferences.is_enabled(PluginId::OSC),
         );
         let meeting_plugin = MeetingPlugin::open(&backend_manager.project_root());
+        let player_plugin = plugins::player::VideoPlayerPlugin::new();
         let mut model_task_manager = model_install::NativeModelTaskManager::default();
         model_task_manager.set_proxy_url(&settings.download_proxy_url);
         let mut runtime_installer = runtime_install::RuntimeInstaller::default();
@@ -1074,6 +1076,9 @@ impl Default for XRTranslateApp {
             speaker_recognition_enabled: settings.speaker_recognition_enabled,
             osc_plugin,
             meeting_plugin,
+            player_plugin,
+            host_audio_import: None,
+            pending_audio_import: None,
             plugin_preferences: settings.plugin_preferences,
             service_config: service_config::ServiceConfigEditor::load(),
             backend_manager,
@@ -1212,6 +1217,7 @@ impl XRTranslateApp {
             default_target_language: self.target_lang.clone(),
             host_session_busy: self.is_translating
                 && self.meeting_plugin.controller.active_meeting_id().is_none(),
+            language: self.ui_language,
         }
     }
 
@@ -1221,9 +1227,135 @@ impl XRTranslateApp {
         self.apply_meeting_action(action, ui.ctx().clone());
     }
 
+    fn render_player_plugin_page(&mut self, ui: &mut egui::Ui) {
+        let snapshot = plugins::player::VideoPlayerUiSnapshot {
+            language: self.ui_language,
+        };
+        let action = self.player_plugin.render_page(&snapshot, ui);
+        self.apply_video_player_action(action, ui.ctx().clone());
+    }
+
+    fn apply_video_player_action(
+        &mut self,
+        action: plugins::player::VideoPlayerAction,
+        ctx: egui::Context,
+    ) {
+        match action {
+            plugins::player::VideoPlayerAction::None => {}
+            plugins::player::VideoPlayerAction::StartTranslation(request) => match request {
+                plugins::player::PlayerTranslationRequest::ImportMediaFile {
+                    path,
+                    source_language,
+                    target_language,
+                    recognition,
+                } => {
+                    self.start_audio_file_translation(
+                        path,
+                        source_language,
+                        target_language,
+                        recognition,
+                        plugins::meeting::audio_file::AudioImportPacing::AsFastAsPossible,
+                        Some(ctx),
+                    );
+                }
+                plugins::player::PlayerTranslationRequest::LiveStream {
+                    source_language,
+                    target_language,
+                    recognition,
+                } => {
+                    self.source_lang = source_language;
+                    self.target_lang = target_language;
+                    self.loopback_recognition = recognition;
+                    self.start(Some(ctx));
+                }
+            },
+        }
+    }
+
+    pub(crate) fn start_audio_file_translation(
+        &mut self,
+        path: std::path::PathBuf,
+        source_language: String,
+        target_language: String,
+        recognition: RecognitionSettings,
+        pacing: plugins::meeting::audio_file::AudioImportPacing,
+        ctx: Option<eframe::egui::Context>,
+    ) {
+        self.source_lang = source_language;
+        self.target_lang = target_language;
+        match self.backend_manager.prepare(&self.server_url) {
+            Ok(backend::BackendStart::Ready) => {
+                self.start_audio_file_session(path, recognition, pacing, ctx);
+            }
+            Ok(backend::BackendStart::Starting(stage)) => {
+                self.pending_audio_import = Some((path, recognition, pacing));
+                self.backend_start_deadline =
+                    Some(std::time::Instant::now() + std::time::Duration::from_secs(180));
+                self.set_connection_status(stage.message());
+            }
+            Err(error) => {
+                self.set_startup_error("Startup failed", error);
+            }
+        }
+    }
+
+    fn start_audio_file_session(
+        &mut self,
+        path: std::path::PathBuf,
+        recognition: RecognitionSettings,
+        pacing: plugins::meeting::audio_file::AudioImportPacing,
+        ctx: Option<eframe::egui::Context>,
+    ) {
+        let (audio_tx, audio_rx) = crossbeam_channel::bounded::<Vec<f32>>(64);
+        let session = start_session(
+            audio_rx,
+            self.event_tx.clone(),
+            SessionConfig {
+                server_url: self.server_url.clone(),
+                source_lang: self.source_lang.clone(),
+                target_lang: self.target_lang.clone(),
+                speaker_recognition_enabled: false,
+                external_audio_gate: ExternalAudioGate::default(),
+                publish_to_host_outputs: true,
+                tts: None,
+                egui_ctx: ctx,
+                vad_threshold: recognition.background_noise.clamp(0.02, 0.95),
+                vad_silence_ms: pause_tolerance_to_ms(recognition.pause_tolerance),
+                continuous_recognition: recognition.continuous_recognition,
+                audio_source: CaptureSource::SystemAudio,
+                finish_when_audio_ends: true,
+            },
+        );
+        match plugins::meeting::audio_file::import_audio_file(
+            path,
+            audio_tx,
+            plugins::meeting::audio_file::AudioImportOptions {
+                chunk_frames: 1_600,
+                pacing,
+            },
+        ) {
+            Ok(import) => {
+                self.sessions = vec![session];
+                self.host_audio_import = Some(import);
+                self.audio_txs.clear();
+                self.is_translating = true;
+                if let Ok(mut state) = self.shared_session_state.lock() {
+                    state.translations.clear();
+                    state.recognition_history.clear();
+                }
+                self.set_connection_status("Transcribing and translating media audio...");
+            }
+            Err(error) => {
+                session.finish();
+                log::error!("Media audio import failed: {error}");
+            }
+        }
+    }
+
     fn render_plugin_page(&mut self, id: PluginId, ui: &mut egui::Ui) {
         match id {
             PluginId::MEETING => self.render_meeting_plugin_page(ui),
+            PluginId::VIDEO_PLAYER => self.render_player_plugin_page(ui),
             PluginId::OSC => self.render_osc_plugin_page(ui),
             _ => self.navigation.page = Page::Translation,
         }
@@ -1715,7 +1847,9 @@ impl XRTranslateApp {
         match self.backend_manager.status(&self.server_url) {
             backend::BackendStatus::Ready => {
                 self.backend_start_deadline = None;
-                if let Some(path) = self.meeting_plugin.pending_audio_import.take() {
+                if let Some((path, recognition, pacing)) = self.pending_audio_import.take() {
+                    self.start_audio_file_session(path, recognition, pacing, ctx);
+                } else if let Some(path) = self.meeting_plugin.pending_audio_import.take() {
                     self.start_audio_import_session(path, ctx);
                 } else {
                     self.start_session(ctx);
@@ -1871,6 +2005,44 @@ impl XRTranslateApp {
                 self.meeting_plugin.controller.refresh_library();
             }
             self.meeting_plugin.audio_import = None;
+        }
+
+        let host_events = self
+            .host_audio_import
+            .as_ref()
+            .map(|import| import.events().try_iter().collect::<Vec<_>>())
+            .unwrap_or_default();
+        let mut host_completed = false;
+        for event in host_events {
+            match event {
+                plugins::meeting::audio_file::AudioImportEvent::Started(info) => {
+                    self.set_connection_status(format!(
+                        "Processing media audio ({} Hz)",
+                        info.source_sample_rate
+                    ));
+                }
+                plugins::meeting::audio_file::AudioImportEvent::Progress(progress) => {
+                    let percentage = progress.fraction.map(|value| value * 100.0);
+                    self.set_connection_status(percentage.map_or_else(
+                        || format!("Processing media audio · {}s", progress.position.as_secs()),
+                        |value| format!("Processing media audio · {value:.0}%"),
+                    ));
+                }
+                plugins::meeting::audio_file::AudioImportEvent::Completed { .. } => {
+                    host_completed = true;
+                }
+                plugins::meeting::audio_file::AudioImportEvent::Stopped { .. } => {
+                    self.host_audio_import = None;
+                }
+                plugins::meeting::audio_file::AudioImportEvent::Error(error) => {
+                    log::error!("Host audio import error: {error}");
+                    self.host_audio_import = None;
+                }
+            }
+        }
+        if host_completed {
+            self.host_audio_import = None;
+            self.set_connection_status("Media translation completed");
         }
     }
 
@@ -2364,6 +2536,52 @@ fn spawn_meeting_audio_router(
     (capture_tx, worker)
 }
 
+impl XRTranslateApp {
+    fn sync_player_subtitles(&mut self) {
+        let active_task_id = self.player_plugin.controller.active_task_id.clone();
+        let Some(active_id) = active_task_id else {
+            return;
+        };
+        let is_realtime = self
+            .player_plugin
+            .controller
+            .store
+            .get(&active_id)
+            .map(|t| t.subtitle_mode == plugins::player::VideoSubtitleMode::RealtimeTranslation)
+            .unwrap_or(false);
+        if !is_realtime {
+            return;
+        }
+
+        if let Ok(state) = self.shared_session_state.lock() {
+            for (idx, entry) in state.translations.iter().enumerate() {
+                if entry.audio_source != CaptureSource::SystemAudio {
+                    continue;
+                }
+
+                let speaker = if entry.speaker_id.is_empty() {
+                    None
+                } else {
+                    Some(entry.speaker_id.clone())
+                };
+                let cue_id = if let Some(sid) = entry.stream_id {
+                    format!("stream_{}_{}", sid, entry.source_start_ms.round() as i64)
+                } else {
+                    format!("cue_{}_{}", idx, entry.source_start_ms.round() as i64)
+                };
+                self.player_plugin.on_translation_segment(
+                    cue_id,
+                    entry.source_start_ms as i64,
+                    entry.source_end_ms as i64,
+                    speaker,
+                    entry.source.clone(),
+                    Some(entry.translated.clone()),
+                );
+            }
+        }
+    }
+}
+
 impl eframe::App for XRTranslateApp {
     fn ui(&mut self, ui: &mut egui::Ui, _frame: &mut eframe::Frame) {
         self.model_task_manager.poll();
@@ -2371,6 +2589,7 @@ impl eframe::App for XRTranslateApp {
         self.app_update_manager.poll();
         self.poll_audio_device_refresh();
         self.poll_audio_import();
+        self.player_plugin.on_visibility_changed(self.navigation.page == Page::Plugin(PluginId::VIDEO_PLAYER));
         ui.ctx()
             .request_repaint_after(std::time::Duration::from_millis(100));
         if self.first_run {
@@ -2382,6 +2601,7 @@ impl eframe::App for XRTranslateApp {
 
         self.poll_backend_startup(Some(ui.ctx().clone()));
         self.poll_session_events();
+        self.sync_player_subtitles();
         if self.plugin_enabled(PluginId::MEETING) {
             self.meeting_plugin.controller.poll_live_view();
         }
@@ -2428,6 +2648,7 @@ impl eframe::App for XRTranslateApp {
 
         if self.navigation.collapsed != prev_collapsed || self.navigation.page != prev_page {
             self.save_settings();
+            self.player_plugin.on_visibility_changed(self.navigation.page == Page::Plugin(PluginId::VIDEO_PLAYER));
         }
 
         // 2. Native Central Content Panel (Takes 100% of remaining width and height)
@@ -2495,8 +2716,32 @@ impl eframe::App for XRTranslateApp {
     }
 }
 
+#[cfg(windows)]
+fn configure_dll_search_paths() {
+    use windows::Win32::System::LibraryLoader::SetDllDirectoryW;
+    use windows::core::HSTRING;
+    if let Ok(exe_path) = std::env::current_exe() {
+        if let Some(exe_dir) = exe_path.parent() {
+            let res_bin = exe_dir.join("resources").join("bin");
+            if res_bin.is_dir() {
+                let _ = unsafe { SetDllDirectoryW(&HSTRING::from(res_bin.as_os_str())) };
+                return;
+            }
+        }
+    }
+    let local_res_bin = std::path::Path::new("rust-client/resources/bin");
+    if local_res_bin.is_dir() {
+        if let Ok(abs) = local_res_bin.canonicalize() {
+            let _ = unsafe { SetDllDirectoryW(&HSTRING::from(abs.as_os_str())) };
+        }
+    }
+}
+
 fn main() -> eframe::Result<()> {
     env_logger::init();
+
+    #[cfg(windows)]
+    configure_dll_search_paths();
 
     if std::env::args().any(|a| a == "--overlay") {
         #[cfg(windows)]

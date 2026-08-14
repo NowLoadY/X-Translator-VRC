@@ -8,6 +8,7 @@
 pub mod audio_file;
 pub mod controller;
 pub mod events;
+pub mod i18n;
 pub mod recording;
 pub mod ui;
 
@@ -37,6 +38,7 @@ pub struct MeetingUiSnapshot {
     pub default_target_language: String,
     /// True when another host feature owns the exclusive recognition session.
     pub host_session_busy: bool,
+    pub language: crate::i18n::UiLanguage,
 }
 
 impl Default for MeetingUiSnapshot {
@@ -46,6 +48,7 @@ impl Default for MeetingUiSnapshot {
             default_source_language: "auto".into(),
             default_target_language: "zh".into(),
             host_session_busy: false,
+            language: crate::i18n::UiLanguage::English,
         }
     }
 }

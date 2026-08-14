@@ -6,6 +6,7 @@
 
 pub mod meeting;
 pub mod osc;
+pub mod player;
 
 use serde::{Deserialize, Deserializer, Serialize, Serializer, de};
 use std::{collections::BTreeMap, fmt};
@@ -17,6 +18,7 @@ pub struct PluginId(&'static str);
 impl PluginId {
     pub const OSC: Self = Self("osc");
     pub const MEETING: Self = Self("meeting");
+    pub const VIDEO_PLAYER: Self = Self("video_player");
 
     pub const fn as_str(self) -> &'static str {
         self.0
@@ -26,6 +28,7 @@ impl PluginId {
         match value {
             "osc" => Some(Self::OSC),
             "meeting" => Some(Self::MEETING),
+            "video_player" => Some(Self::VIDEO_PLAYER),
             _ => None,
         }
     }
@@ -100,7 +103,7 @@ pub struct PluginDescriptor {
     pub default_enabled: bool,
 }
 
-const PLUGIN_DESCRIPTORS: [PluginDescriptor; 2] = [
+const PLUGIN_DESCRIPTORS: [PluginDescriptor; 3] = [
     PluginDescriptor {
         id: PluginId::MEETING,
         title_key: "Meeting notes",
@@ -109,6 +112,19 @@ const PLUGIN_DESCRIPTORS: [PluginDescriptor; 2] = [
         icon: PluginIcon {
             uri: "bytes://plugins/meeting/icon.svg",
             bytes: include_bytes!("../../resources/plugins/meeting/icon.svg"),
+        },
+        scroll_policy: PluginScrollPolicy::Plugin,
+        settings_contribution: PluginSettingsContribution::EnablementOnly,
+        default_enabled: true,
+    },
+    PluginDescriptor {
+        id: PluginId::VIDEO_PLAYER,
+        title_key: "Media Player",
+        description_key: "Play video files and streams with real-time synchronized subtitles.",
+        navigation_order: 150,
+        icon: PluginIcon {
+            uri: "bytes://plugins/player/icon.svg",
+            bytes: include_bytes!("../../resources/plugins/player/icon.svg"),
         },
         scroll_policy: PluginScrollPolicy::Plugin,
         settings_contribution: PluginSettingsContribution::EnablementOnly,
@@ -209,14 +225,6 @@ impl PluginPreferences {
 
     pub fn set_enabled(&mut self, id: PluginId, enabled: bool) {
         self.enabled.insert(id.as_str().to_owned(), enabled);
-    }
-
-    pub fn enabled_plugin_ids(&self) -> impl Iterator<Item = PluginId> + '_ {
-        PluginRegistry::builtin()
-            .descriptors()
-            .iter()
-            .map(|descriptor| descriptor.id)
-            .filter(|id| self.is_enabled(*id))
     }
 }
 

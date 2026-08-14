@@ -67,10 +67,7 @@ use xr_corpus_protocol::{
     SegmentContext as CorpusSegmentContext,
 };
 
-/// At most four VAD-complete turns may await local model inference per
-/// WebSocket session. This bounds retained audio and prevents hidden latency
-/// growth when a model server slows down.
-const INFERENCE_QUEUE_CAPACITY: usize = 4;
+const INFERENCE_QUEUE_CAPACITY: usize = 64;
 /// Results awaiting the only WebSocket writer. This protects backend memory
 /// when a client socket stops consuming messages.
 const INFERENCE_RESULT_CAPACITY: usize = 32;
@@ -673,6 +670,7 @@ async fn serve_session(socket: WebSocket, state: BackendState) {
                                             utterances,
                                             &mut next_utterance_sequence,
                                         )
+                                        .await
                                         && send_error(&outbound_sender, error).await.is_err() {
                                             break;
                                         }
@@ -970,7 +968,7 @@ fn local_model_url(chat_url: &str, path: &str) -> Result<String, String> {
     Ok(parsed.into())
 }
 
-fn enqueue_utterances(
+async fn enqueue_utterances(
     sender: &mpsc::Sender<InferenceJob>,
     session: &SessionAdapter,
     generation: PipelineGeneration,
@@ -979,13 +977,11 @@ fn enqueue_utterances(
 ) -> Result<(), String> {
     debug_assert_eq!(generation.route_epoch, session.route_epoch());
     let jobs = inference_jobs(session, generation, utterances, next_utterance_sequence)?;
-    if sender.capacity() < jobs.len() {
-        return Err(format!(
-            "native inference queue is full (capacity: {INFERENCE_QUEUE_CAPACITY}); finish the current speech before sending more audio"
-        ));
-    }
     for job in jobs {
-        sender.try_send(job).map_err(inference_queue_error)?;
+        sender
+            .send(job)
+            .await
+            .map_err(|_| "native inference worker has stopped".to_owned())?;
     }
     Ok(())
 }
@@ -1082,15 +1078,6 @@ async fn queue_pipeline_drain(
         .await
         .map_err(|_| "native inference worker has stopped".to_owned())?;
     flush_error.map_or(Ok(()), Err)
-}
-
-fn inference_queue_error(error: mpsc::error::TrySendError<InferenceJob>) -> String {
-    match error {
-        mpsc::error::TrySendError::Full(_) => format!(
-            "native inference queue is full (capacity: {INFERENCE_QUEUE_CAPACITY}); finish the current speech before sending more audio"
-        ),
-        mpsc::error::TrySendError::Closed(_) => "native inference worker has stopped".to_owned(),
-    }
 }
 
 async fn run_inference_worker(

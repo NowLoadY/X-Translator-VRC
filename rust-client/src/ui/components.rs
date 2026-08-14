@@ -691,7 +691,7 @@ pub fn searchable_combobox<T: PartialEq + Clone>(
                 ui.horizontal(|ui| {
                     ui.add_space(2.0);
                     let te = egui::TextEdit::singleline(&mut search_query)
-                        .hint_text("🔍 Search...")
+                        .hint_text("Search...")
                         .desired_width(130.0)
                         .margin(Margin::symmetric(6, 4));
                     ui.add(te);
@@ -733,6 +733,204 @@ pub fn searchable_combobox<T: PartialEq + Clone>(
 
     changed
 }
+
+pub fn search_bar(ui: &mut Ui, query: &mut String, hint: &str) -> bool {
+    let mut changed = false;
+    let has_query = !query.is_empty();
+    Frame::new()
+        .fill(Color32::from_rgb(248, 250, 252))
+        .stroke(Stroke::new(1.0, Color32::from_rgb(226, 232, 240)))
+        .corner_radius(CornerRadius::same(16))
+        .inner_margin(Margin::symmetric(16, 10))
+        .show(ui, |ui| {
+            ui.horizontal(|ui| {
+                let text_frame = Frame::new()
+                    .fill(Color32::TRANSPARENT)
+                    .stroke(Stroke::NONE)
+                    .corner_radius(CornerRadius::ZERO)
+                    .inner_margin(Margin::ZERO);
+                let response = ui.add(
+                    egui::TextEdit::singleline(query)
+                        .hint_text(hint)
+                        .frame(text_frame)
+                        .margin(Margin::symmetric(0, 0))
+                        .desired_width(ui.available_width() - if has_query { 24.0 } else { 0.0 }),
+                );
+                if response.changed() {
+                    changed = true;
+                }
+                if !query.is_empty() {
+                    ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                        let clear_btn = Frame::new()
+                            .fill(Color32::from_rgb(226, 232, 240))
+                            .corner_radius(CornerRadius::same(10))
+                            .inner_margin(Margin::symmetric(6, 2))
+                            .show(ui, |ui| {
+                                ui.label(
+                                    egui::RichText::new("×")
+                                        .color(Color32::from_rgb(100, 116, 139))
+                                        .size(12.0)
+                                        .strong(),
+                                )
+                            })
+                            .response
+                            .interact(egui::Sense::click());
+                        if clear_btn.clicked() {
+                            query.clear();
+                            changed = true;
+                        }
+                    });
+                }
+            });
+        });
+    changed
+}
+
+pub fn input_field(ui: &mut Ui, text: &mut String, hint: &str) -> egui::Response {
+    let mut resp = None;
+    Frame::new()
+        .fill(Color32::from_rgb(248, 250, 252))
+        .stroke(Stroke::new(1.0, Color32::from_rgb(226, 232, 240)))
+        .corner_radius(CornerRadius::same(12))
+        .inner_margin(Margin::symmetric(12, 8))
+        .show(ui, |ui| {
+            let text_frame = Frame::new()
+                .fill(Color32::TRANSPARENT)
+                .stroke(Stroke::NONE)
+                .corner_radius(CornerRadius::ZERO)
+                .inner_margin(Margin::ZERO);
+            let r = ui.add(
+                egui::TextEdit::singleline(text)
+                    .hint_text(hint)
+                    .frame(text_frame)
+                    .margin(Margin::ZERO)
+                    .desired_width(ui.available_width()),
+            );
+            resp = Some(r);
+        });
+    resp.unwrap()
+}
+
+pub fn danger_alert(ui: &mut Ui, text: &str) {
+    Frame::new()
+        .fill(Color32::from_rgb(254, 242, 242))
+        .stroke(Stroke::new(1.0, Color32::from_rgb(254, 202, 202)))
+        .corner_radius(CornerRadius::same(10))
+        .inner_margin(Margin::symmetric(12, 8))
+        .show(ui, |ui| {
+            ui.horizontal(|ui| {
+                ui.label(
+                    egui::RichText::new("!")
+                        .strong()
+                        .color(Color32::from_rgb(220, 38, 38)),
+                );
+                ui.label(
+                    egui::RichText::new(text)
+                        .color(Color32::from_rgb(185, 28, 28))
+                        .size(12.5),
+                );
+            });
+        });
+}
+
+pub fn target_language_pair_selector(
+    ui: &mut Ui,
+    id_prefix: &str,
+    source_language: &str,
+    target_language: &mut String,
+    language: crate::i18n::UiLanguage,
+    label_fn: impl Fn(&str, crate::i18n::UiLanguage) -> String,
+) -> bool {
+    let mut changed = false;
+    if source_language == "auto" {
+        let (mut a, mut b) = match target_language.split_once(',') {
+            Some((x, y)) => (x.to_string(), y.to_string()),
+            None => ("zh".to_string(), "en".to_string()),
+        };
+
+        let options_a: Vec<_> = crate::LANGUAGE_OPTIONS
+            .iter()
+            .filter(|(code, _)| *code != b)
+            .map(|(code, label)| ((*code).to_string(), crate::i18n::tr(language, label).to_string()))
+            .collect();
+
+        let options_b: Vec<_> = crate::LANGUAGE_OPTIONS
+            .iter()
+            .filter(|(code, _)| *code != a)
+            .map(|(code, label)| ((*code).to_string(), crate::i18n::tr(language, label).to_string()))
+            .collect();
+
+        ui.horizontal(|ui| {
+            if searchable_combobox(
+                ui,
+                format!("{id_prefix}_target_a"),
+                label_fn(&a, language),
+                &mut a,
+                &options_a,
+            ) {
+                changed = true;
+            }
+            ui.add_space(4.0);
+            ui.label(
+                egui::RichText::new("↔")
+                    .color(crate::ui::theme::text_weak())
+                    .strong(),
+            );
+            ui.add_space(4.0);
+            if searchable_combobox(
+                ui,
+                format!("{id_prefix}_target_b"),
+                label_fn(&b, language),
+                &mut b,
+                &options_b,
+            ) {
+                changed = true;
+            }
+        });
+
+        let new_target = format!("{a},{b}");
+        if new_target != *target_language {
+            *target_language = new_target;
+            changed = true;
+        }
+    } else {
+        if target_language.contains(',') {
+            if let Some((first, _)) = target_language.split_once(',') {
+                *target_language = first.to_string();
+                changed = true;
+            }
+        }
+        if target_language == source_language {
+            let fallback = if source_language == "zh" { "en" } else { "zh" };
+            *target_language = fallback.to_string();
+            changed = true;
+        }
+
+        let mut target_options = Vec::new();
+        for (code, label) in crate::LANGUAGE_OPTIONS {
+            if *code != source_language {
+                target_options.push((
+                    (*code).to_string(),
+                    crate::i18n::tr(language, label).to_string(),
+                ));
+            }
+        }
+
+        if searchable_combobox(
+            ui,
+            format!("{id_prefix}_target"),
+            label_fn(target_language, language),
+            target_language,
+            &target_options,
+        ) {
+            changed = true;
+        }
+    }
+    changed
+}
+
+
+
 
 pub fn language_selector(
     ui: &mut Ui,
@@ -854,9 +1052,7 @@ pub fn danger_button_enabled(ui: &mut Ui, text: &str, enabled: bool) -> egui::Re
 }
 
 pub fn pill_toggle(ui: &mut Ui, checked: &mut bool) -> egui::Response {
-    let id = ui
-        .make_persistent_id("pill_toggle")
-        .with(checked as *const bool);
+    let id = ui.next_auto_id();
     let is_hovered = ui.memory(|m| {
         m.data
             .get_temp::<bool>(id.with("hover_state"))

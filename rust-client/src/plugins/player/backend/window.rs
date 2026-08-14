@@ -1,0 +1,120 @@
+use windows::Win32::Foundation::HWND;
+use windows::Win32::UI::WindowsAndMessaging::{
+    CreateWindowExW, DestroyWindow, SetWindowPos, ShowWindow,
+    HWND_TOP, SW_HIDE, SW_SHOW, SWP_NOACTIVATE, SWP_NOZORDER,
+    WS_CHILD, WS_CLIPCHILDREN, WS_CLIPSIBLINGS,
+};
+use windows::core::PCWSTR;
+
+pub struct NativeVideoHost {
+    pub hwnd: HWND,
+    _parent_hwnd: HWND,
+}
+
+unsafe impl Send for NativeVideoHost {}
+unsafe impl Sync for NativeVideoHost {}
+
+#[cfg(windows)]
+unsafe extern "system" fn enum_thread_wnd_proc(
+    hwnd: HWND,
+    lparam: windows::Win32::Foundation::LPARAM,
+) -> windows::core::BOOL {
+    use windows::Win32::UI::WindowsAndMessaging::{GetWindowLongW, GWL_STYLE, WS_CHILD, WS_VISIBLE};
+    let target = lparam.0 as *mut HWND;
+    unsafe {
+        let style = GetWindowLongW(hwnd, GWL_STYLE) as u32;
+        if (style & WS_VISIBLE.0) != 0 && (style & WS_CHILD.0) == 0 {
+            *target = hwnd;
+            return windows::core::BOOL(0);
+        }
+    }
+    windows::core::BOOL(1)
+}
+
+fn get_thread_main_window() -> Result<HWND, String> {
+    use windows::Win32::Foundation::LPARAM;
+    use windows::Win32::System::Threading::GetCurrentThreadId;
+    use windows::Win32::UI::Input::KeyboardAndMouse::GetActiveWindow;
+    use windows::Win32::UI::WindowsAndMessaging::EnumThreadWindows;
+
+    let mut found_hwnd = HWND::default();
+    unsafe {
+        let thread_id = GetCurrentThreadId();
+        let _ = EnumThreadWindows(
+            thread_id,
+            Some(enum_thread_wnd_proc),
+            LPARAM(&mut found_hwnd as *mut _ as isize),
+        );
+    }
+
+    if found_hwnd.0.is_null() {
+        let active = unsafe { GetActiveWindow() };
+        if !active.0.is_null() {
+            return Ok(active);
+        }
+        return Err("Could not locate main application window handle for thread".into());
+    }
+
+    Ok(found_hwnd)
+}
+
+impl NativeVideoHost {
+    pub fn new() -> Result<Self, String> {
+        let parent_hwnd = get_thread_main_window()?;
+        Self::new_with_parent(parent_hwnd)
+    }
+
+    pub fn new_with_parent(parent_hwnd: HWND) -> Result<Self, String> {
+        let class_name = "STATIC\0".encode_utf16().collect::<Vec<u16>>();
+        
+        let hwnd = unsafe {
+            CreateWindowExW(
+                windows::Win32::UI::WindowsAndMessaging::WINDOW_EX_STYLE(0),
+                PCWSTR(class_name.as_ptr()),
+                PCWSTR::null(),
+                WS_CHILD | WS_CLIPCHILDREN | WS_CLIPSIBLINGS,
+                0, 0, 0, 0,
+                Some(parent_hwnd),
+                None,
+                None,
+                None,
+            )
+        }.map_err(|e| e.to_string())?;
+
+        Ok(Self { hwnd, _parent_hwnd: parent_hwnd })
+    }
+
+    pub fn set_rect(&self, x: i32, y: i32, width: i32, height: i32) {
+        unsafe {
+            SetWindowPos(
+                self.hwnd,
+                Some(HWND_TOP),
+                x,
+                y,
+                width,
+                height,
+                SWP_NOACTIVATE | SWP_NOZORDER,
+            ).ok();
+        }
+    }
+
+    pub fn show(&self) {
+        unsafe {
+            let _ = ShowWindow(self.hwnd, SW_SHOW);
+        }
+    }
+
+    pub fn hide(&self) {
+        unsafe {
+            let _ = ShowWindow(self.hwnd, SW_HIDE);
+        }
+    }
+}
+
+impl Drop for NativeVideoHost {
+    fn drop(&mut self) {
+        unsafe {
+            let _ = DestroyWindow(self.hwnd);
+        }
+    }
+}

@@ -333,25 +333,6 @@ impl MeetingController {
         }
     }
 
-    pub fn end_capture(&mut self) -> bool {
-        let meeting_id = self
-            .active_meeting_id()
-            .or_else(|| self.bundle.as_ref().map(|bundle| bundle.meeting.id.clone()));
-        let Some(meeting_id) = meeting_id else {
-            return false;
-        };
-        match self.store.end_meeting(&meeting_id) {
-            Ok(_) => {
-                self.reload_open_meeting();
-                self.refresh_library();
-                true
-            }
-            Err(error) => {
-                self.set_error(error);
-                false
-            }
-        }
-    }
 
     pub fn create_topic(&mut self) {
         let Some(meeting_id) = self.bundle.as_ref().map(|bundle| bundle.meeting.id.clone()) else {

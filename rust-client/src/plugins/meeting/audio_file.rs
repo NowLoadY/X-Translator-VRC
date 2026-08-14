@@ -58,6 +58,7 @@ impl Default for AudioImportOptions {
 }
 
 #[derive(Debug, Clone)]
+#[allow(dead_code)]
 pub struct AudioFileInfo {
     pub path: PathBuf,
     pub codec: String,
@@ -69,6 +70,7 @@ pub struct AudioFileInfo {
 }
 
 #[derive(Debug, Clone, Copy)]
+#[allow(dead_code)]
 pub struct AudioImportProgress {
     pub decoded_source_frames: u64,
     pub total_source_frames: Option<u64>,
@@ -78,6 +80,7 @@ pub struct AudioImportProgress {
 }
 
 #[derive(Debug, Clone)]
+#[allow(dead_code)]
 pub enum AudioImportEvent {
     Started(AudioFileInfo),
     Progress(AudioImportProgress),
@@ -93,6 +96,7 @@ pub enum AudioImportOutcome {
 }
 
 #[derive(Debug)]
+#[allow(dead_code)]
 pub enum AudioImportError {
     InvalidOptions(String),
     Io(io::Error),
@@ -138,7 +142,7 @@ impl From<io::Error> for AudioImportError {
 pub struct AudioImportHandle {
     stop_requested: Arc<AtomicBool>,
     events: Receiver<AudioImportEvent>,
-    worker: Option<JoinHandle<Result<AudioImportOutcome, AudioImportError>>>,
+    _worker: Option<JoinHandle<Result<AudioImportOutcome, AudioImportError>>>,
 }
 
 impl AudioImportHandle {
@@ -148,23 +152,6 @@ impl AudioImportHandle {
 
     pub fn events(&self) -> &Receiver<AudioImportEvent> {
         &self.events
-    }
-
-    pub fn event_receiver(&self) -> Receiver<AudioImportEvent> {
-        self.events.clone()
-    }
-
-    pub fn is_finished(&self) -> bool {
-        self.worker.as_ref().is_none_or(JoinHandle::is_finished)
-    }
-
-    pub fn join(mut self) -> Result<AudioImportOutcome, AudioImportError> {
-        let Some(worker) = self.worker.take() else {
-            return Err(AudioImportError::WorkerPanicked);
-        };
-        worker
-            .join()
-            .map_err(|_| AudioImportError::WorkerPanicked)?
     }
 }
 
@@ -228,7 +215,7 @@ pub fn import_audio_file(
     Ok(AudioImportHandle {
         stop_requested,
         events,
-        worker: Some(worker),
+        _worker: Some(worker),
     })
 }
 
