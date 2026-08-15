@@ -22,6 +22,116 @@ pub fn render(
     }
 }
 
+fn render_runtime_install_banner(
+    controller: &mut VideoPlayerController,
+    language: crate::i18n::UiLanguage,
+    ui: &mut egui::Ui,
+) {
+    if controller.backend.is_some() {
+        return;
+    }
+
+    components::card(ui, |ui| {
+        ui.vertical(|ui| {
+            ui.horizontal(|ui| {
+                ui.label(egui::RichText::new("🎬").size(22.0));
+                ui.add_space(4.0);
+                ui.vertical(|ui| {
+                    ui.label(
+                        egui::RichText::new(tr(language, "Video Player Runtime Missing"))
+                            .size(16.0)
+                            .strong()
+                            .color(crate::ui::theme::text_strong()),
+                    );
+                    ui.add_space(2.0);
+                    ui.label(
+                        egui::RichText::new(tr(
+                            language,
+                            "Video playback and multi-track audio extraction require the mpv runtime library (mpv-2.dll). You can click the button below to download and configure it directly from the GitHub repository.",
+                        ))
+                        .size(12.5)
+                        .color(crate::ui::theme::text_weak()),
+                    );
+                });
+            });
+
+            ui.add_space(10.0);
+
+            let state = controller.mpv_installer.state().clone();
+            match state {
+                super::installer::MpvInstallState::Idle => {
+                    if components::primary_button(
+                        ui,
+                        tr(language, "Download Player Runtime (46.8 MB)"),
+                    )
+                    .clicked()
+                    {
+                        let _ = controller.mpv_installer.start_download();
+                    }
+                }
+                super::installer::MpvInstallState::Downloading { downloaded, total } => {
+                    ui.horizontal(|ui| {
+                        let ratio = if total > 0 {
+                            (downloaded as f32 / total as f32).clamp(0.0, 1.0)
+                        } else {
+                            0.0
+                        };
+                        let progress_text = format!(
+                            "{} / {} ({:.1}%)",
+                            components::format_file_size(downloaded),
+                            components::format_file_size(total),
+                            ratio * 100.0
+                        );
+                        ui.add(
+                            egui::ProgressBar::new(ratio)
+                                .text(progress_text)
+                                .animate(true),
+                        );
+                    });
+                    ui.add_space(4.0);
+                    ui.label(
+                        egui::RichText::new(tr(language, "Downloading runtime..."))
+                            .size(12.0)
+                            .color(crate::ui::theme::text_weak()),
+                    );
+                }
+                super::installer::MpvInstallState::Extracting => {
+                    ui.horizontal(|ui| {
+                        ui.spinner();
+                        ui.label(
+                            egui::RichText::new(tr(
+                                language,
+                                "Extracting and installing player runtime...",
+                            ))
+                            .size(13.0)
+                            .color(crate::ui::theme::primary()),
+                        );
+                    });
+                }
+                super::installer::MpvInstallState::Failed(ref err) => {
+                    ui.label(
+                        egui::RichText::new(format!("{}: {err}", tr(language, "Download failed")))
+                            .size(12.5)
+                            .color(crate::ui::theme::danger()),
+                    );
+                    ui.add_space(6.0);
+                    if components::primary_button(ui, tr(language, "Retry Download")).clicked() {
+                        let _ = controller.mpv_installer.start_download();
+                    }
+                }
+                super::installer::MpvInstallState::Ready => {
+                    ui.label(
+                        egui::RichText::new(tr(language, "Player runtime installed successfully!"))
+                            .size(13.0)
+                            .color(crate::ui::theme::success()),
+                    );
+                }
+            }
+        });
+    });
+    ui.add_space(14.0);
+}
+
 fn render_library(
     controller: &mut VideoPlayerController,
     language: crate::i18n::UiLanguage,
@@ -44,6 +154,8 @@ fn render_library(
     });
 
     ui.add_space(14.0);
+
+    render_runtime_install_banner(controller, language, ui);
 
     if let Some(error) = &controller.error {
         components::danger_alert(ui, error);
@@ -193,7 +305,15 @@ fn render_library(
         });
 
     if let Some(task) = task_to_play {
-        if let Ok(_) = controller.play_task(&task.id) {
+        if controller.backend.is_none() && !controller.try_init_backend() {
+            controller.error = Some(
+                tr(
+                    language,
+                    "Please download and install the player runtime first",
+                )
+                .into(),
+            );
+        } else if let Ok(_) = controller.play_task(&task.id) {
             action = VideoPlayerAction::None;
         }
     }
@@ -241,6 +361,8 @@ fn render_create(
     });
 
     ui.add_space(14.0);
+
+    render_runtime_install_banner(controller, language, ui);
 
     if let Some(error) = &controller.error {
         components::danger_alert(ui, error);
@@ -300,13 +422,23 @@ fn render_create(
 
                     ui.horizontal(|ui| {
                         if components::primary_button(ui, tr(language, "Create & Play")).clicked() {
-                            match controller.start_draft_task() {
-                                Ok(_) => {
-                                    controller.error = None;
-                                    action = VideoPlayerAction::None;
-                                }
-                                Err(e) => {
-                                    controller.error = Some(e);
+                            if controller.backend.is_none() && !controller.try_init_backend() {
+                                controller.error = Some(
+                                    tr(
+                                        language,
+                                        "Please download and install the player runtime first",
+                                    )
+                                    .into(),
+                                );
+                            } else {
+                                match controller.start_draft_task() {
+                                    Ok(_) => {
+                                        controller.error = None;
+                                        action = VideoPlayerAction::None;
+                                    }
+                                    Err(e) => {
+                                        controller.error = Some(e);
+                                    }
                                 }
                             }
                         }

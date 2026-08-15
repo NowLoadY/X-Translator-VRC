@@ -2695,6 +2695,10 @@ impl eframe::App for XRTranslateApp {
         self.model_task_manager.poll();
         self.runtime_installer.poll();
         self.app_update_manager.poll();
+        self.player_plugin
+            .controller
+            .mpv_installer
+            .set_proxy_url(Some(self.download_proxy_url.clone()));
         self.poll_audio_device_refresh();
         self.poll_audio_import();
         self.player_plugin.on_visibility_changed(self.navigation.page == Page::Plugin(PluginId::VIDEO_PLAYER));

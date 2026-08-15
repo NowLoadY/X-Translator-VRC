@@ -12,6 +12,7 @@ dist/
 *.dll
 *.exe
 *.d
+!rust-client/resources/bin/mpv-2.zip
 
 # IDE and OS files
 .vscode/

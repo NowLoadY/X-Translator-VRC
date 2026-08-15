@@ -41,6 +41,7 @@ pub struct VideoPlayerController {
     pub last_save_instant: Instant,
     pub last_manual_scroll: Option<Instant>,
     pub last_auto_scrolled_idx: Option<usize>,
+    pub mpv_installer: super::installer::MpvInstaller,
 }
 
 impl Default for VideoPlayerController {
@@ -50,7 +51,7 @@ impl Default for VideoPlayerController {
         let backend: Option<Box<dyn MediaBackend>> = match super::backend::mpv::MpvBackend::new() {
             Ok(b) => Some(Box::new(b)),
             Err(e) => {
-                log::error!("Failed to initialize MPV backend: {}", e);
+                log::warn!("MPV backend not initialized on startup: {}", e);
                 None
             }
         };
@@ -84,6 +85,7 @@ impl Default for VideoPlayerController {
             last_save_instant: Instant::now(),
             last_manual_scroll: None,
             last_auto_scrolled_idx: None,
+            mpv_installer: super::installer::MpvInstaller::default(),
         }
     }
 }
@@ -331,7 +333,31 @@ impl VideoPlayerController {
         }
     }
 
+    pub fn try_init_backend(&mut self) -> bool {
+        if self.backend.is_some() {
+            return true;
+        }
+        match super::backend::mpv::MpvBackend::new() {
+            Ok(b) => {
+                self.backend = Some(Box::new(b));
+                self.error = None;
+                log::info!("MPV backend initialized successfully.");
+                true
+            }
+            Err(e) => {
+                log::warn!("MPV backend initialization: {e}");
+                false
+            }
+        }
+    }
+
     pub fn tick(&mut self) {
+        if let Some(res) = self.mpv_installer.poll() {
+            if res.is_ok() {
+                self.try_init_backend();
+            }
+        }
+
         if let Some(backend) = &mut self.backend {
             backend.tick();
 

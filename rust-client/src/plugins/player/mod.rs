@@ -1,6 +1,7 @@
 pub mod backend;
 pub mod controller;
 pub mod i18n;
+pub mod installer;
 pub mod subtitles;
 pub mod task;
 pub mod ui;

@@ -87,6 +87,18 @@ pub fn text_weak() -> Color32 {
     Color32::from_rgb(148, 163, 184)
 }
 
+pub fn primary() -> Color32 {
+    Color32::from_rgb(59, 130, 246)
+}
+
 pub fn primary_dark() -> Color32 {
     Color32::from_rgb(37, 99, 235)
+}
+
+pub fn success() -> Color32 {
+    Color32::from_rgb(22, 163, 74)
+}
+
+pub fn danger() -> Color32 {
+    Color32::from_rgb(220, 38, 38)
 }

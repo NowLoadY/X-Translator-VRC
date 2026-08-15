@@ -754,6 +754,17 @@ fn is_python_directory_name(name: &OsStr) -> bool {
         .any(|forbidden| name.eq_ignore_ascii_case(OsStr::new(forbidden)))
 }
 
+fn should_exclude_from_release_resources(path: &Path) -> bool {
+    let Some(name) = path.file_name().and_then(OsStr::to_str) else {
+        return false;
+    };
+    let lower = name.to_ascii_lowercase();
+    lower == "mpv-2.dll"
+        || lower == "libmpv-2.dll"
+        || lower == "mpv-2.zip"
+        || lower.ends_with(".dll")
+}
+
 fn copy_native_directory(source: &Path, target: &Path) -> Result<(), PackageError> {
     ensure_directory_is_native("release input", source)?;
     fs::create_dir_all(target).map_err(|source| PackageError::Io {
@@ -776,6 +787,9 @@ fn copy_native_directory(source: &Path, target: &Path) -> Result<(), PackageErro
         if file_type.is_dir() {
             copy_native_directory(&entry.path(), &destination)?;
         } else if file_type.is_file() {
+            if should_exclude_from_release_resources(&entry.path()) {
+                continue;
+            }
             ensure_native_file("release input", &entry.path())?;
             copy_file_to(&entry.path(), &destination)?;
         } else {
