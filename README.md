@@ -25,10 +25,6 @@
 </p>
 
 <p align="center">
-  <img src="assets/preview-Translation.png" alt="XRTranslate 翻译界面" width="900" />
-</p>
-
-<p align="center">
   选择语言和麦克风，一键开启实时翻译。
 </p>
 
@@ -40,6 +36,16 @@
 
 <p align="center">
   <img src="assets/preview-Welcome-1.png" alt="XRTranslate 欢迎页" width="760" />
+</p>
+
+支持生成视频字幕并直接高性能播放。
+
+<p align="center">
+  <img src="assets/preview-GenerateVideoSubtitle.png" width="760" />
+</p>
+
+<p align="center">
+  <img src="assets/preview-Translation.png" alt="XRTranslate 翻译界面" width="900" />
 </p>
 
 OSC 字幕可以逐条显示，也可以合并排列。

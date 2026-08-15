@@ -24,9 +24,7 @@
   <a href="#acknowledgements">Acknowledgements</a>
 </p>
 
-<p align="center">
-  <img src="assets/preview-Translation.png" alt="XRTranslate translation screen" width="900" />
-</p>
+
 
 <p align="center">
   Select your languages and microphone, then start real-time translation with one click.
@@ -40,6 +38,16 @@ The welcome page walks through the initial setup and remains available from the 
 
 <p align="center">
   <img src="assets/preview-Welcome-1.png" alt="XRTranslate welcome page" width="760" />
+</p>
+
+Supports generating video subtitles and playing them directly at high performance.
+
+<p align="center">
+  <img src="assets/preview-GenerateVideoSubtitle.png" width="760" />
+</p>
+
+<p align="center">
+  <img src="assets/preview-Translation.png" alt="XRTranslate translation screen" width="900" />
 </p>
 
 OSC subtitles can keep messages separate or arrange them together.
