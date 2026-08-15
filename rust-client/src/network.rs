@@ -101,6 +101,10 @@ pub enum SessionEvent {
         stream_id: u64,
         publish_to_host_outputs: bool,
     },
+    RouteChanged {
+        source_lang: String,
+        target_lang: String,
+    },
     TtsAudio(Vec<u8>),
     BackendError(String),
     Error(String),
@@ -884,6 +888,26 @@ fn forward_server_event(
                 publish_to_host_outputs,
             });
         }
+        Some("route_changed") => {
+            if let Some(data) = data {
+                let source_lang = data
+                    .get("source_lang")
+                    .and_then(Value::as_str)
+                    .unwrap_or("auto")
+                    .to_string();
+                let target_lang = data
+                    .get("target_lang")
+                    .and_then(Value::as_str)
+                    .unwrap_or_default()
+                    .to_string();
+                if !target_lang.is_empty() {
+                    let _ = event_tx.send(SessionEvent::RouteChanged {
+                        source_lang,
+                        target_lang,
+                    });
+                }
+            }
+        }
         Some("error") => {
             let _ = event_tx.send(SessionEvent::BackendError(
                 data.and_then(|d| d.get("message"))
@@ -1089,5 +1113,28 @@ mod tests {
         };
         assert_eq!(activation_matches[0].text, "论文");
         assert_eq!(activation_matches[0].sources[0].subdomain, "research");
+    }
+
+    #[test]
+    fn route_changed_event_forwards_language_pair() {
+        let (sender, receiver) = crossbeam_channel::unbounded();
+        forward_server_event(
+            &sender,
+            r#"{"action":"route_changed","data":{"source_lang":"auto","target_lang":"ja,zh"}}"#,
+            42,
+            false,
+            true,
+            CaptureSource::Microphone,
+        );
+
+        let SessionEvent::RouteChanged {
+            source_lang,
+            target_lang,
+        } = receiver.try_recv().unwrap()
+        else {
+            panic!("expected route_changed event");
+        };
+        assert_eq!(source_lang, "auto");
+        assert_eq!(target_lang, "ja,zh");
     }
 }

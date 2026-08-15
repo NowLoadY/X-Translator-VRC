@@ -37,8 +37,8 @@ use xrtranslate_engine::RouteEpoch;
 use xrtranslate_inference::{AsyncHttpClient, HttpRequest, ReqwestClient};
 use xrtranslate_protocol::{
     ActionControl, ClientControl, DrainReason, ErrorEvent, EventControl, Feature, LatencyMetrics,
-    PcmFormat, PcmFrame, PipelineDrained, RecognitionStreamEnded, ServerEvent, SessionReady,
-    VadActivity,
+    PcmFormat, PcmFrame, PipelineDrained, RecognitionStreamEnded, RouteChanged, ServerEvent,
+    SessionReady, VadActivity,
 };
 use xrtranslate_supervisor::{
     LlamaServerEndpoint, LlamaServerLauncher, LlamaServerProcess, LlamaServerProcessHandle,
@@ -1524,6 +1524,17 @@ async fn handle_inference_event(
             recognized,
             segments,
         } => {
+            if let Some(target_lang) = &recognized.route_switched {
+                send_event(
+                    writer,
+                    Some(generation),
+                    ServerEvent::RouteChanged(RouteChanged {
+                        source_lang: "auto".to_string(),
+                        target_lang: target_lang.clone(),
+                    }),
+                )
+                .await?;
+            }
             let turn_id = segments
                 .first()
                 .map(|context| context.turn_id.clone())

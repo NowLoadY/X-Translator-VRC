@@ -223,6 +223,7 @@ pub enum ServerEvent {
     RecognitionStreamEnded(RecognitionStreamEnded),
     PipelineDrained(PipelineDrained),
     TtsFinished(TtsFinished),
+    RouteChanged(RouteChanged),
     Error(ErrorEvent),
 }
 
@@ -352,9 +353,30 @@ pub struct ErrorEvent {
     pub message: String,
 }
 
+/// Notifies the client that the active language route was dynamically adapted or updated.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct RouteChanged {
+    pub source_lang: String,
+    pub target_lang: String,
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn route_changed_event_matches_the_wire_shape() {
+        let event = ServerEvent::RouteChanged(RouteChanged {
+            source_lang: "auto".into(),
+            target_lang: "ja,zh".into(),
+        });
+        let json = serde_json::to_string(&event).unwrap();
+        assert_eq!(
+            json,
+            r#"{"action":"route_changed","data":{"source_lang":"auto","target_lang":"ja,zh"}}"#
+        );
+        assert_eq!(serde_json::from_str::<ServerEvent>(&json).unwrap(), event);
+    }
 
     #[test]
     fn session_config_serializes_to_the_legacy_json_shape() {

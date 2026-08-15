@@ -109,7 +109,7 @@
     "min_utterance_ms": 750,
     "model_path": "models/3D-Speaker-ERes2NetV2/speaker_embedding.onnx",
     "same_speaker_hysteresis": 0.16,
-    "similarity_threshold": 0.56
+    "similarity_threshold": 0.52
   },
   "storage": {
     "log_dir": "runtime/logs",

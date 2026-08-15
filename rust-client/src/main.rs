@@ -610,6 +610,7 @@ struct SharedSessionState {
     translations: Vec<TranslationHistoryEntry>,
     last_error: Option<String>,
     is_translating: bool,
+    pending_route_change: Option<(String, String)>,
 }
 
 impl Default for XRTranslateApp {
@@ -683,7 +684,8 @@ impl Default for XRTranslateApp {
                     let mut state = shared_state_clone.lock().unwrap();
                     match event {
                         SessionEvent::Connected => {
-                            state.connection_status = "Connected - listening".into()
+                            state.connection_status = "Connected - listening".into();
+                            state.is_translating = true;
                         }
                         SessionEvent::Disconnected(reason) => {
                             osc_publisher.clear_chatbox();
@@ -997,6 +999,12 @@ impl Default for XRTranslateApp {
                                 .pending_recognition_windows
                                 .retain(|window| window.stream_id != stream_id);
                             osc_publisher.end_stream_for(stream_id);
+                        }
+                        SessionEvent::RouteChanged {
+                            source_lang,
+                            target_lang,
+                        } => {
+                            state.pending_route_change = Some((source_lang, target_lang));
                         }
                         SessionEvent::TtsAudio(_audio) => {}
                         SessionEvent::BackendError(error) => {
@@ -1397,6 +1405,8 @@ impl XRTranslateApp {
                 };
                 self.is_translating = true;
                 if let Ok(mut state) = self.shared_session_state.lock() {
+                    state.is_translating = true;
+                    state.connection_status = "Transcribing and translating media audio...".into();
                     state.translations.clear();
                     state.recognition_history.clear();
                 }
@@ -1404,6 +1414,8 @@ impl XRTranslateApp {
             }
             Err(error) => {
                 session.finish();
+                self.player_plugin.controller.pause_task();
+                self.set_startup_error("Media import failed", error.to_string());
                 log::error!("Media audio import failed: {error}");
             }
         }
@@ -1722,6 +1734,10 @@ impl XRTranslateApp {
                     is_imported: true,
                 };
                 self.is_translating = true;
+                if let Ok(mut state) = self.shared_session_state.lock() {
+                    state.is_translating = true;
+                    state.connection_status = "Processing imported audio".into();
+                }
                 self.set_connection_status("Processing imported audio");
             }
             Err(error) => {
@@ -2122,19 +2138,45 @@ impl XRTranslateApp {
                 }
                 plugins::meeting::audio_file::AudioImportEvent::Progress(progress) => {
                     let percentage = progress.fraction.map(|value| value * 100.0);
-                    self.set_connection_status(percentage.map_or_else(
-                        || format!("Processing media audio · {}s", progress.position.as_secs()),
-                        |value| format!("Processing media audio · {value:.0}%"),
-                    ));
+                    match progress.stage {
+                        plugins::meeting::audio_file::AudioImportStage::Extracting => {
+                            self.player_plugin.controller.is_extracting = true;
+                            self.player_plugin.controller.extraction_progress = progress.fraction;
+                            self.player_plugin.controller.extract_position = Some(progress.position);
+                            self.player_plugin.controller.extract_duration = progress.duration;
+                            self.set_connection_status(percentage.map_or_else(
+                                || format!("Extracting media audio · {}s", progress.position.as_secs()),
+                                |value| format!("Extracting media audio · {value:.0}%"),
+                            ));
+                        }
+                        plugins::meeting::audio_file::AudioImportStage::Recognizing => {
+                            self.player_plugin.controller.is_extracting = false;
+                            self.player_plugin.controller.extraction_progress = Some(1.0);
+                            self.player_plugin.controller.recognition_progress = progress.fraction;
+                            self.player_plugin.controller.recognize_position = Some(progress.position);
+                            self.player_plugin.controller.recognize_duration = progress.duration;
+                            self.set_connection_status(percentage.map_or_else(
+                                || format!("Transcribing media audio · {}s", progress.position.as_secs()),
+                                |value| format!("Transcribing media audio · {value:.0}%"),
+                            ));
+                        }
+                    }
                 }
                 plugins::meeting::audio_file::AudioImportEvent::Completed { .. } => {
+                    self.player_plugin.controller.is_extracting = false;
+                    self.player_plugin.controller.extraction_progress = Some(1.0);
+                    self.player_plugin.controller.recognition_progress = Some(1.0);
                     host_completed = true;
                 }
                 plugins::meeting::audio_file::AudioImportEvent::Stopped { .. } => {
+                    self.player_plugin.controller.is_extracting = false;
                     self.host_audio_import = None;
                 }
                 plugins::meeting::audio_file::AudioImportEvent::Error(error) => {
                     log::error!("Host audio import error: {error}");
+                    self.player_plugin.controller.is_extracting = false;
+                    self.player_plugin.controller.error = Some(error.clone());
+                    self.set_startup_error("Media audio error", error);
                     self.host_audio_import = None;
                 }
             }
@@ -2530,12 +2572,27 @@ impl XRTranslateApp {
         }
 
         // Copy latest shared state into self for local rendering when main UI is visible
-        if let Ok(state) = self.shared_session_state.lock() {
+        if let Ok(mut state) = self.shared_session_state.lock() {
             self.connection_status = state.connection_status.clone();
             self.partial_text = state.partial_text.clone();
             self.recognition_history = state.recognition_history.clone();
             self.translations = state.translations.clone();
+            let was_translating = self.is_translating;
             self.is_translating = state.is_translating;
+            if was_translating && !self.is_translating && self.session_owner.is_video_player() {
+                self.player_plugin.controller.pause_task();
+                self.session_owner = TranslationSessionOwner::None;
+                for session in &self.sessions {
+                    session.finish();
+                }
+                self.sessions.clear();
+                self.host_audio_import = None;
+            }
+            if let Some((source_lang, target_lang)) = state.pending_route_change.take() {
+                self.source_lang = source_lang;
+                self.target_lang = target_lang;
+                self.save_settings();
+            }
             if let Some(err) = &state.last_error {
                 self.last_error = Some(err.clone());
             }
@@ -2862,11 +2919,31 @@ fn configure_dll_search_paths() {
     }
 }
 
+#[cfg(windows)]
+fn cleanup_runtime_cache() {
+    let cache_dir = std::path::Path::new("runtime/cache");
+    if let Ok(entries) = std::fs::read_dir(cache_dir) {
+        for entry in entries.flatten() {
+            let path = entry.path();
+            if path.is_file() {
+                if let Some(name) = path.file_name().and_then(|n| n.to_str()) {
+                    if name.starts_with("mpv_decode_") && name.ends_with(".wav") {
+                        let _ = std::fs::remove_file(path);
+                    }
+                }
+            }
+        }
+    }
+}
+
 fn main() -> eframe::Result<()> {
     env_logger::init();
 
     #[cfg(windows)]
     configure_dll_search_paths();
+
+    #[cfg(windows)]
+    cleanup_runtime_cache();
 
     if std::env::args().any(|a| a == "--overlay") {
         #[cfg(windows)]

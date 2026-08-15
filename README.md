@@ -55,6 +55,13 @@ OSC 字幕可以逐条显示，也可以合并排列。
   </tr>
 </table>
 
+支持通过 OSC 快速打字输入与实时翻译发送。
+
+<p align="center">
+  <img src="assets/preview-OSC-type.png" alt="OSC 打字输入与实时翻译" width="760" />
+</p>
+
+
 ---
 
 ## 使用指南

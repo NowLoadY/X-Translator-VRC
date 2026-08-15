@@ -594,6 +594,19 @@ fn render_task_control_card(
                                     .strong(),
                             );
                         });
+                } else if task.subtitles.count() > 0 {
+                    Frame::new()
+                        .fill(Color32::from_rgb(238, 242, 255))
+                        .corner_radius(CornerRadius::same(6))
+                        .inner_margin(Margin::symmetric(8, 2))
+                        .show(ui, |ui| {
+                            ui.label(
+                                egui::RichText::new(format!("✓ {}", tr(language, "Completed")))
+                                    .size(11.5)
+                                    .color(Color32::from_rgb(79, 70, 229))
+                                    .strong(),
+                            );
+                        });
                 } else {
                     Frame::new()
                         .fill(Color32::from_rgb(241, 245, 249))
@@ -628,6 +641,182 @@ fn render_task_control_card(
             });
 
             ui.add_space(10.0);
+
+            // Processing Progress Section (Audio Extraction & Recognition Progress Bars)
+            let is_extracting = controller.is_extracting;
+            let extract_frac = controller
+                .extraction_progress
+                .unwrap_or(if task.subtitles.count() > 0 || (task.is_task_running && !is_extracting) {
+                    1.0
+                } else {
+                    0.0
+                })
+                .clamp(0.0, 1.0);
+            let total_dur_ms = task.duration_ms;
+            let last_cue_end_ms = task.subtitles.cues().last().map(|c| c.end_ms).unwrap_or(0);
+            let recog_pos_ms = controller
+                .recognize_position
+                .map(|p| p.as_millis() as i64)
+                .unwrap_or(last_cue_end_ms);
+            let recog_frac = if total_dur_ms > 0 {
+                (recog_pos_ms as f32 / total_dur_ms as f32).clamp(0.0, 1.0)
+            } else {
+                controller
+                    .recognition_progress
+                    .unwrap_or(if task.subtitles.count() > 0 && !task.is_task_running {
+                        1.0
+                    } else {
+                        0.0
+                    })
+                    .clamp(0.0, 1.0)
+            };
+
+            Frame::new()
+                .fill(Color32::from_rgb(248, 250, 252))
+                .stroke(Stroke::new(1.0, Color32::from_rgb(226, 232, 240)))
+                .corner_radius(CornerRadius::same(8))
+                .inner_margin(Margin::same(12))
+                .show(ui, |ui| {
+                    ui.horizontal(|ui| {
+                        ui.label(
+                            egui::RichText::new(format!("📊 {}", tr(language, "Processing Progress")))
+                                .size(13.5)
+                                .strong()
+                                .color(crate::ui::theme::text_strong()),
+                        );
+                        if task.subtitles.count() > 0 {
+                            ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                                Frame::new()
+                                    .fill(Color32::from_rgb(238, 242, 255))
+                                    .corner_radius(CornerRadius::same(4))
+                                    .inner_margin(Margin::symmetric(6, 2))
+                                    .show(ui, |ui| {
+                                        ui.label(
+                                            egui::RichText::new(format!(
+                                                "✓ {} {}",
+                                                task.subtitles.count(),
+                                                tr(language, "cues generated")
+                                            ))
+                                            .size(11.0)
+                                            .color(Color32::from_rgb(79, 70, 229))
+                                            .strong(),
+                                        );
+                                    });
+                            });
+                        }
+                    });
+
+                    ui.add_space(8.0);
+
+                    // 1. Audio Extraction Progress Bar
+                    ui.horizontal(|ui| {
+                        ui.label(
+                            egui::RichText::new(format!("🎵 {}", tr(language, "Audio Extraction")))
+                                .size(12.0)
+                                .color(crate::ui::theme::text_strong()),
+                        );
+                        ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                            let status_text = if is_extracting {
+                                let pos_str = controller
+                                    .extract_position
+                                    .map(|p| format_time_ms(p.as_millis() as i64))
+                                    .unwrap_or_else(|| "00:00".into());
+                                let dur_str = controller
+                                    .extract_duration
+                                    .or_else(|| {
+                                        if total_dur_ms > 0 {
+                                            Some(std::time::Duration::from_millis(
+                                                total_dur_ms as u64,
+                                            ))
+                                        } else {
+                                            None
+                                        }
+                                    })
+                                    .map(|d| format_time_ms(d.as_millis() as i64))
+                                    .unwrap_or_else(|| "--:--".into());
+                                format!(
+                                    "{} / {} · {:.0}%",
+                                    pos_str,
+                                    dur_str,
+                                    extract_frac * 100.0
+                                )
+                            } else if extract_frac >= 1.0 {
+                                format!("{} (100%)", tr(language, "Extraction Completed"))
+                            } else {
+                                tr(language, "Ready").to_string()
+                            };
+                            ui.label(
+                                egui::RichText::new(status_text).size(11.5).color(
+                                    if is_extracting {
+                                        Color32::from_rgb(37, 99, 235)
+                                    } else {
+                                        crate::ui::theme::text_weak()
+                                    },
+                                ),
+                            );
+                        });
+                    });
+                    ui.add_space(3.0);
+                    ui.add(
+                        egui::ProgressBar::new(extract_frac)
+                            .desired_height(6.0)
+                            .corner_radius(CornerRadius::same(3))
+                            .animate(is_extracting),
+                    );
+
+                    ui.add_space(10.0);
+
+                    // 2. Speech Recognition Progress Bar
+                    ui.horizontal(|ui| {
+                        ui.label(
+                            egui::RichText::new(format!(
+                                "🎙️ {}",
+                                tr(language, "Speech Recognition & Subtitles")
+                            ))
+                            .size(12.0)
+                            .color(crate::ui::theme::text_strong()),
+                        );
+                        ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                            let status_text = if task.is_task_running && !is_extracting {
+                                format!(
+                                    "{} / {} · {:.0}%",
+                                    format_time_ms(recog_pos_ms),
+                                    format_time_ms(total_dur_ms),
+                                    recog_frac * 100.0
+                                )
+                            } else if recog_frac >= 1.0
+                                || (task.subtitles.count() > 0 && !task.is_task_running)
+                            {
+                                format!(
+                                    "{} ({} / {})",
+                                    tr(language, "Recognition Completed"),
+                                    format_time_ms(recog_pos_ms),
+                                    format_time_ms(total_dur_ms)
+                                )
+                            } else {
+                                tr(language, "Ready").to_string()
+                            };
+                            ui.label(
+                                egui::RichText::new(status_text).size(11.5).color(
+                                    if task.is_task_running && !is_extracting {
+                                        Color32::from_rgb(16, 185, 129)
+                                    } else {
+                                        crate::ui::theme::text_weak()
+                                    },
+                                ),
+                            );
+                        });
+                    });
+                    ui.add_space(3.0);
+                    ui.add(
+                        egui::ProgressBar::new(recog_frac)
+                            .desired_height(6.0)
+                            .corner_radius(CornerRadius::same(3))
+                            .animate(task.is_task_running && !is_extracting),
+                    );
+                });
+
+            ui.add_space(10.0);
             ui.separator();
             ui.add_space(6.0);
 
@@ -648,6 +837,7 @@ fn render_task_control_card(
                 .size(13.0)
                 .color(crate::ui::theme::text_weak()),
             )
+            .id_salt("video_player_recognition_settings")
             .default_open(!task.is_task_running)
             .show(ui, |ui| {
                 ui.add_space(6.0);
@@ -778,6 +968,7 @@ fn render_task_control_card(
                     .strong()
                     .color(crate::ui::theme::text_strong()),
                 )
+                .id_salt("video_player_channel_routing")
                 .default_open(true)
                 .show(ui, |ui| {
                     ui.add_space(6.0);
@@ -980,7 +1171,7 @@ fn render_viewport_card(
     let is_paused = controller.get_status() == PlaybackStatus::Paused;
     let recent_hover = controller
         .last_hover_instant
-        .map_or(true, |inst| inst.elapsed().as_secs_f32() < 3.0);
+        .map_or(true, |inst| inst.elapsed().as_secs_f32() < 2.5);
 
     let show_controls = !is_playing || is_paused || recent_hover;
 
@@ -991,6 +1182,28 @@ fn render_viewport_card(
         show_controls,
         0.22,
     );
+
+    // Schedule repaint when timer is active so fade-out triggers automatically without user input
+    if is_playing && !is_paused && recent_hover {
+        let elapsed = controller
+            .last_hover_instant
+            .map_or(0.0, |inst| inst.elapsed().as_secs_f32());
+        let remaining_ms = ((2.5 - elapsed).max(0.0) * 1000.0) as u64;
+        ui.ctx()
+            .request_repaint_after(std::time::Duration::from_millis(remaining_ms.max(20).min(100)));
+    }
+
+    // Hide mouse cursor in fullscreen when controls have faded out
+    if controller.fullscreen_mode && is_playing && !is_paused && controls_alpha < 0.05 {
+        ui.ctx().set_cursor_icon(egui::CursorIcon::None);
+    }
+
+    // Allow Escape key to exit fullscreen
+    if controller.fullscreen_mode && ui.input(|i| i.key_pressed(egui::Key::Escape)) {
+        controller.fullscreen_mode = false;
+        ui.ctx()
+            .send_viewport_cmd(egui::ViewportCommand::Fullscreen(false));
+    }
 
     // Layout constants for the compact floating pill
     let bar_height = 40.0;
@@ -1020,15 +1233,40 @@ fn render_viewport_card(
                 egui::Sense::click_and_drag(),
             );
 
-            let is_mouse_over = response.hovered()
-                || ui.input(|i| i.pointer.latest_pos().map_or(false, |pos| video_rect.contains(pos)));
-            if is_mouse_over {
+            let bar_rect = egui::Rect::from_min_max(
+                egui::pos2(
+                    video_rect.min.x + bar_margin_h,
+                    video_rect.max.y - bar_height - bar_margin_bottom,
+                ),
+                egui::pos2(
+                    video_rect.max.x - bar_margin_h,
+                    video_rect.max.y - bar_margin_bottom,
+                ),
+            );
+
+            let pointer_delta = ui.input(|i| i.pointer.delta());
+            let is_mouse_moving = pointer_delta.length_sq() > 0.25;
+            let is_interacting = ui.input(|i| {
+                i.pointer.any_click()
+                    || i.pointer.any_down()
+                    || i.pointer.any_released()
+                    || i.smooth_scroll_delta != egui::Vec2::ZERO
+            });
+            let is_controls_hovered = ui.input(|i| {
+                i.pointer
+                    .latest_pos()
+                    .map_or(false, |pos| bar_rect.expand(6.0).contains(pos))
+            });
+
+            // Only refresh the idle timer when mouse is moving, clicking, scrolling, or hovering the control bar
+            if is_mouse_moving || is_interacting || (is_controls_hovered && show_controls) {
                 controller.note_mouse_motion();
             }
 
             if response.double_clicked() && controller.current_source.is_some() {
                 controller.toggle_fullscreen();
-                ui.ctx().send_viewport_cmd(egui::ViewportCommand::Fullscreen(controller.fullscreen_mode));
+                ui.ctx()
+                    .send_viewport_cmd(egui::ViewportCommand::Fullscreen(controller.fullscreen_mode));
             }
 
             if is_playing {
@@ -1091,18 +1329,6 @@ fn render_viewport_card(
             // ── Floating Pill Control Bar ─────────────────────────────────────
             if controls_alpha > 0.001 {
                 let alpha = (controls_alpha * 255.0) as u8;
-
-                // Pill rect: inset from edges, slightly above bottom
-                let bar_rect = egui::Rect::from_min_max(
-                    egui::pos2(
-                        video_rect.min.x + bar_margin_h,
-                        video_rect.max.y - bar_height - bar_margin_bottom,
-                    ),
-                    egui::pos2(
-                        video_rect.max.x - bar_margin_h,
-                        video_rect.max.y - bar_margin_bottom,
-                    ),
-                );
 
                 // Dark glass pill background
                 let pill_bg = Color32::from_rgba_unmultiplied(
@@ -1259,7 +1485,7 @@ fn render_subtitles_card(
 
             let is_manually_scrolling = controller
                 .last_manual_scroll
-                .map_or(false, |instant| instant.elapsed() < std::time::Duration::from_secs(4));
+                .map_or(false, |instant| instant.elapsed() < std::time::Duration::from_secs(5));
             let auto_scroll_active = !is_manually_scrolling;
 
             ui.horizontal(|ui| {
@@ -1321,10 +1547,16 @@ fn render_subtitles_card(
                     .max_height(500.0)
                     .auto_shrink([false, false]);
 
+                let viewport_height = controller
+                    .timeline_viewport_height
+                    .unwrap_or(450.0)
+                    .clamp(360.0, 500.0);
+
                 // Programmatic auto-scroll: ONLY when transitioning to a NEW cue
                 if auto_scroll_active && active_idx.is_some() && active_idx != controller.last_auto_scrolled_idx {
                     if let Some(idx) = active_idx {
-                        let target_offset = ((idx as f32 * row_height) - 130.0).max(0.0);
+                        let center_offset = (viewport_height - row_height) * 0.5;
+                        let target_offset = ((idx as f32 * row_height) - center_offset).max(0.0);
                         scroll_area = scroll_area.vertical_scroll_offset(target_offset);
                         controller.last_auto_scrolled_idx = Some(idx);
                     }
@@ -1374,8 +1606,8 @@ fn render_subtitles_card(
                                         );
 
                                         if let Some(speaker) = &cue.speaker_name {
-                                            ui.add_space(6.0);
-                                            components::speaker_badge(ui, speaker);
+                                             ui.add_space(6.0);
+                                             components::speaker_badge(ui, speaker);
                                         }
                                     });
 
@@ -1415,6 +1647,10 @@ fn render_subtitles_card(
                             .response
                             .interact(egui::Sense::click());
 
+                        if is_current && auto_scroll_active {
+                            resp.scroll_to_me(Some(egui::Align::Center));
+                        }
+
                         if resp.clicked() {
                             seek_to_ms = Some(cue.start_ms);
                             controller.last_manual_scroll = None;
@@ -1425,10 +1661,15 @@ fn render_subtitles_card(
                     }
                 });
 
-                let is_hovered = ui.rect_contains_pointer(scroll_output.inner_rect);
+                controller.timeline_viewport_height = Some(scroll_output.inner_rect.height());
+
+                let is_hovered = ui.rect_contains_pointer(scroll_output.inner_rect)
+                    || ui.rect_contains_pointer(scroll_output.inner_rect.expand(16.0));
                 let wheel_scrolled = is_hovered
                     && ui.input(|i| {
-                        i.smooth_scroll_delta.y.abs() > 0.05 || i.smooth_scroll_delta.x.abs() > 0.05
+                        i.smooth_scroll_delta.y.abs() > 0.05
+                            || i.smooth_scroll_delta.x.abs() > 0.05
+                            || i.raw.events.iter().any(|e| matches!(e, egui::Event::MouseWheel { .. }))
                     });
                 let is_dragged = is_hovered && ui.input(|i| i.pointer.is_decidedly_dragging());
 
@@ -1449,7 +1690,14 @@ fn render_subtitles_card(
 
 fn format_time_ms(ms: i64) -> String {
     let secs = ms.max(0) / 1000;
-    format!("{:02}:{:02}", secs / 60, secs % 60)
+    let hours = secs / 3600;
+    let mins = (secs % 3600) / 60;
+    let s = secs % 60;
+    if hours > 0 {
+        format!("{:02}:{:02}:{:02}", hours, mins, s)
+    } else {
+        format!("{:02}:{:02}", mins, s)
+    }
 }
 
 fn format_timestamp_date(timestamp_sec: u64) -> String {

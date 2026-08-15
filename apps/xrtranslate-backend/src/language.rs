@@ -1,5 +1,10 @@
 //! Compact, stateful language routing for bidirectional automatic sessions.
 
+use std::collections::VecDeque;
+
+const RECENT_OBSERVATIONS_LIMIT: usize = 5;
+const SWITCH_CANDIDATE_THRESHOLD: usize = 2;
+
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub(crate) enum Script {
     Latin,
@@ -117,9 +122,13 @@ pub(crate) fn to_traditional_chinese(text: &str) -> String {
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
-struct LanguagePair([SupportedLanguage; 2]);
+pub(crate) struct LanguagePair(pub(crate) [SupportedLanguage; 2]);
 
 impl LanguagePair {
+    pub(crate) fn target_lang(self) -> String {
+        format!("{},{}", self.0[0].code(), self.0[1].code())
+    }
+
     fn parse(source: &str, targets: &str) -> Option<Self> {
         if !source.trim().eq_ignore_ascii_case("auto") {
             return None;
@@ -187,16 +196,14 @@ pub(crate) struct LanguageRoute {
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub(crate) enum AutoDecision {
     Accept(LanguageRoute),
+    Switched {
+        route: LanguageRoute,
+        active: LanguagePair,
+    },
     Retry {
         language: SupportedLanguage,
         candidate: Option<SupportedLanguage>,
     },
-}
-
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
-pub(crate) enum RecoveryDecision {
-    Keep(LanguageRoute),
-    Switch(LanguageRoute),
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -213,7 +220,7 @@ pub(crate) struct AdaptiveLanguageRoute {
     configured: Option<LanguagePair>,
     active: Option<LanguagePair>,
     anchor: Option<SupportedLanguage>,
-    pending: Option<(SupportedLanguage, u8)>,
+    recent_observations: VecDeque<Option<SupportedLanguage>>,
 }
 
 impl AdaptiveLanguageRoute {
@@ -223,7 +230,7 @@ impl AdaptiveLanguageRoute {
             self.configured = configured;
             self.active = configured;
             self.anchor = None;
-            self.pending = None;
+            self.recent_observations.clear();
         }
     }
 
@@ -266,66 +273,48 @@ impl AdaptiveLanguageRoute {
             return AutoDecision::Accept(pair.route(language));
         }
 
+        let candidate = languages().find(|language| {
+            !pair.contains(*language) && script_evidence(*language, text) != Evidence::Incompatible
+        });
+
+        if let Some(candidate) = candidate {
+            self.push_observation(Some(candidate));
+            let count = self
+                .recent_observations
+                .iter()
+                .filter(|observation| **observation == Some(candidate))
+                .count();
+            if count >= SWITCH_CANDIDATE_THRESHOLD {
+                let partner = self
+                    .anchor
+                    .filter(|language| pair.contains(*language))
+                    .unwrap_or(pair.0[1]);
+                let active = LanguagePair([candidate, partner]);
+                self.active = Some(active);
+                self.anchor = Some(candidate);
+                self.recent_observations.clear();
+                return AutoDecision::Switched {
+                    route: active.route(candidate),
+                    active,
+                };
+            }
+        }
+
         let language = pair
             .language_for_text(text)
             .or(self.anchor.and_then(|language| pair.find_matching(language)))
             .unwrap_or(pair.0[0]);
-        let candidate = languages().find(|language| {
-            !pair.contains(*language) && script_evidence(*language, text) != Evidence::Incompatible
-        });
         AutoDecision::Retry {
             language,
             candidate,
         }
     }
 
-    pub(crate) fn recovery(
-        &mut self,
-        forced: SupportedLanguage,
-        forced_text: &str,
-        candidate: Option<SupportedLanguage>,
-    ) -> RecoveryDecision {
+    pub(crate) fn recovery(&mut self, forced: SupportedLanguage) -> LanguageRoute {
         let pair = self
             .active
             .expect("recovery is only used for an automatic pair");
-        let candidate = candidate.filter(|cand| !pair.contains(*cand));
-        let Some(candidate) = candidate else {
-            self.confirm(forced);
-            return RecoveryDecision::Keep(pair.route(forced));
-        };
-
-        // A forced result written in a script which excludes the outside
-        // candidate is positive recovery evidence, not a reason to switch.
-        if script_evidence(forced, forced_text) == Evidence::Compatible
-            && script_evidence(candidate, forced_text) == Evidence::Incompatible
-        {
-            self.confirm(forced);
-            return RecoveryDecision::Keep(pair.route(forced));
-        }
-
-        let count = match self.pending {
-            Some((pending, count)) if pending == candidate => count.saturating_add(1),
-            _ => 1,
-        };
-        self.pending = Some((candidate, count));
-        let threshold = if scripts_overlap(candidate, forced) {
-            3
-        } else {
-            2
-        };
-        if count < threshold {
-            return RecoveryDecision::Keep(pair.route(forced));
-        }
-
-        let partner = self
-            .anchor
-            .filter(|language| pair.contains(*language))
-            .unwrap_or(pair.0[1]);
-        let active = LanguagePair([candidate, partner]);
-        self.active = Some(active);
-        self.anchor = Some(candidate);
-        self.pending = None;
-        RecoveryDecision::Switch(active.route(candidate))
+        pair.route(forced)
     }
 
     pub(crate) fn evidence(&self, language: SupportedLanguage, text: &str) -> bool {
@@ -338,18 +327,17 @@ impl AdaptiveLanguageRoute {
             .other(language)
     }
 
+    fn push_observation(&mut self, observation: Option<SupportedLanguage>) {
+        if self.recent_observations.len() >= RECENT_OBSERVATIONS_LIMIT {
+            self.recent_observations.pop_front();
+        }
+        self.recent_observations.push_back(observation);
+    }
+
     fn confirm(&mut self, language: SupportedLanguage) {
         self.anchor = Some(language);
-        self.pending = None;
+        self.push_observation(None);
     }
-}
-
-fn scripts_overlap(left: SupportedLanguage, right: SupportedLanguage) -> bool {
-    left.0.script == right.0.script
-        || matches!(
-            (left.0.script, right.0.script),
-            (Script::Han, Script::Japanese) | (Script::Japanese, Script::Han)
-        )
 }
 
 fn script_evidence(language: SupportedLanguage, text: &str) -> Evidence {
@@ -452,73 +440,104 @@ mod tests {
                 ..
             }
         ));
-        assert!(matches!(
-            route.recovery(language("ja"), "再会", Some(language("zh"))),
-            RecoveryDecision::Keep(_)
-        ));
-        assert_eq!(route.active_targets(""), "ja,en");
     }
 
     #[test]
-    fn distinct_script_switches_after_two_confirmations_and_keeps_anchor() {
+    fn switches_after_two_outside_observations_within_five_turns() {
         let mut route = AdaptiveLanguageRoute::default();
         route.configure("auto", "ja,en");
         assert!(matches!(
             route.classify(Some("English"), "hello"),
             AutoDecision::Accept(_)
         ));
-        for expected_switch in [false, true] {
-            let decision = route.classify(Some("Korean"), "안녕하세요");
-            let AutoDecision::Retry { candidate, .. } = decision else {
-                panic!()
-            };
-            let switched = matches!(
-                route.recovery(language("ja"), "안녕하세요", candidate),
-                RecoveryDecision::Switch(_)
-            );
-            assert_eq!(switched, expected_switch);
-        }
+
+        // 1. First outside detection -> Retry (forced in-pair for this 1st turn)
+        let decision1 = route.classify(Some("Korean"), "안녕하세요");
+        assert!(matches!(decision1, AutoDecision::Retry { .. }));
+        assert_eq!(route.active_targets(""), "ja,en");
+
+        // 2. Second outside detection in 5 turns -> Directly Accepts & switches to ko,en!
+        let decision2 = route.classify(Some("Korean"), "안녕하세요");
+        assert!(matches!(
+            decision2,
+            AutoDecision::Switched { route: LanguageRoute { source, .. }, .. } if source == language("ko")
+        ));
         assert_eq!(route.active_targets(""), "ko,en");
     }
 
     #[test]
-    fn shared_script_requires_three_confirmations() {
+    fn interleaved_in_pair_still_switches_if_two_outside_in_five_turns() {
         let mut route = AdaptiveLanguageRoute::default();
         route.configure("auto", "ja,en");
-        for expected_switch in [false, false, true] {
-            let AutoDecision::Retry {
-                language: forced,
-                candidate,
-            } = route.classify(Some("Chinese"), "再会")
-            else {
-                panic!()
-            };
-            assert_eq!(
-                matches!(
-                    route.recovery(forced, "再会", candidate),
-                    RecoveryDecision::Switch(_)
-                ),
-                expected_switch
-            );
-        }
+
+        // 1. Outside candidate: Korean (count = 1) -> Retry
+        let decision1 = route.classify(Some("Korean"), "안녕하세요");
+        assert!(matches!(decision1, AutoDecision::Retry { .. }));
+
+        // 2. In-pair utterance: English (observation = None)
+        assert!(matches!(
+            route.classify(Some("English"), "hello world"),
+            AutoDecision::Accept(_)
+        ));
+
+        // 3. Outside candidate: Korean (count = 2 within recent 3 messages <= 5) -> Accept & Switch!
+        let decision2 = route.classify(Some("Korean"), "안녕하세요");
+        assert!(matches!(
+            decision2,
+            AutoDecision::Switched { route: LanguageRoute { source, .. }, .. } if source == language("ko")
+        ));
+        assert_eq!(route.active_targets(""), "ko,en");
+    }
+
+    #[test]
+    fn shared_script_also_switches_on_two_observations() {
+        let mut route = AdaptiveLanguageRoute::default();
+        route.configure("auto", "ja,en");
+
+        // Turn 1: Chinese -> Retry
+        let decision1 = route.classify(Some("Chinese"), "再会");
+        assert!(matches!(decision1, AutoDecision::Retry { .. }));
+
+        // Turn 2: Chinese -> Accept & Switch
+        let decision2 = route.classify(Some("Chinese"), "再会");
+        assert!(matches!(
+            decision2,
+            AutoDecision::Switched { route: LanguageRoute { source, .. }, .. } if source == language("zh")
+        ));
         assert_eq!(route.active_targets(""), "zh,en");
     }
 
     #[test]
-    fn decisive_in_pair_recovery_cancels_candidate() {
+    fn outside_observation_expires_after_five_turns() {
+        let mut route = AdaptiveLanguageRoute::default();
+        route.configure("auto", "ja,en");
+
+        // Turn 1: Korean candidate (1st) -> Retry
+        let decision1 = route.classify(Some("Korean"), "안녕하세요");
+        assert!(matches!(decision1, AutoDecision::Retry { .. }));
+
+        // Turn 2..=6 (5 in-pair turns): pushes 5 `None`s, expiring the first Korean observation
+        for _ in 0..5 {
+            assert!(matches!(
+                route.classify(Some("English"), "hello"),
+                AutoDecision::Accept(_)
+            ));
+        }
+
+        // Turn 7: Korean candidate again (only 1 in recent 5 turns) -> Retry (does not switch)
+        let decision2 = route.classify(Some("Korean"), "안녕하세요");
+        assert!(matches!(decision2, AutoDecision::Retry { .. }));
+        assert_eq!(route.active_targets(""), "ja,en");
+    }
+
+    #[test]
+    fn in_pair_detections_keep_configured_pair() {
         let mut route = AdaptiveLanguageRoute::default();
         route.configure("auto", "ja,en");
         for _ in 0..4 {
-            let AutoDecision::Retry {
-                language,
-                candidate,
-            } = route.classify(Some("Chinese"), "中国語")
-            else {
-                panic!()
-            };
             assert!(matches!(
-                route.recovery(language, "これは日本語です", candidate),
-                RecoveryDecision::Keep(_)
+                route.classify(Some("Japanese"), "これは日本語です"),
+                AutoDecision::Accept(LanguageRoute { source, .. }) if source == language("ja")
             ));
         }
         assert_eq!(route.active_targets(""), "ja,en");
@@ -528,10 +547,11 @@ mod tests {
     fn reconfiguration_resets_adaptation() {
         let mut route = AdaptiveLanguageRoute::default();
         route.configure("auto", "ja,en");
-        route.pending = Some((language("zh"), 2));
+        route.push_observation(Some(language("zh")));
+        assert_eq!(route.recent_observations.len(), 1);
         route.configure("auto", "fr,de");
         assert_eq!(route.active_targets(""), "fr,de");
-        assert_eq!(route.pending, None);
+        assert!(route.recent_observations.is_empty());
     }
 
     #[test]

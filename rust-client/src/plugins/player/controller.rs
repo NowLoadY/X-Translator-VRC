@@ -41,7 +41,16 @@ pub struct VideoPlayerController {
     pub last_save_instant: Instant,
     pub last_manual_scroll: Option<Instant>,
     pub last_auto_scrolled_idx: Option<usize>,
+    pub timeline_viewport_height: Option<f32>,
     pub mpv_installer: super::installer::MpvInstaller,
+
+    pub is_extracting: bool,
+    pub extraction_progress: Option<f32>,
+    pub extract_position: Option<std::time::Duration>,
+    pub extract_duration: Option<std::time::Duration>,
+    pub recognition_progress: Option<f32>,
+    pub recognize_position: Option<std::time::Duration>,
+    pub recognize_duration: Option<std::time::Duration>,
 }
 
 impl Default for VideoPlayerController {
@@ -85,7 +94,15 @@ impl Default for VideoPlayerController {
             last_save_instant: Instant::now(),
             last_manual_scroll: None,
             last_auto_scrolled_idx: None,
+            timeline_viewport_height: None,
             mpv_installer: super::installer::MpvInstaller::default(),
+            is_extracting: false,
+            extraction_progress: None,
+            extract_position: None,
+            extract_duration: None,
+            recognition_progress: None,
+            recognize_position: None,
+            recognize_duration: None,
         }
     }
 }
@@ -252,6 +269,13 @@ impl VideoPlayerController {
 
     pub fn clear_and_restart_task(&mut self) {
         self.subtitles.clear();
+        self.is_extracting = false;
+        self.extraction_progress = None;
+        self.extract_position = None;
+        self.extract_duration = None;
+        self.recognition_progress = None;
+        self.recognize_position = None;
+        self.recognize_duration = None;
         if let Some(task_id) = &self.active_task_id {
             if let Some(task) = self.store.get_mut(task_id) {
                 task.subtitles = self.subtitles.clone();
@@ -322,7 +346,9 @@ impl VideoPlayerController {
     }
 
     pub fn note_mouse_motion(&mut self) {
-        let should_trigger = self.last_hover_instant.map_or(true, |inst| inst.elapsed().as_secs_f32() > 3.0);
+        let should_trigger = self
+            .last_hover_instant
+            .map_or(true, |inst| inst.elapsed().as_secs_f32() > 2.5);
         self.last_hover_instant = Some(Instant::now());
         if should_trigger {
             if let Some(src) = &self.current_source {

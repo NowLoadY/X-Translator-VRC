@@ -55,6 +55,13 @@ OSC subtitles can keep messages separate or arrange them together.
   </tr>
 </table>
 
+Supports fast typing and real-time translation through OSC.
+
+<p align="center">
+  <img src="assets/preview-OSC-type.png" alt="OSC Typing and Real-Time Translation" width="760" />
+</p>
+
+
 ---
 
 ## User Guide

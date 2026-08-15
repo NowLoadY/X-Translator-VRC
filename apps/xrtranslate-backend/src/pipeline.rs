@@ -46,7 +46,7 @@ use xrtranslate_vad::{
 };
 
 use crate::language::{
-    AdaptiveLanguageRoute, AutoDecision, LanguageRoute, RecoveryDecision, SupportedLanguage,
+    AdaptiveLanguageRoute, AutoDecision, LanguageRoute, SupportedLanguage,
     is_traditional_chinese, to_traditional_chinese,
 };
 
@@ -66,6 +66,7 @@ pub(crate) struct RecognizedOutput {
     pub(crate) source_language: String,
     pub(crate) target_language: String,
     pub(crate) asr_elapsed: Duration,
+    pub(crate) route_switched: Option<String>,
 }
 
 /// VAD output paired with its absolute position inside the current audio epoch.
@@ -447,7 +448,8 @@ impl NativePipeline {
             pre_roll_frames: 10,
             max_active_frames: frames_for_ms(config.asr.vad_max_utterance_ms),
             max_active_overlap_frames: frames_for_ms(config.asr.vad_overlap_ms),
-            min_speech_frames_to_start: 2,
+            min_speech_frames_to_start: 3,
+            opening_window_frames: 4,
         };
         let endpoint = EndpointDetector::new(endpoint_config).map_err(|error| error.to_string())?;
         let http =
@@ -943,16 +945,19 @@ impl NativeInference {
             return Ok(None);
         };
         let explicit_route = explicit_language_route(source_language, target_language);
-        let (transcript, route) = if let Some(route) = explicit_route {
-            (auto_transcript, route)
+        let (transcript, route, route_switched) = if let Some(route) = explicit_route {
+            (auto_transcript, route, None)
         } else {
             match adaptive_route
                 .classify(auto_transcript.language.as_deref(), &auto_transcript.text)
             {
-                AutoDecision::Accept(route) => (auto_transcript, route),
+                AutoDecision::Accept(route) => (auto_transcript, route, None),
+                AutoDecision::Switched { route, active } => {
+                    (auto_transcript, route, Some(active.target_lang()))
+                }
                 AutoDecision::Retry {
                     language,
-                    candidate,
+                    candidate: _,
                 } => {
                     warn!(
                         detected_language =
@@ -991,17 +996,8 @@ impl NativeInference {
                         };
                         forced = alternate;
                     }
-                    match adaptive_route.recovery(forced_language, &forced.text, candidate) {
-                        RecoveryDecision::Keep(route) => (forced, route),
-                        RecoveryDecision::Switch(route) => {
-                            warn!(
-                                source_language = route.source.model_name(),
-                                target_language = route.target.model_name(),
-                                "adaptive language pair switched after repeated outside-language evidence"
-                            );
-                            (auto_transcript, route)
-                        }
-                    }
+                    let route = adaptive_route.recovery(forced_language);
+                    (forced, route, None)
                 }
             }
         };
@@ -1022,6 +1018,7 @@ impl NativeInference {
             source_language: route.source.code().to_owned(),
             target_language: route.target.code().to_owned(),
             asr_elapsed,
+            route_switched,
         }))
     }
 
