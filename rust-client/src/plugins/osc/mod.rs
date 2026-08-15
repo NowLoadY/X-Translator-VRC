@@ -16,6 +16,7 @@ pub use ui::{OscPageContext, OscUiAction};
 pub struct OscPlugin {
     manager: OscManager,
     draft: OscSettings,
+    draft_input: String,
     host_enabled: bool,
 }
 
@@ -25,6 +26,7 @@ impl OscPlugin {
         Self {
             manager,
             draft,
+            draft_input: String::new(),
             host_enabled,
         }
     }
@@ -39,6 +41,18 @@ impl OscPlugin {
 
     pub fn draft_mut(&mut self) -> &mut OscSettings {
         &mut self.draft
+    }
+
+    pub fn draft_input(&self) -> &str {
+        &self.draft_input
+    }
+
+    pub fn draft_input_mut(&mut self) -> &mut String {
+        &mut self.draft_input
+    }
+
+    pub fn send_manual_message(&mut self, text: &str) {
+        self.manager.send_manual_message(text);
     }
 
     pub fn apply_draft(&mut self) -> Result<(), String> {

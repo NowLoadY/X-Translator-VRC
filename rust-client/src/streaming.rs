@@ -1,4 +1,6 @@
-use xrtranslate_engine::remove_transcript_overlap;
+use xrtranslate_engine::{
+    collapse_asr_split_words, is_split_word_pair, remove_transcript_overlap,
+};
 use xrtranslate_protocol::CorpusTermMatch;
 
 const SOFT_CAPTION_SPAN_MS: f64 = 4_500.0;
@@ -25,14 +27,16 @@ pub(crate) struct HandoffText {
 
 impl RevisableText {
     pub(crate) fn new(hypothesis: &str) -> Self {
+        let hypothesis = collapse_asr_split_words(hypothesis.trim());
         Self {
             stable: String::new(),
-            hypothesis: hypothesis.trim().to_owned(),
+            hypothesis,
         }
     }
 
     pub(crate) fn update(&mut self, hypothesis: &str, overlap_ratio: f32) -> RevisionUpdate {
-        let hypothesis = hypothesis.trim();
+        let hypothesis = collapse_asr_split_words(hypothesis.trim());
+        let hypothesis = hypothesis.as_str();
         if hypothesis.is_empty() {
             return self.snapshot();
         }
@@ -74,6 +78,7 @@ impl RevisableText {
         }
         let hypothesis_start = text.len();
         text.push_str(&self.hypothesis);
+        let text = collapse_asr_split_words(&text);
         RevisionUpdate {
             text,
             hypothesis_start,
@@ -149,7 +154,7 @@ fn sequence_alignment(
     let mut lengths = vec![vec![0_u8; next.len() + 1]; previous.len() + 1];
     for left in (0..previous.len()).rev() {
         for right in (0..next.len()).rev() {
-            lengths[left][right] = if previous[left].normalized == next[right].normalized {
+            lengths[left][right] = if tokens_aligned(previous, left, next, right) {
                 lengths[left + 1][right + 1].saturating_add(1)
             } else {
                 lengths[left + 1][right].max(lengths[left][right + 1])
@@ -164,7 +169,7 @@ fn sequence_alignment(
     let mut right = 0;
     let mut pairs = Vec::with_capacity(score);
     while left < previous.len() && right < next.len() {
-        if previous[left].normalized == next[right].normalized {
+        if tokens_aligned(previous, left, next, right) {
             pairs.push((left, right));
             left += 1;
             right += 1;
@@ -199,7 +204,32 @@ fn sequence_alignment(
     })
 }
 
+fn tokens_aligned(
+    previous: &[AlignmentToken],
+    left: usize,
+    next: &[AlignmentToken],
+    right: usize,
+) -> bool {
+    let p = &previous[left].normalized;
+    let n = &next[right].normalized;
+    if p == n {
+        return true;
+    }
+    if (left == previous.len() - 1 || right == 0) && (n.starts_with(p) || p.starts_with(n)) {
+        let min_len = p.len().min(n.len());
+        if min_len >= 2 {
+            return true;
+        }
+    }
+    false
+}
+
 pub(crate) fn handoff_text(previous: &str, next: &str, overlap_ratio: f32) -> HandoffText {
+    let previous_cleaned = collapse_asr_split_words(previous);
+    let next_cleaned = collapse_asr_split_words(next);
+    let previous = previous_cleaned.as_str();
+    let next = next_cleaned.as_str();
+
     let previous_tokens = alignment_tokens(previous);
     let next_tokens = alignment_tokens(next);
     if let Some(alignment) = sequence_alignment(&previous_tokens, &next_tokens) {
@@ -420,14 +450,40 @@ fn ends_at_sentence_boundary(source: &str) -> bool {
 }
 
 fn needs_separator(current: &str, addition: &str) -> bool {
-    !current.is_empty()
-        && current
-            .chars()
+    if current.is_empty() || addition.is_empty() {
+        return false;
+    }
+    let left_last = current.chars().last();
+    let right_first = addition.chars().next();
+    let Some((left, right)) = left_last.zip(right_first) else {
+        return false;
+    };
+    if left.is_whitespace()
+        || right.is_whitespace()
+        || is_compact_script(left)
+        || is_compact_script(right)
+    {
+        return false;
+    }
+    if left.is_alphabetic() && right.is_alphabetic() {
+        let last_word = current
+            .split(|c: char| !c.is_alphabetic())
+            .filter(|w| !w.is_empty())
             .last()
-            .zip(addition.chars().next())
-            .is_some_and(|(left, right)| {
-                !left.is_whitespace() && !is_compact_script(left) && !is_compact_script(right)
-            })
+            .unwrap_or_default();
+        let first_word = addition
+            .split(|c: char| !c.is_alphabetic())
+            .filter(|w| !w.is_empty())
+            .next()
+            .unwrap_or_default();
+        if !last_word.is_empty()
+            && !first_word.is_empty()
+            && is_split_word_pair(last_word, first_word)
+        {
+            return false;
+        }
+    }
+    true
 }
 
 fn is_compact_script(character: char) -> bool {
@@ -565,5 +621,40 @@ mod tests {
         let mut text = RevisableText::new("那天我们走了很久");
         let update = text.update("走了很久没有争吵", 0.5);
         assert_eq!(update.text, "那天我们走了很久没有争吵");
+    }
+
+    #[test]
+    fn revisable_text_repairs_split_words_and_revises_partial_tokens() {
+        let mut text = RevisableText::new("So, literally, what reinforcement learning does is it goes to the ones that worked real");
+        let update = text.update("the ones that worked really well.", 0.34);
+        assert_eq!(
+            update.text,
+            "So, literally, what reinforcement learning does is it goes to the ones that worked really well."
+        );
+
+        let mut split_text = RevisableText::new("the ones that worked real ly");
+        let update2 = split_text.update("worked really well.", 0.34);
+        assert_eq!(
+            update2.text,
+            "the ones that worked really well."
+        );
+    }
+
+    #[test]
+    fn caption_handoff_handles_split_words_at_bubble_boundary() {
+        let handoff = handoff_text(
+            "So, literally, what reinforcement learning does is it goes to the ones that worked real ly well.",
+            "really well. Next sentence continues.",
+            0.5,
+        );
+        assert_eq!(handoff.text, "Next sentence continues.");
+        assert!(handoff.source_start > 0);
+    }
+
+    #[test]
+    fn append_text_joins_split_words_seamlessly() {
+        let mut text = "worked real".to_owned();
+        append_text(&mut text, "ly well");
+        assert_eq!(text, "worked really well");
     }
 }

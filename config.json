@@ -25,6 +25,11 @@
     "sample_rate": 16000,
     "tts_sample_rate": 48000
   },
+  "denoise": {
+    "enabled": true,
+    "intra_threads": 1,
+    "model_path": "models/gtcrn/gtcrn_simple.onnx"
+  },
   "frontend": {
     "show_speaker": false
   },
@@ -103,8 +108,8 @@
     "max_speakers": 8,
     "min_utterance_ms": 750,
     "model_path": "models/3D-Speaker-ERes2NetV2/speaker_embedding.onnx",
-    "same_speaker_hysteresis": 0.1,
-    "similarity_threshold": 0.52
+    "same_speaker_hysteresis": 0.16,
+    "similarity_threshold": 0.56
   },
   "storage": {
     "log_dir": "runtime/logs",

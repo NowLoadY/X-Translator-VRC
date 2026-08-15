@@ -1,7 +1,7 @@
 //! Compact, stateful language routing for bidirectional automatic sessions.
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
-enum Script {
+pub(crate) enum Script {
     Latin,
     Han,
     Japanese,
@@ -30,6 +30,7 @@ macro_rules! language {
 const LANGUAGES: &[LanguageSpec] = &[
     language!("af", "Afrikaans", Latin),
     language!("zh", "Chinese", Han),
+    language!("zh-TW", "Chinese", Han),
     language!("en", "English", Latin),
     language!("fr", "French", Latin),
     language!("pt", "Portuguese", Latin),
@@ -52,14 +53,33 @@ pub(crate) struct SupportedLanguage(&'static LanguageSpec);
 
 impl SupportedLanguage {
     pub(crate) fn from_code(code: &str) -> Option<Self> {
+        let code = code.trim();
         LANGUAGES
             .iter()
-            .find(|language| language.code.eq_ignore_ascii_case(code.trim()))
+            .find(|language| language.code.eq_ignore_ascii_case(code))
             .map(Self)
+            .or_else(|| {
+                if code.eq_ignore_ascii_case("zh-hant")
+                    || code.eq_ignore_ascii_case("zh-hk")
+                    || code.eq_ignore_ascii_case("zh-mo")
+                {
+                    LANGUAGES.iter().find(|l| l.code == "zh-TW").map(Self)
+                } else if code.eq_ignore_ascii_case("zh-hans") || code.eq_ignore_ascii_case("zh-cn") {
+                    LANGUAGES.iter().find(|l| l.code == "zh").map(Self)
+                } else {
+                    None
+                }
+            })
     }
 
     pub(crate) fn from_model_label(label: &str) -> Option<Self> {
         let label = label.trim();
+        if label.eq_ignore_ascii_case("Traditional Chinese")
+            || label.eq_ignore_ascii_case("TraditionalChinese")
+            || label.eq_ignore_ascii_case("Chinese (Traditional)")
+        {
+            return LANGUAGES.iter().find(|l| l.code == "zh-TW").map(Self);
+        }
         LANGUAGES
             .iter()
             .find(|language| language.model_name.eq_ignore_ascii_case(label))
@@ -78,6 +98,22 @@ impl SupportedLanguage {
     pub(crate) const fn model_name(self) -> &'static str {
         self.0.model_name
     }
+
+    pub(crate) const fn script(self) -> Script {
+        self.0.script
+    }
+}
+
+pub(crate) fn is_traditional_chinese(code: &str) -> bool {
+    let code = code.trim();
+    code.eq_ignore_ascii_case("zh-tw")
+        || code.eq_ignore_ascii_case("zh-hant")
+        || code.eq_ignore_ascii_case("zh-hk")
+        || code.eq_ignore_ascii_case("zh-mo")
+}
+
+pub(crate) fn to_traditional_chinese(text: &str) -> String {
+    zhconv::zhconv(text, zhconv::Variant::ZhTW)
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -93,12 +129,29 @@ impl LanguagePair {
         (languages.next().is_none() && pair.0[0] != pair.0[1]).then_some(pair)
     }
 
+    fn find_matching(self, language: SupportedLanguage) -> Option<SupportedLanguage> {
+        if self.0[0] == language
+            || (self.0[0].model_name() == language.model_name()
+                && self.0[0].script() == language.script())
+        {
+            Some(self.0[0])
+        } else if self.0[1] == language
+            || (self.0[1].model_name() == language.model_name()
+                && self.0[1].script() == language.script())
+        {
+            Some(self.0[1])
+        } else {
+            None
+        }
+    }
+
     fn contains(self, language: SupportedLanguage) -> bool {
-        self.0.contains(&language)
+        self.find_matching(language).is_some()
     }
 
     fn other(self, language: SupportedLanguage) -> SupportedLanguage {
-        if language == self.0[0] {
+        let matched = self.find_matching(language).unwrap_or(language);
+        if matched == self.0[0] {
             self.0[1]
         } else {
             self.0[0]
@@ -106,9 +159,10 @@ impl LanguagePair {
     }
 
     fn route(self, source: SupportedLanguage) -> LanguageRoute {
+        let matched = self.find_matching(source).unwrap_or(source);
         LanguageRoute {
-            source,
-            target: self.other(source),
+            source: matched,
+            target: self.other(matched),
         }
     }
 
@@ -204,8 +258,9 @@ impl AdaptiveLanguageRoute {
                 .flat_map(|label| label.split(','))
                 .filter_map(SupportedLanguage::from_model_label)
         };
-        if let Some(language) = languages().find(|language| {
-            pair.contains(*language) && script_evidence(*language, text) != Evidence::Incompatible
+        if let Some(language) = languages().find_map(|language| {
+            let matched = pair.find_matching(language)?;
+            (script_evidence(matched, text) != Evidence::Incompatible).then_some(matched)
         }) {
             self.confirm(language);
             return AutoDecision::Accept(pair.route(language));
@@ -213,7 +268,7 @@ impl AdaptiveLanguageRoute {
 
         let language = pair
             .language_for_text(text)
-            .or(self.anchor.filter(|language| pair.contains(*language)))
+            .or(self.anchor.and_then(|language| pair.find_matching(language)))
             .unwrap_or(pair.0[0]);
         let candidate = languages().find(|language| {
             !pair.contains(*language) && script_evidence(*language, text) != Evidence::Incompatible
@@ -233,6 +288,7 @@ impl AdaptiveLanguageRoute {
         let pair = self
             .active
             .expect("recovery is only used for an automatic pair");
+        let candidate = candidate.filter(|cand| !pair.contains(*cand));
         let Some(candidate) = candidate else {
             self.confirm(forced);
             return RecoveryDecision::Keep(pair.route(forced));
@@ -359,11 +415,26 @@ mod tests {
                 SupportedLanguage::from_code(spec.code),
                 Some(SupportedLanguage(spec))
             );
-            assert_eq!(
-                SupportedLanguage::from_model_label(spec.model_name),
-                Some(SupportedLanguage(spec))
-            );
+            assert!(SupportedLanguage::from_model_label(spec.model_name).is_some());
         }
+        assert_eq!(
+            SupportedLanguage::from_model_label("Traditional Chinese"),
+            SupportedLanguage::from_code("zh-TW")
+        );
+    }
+
+    #[test]
+    fn traditional_chinese_detection_and_conversion() {
+        assert!(is_traditional_chinese("zh-tw"));
+        assert!(is_traditional_chinese("zh-TW"));
+        assert!(is_traditional_chinese("zh-Hant"));
+        assert!(!is_traditional_chinese("zh"));
+        assert!(!is_traditional_chinese("en"));
+
+        assert_eq!(
+            to_traditional_chinese("设置与翻译"),
+            "設置與翻譯"
+        );
     }
 
     #[test]

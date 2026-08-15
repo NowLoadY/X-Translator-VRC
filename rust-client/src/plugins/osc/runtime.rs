@@ -279,6 +279,11 @@ struct HistoryMessage {
     speaker_id: String,
     expires_at: Instant,
 }
+#[derive(Clone)]
+struct ManualMessage {
+    text: String,
+    expires_at: Instant,
+}
 struct QueuedMessage {
     text: String,
     typing: bool,
@@ -294,6 +299,10 @@ enum Command {
         speaker_id: String,
         ongoing: bool,
         /// Optional lifetime for this message.
+        ttl: Option<Duration>,
+    },
+    ManualMessage {
+        text: String,
         ttl: Option<Duration>,
     },
     RollStream {
@@ -329,6 +338,21 @@ impl OscHandle {
             speaker_id: speaker_id.trim().into(),
             ongoing,
             ttl: None,
+        });
+    }
+
+    pub fn send_manual_message(&self, text: &str) {
+        let _ = self.tx.send(Command::ManualMessage {
+            text: text.trim().into(),
+            ttl: None,
+        });
+    }
+
+    #[allow(dead_code)]
+    pub fn send_manual_message_with_ttl(&self, text: &str, ttl: Option<Duration>) {
+        let _ = self.tx.send(Command::ManualMessage {
+            text: text.trim().into(),
+            ttl,
         });
     }
 
@@ -431,6 +455,13 @@ impl OscManager {
     }
     pub fn clear_chatbox(&self) {
         let _ = self.tx.send(Command::Clear);
+    }
+    pub fn send_manual_message(&self, text: &str) {
+        self.handle().send_manual_message(text);
+    }
+    #[allow(dead_code)]
+    pub fn send_manual_message_with_ttl(&self, text: &str, ttl: Option<Duration>) {
+        self.handle().send_manual_message_with_ttl(text, ttl);
     }
 
     pub fn handle(&self) -> OscHandle {
@@ -569,15 +600,45 @@ fn dispatch_loop(
     let monitor = super::sys_info::SystemMonitor::new();
     let mut history = Vec::new();
     let mut live = Vec::new();
+    let mut manual_message: Option<ManualMessage> = None;
     let mut pending = None;
     let mut last_send = Instant::now() - COOLDOWN;
     loop {
         let wait = dispatch_wait(
             pending.as_ref(),
             last_send,
-            next_content_expiry(&history, &live),
+            next_content_expiry(&history, &live, manual_message.as_ref()),
         );
         match rx.recv_timeout(wait) {
+            Ok(Command::ManualMessage { text, ttl }) if settings.enabled => {
+                let now = Instant::now();
+                expire_chatbox_entries(&mut history, &mut live, now);
+                let effective_ttl = ttl.unwrap_or_else(|| {
+                    Duration::from_secs_f64(settings.history_ttl_seconds)
+                });
+                let expires_at = now + effective_ttl;
+                let manual = ManualMessage {
+                    text,
+                    expires_at,
+                };
+                let metrics = monitor.snapshot();
+                let message = build_queued_message(
+                    &history,
+                    &live,
+                    Some(&manual),
+                    &settings,
+                    &metrics,
+                    !live.is_empty(),
+                    true,
+                    true,
+                );
+                if message.text.is_empty() {
+                    continue;
+                }
+                manual_message = Some(manual);
+                queue_message(&mut pending, message);
+            }
+            Ok(Command::ManualMessage { .. }) => {}
             Ok(Command::Message {
                 stream_id,
                 source,
@@ -616,7 +677,14 @@ fn dispatch_loop(
                 queue_message(
                     &mut pending,
                     build_queued_message(
-                        &history, &live, &settings, &metrics, ongoing, !ongoing, !ongoing,
+                        &history,
+                        &live,
+                        manual_message.as_ref(),
+                        &settings,
+                        &metrics,
+                        ongoing,
+                        !ongoing,
+                        !ongoing,
                     ),
                 );
             }
@@ -642,7 +710,16 @@ fn dispatch_loop(
                 let metrics = monitor.snapshot();
                 queue_message(
                     &mut pending,
-                    build_queued_message(&history, &live, &settings, &metrics, true, true, true),
+                    build_queued_message(
+                        &history,
+                        &live,
+                        manual_message.as_ref(),
+                        &settings,
+                        &metrics,
+                        true,
+                        true,
+                        true,
+                    ),
                 );
             }
             Ok(Command::RollStream { .. }) => {}
@@ -655,6 +732,7 @@ fn dispatch_loop(
                         build_queued_message(
                             &history,
                             &live,
+                            manual_message.as_ref(),
                             &settings,
                             &metrics,
                             !live.is_empty(),
@@ -665,6 +743,7 @@ fn dispatch_loop(
                 }
             }
             Ok(Command::Clear) => {
+                manual_message = None;
                 history.clear();
                 live.clear();
                 if settings.enabled {
@@ -675,19 +754,27 @@ fn dispatch_loop(
             }
             Ok(Command::Update(updated)) => {
                 if settings.enabled && !updated.enabled {
+                    manual_message = None;
                     send_message(&settings, &clear_message(), &status);
                     pending = None;
                     last_send = Instant::now();
                 }
                 settings = updated;
-                expire_chatbox_entries(&mut history, &mut live, Instant::now());
+                let now = Instant::now();
+                expire_chatbox_entries(&mut history, &mut live, now);
                 if settings.enabled {
                     let metrics = monitor.snapshot();
+                    if let Some(manual) = &manual_message {
+                        if now >= manual.expires_at {
+                            manual_message = None;
+                        }
+                    }
                     queue_message(
                         &mut pending,
                         build_queued_message(
                             &history,
                             &live,
+                            manual_message.as_ref(),
                             &settings,
                             &metrics,
                             !live.is_empty(),
@@ -707,12 +794,27 @@ fn dispatch_loop(
             }
             Err(crossbeam_channel::RecvTimeoutError::Timeout) => {
                 let now = Instant::now();
-                if expire_chatbox_entries(&mut history, &mut live, now) {
+                let mut manual_expired = false;
+                if let Some(manual) = &manual_message {
+                    if now >= manual.expires_at {
+                        manual_message = None;
+                        manual_expired = true;
+                    }
+                }
+                let asr_expired = expire_chatbox_entries(&mut history, &mut live, now);
+                if manual_expired || asr_expired {
                     let metrics = monitor.snapshot();
                     queue_message(
                         &mut pending,
                         build_queued_message(
-                            &history, &live, &settings, &metrics, false, false, true,
+                            &history,
+                            &live,
+                            manual_message.as_ref(),
+                            &settings,
+                            &metrics,
+                            !live.is_empty(),
+                            false,
+                            true,
                         ),
                     );
                 }
@@ -792,6 +894,7 @@ fn send_message(settings: &OscSettings, message: &QueuedMessage, status: &Mutex<
 fn build_queued_message(
     history: &[HistoryMessage],
     live: &[HistoryMessage],
+    manual_message: Option<&ManualMessage>,
     settings: &OscSettings,
     metrics: &super::sys_info::SystemMetrics,
     typing: bool,
@@ -799,11 +902,11 @@ fn build_queued_message(
     final_priority: bool,
 ) -> QueuedMessage {
     QueuedMessage {
-        text: build_chatbox_text(history, live, settings, metrics),
+        text: build_chatbox_text(history, live, manual_message, settings, metrics),
         typing,
         notify,
         final_priority,
-        expires_at: next_content_expiry(history, live),
+        expires_at: next_content_expiry(history, live, manual_message),
     }
 }
 
@@ -823,12 +926,22 @@ fn dispatch_wait(
     }
 }
 
-fn next_content_expiry(history: &[HistoryMessage], live: &[HistoryMessage]) -> Option<Instant> {
-    history
+fn next_content_expiry(
+    history: &[HistoryMessage],
+    live: &[HistoryMessage],
+    manual_message: Option<&ManualMessage>,
+) -> Option<Instant> {
+    let asr_expiry = history
         .iter()
         .chain(live.iter())
         .map(|entry| entry.expires_at)
-        .min()
+        .min();
+    match (asr_expiry, manual_message.map(|m| m.expires_at)) {
+        (Some(a), Some(m)) => Some(a.min(m)),
+        (Some(a), None) => Some(a),
+        (None, Some(m)) => Some(m),
+        (None, None) => None,
+    }
 }
 
 fn listener_config_changed(previous: &OscSettings, updated: &OscSettings) -> bool {
@@ -860,6 +973,7 @@ fn clear_runtime_preview(status: &Mutex<RuntimeStatus>) {
 fn build_chatbox_text(
     history: &[HistoryMessage],
     live: &[HistoryMessage],
+    manual_message: Option<&ManualMessage>,
     settings: &OscSettings,
     metrics: &super::sys_info::SystemMetrics,
 ) -> String {
@@ -872,7 +986,28 @@ fn build_chatbox_text(
         entries.pop_front();
     }
 
-    // Header and footer exist only while live messages remain.
+    if let Some(manual) = manual_message {
+        let manual_raw = manual.text.trim();
+        if !manual_raw.is_empty() {
+            let manual_tagged = format!("⌨️ {manual_raw}");
+            let manual_text = trim_text(&manual_tagged, settings.max_text_length);
+            let manual_len = manual_text.chars().count();
+            if entries.is_empty() || manual_len >= settings.max_text_length {
+                return manual_text;
+            }
+            let available_for_asr = settings.max_text_length.saturating_sub(manual_len + 1);
+            if available_for_asr == 0 {
+                return manual_text;
+            }
+            let asr_text = fit_asr_entries(&mut entries, available_for_asr, settings);
+            if asr_text.is_empty() {
+                return manual_text;
+            }
+            return format!("{asr_text}\n{manual_text}");
+        }
+    }
+
+    // Header and footer exist only while live messages remain and no manual message is active.
     if entries.is_empty() {
         return String::new();
     }
@@ -893,6 +1028,25 @@ fn build_chatbox_text(
         }
     }
 
+    String::new()
+}
+
+fn fit_asr_entries(
+    entries: &mut VecDeque<HistoryMessage>,
+    limit: usize,
+    settings: &OscSettings,
+) -> String {
+    while let Some(first) = entries.front() {
+        let rendered = render_entries(entries.iter(), settings);
+        if rendered.chars().count() <= limit {
+            return rendered;
+        }
+        if entries.len() > 1 {
+            entries.pop_front();
+        } else {
+            return trim_text(&render_entry(first, settings), limit);
+        }
+    }
     String::new()
 }
 
@@ -1138,39 +1292,39 @@ mod tests {
         };
 
         assert_eq!(
-            build_chatbox_text(&history, &[], &settings, &metrics),
+            build_chatbox_text(&history, &[], None, &settings, &metrics),
             "first source\nfirst target\nsecond source\nsecond target"
         );
         settings.message_separator = OscMessageSeparator::Space;
         assert_eq!(
-            build_chatbox_text(&history, &[], &settings, &metrics),
+            build_chatbox_text(&history, &[], None, &settings, &metrics),
             "first source second source\nfirst target second target"
         );
         settings.format_mode = OscFormatMode::BilingualTargetFirst;
         assert_eq!(
-            build_chatbox_text(&history, &[], &settings, &metrics),
+            build_chatbox_text(&history, &[], None, &settings, &metrics),
             "first target second target\nfirst source second source"
         );
         settings.format_mode = OscFormatMode::Inline;
         assert_eq!(
-            build_chatbox_text(&history, &[], &settings, &metrics),
+            build_chatbox_text(&history, &[], None, &settings, &metrics),
             "first source second source | first target second target"
         );
         settings.max_text_length = 39;
         assert_eq!(
-            build_chatbox_text(&history, &[], &settings, &metrics),
+            build_chatbox_text(&history, &[], None, &settings, &metrics),
             "second source | second target"
         );
         settings.format_mode = OscFormatMode::TargetOnly;
         settings.max_text_length = 144;
         settings.message_separator = OscMessageSeparator::NewLine;
         assert_eq!(
-            build_chatbox_text(&history, &[], &settings, &metrics),
+            build_chatbox_text(&history, &[], None, &settings, &metrics),
             "first target\nsecond target"
         );
         settings.message_separator = OscMessageSeparator::Space;
         assert_eq!(
-            build_chatbox_text(&history, &[], &settings, &metrics),
+            build_chatbox_text(&history, &[], None, &settings, &metrics),
             "first target second target"
         );
     }
@@ -1238,7 +1392,7 @@ mod tests {
         let live = history_message(started + Duration::from_secs(13), "live");
 
         assert_eq!(
-            next_content_expiry(&history, &[live]),
+            next_content_expiry(&history, &[live], None),
             Some(started + Duration::from_secs(10)),
         );
     }
@@ -1267,14 +1421,14 @@ mod tests {
             started + Duration::from_secs(1),
         ));
         assert_eq!(history.len(), 1);
-        assert!(build_chatbox_text(&history, &[], &settings, &metrics).contains("new"));
+        assert!(build_chatbox_text(&history, &[], None, &settings, &metrics).contains("new"));
 
         assert!(expire_chatbox_entries(
             &mut history,
             &mut live,
             started + Duration::from_secs(3),
         ));
-        assert!(build_chatbox_text(&history, &[], &settings, &metrics).is_empty());
+        assert!(build_chatbox_text(&history, &[], None, &settings, &metrics).is_empty());
     }
 
     #[test]
@@ -1299,11 +1453,59 @@ mod tests {
         let text = build_chatbox_text(
             &history,
             &[],
+            None,
             &settings,
             &super::super::sys_info::SystemMetrics::default(),
         );
         assert_eq!(text, "H\n23456789\nF");
         assert_eq!(text.chars().count(), settings.max_text_length);
+    }
+
+    #[test]
+    fn manual_message_occupies_bottom_and_shrinks_asr_space_without_banners() {
+        let now = Instant::now();
+        let history = vec![history_message(now + Duration::from_secs(10), "hello ASR")];
+        let settings = OscSettings {
+            max_text_length: 40,
+            header_config: BannerConfig {
+                content_type: BannerContentType::CustomText,
+                custom_text: "HEADER".into(),
+                show_device_name: false,
+            },
+            footer_config: BannerConfig {
+                content_type: BannerContentType::CustomText,
+                custom_text: "FOOTER".into(),
+                show_device_name: false,
+            },
+            ..OscSettings::default()
+        };
+        let metrics = super::super::sys_info::SystemMetrics::default();
+
+        // 1. Without manual message: Header and footer are shown
+        let normal_text = build_chatbox_text(&history, &[], None, &settings, &metrics);
+        assert!(normal_text.contains("HEADER"));
+        assert!(normal_text.contains("FOOTER"));
+        assert!(normal_text.contains("hello ASR"));
+
+        // 2. With manual message: Header and footer are suppressed, manual message is at bottom with ⌨️ tag
+        let manual = ManualMessage {
+            text: "typing note".into(),
+            expires_at: now + Duration::from_secs(10),
+        };
+        let combined = build_chatbox_text(&history, &[], Some(&manual), &settings, &metrics);
+        assert!(!combined.contains("HEADER"));
+        assert!(!combined.contains("FOOTER"));
+        assert_eq!(combined, "hello ASR\n⌨️ typing note");
+
+        // 3. When manual message takes most space, ASR space shrinks accordingly
+        let tight_settings = OscSettings {
+            max_text_length: 20,
+            ..settings
+        };
+        let tight_combined =
+            build_chatbox_text(&history, &[], Some(&manual), &tight_settings, &metrics);
+        assert_eq!(tight_combined, "ASR\n⌨️ typing note");
+        assert!(tight_combined.chars().count() <= 20);
     }
 
     #[test]
@@ -1402,6 +1604,117 @@ mod tests {
         assert_eq!(
             receive_chatbox_input(&receiver).0,
             "first\none\nsecond\ntwo"
+        );
+
+        tx.send(Command::Shutdown).unwrap();
+        worker.join().unwrap();
+    }
+
+    #[test]
+    fn manual_message_overrides_asr_and_resumes_active_asr_after_ttl() {
+        let receiver = UdpSocket::bind("127.0.0.1:0").unwrap();
+        receiver
+            .set_read_timeout(Some(Duration::from_secs(4)))
+            .unwrap();
+        let settings = OscSettings {
+            ip: "127.0.0.1".into(),
+            send_port: receiver.local_addr().unwrap().port(),
+            history_ttl_seconds: 2.0,
+            ..OscSettings::default()
+        };
+        let status = Arc::new(Mutex::new(RuntimeStatus::default()));
+        let worker_status = Arc::clone(&status);
+        let (tx, rx) = unbounded();
+        let worker = thread::spawn(move || dispatch_loop(rx, settings, worker_status));
+
+        // 1. Send an initial ASR message
+        tx.send(Command::Message {
+            stream_id: 1,
+            source: "speech 1".into(),
+            translated: "翻译 1".into(),
+            speaker_id: String::new(),
+            ongoing: false,
+            ttl: Some(Duration::from_secs(2)),
+        })
+        .unwrap();
+        assert_eq!(
+            receive_chatbox_input(&receiver).0,
+            "speech 1\n翻译 1"
+        );
+
+        // Wait past the 500ms cooldown so manual message can send immediately
+        thread::sleep(Duration::from_millis(550));
+
+        // 2. Send a temporary manual message with 600ms TTL
+        tx.send(Command::ManualMessage {
+            text: "typing test".into(),
+            ttl: Some(Duration::from_millis(600)),
+        })
+        .unwrap();
+        assert_eq!(
+            receive_chatbox_input(&receiver).0,
+            "speech 1\n翻译 1\n⌨️ typing test"
+        );
+
+        // Wait past the 500ms cooldown so next ASR update can send
+        thread::sleep(Duration::from_millis(550));
+
+        // 3. Send another ASR message during manual message display.
+        // It updates the space above the manual message while keeping manual text at the bottom.
+        tx.send(Command::Message {
+            stream_id: 2,
+            source: "speech 2".into(),
+            translated: "翻译 2".into(),
+            speaker_id: String::new(),
+            ongoing: false,
+            ttl: Some(Duration::from_secs(2)),
+        })
+        .unwrap();
+        let (during_text, _) = receive_chatbox_input(&receiver);
+        assert!(during_text.contains("speech 2"));
+        assert!(during_text.ends_with("⌨️ typing test"));
+
+        // 4. Wait past the manual message TTL and cooldown,
+        // at which point manual text disappears and full ASR messages remain!
+        let (resumed_text, _) = receive_chatbox_input(&receiver);
+        assert!(resumed_text.contains("speech 2"));
+        assert!(!resumed_text.contains("⌨️ typing test"));
+
+        tx.send(Command::Shutdown).unwrap();
+        worker.join().unwrap();
+    }
+
+    #[test]
+    fn manual_message_clears_when_no_active_asr_remains() {
+        let receiver = UdpSocket::bind("127.0.0.1:0").unwrap();
+        receiver
+            .set_read_timeout(Some(Duration::from_secs(2)))
+            .unwrap();
+        let settings = OscSettings {
+            ip: "127.0.0.1".into(),
+            send_port: receiver.local_addr().unwrap().port(),
+            history_ttl_seconds: 0.1,
+            ..OscSettings::default()
+        };
+        let status = Arc::new(Mutex::new(RuntimeStatus::default()));
+        let worker_status = Arc::clone(&status);
+        let (tx, rx) = unbounded();
+        let worker = thread::spawn(move || dispatch_loop(rx, settings, worker_status));
+
+        tx.send(Command::ManualMessage {
+            text: "temporary note".into(),
+            ttl: Some(Duration::from_millis(80)),
+        })
+        .unwrap();
+        assert_eq!(
+            receive_chatbox_input(&receiver).0,
+            "⌨️ temporary note"
+        );
+
+        // After TTL expires, with no other ASR messages, chatbox should clear.
+        assert_eq!(
+            receive_chatbox_input(&receiver).0,
+            String::new()
         );
 
         tx.send(Command::Shutdown).unwrap();

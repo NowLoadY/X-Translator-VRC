@@ -62,6 +62,8 @@ pub enum VadError {
     },
     /// At least one silence frame is required to automatically finish speech.
     InvalidSilenceFrames,
+    /// At least one speech frame is required to start speech.
+    InvalidMinSpeechFrames,
     /// At least one active-speech frame is required to bound utterance memory.
     InvalidMaxActiveFrames,
     /// Adaptive endpointing must begin within the hard active-speech limit.
@@ -103,6 +105,9 @@ impl fmt::Display for VadError {
             ),
             Self::InvalidSilenceFrames => {
                 formatter.write_str("silence_frames_to_finalize must be at least one")
+            }
+            Self::InvalidMinSpeechFrames => {
+                formatter.write_str("min_speech_frames_to_start must be at least one")
             }
             Self::InvalidMaxActiveFrames => {
                 formatter.write_str("max_active_frames must be at least one")
@@ -319,6 +324,9 @@ pub struct EndpointConfig {
     /// protects phonemes spanning the forced boundary; downstream ASR text
     /// must remove the matching prefix.
     pub max_active_overlap_frames: usize,
+    /// Consecutive speech frames required before transitioning to speech start.
+    /// Defaults to 2 (roughly 64 ms) to reject isolated transient noise spikes.
+    pub min_speech_frames_to_start: usize,
 }
 
 impl Default for EndpointConfig {
@@ -335,6 +343,7 @@ impl Default for EndpointConfig {
             // Bound uninterrupted speech at ~8 seconds with ~256 ms overlap.
             max_active_frames: 250,
             max_active_overlap_frames: 8,
+            min_speech_frames_to_start: 2,
         }
     }
 }
@@ -349,6 +358,9 @@ impl EndpointConfig {
         }
         if self.silence_frames_to_finalize == 0 {
             return Err(VadError::InvalidSilenceFrames);
+        }
+        if self.min_speech_frames_to_start == 0 {
+            return Err(VadError::InvalidMinSpeechFrames);
         }
         if self.max_active_frames == 0 {
             return Err(VadError::InvalidMaxActiveFrames);
@@ -484,6 +496,7 @@ pub struct EndpointDetector {
     config: EndpointConfig,
     pre_roll: VecDeque<Vec<i16>>,
     hard_split_overlap: VecDeque<Vec<i16>>,
+    opening_frames: usize,
     active: Option<ActiveUtterance>,
 }
 
@@ -503,6 +516,7 @@ impl EndpointDetector {
             config: config.validate()?,
             pre_roll: VecDeque::with_capacity(config.pre_roll_frames),
             hard_split_overlap: VecDeque::with_capacity(config.max_active_overlap_frames),
+            opening_frames: 0,
             active: None,
         })
     }
@@ -542,7 +556,6 @@ impl EndpointDetector {
         validate_probability(probability)?;
 
         let is_speech = probability >= self.config.speech_threshold;
-        let frame = samples.to_vec();
 
         if self.active.is_some() {
             let end_reason = {
@@ -550,7 +563,7 @@ impl EndpointDetector {
                     .active
                     .as_mut()
                     .expect("active utterance was checked above");
-                active.samples.extend_from_slice(&frame);
+                active.samples.extend_from_slice(samples);
                 active.active_frames += 1;
                 if is_speech {
                     active.trailing_silence_frames = 0;
@@ -593,38 +606,69 @@ impl EndpointDetector {
         }
 
         if !is_speech {
+            self.opening_frames = 0;
             self.hard_split_overlap.clear();
-            self.push_pre_roll(frame);
+            self.push_pre_roll(samples.to_vec());
             return Ok(EndpointEvent::Listening);
         }
 
         let overlap_frames = self.hard_split_overlap.len();
-        let pre_roll_frames = if overlap_frames == 0 {
+        if overlap_frames == 0 && self.config.min_speech_frames_to_start > 1 {
+            self.opening_frames += 1;
+            self.push_pre_roll(samples.to_vec());
+            if self.opening_frames < self.config.min_speech_frames_to_start {
+                return Ok(EndpointEvent::Listening);
+            }
+        }
+
+        let confirmed_opening_frames =
+            if overlap_frames == 0 && self.config.min_speech_frames_to_start > 1 {
+                self.opening_frames
+            } else {
+                1
+            };
+        self.opening_frames = 0;
+
+        let pre_roll_total = if overlap_frames == 0 {
             self.pre_roll.len()
         } else {
             0
         };
         let mut utterance =
-            Vec::with_capacity((pre_roll_frames + overlap_frames + 1) * FRAME_SAMPLES);
+            Vec::with_capacity((pre_roll_total + overlap_frames + 1) * FRAME_SAMPLES);
         if overlap_frames > 0 {
             for overlap_frame in self.hard_split_overlap.drain(..) {
                 utterance.extend_from_slice(&overlap_frame);
             }
             self.pre_roll.clear();
+            utterance.extend_from_slice(samples);
         } else {
             for pre_roll_frame in self.pre_roll.drain(..) {
                 utterance.extend_from_slice(&pre_roll_frame);
             }
+            if confirmed_opening_frames <= 1 {
+                utterance.extend_from_slice(samples);
+            }
         }
-        utterance.extend_from_slice(&frame);
+
+        let pre_roll_frames = if overlap_frames == 0 {
+            if confirmed_opening_frames > 1 {
+                pre_roll_total.saturating_sub(confirmed_opening_frames)
+            } else {
+                pre_roll_total
+            }
+        } else {
+            0
+        };
+
         self.active = Some(ActiveUtterance {
             samples: utterance,
             pre_roll_frames,
             overlap_frames,
-            active_frames: 1,
+            active_frames: confirmed_opening_frames,
             trailing_silence_frames: 0,
         });
-        if self.config.max_active_frames == 1 {
+        if self.config.max_active_frames <= confirmed_opening_frames {
             return Ok(EndpointEvent::Finalized(
                 self.finalize_active(UtteranceEndReason::MaxActiveFrames),
             ));
@@ -647,6 +691,7 @@ impl EndpointDetector {
     /// Calling this while listening discards only retained pre-roll, since there
     /// is no utterance to submit to ASR.
     pub fn flush(&mut self) -> Option<Utterance> {
+        self.opening_frames = 0;
         self.pre_roll.clear();
         self.hard_split_overlap.clear();
         self.active
@@ -666,6 +711,7 @@ impl EndpointDetector {
 
     /// Discards active speech and retained pre-roll without emitting an utterance.
     pub fn reset(&mut self) {
+        self.opening_frames = 0;
         self.pre_roll.clear();
         self.hard_split_overlap.clear();
         self.active = None;
@@ -745,8 +791,65 @@ mod tests {
             adaptive_silence_frames_to_finalize: silence_frames_to_finalize,
             max_active_frames,
             max_active_overlap_frames: 0,
+            min_speech_frames_to_start: 1,
         })
         .expect("test endpoint config must be valid")
+    }
+
+    #[test]
+    fn debounce_ignores_isolated_speech_frame_and_cleans_up() {
+        let mut detector = EndpointDetector::new(EndpointConfig {
+            speech_threshold: 0.5,
+            pre_roll_frames: 2,
+            silence_frames_to_finalize: 2,
+            adaptive_silence_frames_to_finalize: 2,
+            min_speech_frames_to_start: 2,
+            ..EndpointConfig::default()
+        })
+        .unwrap();
+
+        // Silence
+        assert_eq!(detector.push(&frame(1), 0.1).unwrap(), EndpointEvent::Listening);
+        // Single isolated speech frame (noise spike / breath)
+        assert_eq!(detector.push(&frame(2), 0.9).unwrap(), EndpointEvent::Listening);
+        assert_eq!(detector.state(), EndpointState::Listening);
+        // Next frame is silence again -> debounce resets
+        assert_eq!(detector.push(&frame(3), 0.1).unwrap(), EndpointEvent::Listening);
+        assert_eq!(detector.state(), EndpointState::Listening);
+        // No utterance was started, so flush returns None
+        assert_eq!(detector.flush(), None);
+    }
+
+    #[test]
+    fn debounce_preserves_audio_and_starts_speech_when_confirmed() {
+        let mut detector = EndpointDetector::new(EndpointConfig {
+            speech_threshold: 0.5,
+            pre_roll_frames: 4,
+            silence_frames_to_finalize: 2,
+            adaptive_silence_frames_to_finalize: 2,
+            min_speech_frames_to_start: 2,
+            ..EndpointConfig::default()
+        })
+        .unwrap();
+
+        // 2 frames of pre-roll silence
+        assert_eq!(detector.push(&frame(10), 0.1).unwrap(), EndpointEvent::Listening);
+        assert_eq!(detector.push(&frame(20), 0.1).unwrap(), EndpointEvent::Listening);
+        // Frame 1 of speech -> debounce buffering
+        assert_eq!(detector.push(&frame(30), 0.9).unwrap(), EndpointEvent::Listening);
+        assert_eq!(detector.state(), EndpointState::Listening);
+        // Frame 2 of speech -> confirmed start!
+        assert_eq!(detector.push(&frame(40), 0.9).unwrap(), EndpointEvent::SpeechStarted);
+        assert_eq!(detector.state(), EndpointState::Speaking { trailing_silence_frames: 0 });
+
+        let utterance = detector.flush().unwrap();
+        // Utterance contains: [10 (silence), 20 (silence), 30 (speech frame 1), 40 (speech frame 2)]
+        assert_eq!(utterance.frame_count(), 4);
+        assert_eq!(utterance.pre_roll_frames, 2);
+        assert_eq!(utterance.samples[0], 10);
+        assert_eq!(utterance.samples[FRAME_SAMPLES], 20);
+        assert_eq!(utterance.samples[FRAME_SAMPLES * 2], 30);
+        assert_eq!(utterance.samples[FRAME_SAMPLES * 3], 40);
     }
 
     #[test]
@@ -961,6 +1064,7 @@ mod tests {
             pre_roll_frames: 0,
             max_active_frames: 10,
             max_active_overlap_frames: 0,
+            min_speech_frames_to_start: 1,
         })
         .unwrap();
 
@@ -988,6 +1092,7 @@ mod tests {
             pre_roll_frames: 0,
             max_active_frames: 16,
             max_active_overlap_frames: 0,
+            min_speech_frames_to_start: 1,
         };
         assert_eq!(config.silence_frames_to_finalize_for(100), 2);
 
@@ -1016,6 +1121,7 @@ mod tests {
             pre_roll_frames: 2,
             max_active_frames: 4,
             max_active_overlap_frames: 2,
+            min_speech_frames_to_start: 1,
         };
         let mut detector = EndpointDetector::new(config).unwrap();
         for value in 1..4 {
@@ -1057,6 +1163,7 @@ mod tests {
             pre_roll_frames: 1,
             max_active_frames: 100,
             max_active_overlap_frames: 2,
+            min_speech_frames_to_start: 1,
         };
         let mut detector = EndpointDetector::new(config).unwrap();
         detector.push(&frame(0), 0.1).unwrap(); // populate pre_roll

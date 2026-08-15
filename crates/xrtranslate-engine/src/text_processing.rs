@@ -75,12 +75,12 @@ fn split_translation_segments_internal(text: &str, emit_unterminated: bool) -> V
     segments
 }
 
-/// Collapses only obvious adjacent ASR repetitions across all alphabetic and CJK scripts.
+/// Collapses only obvious adjacent ASR repetitions across all alphabetic and CJK scripts,
+/// and merges split English words and subwords created across chunk boundaries or ASR tokenization.
 ///
 /// The transformation is repeated until stable: adjacent words (case-insensitively across
 /// alphabetic scripts), punctuation-separated CJK phrases, repeated short CJK phrases,
-/// and a set of repeated CJK stutter characters are collapsed. Non-adjacent repeated
-/// words are retained.
+/// repeated CJK stutter characters, and split subword fragments are collapsed.
 pub fn remove_asr_stutters(text: &str) -> String {
     let mut value = text.trim().to_owned();
     if value.is_empty() {
@@ -93,6 +93,7 @@ pub fn remove_asr_stutters(text: &str) -> String {
         value = collapse_matches(&value, repeated_cjk_phrase_end);
         value = collapse_matches(&value, repeated_cjk_short_phrase_end);
         value = collapse_matches(&value, repeated_cjk_stutter_character_end);
+        value = collapse_asr_split_words(&value);
         if value == previous {
             return value.trim().to_owned();
         }
@@ -107,19 +108,65 @@ pub fn remove_asr_stutters(text: &str) -> String {
 /// more characters. This avoids deleting intentional short repetitions such
 /// as "yes, yes" while still handling a split through a distinctive word.
 pub fn remove_transcript_overlap(previous: &str, current: &str) -> String {
+    let previous_cleaned = collapse_asr_split_words(previous);
+    let current_cleaned = collapse_asr_split_words(current);
+    let previous = &previous_cleaned;
+    let current = &current_cleaned;
+
     let previous_tokens = overlap_tokens(previous);
     let current_tokens = overlap_tokens(current);
     let maximum = previous_tokens.len().min(current_tokens.len()).min(24);
     let matched = (1..=maximum).rev().find(|&count| {
         let left = &previous_tokens[previous_tokens.len() - count..];
         let right = &current_tokens[..count];
-        left.iter()
+        let exact_match = left.iter()
             .zip(right)
-            .all(|(left, right)| left.normalized == right.normalized)
-            && (count >= 2
-                || left
-                    .first()
-                    .is_some_and(|token| token.normalized.chars().count() >= 4))
+            .all(|(left, right)| left.normalized == right.normalized);
+        if exact_match {
+            if count >= 2 {
+                return true;
+            }
+            if let Some(token) = left.first() {
+                let is_cjk = token.normalized.chars().any(is_content_cjk_or_kana)
+                    || token.normalized.chars().any(is_hangul);
+                if is_cjk || current_tokens.len() == 1 || token.normalized.chars().count() >= 4 {
+                    return true;
+                }
+            }
+        }
+
+        // Subword / concatenated match
+        let left_concat: String = left.iter().map(|token| token.normalized.as_str()).collect();
+        let right_concat: String = right.iter().map(|token| token.normalized.as_str()).collect();
+        if left_concat == right_concat && (left_concat.chars().count() >= 4 || count >= 2) {
+            return true;
+        }
+
+        // Trailing prefix match (previous ended with partial word, current completed it)
+        if left.len() == right.len() && count >= 1 {
+            let prefix_matches = if count > 1 {
+                left[..count - 1]
+                    .iter()
+                    .zip(&right[..count - 1])
+                    .all(|(l, r)| l.normalized == r.normalized)
+            } else {
+                true
+            };
+            if prefix_matches {
+                let last_left = &left[count - 1].normalized;
+                let last_right = &right[count - 1].normalized;
+                if last_right.starts_with(last_left) {
+                    let remainder = &last_right[last_left.len()..];
+                    if (count >= 2 && last_left.len() >= 2)
+                        || last_left.len() >= 4
+                        || is_split_word_pair(last_left, remainder)
+                    {
+                        return true;
+                    }
+                }
+            }
+        }
+        false
     });
     let Some(matched) = matched else {
         return current.trim().to_owned();
@@ -579,6 +626,362 @@ fn is_content_cjk_or_kana(character: char) -> bool {
     )
 }
 
+/// Returns true if two adjacent alphabetic words should be collapsed into a single word.
+pub fn is_split_word_pair(left: &str, right: &str) -> bool {
+    let l = left.to_lowercase();
+    let r = right.to_lowercase();
+    if l.is_empty() || r.is_empty() {
+        return false;
+    }
+    if !l.chars().all(|c| c.is_alphabetic()) || !r.chars().all(|c| c.is_alphabetic()) {
+        return false;
+    }
+
+    // 1. Non-standalone suffixes attaching to stems of length >= 2
+    if l.len() >= 2 {
+        match r.as_str() {
+            "ly" | "ing" | "ed" | "ment" | "tion" | "sion" | "ness" | "ible" | "able" | "ful"
+            | "less" | "ity" | "ive" | "ty" | "teen" | "th" | "eth" | "ward" | "wards" | "ship"
+            | "hood" | "ize" | "ise" | "ate" => return true,
+            "es" | "s" => {
+                if !matches!(
+                    l.as_str(),
+                    "he" | "she" | "it" | "that" | "what" | "who" | "let" | "there"
+                ) {
+                    return true;
+                }
+            }
+            "er" | "est" => {
+                if matches!(
+                    l.as_str(),
+                    "fast" | "slow" | "high" | "low" | "big" | "bigg" | "small" | "larg" | "great"
+                        | "bett" | "furth" | "earli" | "lat" | "long" | "short" | "old" | "young"
+                        | "new" | "hard" | "easi" | "clear" | "simpl" | "strong" | "smart" | "cool"
+                        | "warm" | "deep" | "rich" | "poor" | "tall" | "quick" | "dark" | "bright"
+                        | "hot" | "hott" | "cold" | "clean" | "fresh" | "tough" | "rough" | "light"
+                        | "heavi" | "wid" | "saf" | "fin" | "nic" | "clos"
+                ) {
+                    return true;
+                }
+            }
+            _ => {}
+        }
+    }
+
+    // 2. Multi-part compound words & common split phrases
+    match (l.as_str(), r.as_str()) {
+        ("can", "not")
+        | ("every", "thing")
+        | ("some", "thing")
+        | ("any", "thing")
+        | ("no", "thing")
+        | ("every", "one")
+        | ("some", "one")
+        | ("any", "one")
+        | ("every", "body")
+        | ("some", "body")
+        | ("any", "body")
+        | ("no", "body")
+        | ("every", "where")
+        | ("some", "where")
+        | ("any", "where")
+        | ("no", "where")
+        | ("with", "out")
+        | ("with", "in")
+        | ("in", "side")
+        | ("out", "side")
+        | ("where", "ever")
+        | ("what", "ever")
+        | ("when", "ever")
+        | ("how", "ever")
+        | ("who", "ever")
+        | ("which", "ever")
+        | ("my", "self")
+        | ("your", "self")
+        | ("him", "self")
+        | ("her", "self")
+        | ("it", "self")
+        | ("one", "self")
+        | ("our", "selves")
+        | ("your", "selves")
+        | ("them", "selves")
+        | ("any", "way")
+        | ("any", "more")
+        | ("some", "times")
+        | ("some", "time")
+        | ("some", "how")
+        | ("some", "what")
+        | ("any", "how")
+        | ("over", "all")
+        | ("there", "fore")
+        | ("where", "as")
+        | ("where", "by")
+        | ("where", "in")
+        | ("mean", "while")
+        | ("never", "theless")
+        | ("none", "theless")
+        | ("never", "the")
+        | ("none", "the")
+        | ("al", "though")
+        | ("al", "ready")
+        | ("al", "together")
+        | ("al", "most")
+        | ("al", "ways")
+        | ("al", "so")
+        | ("to", "gether")
+        | ("be", "cause")
+        | ("be", "come")
+        | ("be", "came")
+        | ("be", "comes")
+        | ("be", "coming")
+        | ("be", "fore")
+        | ("be", "forehand")
+        | ("be", "hind")
+        | ("be", "low")
+        | ("be", "tween")
+        | ("be", "yond")
+        | ("be", "sides")
+        | ("to", "day")
+        | ("to", "night")
+        | ("to", "morrow")
+        | ("under", "stand")
+        | ("under", "standing")
+        | ("under", "stood")
+        | ("reinforce", "ment")
+        | ("rein", "forcement")
+        | ("rein", "force")
+        | ("down", "load")
+        | ("up", "load")
+        | ("up", "date")
+        | ("up", "grade")
+        | ("out", "put")
+        | ("in", "put")
+        | ("feed", "back")
+        | ("data", "base")
+        | ("data", "set")
+        | ("pass", "word")
+        | ("key", "board")
+        | ("on", "line")
+        | ("off", "line")
+        | ("back", "end")
+        | ("front", "end")
+        | ("life", "time")
+        | ("time", "line")
+        | ("note", "book")
+        | ("screen", "shot")
+        | ("time", "stamp")
+        | ("work", "place")
+        | ("work", "space")
+        | ("work", "flow")
+        | ("work", "load")
+        | ("net", "work")
+        | ("frame", "work")
+        | ("gate", "way")
+        | ("hard", "ware")
+        | ("soft", "ware")
+        | ("firm", "ware")
+        | ("middle", "ware")
+        | ("sound", "track")
+        | ("voice", "print")
+        | ("speech", "to")
+        | ("text", "to")
+        | ("in", "to")
+        | ("on", "to")
+        | ("up", "on") => return true,
+        _ => {}
+    }
+
+    // 3. Common prefixes
+    match l.as_str() {
+        "un" => matches!(
+            r.as_str(),
+            "able"
+                | "known"
+                | "certain"
+                | "expected"
+                | "fortunate"
+                | "fortunately"
+                | "necessary"
+                | "usual"
+                | "available"
+                | "limited"
+                | "defined"
+                | "der"
+                | "derstand"
+                | "derstanding"
+                | "derstood"
+                | "clear"
+                | "safe"
+                | "true"
+                | "real"
+                | "happy"
+                | "fair"
+                | "like"
+                | "equal"
+                | "easy"
+                | "even"
+                | "official"
+                | "stable"
+                | "sure"
+                | "wanted"
+                | "used"
+                | "touched"
+        ),
+        "re" => matches!(
+            r.as_str(),
+            "inforce"
+                | "inforcement"
+                | "view"
+                | "turn"
+                | "start"
+                | "cognition"
+                | "cognize"
+                | "peat"
+                | "place"
+                | "quire"
+                | "cover"
+                | "covery"
+                | "lease"
+                | "move"
+                | "main"
+                | "member"
+                | "mind"
+                | "port"
+                | "quest"
+                | "set"
+                | "solve"
+                | "sult"
+                | "sume"
+                | "tain"
+                | "vise"
+                | "vision"
+                | "build"
+                | "create"
+                | "write"
+                | "read"
+                | "load"
+                | "play"
+                | "order"
+                | "group"
+                | "name"
+                | "fresh"
+                | "open"
+                | "send"
+                | "try"
+        ),
+        "dis" => matches!(
+            r.as_str(),
+            "connect"
+                | "appear"
+                | "cover"
+                | "play"
+                | "able"
+                | "agree"
+                | "card"
+                | "charge"
+                | "cuss"
+                | "cussion"
+                | "order"
+                | "place"
+                | "prove"
+                | "tance"
+                | "tinct"
+                | "close"
+                | "count"
+                | "like"
+                | "miss"
+                | "mount"
+                | "trust"
+        ),
+        "inter" => matches!(
+            r.as_str(),
+            "net" | "face" | "action" | "national" | "active" | "val" | "view" | "sect" | "nal"
+        ),
+        "sub" => matches!(
+            r.as_str(),
+            "agent" | "script" | "title" | "titles" | "system" | "set" | "string" | "ject" | "mit"
+        ),
+        "non" => r.len() >= 3,
+        _ => false,
+    }
+}
+
+/// Collapses split English words and subwords created across chunk boundaries or ASR tokenization.
+pub fn collapse_asr_split_words(text: &str) -> String {
+    let text = text.trim();
+    if text.is_empty() {
+        return String::new();
+    }
+
+    let mut result = text.to_owned();
+    loop {
+        let previous = result.clone();
+        result = collapse_split_word_pass(&previous);
+        if result == previous {
+            break;
+        }
+    }
+    result
+}
+
+fn collapse_split_word_pass(text: &str) -> String {
+    let characters: Vec<char> = text.chars().collect();
+    let mut collapsed = Vec::with_capacity(characters.len());
+    let mut i = 0;
+    while i < characters.len() {
+        if is_word_re_character(characters[i]) {
+            let w1_start = i;
+            while i < characters.len() && is_word_re_character(characters[i]) {
+                i += 1;
+            }
+            let w1_end = i;
+            let w1: String = characters[w1_start..w1_end].iter().collect();
+
+            // Check what follows w1
+            let ws_start = i;
+            while i < characters.len() && characters[i].is_whitespace() {
+                i += 1;
+            }
+            let ws_end = i;
+
+            if ws_end > ws_start && i < characters.len() && is_word_re_character(characters[i]) {
+                let w2_start = i;
+                while i < characters.len() && is_word_re_character(characters[i]) {
+                    i += 1;
+                }
+                let w2_end = i;
+                let w2: String = characters[w2_start..w2_end].iter().collect();
+
+                if is_split_word_pair(&w1, &w2) {
+                    let merged = merge_word_casing(&w1, &w2);
+                    collapsed.extend(merged.chars());
+                    continue;
+                } else {
+                    collapsed.extend(&characters[w1_start..ws_end]);
+                    i = w2_start;
+                    continue;
+                }
+            } else {
+                collapsed.extend(&characters[w1_start..ws_end]);
+                continue;
+            }
+        } else {
+            collapsed.push(characters[i]);
+            i += 1;
+        }
+    }
+    collapsed.into_iter().collect()
+}
+
+fn merge_word_casing(w1: &str, w2: &str) -> String {
+    let all_caps = w1.chars().all(char::is_uppercase) && w2.chars().all(char::is_uppercase);
+    if all_caps {
+        format!("{}{}", w1, w2.to_uppercase())
+    } else {
+        format!("{}{}", w1, w2.to_lowercase())
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -613,6 +1016,22 @@ mod tests {
         assert_eq!(
             remove_transcript_overlap("今天我们去公园", "去公园然后吃饭"),
             "然后吃饭"
+        );
+        assert_eq!(
+            remove_transcript_overlap("今天天气真好", "好"),
+            ""
+        );
+        assert_eq!(
+            remove_transcript_overlap("今日はいい天気ですね", "ね"),
+            ""
+        );
+        assert_eq!(
+            remove_transcript_overlap("ありがとうございます", "す"),
+            ""
+        );
+        assert_eq!(
+            remove_transcript_overlap("I saw a dog", "dog"),
+            ""
         );
         assert_eq!(
             remove_transcript_overlap("yes", "yes, yes we can"),
@@ -712,4 +1131,66 @@ mod tests {
             vec!["ascii colon:"]
         );
     }
+
+    #[test]
+    fn collapses_split_english_words_and_subwords() {
+        assert_eq!(
+            collapse_asr_split_words("worked real ly well"),
+            "worked really well"
+        );
+        assert_eq!(
+            collapse_asr_split_words("So, literally, what reinforcement learning does is it goes to the ones that worked real ly well."),
+            "So, literally, what reinforcement learning does is it goes to the ones that worked really well."
+        );
+        assert_eq!(
+            collapse_asr_split_words("reinforce ment learn ing"),
+            "reinforcement learning"
+        );
+        assert_eq!(
+            collapse_asr_split_words("nine ty-seven"),
+            "ninety-seven"
+        );
+        assert_eq!(
+            collapse_asr_split_words("every thing can not be done with out you"),
+            "everything cannot be done without you"
+        );
+        assert_eq!(
+            collapse_asr_split_words("un der stand ing"),
+            "understanding"
+        );
+        assert_eq!(
+            collapse_asr_split_words("REAL LY GOOD"),
+            "REALLY GOOD"
+        );
+        assert_eq!(
+            collapse_asr_split_words("Real ly Good"),
+            "Really Good"
+        );
+    }
+
+    #[test]
+    fn removes_transcript_overlap_with_split_and_partial_words() {
+        assert_eq!(
+            remove_transcript_overlap(
+                "So it worked real",
+                "really well, then we left."
+            ),
+            "well, then we left."
+        );
+        assert_eq!(
+            remove_transcript_overlap(
+                "the ones that worked real ly",
+                "really well, and then we turned."
+            ),
+            "well, and then we turned."
+        );
+        assert_eq!(
+            remove_transcript_overlap(
+                "reinforce ment",
+                "reinforcement learning"
+            ),
+            "learning"
+        );
+    }
 }
+

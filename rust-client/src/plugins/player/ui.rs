@@ -3,11 +3,9 @@ use super::{
     controller::{VideoPlayerController, VideoPlayerRoute},
     i18n::tr,
     PlayerTranslationRequest, VideoPlayerAction, VideoPlayerPlugin, VideoPlayerUiSnapshot,
-    VideoSubtitleMode,
 };
 use crate::ui::components;
 use eframe::egui::{self, Color32, CornerRadius, Frame, Margin, Stroke};
-use std::path::PathBuf;
 
 pub fn render(
     plugin: &mut VideoPlayerPlugin,
@@ -196,31 +194,7 @@ fn render_library(
 
     if let Some(task) = task_to_play {
         if let Ok(_) = controller.play_task(&task.id) {
-            if task.subtitle_mode == VideoSubtitleMode::RealtimeTranslation {
-                match &task.source {
-                    super::backend::MediaSource::LocalFile(path) => {
-                        action = VideoPlayerAction::StartTranslation(
-                            PlayerTranslationRequest::ImportMediaFile {
-                                path: path.clone(),
-                                source_language: task.source_language,
-                                target_language: task.target_language,
-                                recognition: task.recognition.clone(),
-                            },
-                        );
-                    }
-                    super::backend::MediaSource::NetworkStream(_) => {
-                        action = VideoPlayerAction::StartTranslation(
-                            PlayerTranslationRequest::LiveStream {
-                                source_language: task.source_language,
-                                target_language: task.target_language,
-                                recognition: task.recognition.clone(),
-                            },
-                        );
-                    }
-                }
-            } else {
-                action = VideoPlayerAction::StopTranslation;
-            }
+            action = VideoPlayerAction::None;
         }
     }
 
@@ -288,24 +262,11 @@ fn render_create(
 
                     ui.horizontal(|ui| {
                         let text_width = (ui.available_width() - 95.0).max(100.0);
-                        let response = ui.add(
+                        ui.add(
                             egui::TextEdit::singleline(&mut controller.draft_source)
                                 .hint_text(tr(language, "Enter stream URL or choose local file..."))
                                 .desired_width(text_width),
                         );
-
-                        if response.changed() && controller.draft_title.trim().is_empty() {
-                            let text = controller.draft_source.trim();
-                            if !text.starts_with("http://")
-                                && !text.starts_with("https://")
-                                && !text.starts_with("rtsp://")
-                                && !text.starts_with("rtmp://")
-                            {
-                                if let Some(filename) = std::path::Path::new(text).file_name() {
-                                    controller.draft_title = filename.to_string_lossy().to_string();
-                                }
-                            }
-                        }
 
                         if components::primary_button(ui, tr(language, "Browse...")).clicked() {
                             if let Some(path) = rfd::FileDialog::new()
@@ -313,13 +274,6 @@ fn render_create(
                                 .add_filter("Audio Files", &["mp3", "wav", "flac", "aac", "ogg", "m4a"])
                                 .pick_file()
                             {
-                                let file_title = path
-                                    .file_name()
-                                    .map(|s| s.to_string_lossy().to_string())
-                                    .unwrap_or_default();
-                                if controller.draft_title.trim().is_empty() {
-                                    controller.draft_title = file_title;
-                                }
                                 controller.draft_source = path.to_string_lossy().to_string();
                             }
                         }
@@ -342,212 +296,14 @@ fn render_create(
                             .desired_width(ui.available_width()),
                     );
 
-                    ui.add_space(16.0);
-                    ui.separator();
-                    ui.add_space(16.0);
-
-                    ui.horizontal(|ui| {
-                        ui.vertical(|ui| {
-                            ui.label(
-                                egui::RichText::new(tr(language, "Spoken language"))
-                                    .strong()
-                                    .color(crate::ui::theme::text_strong()),
-                            );
-                            ui.add_space(4.0);
-
-                            let mut source_options = vec![(
-                                "auto".to_string(),
-                                tr(language, "Auto (bidirectional)").to_string(),
-                            )];
-                            for (code, label) in crate::LANGUAGE_OPTIONS {
-                                source_options.push((
-                                    (*code).to_string(),
-                                    tr(language, label).to_string(),
-                                ));
-                            }
-
-                            if components::searchable_combobox(
-                                ui,
-                                "video_source_lang",
-                                crate::language_label(language, &controller.draft_source_lang),
-                                &mut controller.draft_source_lang,
-                                &source_options,
-                            ) && controller.draft_source_lang != "auto"
-                                && controller.draft_target_lang == controller.draft_source_lang
-                            {
-                                controller.draft_target_lang = if controller.draft_source_lang == "zh" {
-                                    "en".to_string()
-                                } else {
-                                    "zh".to_string()
-                                };
-                            }
-                        });
-
-                        ui.add_space(24.0);
-
-                        ui.vertical(|ui| {
-                            ui.label(
-                                egui::RichText::new(tr(language, "Translation language"))
-                                    .strong()
-                                    .color(crate::ui::theme::text_strong()),
-                            );
-                            ui.add_space(4.0);
-
-                            components::target_language_pair_selector(
-                                ui,
-                                "video_create",
-                                &controller.draft_source_lang,
-                                &mut controller.draft_target_lang,
-                                language,
-                                |code, lang| crate::language_label(lang, code).to_string(),
-                            );
-                        });
-                    });
-
-                    ui.add_space(16.0);
-                    ui.separator();
-                    ui.add_space(16.0);
-
-                    ui.label(
-                        egui::RichText::new(tr(language, "Subtitle Mode"))
-                            .size(15.0)
-                            .strong()
-                            .color(crate::ui::theme::text_strong()),
-                    );
-                    ui.add_space(8.0);
-
-                    let mut mode_idx = match controller.draft_subtitle_mode {
-                        VideoSubtitleMode::RealtimeTranslation => 0,
-                        VideoSubtitleMode::ImportedSrt(_) => 1,
-                        VideoSubtitleMode::None => 2,
-                    };
-
-                    ui.horizontal(|ui| {
-                        if ui.radio_value(&mut mode_idx, 0, tr(language, "Realtime Audio Translation")).clicked() {
-                            controller.draft_subtitle_mode = VideoSubtitleMode::RealtimeTranslation;
-                        }
-                        ui.add_space(12.0);
-                        if ui.radio_value(&mut mode_idx, 1, tr(language, "Import Existing SRT Subtitles")).clicked() {
-                            controller.draft_subtitle_mode = VideoSubtitleMode::ImportedSrt(PathBuf::new());
-                        }
-                        ui.add_space(12.0);
-                        if ui.radio_value(&mut mode_idx, 2, tr(language, "No Subtitles")).clicked() {
-                            controller.draft_subtitle_mode = VideoSubtitleMode::None;
-                        }
-                    });
-
-                    if let VideoSubtitleMode::ImportedSrt(path) = &mut controller.draft_subtitle_mode {
-                        ui.add_space(8.0);
-                        ui.horizontal(|ui| {
-                            let path_str = path.to_string_lossy().to_string();
-                            ui.add(
-                                egui::TextEdit::singleline(&mut path_str.as_str())
-                                    .desired_width((ui.available_width() - 110.0).max(100.0))
-                                    .interactive(false),
-                            );
-                            if components::primary_button(ui, tr(language, "Choose SRT...")).clicked() {
-                                if let Some(srt_file) = rfd::FileDialog::new()
-                                    .add_filter("SRT Subtitles", &["srt"])
-                                    .pick_file()
-                                {
-                                    *path = srt_file;
-                                }
-                            }
-                        });
-                    }
-
-                    if controller.draft_subtitle_mode == VideoSubtitleMode::RealtimeTranslation {
-                        ui.add_space(16.0);
-                        ui.separator();
-                        ui.add_space(16.0);
-
-                        ui.label(
-                            egui::RichText::new(tr(language, "Recognition Settings"))
-                                .size(15.0)
-                                .strong()
-                                .color(crate::ui::theme::text_strong()),
-                        );
-                        ui.add_space(8.0);
-
-                        let recognize_when = tr(language, "Recognize when:");
-                        let speak = tr(language, "Speak");
-                        let always = tr(language, "Always");
-                        let vad_sensitivity = tr(language, "VAD Sensitivity");
-                        let pause_tolerance = tr(language, "Pause tolerance");
-
-                        ui.horizontal(|ui| {
-                            ui.label(
-                                egui::RichText::new(recognize_when)
-                                    .strong()
-                                    .color(crate::ui::theme::text_strong()),
-                            );
-                            egui::ComboBox::from_id_salt("video_draft_recognition_timing")
-                                .selected_text(if controller.draft_recognition.continuous_recognition {
-                                    always
-                                } else {
-                                    speak
-                                })
-                                .show_ui(ui, |ui| {
-                                    ui.selectable_value(&mut controller.draft_recognition.continuous_recognition, false, speak);
-                                    ui.selectable_value(&mut controller.draft_recognition.continuous_recognition, true, always);
-                                });
-                        });
-
-                        ui.add_space(8.0);
-
-                        components::modern_slider_f32(
-                            ui,
-                            &mut controller.draft_recognition.background_noise,
-                            0.05..=0.8,
-                            0.15,
-                            vad_sensitivity,
-                            &[],
-                        );
-
-                        if !controller.draft_recognition.continuous_recognition {
-                            ui.add_space(8.0);
-                            components::modern_slider_f32(
-                                ui,
-                                &mut controller.draft_recognition.pause_tolerance,
-                                0.0..=1.0,
-                                0.5,
-                                pause_tolerance,
-                                &[],
-                            );
-                        }
-                    }
-
                     ui.add_space(20.0);
 
                     ui.horizontal(|ui| {
-                        if components::primary_button(ui, tr(language, "Start Playback")).clicked() {
+                        if components::primary_button(ui, tr(language, "Create & Play")).clicked() {
                             match controller.start_draft_task() {
-                                Ok(task_id) => {
-                                    if let Some(task) = controller.store.get(&task_id) {
-                                        if task.subtitle_mode == VideoSubtitleMode::RealtimeTranslation {
-                                            match &task.source {
-                                                super::backend::MediaSource::LocalFile(path) => {
-                                                    action = VideoPlayerAction::StartTranslation(
-                                                        PlayerTranslationRequest::ImportMediaFile {
-                                                            path: path.clone(),
-                                                            source_language: task.source_language.clone(),
-                                                            target_language: task.target_language.clone(),
-                                                            recognition: task.recognition.clone(),
-                                                        },
-                                                    );
-                                                }
-                                                super::backend::MediaSource::NetworkStream(_) => {
-                                                    action = VideoPlayerAction::StartTranslation(
-                                                        PlayerTranslationRequest::LiveStream {
-                                                            source_language: task.source_language.clone(),
-                                                            target_language: task.target_language.clone(),
-                                                            recognition: task.recognition.clone(),
-                                                        },
-                                                    );
-                                                }
-                                            }
-                                        }
-                                    }
+                                Ok(_) => {
+                                    controller.error = None;
+                                    action = VideoPlayerAction::None;
                                 }
                                 Err(e) => {
                                     controller.error = Some(e);
@@ -575,6 +331,12 @@ fn render_player(
     ui: &mut egui::Ui,
 ) -> VideoPlayerAction {
     let mut action = VideoPlayerAction::None;
+
+    // Handle ESC key to exit fullscreen
+    if controller.fullscreen_mode && ui.input(|i| i.key_pressed(egui::Key::Escape)) {
+        controller.fullscreen_mode = false;
+        ui.ctx().send_viewport_cmd(egui::ViewportCommand::Fullscreen(false));
+    }
 
     if !controller.fullscreen_mode {
         ui.horizontal(|ui| {
@@ -628,13 +390,442 @@ fn render_player(
         ui.add_space(10.0);
     }
 
-    egui::ScrollArea::vertical()
-        .auto_shrink([false, false])
-        .show(ui, |ui| {
-            render_viewport_card(controller, language, ui);
-            render_subtitles_card(controller, language, ui);
-            ui.add_space(16.0);
+    if controller.fullscreen_mode {
+        render_viewport_card(controller, language, ui);
+    } else {
+        egui::ScrollArea::vertical()
+            .auto_shrink([false, false])
+            .show(ui, |ui| {
+                render_viewport_card(controller, language, ui);
+                let task_action = render_task_control_card(controller, language, ui);
+                if task_action != VideoPlayerAction::None {
+                    action = task_action;
+                }
+                render_subtitles_card(controller, language, ui);
+                ui.add_space(16.0);
+            });
+    }
+
+    action
+}
+
+fn render_task_control_card(
+    controller: &mut VideoPlayerController,
+    language: crate::i18n::UiLanguage,
+    ui: &mut egui::Ui,
+) -> VideoPlayerAction {
+    let mut action = VideoPlayerAction::None;
+
+    if controller.fullscreen_mode {
+        return action;
+    }
+
+    let Some(active_id) = controller.active_task_id.clone() else {
+        return action;
+    };
+
+    let Some(task) = controller.store.get_mut(&active_id) else {
+        return action;
+    };
+
+    let mut routing_changed = false;
+    let mut task_settings_changed = false;
+    let mut do_start = false;
+    let mut do_pause = false;
+    let mut do_restart = false;
+
+    ui.add_space(10.0);
+
+    components::card(ui, |ui| {
+        ui.vertical(|ui| {
+            // Header: Task Status and Start / Pause / Restart Buttons
+            ui.horizontal(|ui| {
+                ui.label(
+                    egui::RichText::new(tr(language, "Task Configuration"))
+                        .size(16.0)
+                        .strong()
+                        .color(crate::ui::theme::text_strong()),
+                );
+
+                ui.add_space(8.0);
+
+                if task.is_task_running {
+                    Frame::new()
+                        .fill(Color32::from_rgb(220, 252, 231))
+                        .corner_radius(CornerRadius::same(6))
+                        .inner_margin(Margin::symmetric(8, 2))
+                        .show(ui, |ui| {
+                            ui.label(
+                                egui::RichText::new(format!("● {}", tr(language, "Running")))
+                                    .size(11.5)
+                                    .color(Color32::from_rgb(22, 101, 52))
+                                    .strong(),
+                            );
+                        });
+                } else {
+                    Frame::new()
+                        .fill(Color32::from_rgb(241, 245, 249))
+                        .corner_radius(CornerRadius::same(6))
+                        .inner_margin(Margin::symmetric(8, 2))
+                        .show(ui, |ui| {
+                            ui.label(
+                                egui::RichText::new(format!("○ {}", tr(language, "Idle / Ready")))
+                                    .size(11.5)
+                                    .color(crate::ui::theme::text_weak()),
+                            );
+                        });
+                }
+
+                ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                    if components::animated_button(ui, tr(language, "Clear & Restart")).clicked() {
+                        do_restart = true;
+                    }
+
+                    ui.add_space(6.0);
+
+                    if task.is_task_running {
+                        if components::animated_button(ui, tr(language, "Pause Task")).clicked() {
+                            do_pause = true;
+                        }
+                    } else {
+                        if components::primary_button(ui, tr(language, "Start Task")).clicked() {
+                            do_start = true;
+                        }
+                    }
+                });
+            });
+
+            ui.add_space(10.0);
+            ui.separator();
+            ui.add_space(6.0);
+
+            let config_summary = format!(
+                "{} → {} | VAD: {:.2} | Pause: {:.2}s",
+                crate::language_label(language, &task.source_language),
+                crate::language_label(language, &task.target_language),
+                task.recognition.background_noise,
+                task.recognition.pause_tolerance
+            );
+
+            egui::CollapsingHeader::new(
+                egui::RichText::new(format!(
+                    "⚙ {} ({})",
+                    tr(language, "Recognition Settings"),
+                    config_summary
+                ))
+                .size(13.0)
+                .color(crate::ui::theme::text_weak()),
+            )
+            .default_open(!task.is_task_running)
+            .show(ui, |ui| {
+                ui.add_space(6.0);
+
+                // Spoken & Translation Languages, VAD
+                ui.horizontal(|ui| {
+                    ui.vertical(|ui| {
+                        ui.label(
+                            egui::RichText::new(tr(language, "Spoken language"))
+                                .size(12.5)
+                                .strong()
+                                .color(crate::ui::theme::text_strong()),
+                        );
+                        ui.add_space(4.0);
+
+                        let mut source_options = vec![(
+                            "auto".to_string(),
+                            tr(language, "Auto (bidirectional)").to_string(),
+                        )];
+                        for (code, label) in crate::LANGUAGE_OPTIONS {
+                            source_options.push((
+                                (*code).to_string(),
+                                tr(language, label).to_string(),
+                            ));
+                        }
+
+                        if components::searchable_combobox(
+                            ui,
+                            "video_player_source_lang",
+                            crate::language_label(language, &task.source_language),
+                            &mut task.source_language,
+                            &source_options,
+                        ) {
+                            task_settings_changed = true;
+                            if task.source_language != "auto" && task.target_language == task.source_language {
+                                task.target_language = if task.source_language == "zh" {
+                                    "en".to_string()
+                                } else {
+                                    "zh".to_string()
+                                };
+                            }
+                        }
+                    });
+
+                    ui.add_space(20.0);
+
+                    ui.vertical(|ui| {
+                        ui.label(
+                            egui::RichText::new(tr(language, "Translation language"))
+                                .size(12.5)
+                                .strong()
+                                .color(crate::ui::theme::text_strong()),
+                        );
+                        ui.add_space(4.0);
+
+                        if components::target_language_pair_selector(
+                            ui,
+                            "video_player_target_lang",
+                            &task.source_language,
+                            &mut task.target_language,
+                            language,
+                            |code, lang| crate::language_label(lang, code).to_string(),
+                        ) {
+                            task_settings_changed = true;
+                        }
+                    });
+
+                    ui.add_space(20.0);
+
+                    ui.vertical(|ui| {
+                        ui.label(
+                            egui::RichText::new(tr(language, "VAD Sensitivity"))
+                                .size(12.5)
+                                .strong()
+                                .color(crate::ui::theme::text_strong()),
+                        );
+                        ui.add_space(4.0);
+                        let mut noise = task.recognition.background_noise;
+                        if ui.add(egui::Slider::new(&mut noise, 0.05..=0.8).show_value(true)).changed() {
+                            task.recognition.background_noise = noise;
+                            task_settings_changed = true;
+                        }
+                    });
+
+                    ui.add_space(20.0);
+
+                    ui.vertical(|ui| {
+                        ui.label(
+                            egui::RichText::new(tr(language, "Pause tolerance"))
+                                .size(12.5)
+                                .strong()
+                                .color(crate::ui::theme::text_strong()),
+                        );
+                        ui.add_space(4.0);
+                        let mut pause = task.recognition.pause_tolerance;
+                        if ui.add(egui::Slider::new(&mut pause, 0.0..=1.0).show_value(true)).changed() {
+                            task.recognition.pause_tolerance = pause;
+                            task_settings_changed = true;
+                        }
+                    });
+                });
+
+                ui.add_space(14.0);
+
+                let layout_info = controller
+                    .backend
+                    .as_ref()
+                    .and_then(|b| b.get_audio_layout())
+                    .unwrap_or_else(|| {
+                        if task.audio_channels.len() == 2 {
+                            "stereo".to_string()
+                        } else if task.audio_channels.len() == 6 {
+                            "5.1".to_string()
+                        } else {
+                            format!("{} ch", task.audio_channels.len())
+                        }
+                    });
+
+                // Channel Routing Matrix Collapsible Panel
+                egui::CollapsingHeader::new(
+                    egui::RichText::new(format!(
+                        "🔊 {} ({}: {})",
+                        tr(language, "Channel Routing & Separation"),
+                        tr(language, "Audio Layout"),
+                        layout_info
+                    ))
+                    .size(14.0)
+                    .strong()
+                    .color(crate::ui::theme::text_strong()),
+                )
+                .default_open(true)
+                .show(ui, |ui| {
+                    ui.add_space(6.0);
+
+                    // Quick Presets
+                    ui.horizontal(|ui| {
+                        ui.label(
+                            egui::RichText::new("Presets:")
+                                .size(12.0)
+                                .color(crate::ui::theme::text_weak()),
+                        );
+                        ui.add_space(4.0);
+
+                        if ui.button(egui::RichText::new(tr(language, "Enable All")).size(11.5)).clicked() {
+                            for ch in &mut task.audio_channels {
+                                ch.playback = true;
+                                ch.recognition = true;
+                            }
+                            routing_changed = true;
+                        }
+
+                        if ui.button(egui::RichText::new(tr(language, "Dialogue Only")).size(11.5)).clicked() {
+                            let has_fc = task.audio_channels.iter().any(|c| c.id == "fc");
+                            for ch in &mut task.audio_channels {
+                                ch.playback = true;
+                                if has_fc {
+                                    ch.recognition = ch.id == "fc";
+                                } else {
+                                    ch.recognition = true;
+                                }
+                            }
+                            routing_changed = true;
+                        }
+
+                        if ui.button(egui::RichText::new(tr(language, "Stereo Default")).size(11.5)).clicked() {
+                            for ch in &mut task.audio_channels {
+                                ch.playback = true;
+                                if ch.id == "lfe" || ch.id == "sl" || ch.id == "sr" || ch.id == "bl" || ch.id == "br" {
+                                    ch.recognition = false;
+                                } else {
+                                    ch.recognition = true;
+                                }
+                            }
+                            routing_changed = true;
+                        }
+                    });
+
+                    ui.add_space(8.0);
+
+                    // Double-Column Checkbox Table Frame
+                    Frame::new()
+                        .fill(Color32::from_rgb(248, 250, 252))
+                        .stroke(Stroke::new(1.0, Color32::from_rgb(226, 232, 240)))
+                        .corner_radius(CornerRadius::same(10))
+                        .inner_margin(Margin::same(10))
+                        .show(ui, |ui| {
+                            egui::Grid::new("player_channel_routing_grid")
+                                .num_columns(3)
+                                .spacing([24.0, 8.0])
+                                .striped(true)
+                                .show(ui, |ui| {
+                                    // Table Header
+                                    ui.label(
+                                        egui::RichText::new(tr(language, "Channel"))
+                                            .size(12.5)
+                                            .strong()
+                                            .color(crate::ui::theme::text_strong()),
+                                    );
+                                    ui.label(
+                                        egui::RichText::new(tr(language, "Playback (Hear Audio)"))
+                                            .size(12.5)
+                                            .strong()
+                                            .color(Color32::from_rgb(37, 99, 235)),
+                                    );
+                                    ui.label(
+                                        egui::RichText::new(tr(language, "Recognition (Send to ASR)"))
+                                            .size(12.5)
+                                            .strong()
+                                            .color(Color32::from_rgb(16, 185, 129)),
+                                    );
+                                    ui.end_row();
+
+                                    for ch in &mut task.audio_channels {
+                                        if ch.id == "fc" {
+                                            ui.label(
+                                                egui::RichText::new(&ch.name)
+                                                    .strong()
+                                                    .color(Color32::from_rgb(37, 99, 235)),
+                                            );
+                                        } else {
+                                            ui.label(&ch.name);
+                                        }
+
+                                        if ui.checkbox(&mut ch.playback, "").changed() {
+                                            routing_changed = true;
+                                        }
+                                        if ui.checkbox(&mut ch.recognition, "").changed() {
+                                            task_settings_changed = true;
+                                        }
+                                        ui.end_row();
+                                    }
+                                });
+                        });
+                });
+            });
         });
+    });
+
+    if do_restart {
+        if let Some(task) = controller.store.get(&active_id) {
+            let source = task.source.clone();
+            let source_language = task.source_language.clone();
+            let target_language = task.target_language.clone();
+            let recognition = task.recognition.clone();
+            let audio_channels = task.audio_channels.clone();
+            controller.clear_and_restart_task();
+            match &source {
+                super::backend::MediaSource::LocalFile(path) => {
+                    action = VideoPlayerAction::StartTranslation(
+                        PlayerTranslationRequest::ImportMediaFile {
+                            path: path.clone(),
+                            source_language,
+                            target_language,
+                            recognition,
+                            audio_channels,
+                        },
+                    );
+                }
+                super::backend::MediaSource::NetworkStream(_) => {
+                    action = VideoPlayerAction::StartTranslation(
+                        PlayerTranslationRequest::LiveStream {
+                            source_language,
+                            target_language,
+                            recognition,
+                            audio_channels,
+                        },
+                    );
+                }
+            }
+        }
+    } else if do_pause {
+        controller.pause_task();
+        action = VideoPlayerAction::StopTranslation;
+    } else if do_start {
+        if let Some(task) = controller.store.get(&active_id) {
+            let source = task.source.clone();
+            let source_language = task.source_language.clone();
+            let target_language = task.target_language.clone();
+            let recognition = task.recognition.clone();
+            let audio_channels = task.audio_channels.clone();
+            controller.start_task();
+            match &source {
+                super::backend::MediaSource::LocalFile(path) => {
+                    action = VideoPlayerAction::StartTranslation(
+                        PlayerTranslationRequest::ImportMediaFile {
+                            path: path.clone(),
+                            source_language,
+                            target_language,
+                            recognition,
+                            audio_channels,
+                        },
+                    );
+                }
+                super::backend::MediaSource::NetworkStream(_) => {
+                    action = VideoPlayerAction::StartTranslation(
+                        PlayerTranslationRequest::LiveStream {
+                            source_language,
+                            target_language,
+                            recognition,
+                            audio_channels,
+                        },
+                    );
+                }
+            }
+        }
+    } else if routing_changed {
+        controller.apply_channel_routing();
+    } else if task_settings_changed {
+        let _ = controller.store.save_to_dir(&controller.storage_dir);
+    }
 
     action
 }
@@ -644,18 +835,57 @@ fn render_viewport_card(
     language: crate::i18n::UiLanguage,
     ui: &mut egui::Ui,
 ) {
-    let viewport_height = if controller.fullscreen_mode {
-        (ui.available_height() - 20.0).max(400.0)
+    let total_player_height = if controller.fullscreen_mode {
+        ui.available_height()
     } else {
-        380.0
+        400.0
     };
 
-    components::card(ui, |ui| {
-        ui.vertical(|ui| {
-            // 1. Video Canvas Frame
+    let is_playing = controller.current_source.is_some()
+        && (controller.get_status() == PlaybackStatus::Playing
+            || controller.get_status() == PlaybackStatus::Paused);
+
+    let is_paused = controller.get_status() == PlaybackStatus::Paused;
+    let recent_hover = controller
+        .last_hover_instant
+        .map_or(true, |inst| inst.elapsed().as_secs_f32() < 3.0);
+
+    let show_controls = !is_playing || is_paused || recent_hover;
+
+    // Smooth animated opacity for the floating overlay
+    let controls_alpha = crate::ui::animation::AnimationSystem::animate_bool(
+        ui.ctx(),
+        egui::Id::new("player_controls_overlay_alpha"),
+        show_controls,
+        0.22,
+    );
+
+    // Layout constants for the compact floating pill
+    let bar_height = 40.0;
+    let bar_margin_h = 16.0;
+    let bar_margin_bottom = if controller.fullscreen_mode { 16.0 } else { 6.0 };
+    let hwnd_shrink = (bar_height + bar_margin_bottom + 2.0) * controls_alpha;
+
+    let (corner_radius, stroke_style) = if controller.fullscreen_mode {
+        (CornerRadius::ZERO, Stroke::NONE)
+    } else {
+        (CornerRadius::same(12), Stroke::new(1.0, Color32::from_rgb(30, 41, 59)))
+    };
+
+    // Dark Cinema / Video Player Outer Container
+    let outer_resp = Frame::new()
+        .fill(Color32::from_rgb(10, 15, 26))
+        .stroke(stroke_style)
+        .corner_radius(corner_radius)
+        .inner_margin(Margin::same(0))
+        .show(ui, |ui| {
+            ui.set_width(ui.available_width());
+            ui.set_height(total_player_height);
+
+            // Video area takes the full height
             let (video_rect, response) = ui.allocate_exact_size(
-                egui::vec2(ui.available_width(), viewport_height - 68.0),
-                egui::Sense::hover(),
+                egui::vec2(ui.available_width(), total_player_height),
+                egui::Sense::click_and_drag(),
             );
 
             let is_mouse_over = response.hovered()
@@ -664,9 +894,10 @@ fn render_viewport_card(
                 controller.note_mouse_motion();
             }
 
-            let is_playing = controller.current_source.is_some()
-                && (controller.get_status() == PlaybackStatus::Playing
-                    || controller.get_status() == PlaybackStatus::Paused);
+            if response.double_clicked() && controller.current_source.is_some() {
+                controller.toggle_fullscreen();
+                ui.ctx().send_viewport_cmd(egui::ViewportCommand::Fullscreen(controller.fullscreen_mode));
+            }
 
             if is_playing {
                 if controller.native_host.is_none() {
@@ -684,14 +915,16 @@ fn render_viewport_card(
                 }
 
                 if let Some(host) = &controller.native_host {
-                    let pixels_per_point = ui.ctx().pixels_per_point();
-                    let physical_min = video_rect.min.to_vec2() * pixels_per_point;
-                    let physical_size = video_rect.size() * pixels_per_point;
+                    let ppp = ui.ctx().pixels_per_point();
+                    let physical_min = video_rect.min.to_vec2() * ppp;
+                    let physical_size = video_rect.size() * ppp;
+                    // Shrink native HWND by the control bar area so controls are not occluded
+                    let shrink_px = hwnd_shrink * ppp;
                     host.set_rect(
                         physical_min.x.round() as i32,
                         physical_min.y.round() as i32,
                         physical_size.x.round() as i32,
-                        physical_size.y.round() as i32,
+                        (physical_size.y - shrink_px).round().max(0.0) as i32,
                     );
                     host.show();
                 }
@@ -701,8 +934,8 @@ fn render_viewport_card(
                 }
                 ui.painter().rect_filled(
                     video_rect,
-                    CornerRadius::same(12),
-                    Color32::from_rgb(15, 23, 42),
+                    corner_radius,
+                    Color32::from_rgb(10, 15, 26),
                 );
                 ui.painter().text(
                     video_rect.center() - egui::vec2(0.0, 10.0),
@@ -723,134 +956,131 @@ fn render_viewport_card(
                 );
             }
 
-            ui.add_space(8.0);
+            // ── Floating Pill Control Bar ─────────────────────────────────────
+            if controls_alpha > 0.001 {
+                let alpha = (controls_alpha * 255.0) as u8;
 
-            // 2. Light Theme Control Bar
-            Frame::new()
-                .fill(Color32::from_rgb(245, 248, 252))
-                .stroke(Stroke::new(1.0, Color32::from_rgb(226, 232, 240)))
-                .corner_radius(CornerRadius::same(12))
-                .inner_margin(Margin::symmetric(14, 8))
-                .show(ui, |ui| {
-                    ui.horizontal(|ui| {
-                        let play_text = if controller.get_status() == PlaybackStatus::Playing {
-                            tr(language, "Pause")
-                        } else {
-                            tr(language, "Play")
-                        };
-                        if components::primary_button_enabled(
-                            ui,
-                            play_text,
-                            controller.current_source.is_some(),
-                        )
-                        .clicked()
-                        {
-                            controller.toggle_play();
-                        }
+                // Pill rect: inset from edges, slightly above bottom
+                let bar_rect = egui::Rect::from_min_max(
+                    egui::pos2(
+                        video_rect.min.x + bar_margin_h,
+                        video_rect.max.y - bar_height - bar_margin_bottom,
+                    ),
+                    egui::pos2(
+                        video_rect.max.x - bar_margin_h,
+                        video_rect.max.y - bar_margin_bottom,
+                    ),
+                );
 
-                        ui.add_space(8.0);
+                // Dark glass pill background
+                let pill_bg = Color32::from_rgba_unmultiplied(
+                    12, 18, 32,
+                    (alpha as f32 * 0.92) as u8,
+                );
+                let pill_border = Color32::from_rgba_unmultiplied(
+                    55, 70, 95,
+                    (alpha as f32 * 0.6) as u8,
+                );
+                ui.painter().rect_filled(bar_rect, CornerRadius::same(20), pill_bg);
+                ui.painter().rect_stroke(bar_rect, CornerRadius::same(20), Stroke::new(1.0, pill_border), egui::StrokeKind::Outside);
 
-                        ui.label(
-                            egui::RichText::new(format!(
-                                "{} / {}",
-                                format_time_ms(controller.get_time_ms()),
-                                format_time_ms(controller.get_duration_ms())
-                            ))
-                            .monospace()
-                            .size(11.5)
-                            .strong()
-                            .color(crate::ui::theme::text_strong()),
-                        );
+                // Child UI inside the pill
+                let mut child_ui = ui.new_child(
+                    egui::UiBuilder::new()
+                        .max_rect(bar_rect.shrink2(egui::vec2(10.0, 0.0)))
+                        .layout(egui::Layout::left_to_right(egui::Align::Center)),
+                );
+                child_ui.set_opacity(controls_alpha);
 
-                        ui.add_space(8.0);
+                child_ui.horizontal(|ui| {
+                    ui.spacing_mut().item_spacing.x = 6.0;
 
-                        let mut current_sec = (controller.get_time_ms() / 1000) as f32;
-                        let max_sec = (controller.get_duration_ms().max(1) / 1000) as f32;
-                        let seek_slider_width = (ui.available_width() - 340.0).max(60.0);
-                        let slider = egui::Slider::new(&mut current_sec, 0.0..=max_sec).show_value(false);
-                        if ui.add_sized([seek_slider_width, 18.0], slider).changed() {
-                            if let Some(backend) = &mut controller.backend {
-                                backend.seek((current_sec * 1000.0) as i64);
-                            }
-                        }
+                    // ── Play / Pause ──
+                    let play_icon = if controller.get_status() == PlaybackStatus::Playing {
+                        "⏸"
+                    } else {
+                        "⏵"
+                    };
+                    let play_enabled = controller.current_source.is_some();
+                    if dark_pill_button(ui, play_icon, play_enabled, true) {
+                        controller.toggle_play();
+                    }
 
-                        ui.add_space(8.0);
-
-                        let mut vol = controller.volume;
-                        let vol_slider = egui::Slider::new(&mut vol, 0.0..=1.0).show_value(false);
-                        if ui.add_sized([45.0, 16.0], vol_slider).changed() {
-                            controller.set_volume(vol);
-                        }
-
-                        ui.add_space(4.0);
-
-                        if components::animated_button(
-                            ui,
-                            if controller.muted {
-                                tr(language, "Unmute")
-                            } else {
-                                tr(language, "Mute")
-                            },
-                        )
-                        .clicked()
-                        {
-                            controller.toggle_mute();
-                        }
-
-                        ui.add_space(4.0);
-
-                        if components::animated_button(
-                            ui,
-                            if controller.show_subtitles {
-                                tr(language, "Hide Subtitles")
-                            } else {
-                                tr(language, "Show Subtitles")
-                            },
-                        )
-                        .clicked()
-                        {
-                            controller.show_subtitles = !controller.show_subtitles;
-                        }
-
-                        ui.add_space(4.0);
-
-                        if components::animated_button(
-                            ui,
-                            if controller.fullscreen_mode {
-                                tr(language, "Exit Fullscreen")
-                            } else {
-                                tr(language, "Fullscreen")
-                            },
-                        )
-                        .clicked()
-                        {
-                            controller.toggle_fullscreen();
-                        }
-                    });
-                });
-
-            if is_playing {
-                let diag = controller.get_diagnostics();
-                ui.add_space(6.0);
-                ui.horizontal(|ui| {
+                    // ── Time ──
                     ui.label(
                         egui::RichText::new(format!(
-                            "HWDEC: {} | Codec: {} | {}x{} | {:.1} FPS | Dropped: {}",
-                            if diag.hwdec_current.is_empty() { "auto" } else { &diag.hwdec_current },
-                            if diag.video_codec.is_empty() { "-" } else { &diag.video_codec },
-                            diag.width,
-                            diag.height,
-                            diag.fps,
-                            diag.dropped_frames,
+                            "{} / {}",
+                            format_time_ms(controller.get_time_ms()),
+                            format_time_ms(controller.get_duration_ms())
                         ))
+                        .monospace()
                         .size(11.0)
-                        .color(crate::ui::theme::text_weak())
-                        .monospace(),
+                        .color(Color32::from_rgba_unmultiplied(200, 210, 225, alpha)),
                     );
+
+                    // ── Seek slider ──
+                    let mut current_sec = (controller.get_time_ms() / 1000) as f32;
+                    let max_sec = (controller.get_duration_ms().max(1) / 1000) as f32;
+                    let right_w = 180.0; // space for buttons to the right
+                    let slider_w = (ui.available_width() - right_w).max(30.0);
+                    let slider = egui::Slider::new(&mut current_sec, 0.0..=max_sec).show_value(false);
+                    if ui.add_sized([slider_w, 14.0], slider).changed() {
+                        if let Some(backend) = &mut controller.backend {
+                            backend.seek((current_sec * 1000.0) as i64);
+                        }
+                    }
+
+                    // ── Volume ──
+                    let mut vol = controller.volume;
+                    let vol_slider = egui::Slider::new(&mut vol, 0.0..=1.0).show_value(false);
+                    if ui.add_sized([36.0, 14.0], vol_slider).changed() {
+                        controller.set_volume(vol);
+                    }
+
+                    // ── Mute ──
+                    let mute_icon = if controller.muted { "🔇" } else { "🔊" };
+                    if dark_pill_button(ui, mute_icon, true, false) {
+                        controller.toggle_mute();
+                    }
+
+                    // ── Subtitles ──
+                    let sub_icon = if controller.show_subtitles { "💬" } else { "💬" };
+                    if dark_pill_button(ui, sub_icon, true, false) {
+                        controller.show_subtitles = !controller.show_subtitles;
+                    }
+
+                    // ── Fullscreen ──
+                    let fs_icon = if controller.fullscreen_mode { "⛶" } else { "⛶" };
+                    if dark_pill_button(ui, fs_icon, true, false) {
+                        controller.toggle_fullscreen();
+                        ui.ctx().send_viewport_cmd(egui::ViewportCommand::Fullscreen(controller.fullscreen_mode));
+                    }
                 });
             }
         });
-    });
+
+    let _ = outer_resp;
+
+    if is_playing && !controller.fullscreen_mode {
+        let diag = controller.get_diagnostics();
+        ui.add_space(4.0);
+        ui.horizontal(|ui| {
+            ui.label(
+                egui::RichText::new(format!(
+                    "HWDEC: {} | Codec: {} | {}x{} | {:.1} FPS | Dropped: {}",
+                    if diag.hwdec_current.is_empty() { "auto" } else { &diag.hwdec_current },
+                    if diag.video_codec.is_empty() { "-" } else { &diag.video_codec },
+                    diag.width,
+                    diag.height,
+                    diag.fps,
+                    diag.dropped_frames,
+                ))
+                .size(11.0)
+                .color(crate::ui::theme::text_weak())
+                .monospace(),
+            );
+        });
+    }
 }
 
 fn render_subtitles_card(
@@ -866,6 +1096,40 @@ fn render_subtitles_card(
 
     components::card(ui, |ui| {
         ui.vertical(|ui| {
+            let current_time_ms = controller.get_time_ms();
+            let now = std::time::Instant::now();
+
+            let cues = controller.subtitles.cues();
+            let cues_count = cues.len();
+
+            let active_idx = if cues_count > 0 {
+                let query_time = current_time_ms + 250;
+                let idx = cues.partition_point(|cue| cue.start_ms <= query_time);
+                if idx > 0 {
+                    let candidate_idx = idx - 1;
+                    let cue = &cues[candidate_idx];
+                    let effective_end = if cue.end_ms <= cue.start_ms {
+                        cue.start_ms + 3000
+                    } else {
+                        cue.end_ms.max(cue.start_ms + 2000)
+                    };
+                    if current_time_ms <= effective_end {
+                        Some(candidate_idx)
+                    } else {
+                        None
+                    }
+                } else {
+                    None
+                }
+            } else {
+                None
+            };
+
+            let is_manually_scrolling = controller
+                .last_manual_scroll
+                .map_or(false, |instant| instant.elapsed() < std::time::Duration::from_secs(4));
+            let auto_scroll_active = !is_manually_scrolling;
+
             ui.horizontal(|ui| {
                 ui.label(
                     egui::RichText::new(tr(language, "Live Subtitles & Translation"))
@@ -876,154 +1140,170 @@ fn render_subtitles_card(
                 ui.add_space(8.0);
                 components::speaker_badge(
                     ui,
-                    &format!("{} {}", controller.subtitles.count(), tr(language, "Subtitles Count")),
+                    &format!("{} {}", cues_count, tr(language, "Subtitles Count")),
                 );
+
+                if is_manually_scrolling {
+                    ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                        if ui
+                            .button(
+                                egui::RichText::new("⤓ Auto-scroll")
+                                    .size(12.0)
+                                    .color(Color32::from_rgb(37, 99, 235)),
+                            )
+                            .clicked()
+                        {
+                            controller.last_manual_scroll = None;
+                            controller.last_auto_scrolled_idx = None;
+                        }
+                    });
+                }
             });
 
             ui.add_space(10.0);
 
-            let current_time_ms = controller.get_time_ms();
-            let active_cue = controller.subtitles.active_cue_at(current_time_ms);
-
-            // Highlighted Active Subtitle Banner (Full Card Width)
-            Frame::new()
-                .fill(Color32::from_rgb(239, 246, 255))
-                .stroke(Stroke::new(1.0, Color32::from_rgb(191, 219, 254)))
-                .corner_radius(CornerRadius::same(12))
-                .inner_margin(Margin::same(14))
-                .show(ui, |ui| {
-                    ui.set_width(ui.available_width());
-                    if let Some(cue) = active_cue {
-                        ui.vertical(|ui| {
-                            ui.horizontal(|ui| {
-                                if let Some(speaker) = &cue.speaker_name {
-                                    components::speaker_badge(ui, speaker);
-                                    ui.add_space(6.0);
-                                }
-                                ui.label(
-                                    egui::RichText::new(format!(
-                                        "[{} - {}]",
-                                        format_time_ms(cue.start_ms),
-                                        format_time_ms(cue.end_ms.max(cue.start_ms + 2000))
-                                    ))
-                                    .size(11.5)
-                                    .color(Color32::from_rgb(59, 130, 246)),
-                                );
-                            });
-
-                            ui.add_space(4.0);
-
-                            ui.label(
-                                egui::RichText::new(&cue.original_text)
-                                    .size(14.0)
-                                    .color(crate::ui::theme::text_weak()),
-                            );
-
-                            if let Some(trans) = &cue.translated_text {
-                                ui.add_space(2.0);
-                                ui.label(
-                                    egui::RichText::new(trans)
-                                        .size(18.0)
-                                        .strong()
-                                        .color(Color32::from_rgb(30, 58, 138)),
-                                );
-                            }
-                        });
-                    } else {
-                        ui.horizontal(|ui| {
+            if cues.is_empty() {
+                Frame::new()
+                    .fill(Color32::from_rgb(248, 250, 252))
+                    .stroke(Stroke::new(1.0, Color32::from_rgb(241, 245, 249)))
+                    .corner_radius(CornerRadius::same(10))
+                    .inner_margin(Margin::same(20))
+                    .show(ui, |ui| {
+                        ui.set_width(ui.available_width());
+                        ui.centered_and_justified(|ui| {
                             ui.label(
                                 egui::RichText::new(tr(language, "No subtitle at current timestamp"))
-                                    .size(14.0)
+                                    .size(13.5)
                                     .color(crate::ui::theme::text_weak()),
                             );
                         });
+                    });
+            } else {
+                let mut seek_to_ms = None;
+                let row_height = 88.0;
+                let total_rows = cues.len();
+
+                let mut scroll_area = egui::ScrollArea::vertical()
+                    .id_salt("player_subtitles_timeline_scroll")
+                    .min_scrolled_height(360.0)
+                    .max_height(500.0)
+                    .auto_shrink([false, false]);
+
+                // Programmatic auto-scroll: ONLY when transitioning to a NEW cue
+                if auto_scroll_active && active_idx.is_some() && active_idx != controller.last_auto_scrolled_idx {
+                    if let Some(idx) = active_idx {
+                        let target_offset = ((idx as f32 * row_height) - 130.0).max(0.0);
+                        scroll_area = scroll_area.vertical_scroll_offset(target_offset);
+                        controller.last_auto_scrolled_idx = Some(idx);
+                    }
+                }
+
+                let scroll_output = scroll_area.show_rows(ui, row_height, total_rows, |ui, row_range| {
+                    for idx in row_range {
+                        let cue = &cues[idx];
+                        let is_current = Some(idx) == active_idx;
+
+                        let bg_color = if is_current {
+                            Color32::from_rgb(239, 246, 255)
+                        } else {
+                            Color32::from_rgb(248, 250, 252)
+                        };
+
+                        let stroke = if is_current {
+                            Stroke::new(1.5, Color32::from_rgb(96, 165, 250))
+                        } else {
+                            Stroke::new(1.0, Color32::from_rgb(241, 245, 249))
+                        };
+
+                        let resp = Frame::new()
+                            .fill(bg_color)
+                            .stroke(stroke)
+                            .corner_radius(CornerRadius::same(if is_current { 10 } else { 8 }))
+                            .inner_margin(Margin::symmetric(14, 8))
+                            .show(ui, |ui| {
+                                ui.set_width(ui.available_width());
+                                ui.set_height(row_height - 8.0);
+                                ui.vertical(|ui| {
+                                    ui.horizontal(|ui| {
+                                        ui.label(
+                                            egui::RichText::new(format!(
+                                                "[{} - {}]",
+                                                format_time_ms(cue.start_ms),
+                                                format_time_ms(cue.end_ms.max(cue.start_ms + 2000))
+                                            ))
+                                            .size(11.5)
+                                            .monospace()
+                                            .color(if is_current {
+                                                Color32::from_rgb(37, 99, 235)
+                                            } else {
+                                                Color32::from_rgb(59, 130, 246)
+                                            })
+                                            .strong(),
+                                        );
+
+                                        if let Some(speaker) = &cue.speaker_name {
+                                            ui.add_space(6.0);
+                                            components::speaker_badge(ui, speaker);
+                                        }
+                                    });
+
+                                    ui.add_space(2.0);
+
+                                    ui.add(
+                                        egui::Label::new(
+                                            egui::RichText::new(&cue.original_text)
+                                                .size(12.5)
+                                                .color(if is_current {
+                                                    crate::ui::theme::text_strong()
+                                                } else {
+                                                    crate::ui::theme::text_weak()
+                                                }),
+                                        )
+                                        .truncate(),
+                                    );
+
+                                    if let Some(trans) = &cue.translated_text {
+                                        ui.add_space(1.0);
+                                        ui.add(
+                                            egui::Label::new(
+                                                egui::RichText::new(trans)
+                                                    .size(14.0)
+                                                    .strong()
+                                                    .color(if is_current {
+                                                        Color32::from_rgb(30, 58, 138)
+                                                    } else {
+                                                        Color32::from_rgb(30, 64, 175)
+                                                    }),
+                                            )
+                                            .truncate(),
+                                        );
+                                    }
+                                });
+                            })
+                            .response
+                            .interact(egui::Sense::click());
+
+                        if resp.clicked() {
+                            seek_to_ms = Some(cue.start_ms);
+                            controller.last_manual_scroll = None;
+                            controller.last_auto_scrolled_idx = None;
+                        }
+
+                        ui.add_space(8.0);
                     }
                 });
 
-            // Scrollable Timeline History (Virtualized with show_rows for extreme performance)
-            let cues = controller.subtitles.cues();
-            if !cues.is_empty() {
-                ui.add_space(10.0);
-                ui.label(
-                    egui::RichText::new(tr(language, "Subtitle Timeline"))
-                        .size(13.0)
-                        .strong()
-                        .color(crate::ui::theme::text_strong()),
-                );
-                ui.add_space(6.0);
-
-                let mut seek_to_ms = None;
-                let total_rows = cues.len();
-                let row_height = 46.0;
-
-                egui::ScrollArea::vertical()
-                    .id_salt("player_subtitles_timeline_scroll")
-                    .max_height(200.0)
-                    .auto_shrink([false, false])
-                    .show_rows(ui, row_height, total_rows, |ui, row_range| {
-                        for idx in row_range {
-                            let cue = &cues[idx];
-                            let is_current = current_time_ms >= cue.start_ms
-                                && current_time_ms <= cue.end_ms.max(cue.start_ms + 2000);
-
-                            let bg_color = if is_current {
-                                Color32::from_rgb(239, 246, 255)
-                            } else {
-                                Color32::from_rgb(248, 250, 252)
-                            };
-
-                            let resp = Frame::new()
-                                .fill(bg_color)
-                                .stroke(if is_current {
-                                    Stroke::new(1.0, Color32::from_rgb(147, 197, 253))
-                                } else {
-                                    Stroke::new(1.0, Color32::from_rgb(241, 245, 249))
-                                })
-                                .corner_radius(CornerRadius::same(8))
-                                .inner_margin(Margin::symmetric(10, 6))
-                                .show(ui, |ui| {
-                                    ui.set_width(ui.available_width());
-                                    ui.horizontal(|ui| {
-                                        ui.label(
-                                            egui::RichText::new(format_time_ms(cue.start_ms))
-                                                .monospace()
-                                                .size(11.5)
-                                                .color(Color32::from_rgb(37, 99, 235))
-                                                .strong(),
-                                        );
-                                        ui.add_space(6.0);
-
-                                        if let Some(speaker) = &cue.speaker_name {
-                                            components::speaker_badge(ui, speaker);
-                                            ui.add_space(6.0);
-                                        }
-
-                                        ui.vertical(|ui| {
-                                            ui.label(
-                                                egui::RichText::new(&cue.original_text)
-                                                    .size(12.5)
-                                                    .color(crate::ui::theme::text_weak()),
-                                            );
-                                            if let Some(trans) = &cue.translated_text {
-                                                ui.label(
-                                                    egui::RichText::new(trans)
-                                                        .size(13.5)
-                                                        .strong()
-                                                        .color(crate::ui::theme::text_strong()),
-                                                );
-                                            }
-                                        });
-                                    });
-                                })
-                                .response
-                                .interact(egui::Sense::click());
-
-                            if resp.clicked() {
-                                seek_to_ms = Some(cue.start_ms);
-                            }
-                            ui.add_space(4.0);
-                        }
+                let is_hovered = ui.rect_contains_pointer(scroll_output.inner_rect);
+                let wheel_scrolled = is_hovered
+                    && ui.input(|i| {
+                        i.smooth_scroll_delta.y.abs() > 0.05 || i.smooth_scroll_delta.x.abs() > 0.05
                     });
+                let is_dragged = is_hovered && ui.input(|i| i.pointer.is_decidedly_dragging());
+
+                if wheel_scrolled || is_dragged {
+                    controller.last_manual_scroll = Some(now);
+                    controller.last_auto_scrolled_idx = active_idx;
+                }
 
                 if let Some(ms) = seek_to_ms {
                     if let Some(backend) = &mut controller.backend {
@@ -1057,4 +1337,48 @@ fn format_timestamp_date(timestamp_sec: u64) -> String {
         return format!("{}d ago", days);
     }
     "Recently".into()
+}
+
+/// Compact dark-themed button for the floating video control bar.
+/// Returns `true` if clicked.
+fn dark_pill_button(ui: &mut egui::Ui, icon: &str, enabled: bool, accent: bool) -> bool {
+    let desired = egui::vec2(32.0, 28.0);
+    let (rect, response) = ui.allocate_exact_size(desired, egui::Sense::click());
+
+    if ui.is_rect_visible(rect) {
+        let hovered = response.hovered() && enabled;
+        let pressed = response.is_pointer_button_down_on() && enabled;
+
+        let bg = if pressed {
+            Color32::from_rgba_unmultiplied(80, 100, 140, 180)
+        } else if hovered {
+            Color32::from_rgba_unmultiplied(55, 70, 100, 160)
+        } else if accent {
+            Color32::from_rgba_unmultiplied(37, 99, 235, 200)
+        } else {
+            Color32::from_rgba_unmultiplied(35, 45, 65, 140)
+        };
+
+        let text_color = if !enabled {
+            Color32::from_rgb(90, 100, 115)
+        } else if pressed {
+            Color32::WHITE
+        } else if hovered {
+            Color32::from_rgb(220, 230, 245)
+        } else {
+            Color32::from_rgb(190, 200, 215)
+        };
+
+        ui.painter()
+            .rect_filled(rect, CornerRadius::same(8), bg);
+        ui.painter().text(
+            rect.center(),
+            egui::Align2::CENTER_CENTER,
+            icon,
+            egui::FontId::proportional(14.0),
+            text_color,
+        );
+    }
+
+    response.clicked() && enabled
 }

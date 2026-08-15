@@ -149,8 +149,8 @@ impl TrackerConfig {
 impl Default for TrackerConfig {
     fn default() -> Self {
         Self {
-            similarity_threshold: 0.52,
-            same_speaker_hysteresis: 0.10,
+            similarity_threshold: 0.56,
+            same_speaker_hysteresis: 0.16,
             max_speakers: 8,
         }
     }

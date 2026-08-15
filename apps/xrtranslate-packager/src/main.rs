@@ -29,6 +29,10 @@ const SPEAKER_RELATIVE_PATH: &str = "models/3D-Speaker-ERes2NetV2/speaker_embedd
 const SPEAKER_MODEL_BYTES: u64 = 71_964_309;
 const SPEAKER_MODEL_SHA256: &str =
     "0dde34a7c212b7b4ece05b2a120409507971d1cc504e30ed05ec61c7e5dc5d9b";
+const DENOISE_RELATIVE_PATH: &str = "models/gtcrn/gtcrn_simple.onnx";
+const DENOISE_MODEL_BYTES: u64 = 535_638;
+const DENOISE_MODEL_SHA256: &str =
+    "e77603ac0c23dac3227dd2d7135b3a585cbee2679048aecfa886657d3ae1b534";
 const INTERNAL_BIN_DIRECTORY: &str = "bin";
 const CORPORA_RELEASE_ROOT: &str = "corpora";
 const CORPORA_CONFIG_ROOT: &str = "corpora/v1";
@@ -70,6 +74,9 @@ struct Arguments {
     /// 3D-Speaker ERes2NetV2 speaker-embedding ONNX file bundled in every release.
     #[arg(long)]
     speaker_model: Option<PathBuf>,
+    /// GTCRN-Light v3 speech enhancement ONNX file bundled in every release.
+    #[arg(long)]
+    denoise_model: Option<PathBuf>,
     /// Destination release directory. It must not already exist.
     #[arg(long)]
     output: PathBuf,
@@ -145,6 +152,7 @@ struct ReleasePlan {
     license: PathBuf,
     vad_model: PathBuf,
     speaker_model: PathBuf,
+    denoise_model: PathBuf,
     output: PathBuf,
     include_models: bool,
     assets: ResolvedModelAssets,
@@ -161,6 +169,12 @@ fn main() -> Result<(), Box<dyn Error>> {
         &plan.speaker_model,
         SPEAKER_MODEL_BYTES,
         SPEAKER_MODEL_SHA256,
+    )?;
+    verify_file_integrity(
+        "--denoise-model",
+        &plan.denoise_model,
+        DENOISE_MODEL_BYTES,
+        DENOISE_MODEL_SHA256,
     )?;
     if plan.output.exists() {
         return Err(PackageError::InvalidInput(format!(
@@ -225,6 +239,10 @@ impl ReleasePlan {
             .speaker_model
             .unwrap_or_else(|| project_root.join(SPEAKER_RELATIVE_PATH));
         require_regular_file("--speaker-model", &speaker_model)?;
+        let denoise_model = arguments
+            .denoise_model
+            .unwrap_or_else(|| project_root.join(DENOISE_RELATIVE_PATH));
+        require_regular_file("--denoise-model", &denoise_model)?;
 
         ensure_directory_is_native("--resources-dir", &arguments.resources_dir)?;
         ensure_directory_is_native("--corpora-dir", &arguments.corpora_dir)?;
@@ -233,6 +251,7 @@ impl ReleasePlan {
         })?;
         ensure_native_file("--vad-model", &vad_model)?;
         ensure_native_file("--speaker-model", &speaker_model)?;
+        ensure_native_file("--denoise-model", &denoise_model)?;
 
         let config = AppConfig::from_path(&arguments.config)?;
         let mut asset_config = ModelAssetsConfig {
@@ -272,6 +291,7 @@ impl ReleasePlan {
             license: arguments.license,
             vad_model,
             speaker_model,
+            denoise_model,
             output: arguments.output,
             include_models: arguments.include_models,
             assets,
@@ -334,6 +354,7 @@ fn package(plan: &ReleasePlan) -> Result<PathBuf, PackageError> {
         copy_file_to(&plan.license, &staging.join("LICENSE"))?;
         copy_file_to(&plan.vad_model, &staging.join(VAD_RELATIVE_PATH))?;
         copy_file_to(&plan.speaker_model, &staging.join(SPEAKER_RELATIVE_PATH))?;
+        copy_file_to(&plan.denoise_model, &staging.join(DENOISE_RELATIVE_PATH))?;
         fs::write(staging.join("config.json"), &plan.packaged_config).map_err(|source| {
             PackageError::Io {
                 context: format!("cannot write staged config in {}", staging.display()),
@@ -407,6 +428,16 @@ fn rewrite_config(config_path: &Path) -> Result<String, PackageError> {
         "model_path".into(),
         Value::String(SPEAKER_RELATIVE_PATH.into()),
     );
+    let denoise = root_object
+        .entry("denoise")
+        .or_insert_with(|| Value::Object(Map::new()))
+        .as_object_mut()
+        .ok_or_else(|| PackageError::InvalidInput("config.denoise must be a JSON object".into()))?;
+    denoise.insert("enabled".into(), Value::Bool(true));
+    denoise.insert(
+        "model_path".into(),
+        Value::String(DENOISE_RELATIVE_PATH.into()),
+    );
     let prompt_context = root_object
         .entry("prompt_context")
         .or_insert_with(|| Value::Object(Map::new()))
@@ -459,6 +490,16 @@ fn release_manifest(
             },
             "bytes": SPEAKER_MODEL_BYTES,
             "sha256": SPEAKER_MODEL_SHA256,
+        },
+        "denoise_model": {
+            "path": DENOISE_RELATIVE_PATH,
+            "architecture": "GTCRN-Light-v3",
+            "source": {
+                "repository": "k2-fsa/sherpa-onnx",
+                "release": "speech-enhancement-models",
+            },
+            "bytes": DENOISE_MODEL_BYTES,
+            "sha256": DENOISE_MODEL_SHA256,
         },
         "resources": "resources",
         "corpora": {
@@ -918,6 +959,7 @@ mod tests {
         let corpora = source.join("corpora");
         let vad = source.join("silero_vad.onnx");
         let speaker = source.join("speaker_embedding.onnx");
+        let denoise = source.join("gtcrn_simple.onnx");
         let config = source.join("config.json");
         let license = source.join("LICENSE");
         write(&client, b"client");
@@ -962,6 +1004,7 @@ zh,en,fr,pt,es,ja,ru,ko,th,it,de,vi,id,pl,cs,nl
         );
         write(&vad, b"onnx");
         write(&speaker, b"onnx");
+        write(&denoise, b"onnx");
         write(&config, br#"{"model_manager":{"llama_server_path":"old"}}"#);
         write(&license, b"AGPL-3.0-only");
 
@@ -977,6 +1020,7 @@ zh,en,fr,pt,es,ja,ru,ko,th,it,de,vi,id,pl,cs,nl
             license,
             vad_model: Some(vad),
             speaker_model: Some(speaker),
+            denoise_model: Some(denoise),
             output: output.clone(),
             include_models: false,
             check: false,
@@ -1025,6 +1069,7 @@ zh,en,fr,pt,es,ja,ru,ko,th,it,de,vi,id,pl,cs,nl
         );
         assert!(output.join(VAD_RELATIVE_PATH).is_file());
         assert!(output.join(SPEAKER_RELATIVE_PATH).is_file());
+        assert!(output.join(DENOISE_RELATIVE_PATH).is_file());
         assert!(output.join("release-manifest.json").is_file());
         assert!(!output.join("runtime/llama.cpp").exists());
         assert!(!output.join("backend").exists());
@@ -1038,6 +1083,7 @@ zh,en,fr,pt,es,ja,ru,ko,th,it,de,vi,id,pl,cs,nl
         assert_eq!(manifest["python"], false);
         assert_eq!(manifest["runtime"]["included"], false);
         assert_eq!(manifest["speaker_model"]["path"], SPEAKER_RELATIVE_PATH);
+        assert_eq!(manifest["denoise_model"]["path"], DENOISE_RELATIVE_PATH);
         assert_eq!(
             manifest["entrypoints"]["client"],
             format!("XRTranslate-v{version}{extension}")

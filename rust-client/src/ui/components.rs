@@ -850,13 +850,13 @@ pub fn target_language_pair_selector(
 
         let options_a: Vec<_> = crate::LANGUAGE_OPTIONS
             .iter()
-            .filter(|(code, _)| *code != b)
+            .filter(|(code, _)| !crate::languages_conflict(code, &b))
             .map(|(code, label)| ((*code).to_string(), crate::i18n::tr(language, label).to_string()))
             .collect();
 
         let options_b: Vec<_> = crate::LANGUAGE_OPTIONS
             .iter()
-            .filter(|(code, _)| *code != a)
+            .filter(|(code, _)| !crate::languages_conflict(code, &a))
             .map(|(code, label)| ((*code).to_string(), crate::i18n::tr(language, label).to_string()))
             .collect();
 
@@ -900,15 +900,15 @@ pub fn target_language_pair_selector(
                 changed = true;
             }
         }
-        if target_language == source_language {
-            let fallback = if source_language == "zh" { "en" } else { "zh" };
+        if crate::languages_conflict(target_language, source_language) {
+            let fallback = if crate::languages_conflict(source_language, "zh") { "en" } else { "zh" };
             *target_language = fallback.to_string();
             changed = true;
         }
 
         let mut target_options = Vec::new();
         for (code, label) in crate::LANGUAGE_OPTIONS {
-            if *code != source_language {
+            if !crate::languages_conflict(code, source_language) {
                 target_options.push((
                     (*code).to_string(),
                     crate::i18n::tr(language, label).to_string(),

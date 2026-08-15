@@ -1,0 +1,14 @@
+[package]
+name = "xrtranslate-denoise"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+description = "Ultra-lightweight real-time GTCRN speech enhancement and background noise suppression."
+
+[dependencies]
+ndarray = "0.16"
+ort = { version = "=2.0.0-rc.10", features = ["ndarray"] }
+tracing = "0.1"
+
+[dev-dependencies]

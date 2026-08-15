@@ -46,6 +46,7 @@ pub struct AudioImportOptions {
     /// Number of mono 16 kHz frames per emitted message. 1600 is 100 ms.
     pub chunk_frames: usize,
     pub pacing: AudioImportPacing,
+    pub recognition_channels: Vec<usize>,
 }
 
 impl Default for AudioImportOptions {
@@ -53,6 +54,7 @@ impl Default for AudioImportOptions {
         Self {
             chunk_frames: 1_600,
             pacing: AudioImportPacing::Realtime,
+            recognition_channels: Vec::new(),
         }
     }
 }
@@ -260,18 +262,22 @@ fn run_import(
         )
         .map_err(map_probe_error)?;
     let mut format = probed.format;
-    let track = format
+    let (track_id, codec_params, mut decoder) = format
         .tracks()
         .iter()
-        .find(|track| track.codec_params.codec != CODEC_TYPE_NULL)
-        .ok_or_else(|| AudioImportError::Unsupported("no decodable audio track".into()))?;
-    let track_id = track.id;
-    let codec_params = track.codec_params.clone();
+        .find_map(|t| {
+            if t.codec_params.codec == CODEC_TYPE_NULL {
+                return None;
+            }
+            let decoder = symphonia::default::get_codecs()
+                .make(&t.codec_params, &DecoderOptions::default())
+                .ok()?;
+            Some((t.id, t.codec_params.clone(), decoder))
+        })
+        .ok_or_else(|| AudioImportError::Unsupported("no decodable audio track found in media file".into()))?;
+
     let codec_name = format!("{:?}", codec_params.codec);
     let total_source_frames = codec_params.n_frames;
-    let mut decoder = symphonia::default::get_codecs()
-        .make(&codec_params, &DecoderOptions::default())
-        .map_err(map_decode_error)?;
 
     let mut source_format = None;
     let mut resampler = None;
@@ -348,7 +354,11 @@ fn run_import(
 
         let mut converted = SampleBuffer::<f32>::new(decoded.capacity() as u64, spec);
         converted.copy_interleaved_ref(decoded);
-        let mono = downmix_interleaved(converted.samples(), channels);
+        let mono = downmix_interleaved(
+            converted.samples(),
+            channels,
+            &options.recognition_channels,
+        );
         decoded_source_frames += mono.len() as u64;
         resampler
             .as_mut()
@@ -388,47 +398,63 @@ fn run_import(
     Ok(sink.sent_frames)
 }
 
-fn downmix_interleaved(samples: &[f32], channels: usize) -> Vec<f32> {
+fn downmix_interleaved(
+    samples: &[f32],
+    channels: usize,
+    recognition_channels: &[usize],
+) -> Vec<f32> {
     if channels == 1 {
         return samples.to_vec();
     }
-    let scale = 1.0 / channels as f32;
-    samples
-        .chunks_exact(channels)
-        .map(|frame| frame.iter().copied().sum::<f32>() * scale)
-        .collect()
-}
 
-fn send_progress(
-    event_tx: &Sender<AudioImportEvent>,
-    decoded_source_frames: u64,
-    total_source_frames: Option<u64>,
-    source_rate: u32,
-) {
-    let position =
-        duration_from_frames(Some(decoded_source_frames), source_rate).unwrap_or(Duration::ZERO);
-    let duration = duration_from_frames(total_source_frames, source_rate);
-    let fraction = total_source_frames
-        .filter(|total| *total > 0)
-        .map(|total| (decoded_source_frames as f64 / total as f64).clamp(0.0, 1.0) as f32);
-    let _ = event_tx.send(AudioImportEvent::Progress(AudioImportProgress {
-        decoded_source_frames,
-        total_source_frames,
-        position,
-        duration,
-        fraction,
-    }));
-}
+    let active_channels: Vec<usize> = recognition_channels
+        .iter()
+        .copied()
+        .filter(|&idx| idx < channels)
+        .collect();
 
-fn duration_from_frames(frames: Option<u64>, sample_rate: u32) -> Option<Duration> {
-    frames.map(|frames| Duration::from_secs_f64(frames as f64 / sample_rate as f64))
-}
+    if !active_channels.is_empty() {
+        if active_channels.len() == 1 {
+            let single_idx = active_channels[0];
+            return samples
+                .chunks_exact(channels)
+                .map(|frame| frame[single_idx])
+                .collect();
+        }
 
-fn check_cancelled(stop_requested: &AtomicBool) -> Result<(), AudioImportError> {
-    if stop_requested.load(Ordering::Acquire) {
-        Err(AudioImportError::Cancelled)
+        let scale = 1.0 / active_channels.len() as f32;
+        return samples
+            .chunks_exact(channels)
+            .map(|frame| {
+                let sum: f32 = active_channels.iter().map(|&idx| frame[idx]).sum();
+                sum * scale
+            })
+            .collect();
+    } else if channels >= 6 {
+        // Standard SMPTE / WAVE 5.1/7.1 order: 0:FL, 1:FR, 2:FC, 3:LFE, 4:SL/BL, 5:SR/BR
+        // Prioritize Center dialogue while attenuating surround and ignoring LFE
+        samples
+            .chunks_exact(channels)
+            .map(|frame| {
+                let l = frame[0];
+                let r = frame[1];
+                let c = frame[2];
+                let ls = frame[4];
+                let rs = frame[5];
+                c * 0.85 + (l + r) * 0.12 + (ls + rs) * 0.03
+            })
+            .collect()
+    } else if channels == 2 {
+        samples
+            .chunks_exact(2)
+            .map(|frame| (frame[0] + frame[1]) * 0.5)
+            .collect()
     } else {
-        Ok(())
+        let scale = 1.0 / channels as f32;
+        samples
+            .chunks_exact(channels)
+            .map(|frame| frame.iter().copied().sum::<f32>() * scale)
+            .collect()
     }
 }
 
@@ -504,6 +530,39 @@ impl<'a> ChunkSink<'a> {
                 thread::sleep((deadline - Instant::now()).min(SEND_POLL_INTERVAL));
             }
         }
+        Ok(())
+    }
+}
+
+fn send_progress(
+    event_tx: &Sender<AudioImportEvent>,
+    decoded_source_frames: u64,
+    total_source_frames: Option<u64>,
+    source_rate: u32,
+) {
+    let position =
+        duration_from_frames(Some(decoded_source_frames), source_rate).unwrap_or(Duration::ZERO);
+    let duration = duration_from_frames(total_source_frames, source_rate);
+    let fraction = total_source_frames
+        .filter(|total| *total > 0)
+        .map(|total| (decoded_source_frames as f64 / total as f64).clamp(0.0, 1.0) as f32);
+    let _ = event_tx.send(AudioImportEvent::Progress(AudioImportProgress {
+        decoded_source_frames,
+        total_source_frames,
+        position,
+        duration,
+        fraction,
+    }));
+}
+
+fn duration_from_frames(frames: Option<u64>, sample_rate: u32) -> Option<Duration> {
+    frames.map(|frames| Duration::from_secs_f64(frames as f64 / sample_rate as f64))
+}
+
+fn check_cancelled(stop_requested: &AtomicBool) -> Result<(), AudioImportError> {
+    if stop_requested.load(Ordering::Acquire) {
+        Err(AudioImportError::Cancelled)
+    } else {
         Ok(())
     }
 }
@@ -683,8 +742,53 @@ mod tests {
 
     #[test]
     fn downmixes_interleaved_stereo() {
-        let mono = downmix_interleaved(&[1.0, -1.0, 0.25, 0.75], 2);
+        let mono = downmix_interleaved(&[1.0, -1.0, 0.25, 0.75], 2, &[]);
         assert_eq!(mono, vec![0.0, 0.5]);
+    }
+
+    #[test]
+    fn test_downmix_multiple_explicit() {
+        let channels = 6;
+        let frames = 2;
+        let mut input = vec![0.0; channels * frames];
+        // Standard 5.1 layout: 0:FL, 1:FR, 2:FC, 3:LFE, 4:SL, 5:SR
+        // Frame 0: FL=0.3, FC=0.5
+        input[0] = 0.3;
+        input[2] = 0.5;
+        // Frame 1: FL=0.4, FC=0.6
+        input[6] = 0.4;
+        input[8] = 0.6;
+
+        // Request FL (0) and FC (2)
+        let mixed = downmix_interleaved(&input, channels, &[0, 2]);
+        
+        let expected: Vec<f32> = vec![
+            (0.3 + 0.5) / 2.0,
+            (0.4 + 0.6) / 2.0,
+        ];
+        assert_eq!(mixed, expected);
+    }
+
+    #[test]
+    fn downmixes_interleaved_5_1_surround_with_dialogue_isolation() {
+        // [FL, FR, FC, LFE, SL, SR]
+        // LFE=10.0 (loud explosion), SL=2.0, SR=2.0 (ambient), FC=1.0 (dialogue), FL=0.0, FR=0.0
+        let mono = downmix_interleaved(&[0.0, 0.0, 1.0, 10.0, 2.0, 2.0], 6, &[]);
+        // FC*0.85 + (SL+SR)*0.03 = 0.85 + 0.12 = 0.97 (LFE is completely ignored)
+        assert!((mono[0] - 0.97).abs() < 1e-4);
+    }
+
+    #[test]
+    fn isolates_dialogue_from_multichannel() {
+        // [FL, FR, FC, LFE, SL, SR]
+        // Channel values: FL=1.0, FR=2.0, FC=3.0, LFE=4.0, SL=5.0, SR=6.0
+        let mono_c = downmix_interleaved(&[1.0, 2.0, 3.0, 4.0, 5.0, 6.0], 6, &[2]);
+        // FC is index 2 -> 3.0
+        assert_eq!(mono_c, vec![3.0]);
+
+        let mono_lr = downmix_interleaved(&[1.0, 2.0, 3.0, 4.0, 5.0, 6.0], 6, &[0, 1]);
+        // FL is 1.0, FR is 2.0 -> average = 1.5
+        assert_eq!(mono_lr, vec![1.5]);
     }
 
     #[test]

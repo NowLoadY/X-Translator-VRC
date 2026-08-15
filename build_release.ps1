@@ -14,6 +14,7 @@ $workspaceManifest = Join-Path $projectRoot 'Cargo.toml'
 $configPath = Join-Path $projectRoot 'config.json'
 $vadModel = Join-Path $projectRoot 'models\silero-vad\src\silero_vad\data\silero_vad.onnx'
 $speakerModel = Join-Path $projectRoot 'models\3D-Speaker-ERes2NetV2\speaker_embedding.onnx'
+$denoiseModel = Join-Path $projectRoot 'models\gtcrn\gtcrn_simple.onnx'
 $corporaDirectory = Join-Path $projectRoot 'XR-Corpus\corpora'
 $cargoPath = Join-Path $env:USERPROFILE '.cargo\bin\cargo.exe'
 
@@ -28,6 +29,9 @@ if (-not (Test-Path -LiteralPath $vadModel)) {
 }
 if (-not (Test-Path -LiteralPath $speakerModel)) {
     throw "ERes2NetV2 speaker ONNX model was not found: $speakerModel"
+}
+if (-not (Test-Path -LiteralPath $denoiseModel)) {
+    throw "GTCRN denoise ONNX model was not found: $denoiseModel"
 }
 if (-not (Test-Path -LiteralPath $corporaDirectory)) {
     throw "Versioned Markdown corpora were not found: $corporaDirectory"
@@ -91,6 +95,7 @@ $packageArguments = @(
     '--corpora-dir', $corporaDirectory,
     '--vad-model', $vadModel,
     '--speaker-model', $speakerModel,
+    '--denoise-model', $denoiseModel,
     '--output', $Output
 )
 if ($IncludeModels) {

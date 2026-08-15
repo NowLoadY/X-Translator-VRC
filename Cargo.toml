@@ -10,6 +10,7 @@ members = [
     "crates/xrtranslate-assets",
     "crates/xrtranslate-speaker",
     "crates/xrtranslate-vad",
+    "crates/xrtranslate-denoise",
     "crates/xrtranslate-supervisor",
     "apps/xrtranslate-backend",
     "apps/xrtranslate-installer",

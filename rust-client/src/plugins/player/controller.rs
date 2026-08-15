@@ -1,7 +1,7 @@
 use super::{
     backend::{window::NativeVideoHost, MediaBackend, MediaSource, PlaybackStatus},
     subtitles::{SubtitleCue, SubtitleTimeline},
-    task::{VideoSubtitleMode, VideoTask, VideoTaskStore},
+    task::{AudioChannelItem, VideoSubtitleMode, VideoTask, VideoTaskStore},
 };
 use std::path::PathBuf;
 use std::time::Instant;
@@ -39,6 +39,8 @@ pub struct VideoPlayerController {
 
     pub last_hover_instant: Option<Instant>,
     pub last_save_instant: Instant,
+    pub last_manual_scroll: Option<Instant>,
+    pub last_auto_scrolled_idx: Option<usize>,
 }
 
 impl Default for VideoPlayerController {
@@ -74,12 +76,14 @@ impl Default for VideoPlayerController {
             draft_target_lang: "zh".into(),
             draft_subtitle_mode: VideoSubtitleMode::RealtimeTranslation,
             draft_recognition: crate::client_settings::RecognitionSettings {
-                background_noise: 0.15,
-                pause_tolerance: 0.5,
+                background_noise: 0.6,
+                pause_tolerance: 1.0,
                 continuous_recognition: false,
             },
             last_hover_instant: Some(Instant::now()),
             last_save_instant: Instant::now(),
+            last_manual_scroll: None,
+            last_auto_scrolled_idx: None,
         }
     }
 }
@@ -93,6 +97,7 @@ impl VideoPlayerController {
         self.route = VideoPlayerRoute::Library;
         self.active_task_id = None;
         self.current_source = None;
+        self.last_auto_scrolled_idx = None;
         if let Some(host) = &self.native_host {
             host.hide();
         }
@@ -106,14 +111,15 @@ impl VideoPlayerController {
         self.route = VideoPlayerRoute::Create;
         self.active_task_id = None;
         self.current_source = None;
+        self.last_auto_scrolled_idx = None;
         self.draft_title.clear();
         self.draft_source.clear();
         self.draft_source_lang = "auto".into();
         self.draft_target_lang = "zh".into();
         self.draft_subtitle_mode = VideoSubtitleMode::RealtimeTranslation;
         self.draft_recognition = crate::client_settings::RecognitionSettings {
-            background_noise: 0.15,
-            pause_tolerance: 0.5,
+            background_noise: 0.6,
+            pause_tolerance: 1.0,
             continuous_recognition: false,
         };
         self.error = None;
@@ -201,6 +207,7 @@ impl VideoPlayerController {
                     backend.load_stream_url(url.clone())?;
                 }
             }
+            backend.set_channel_routing(&task.audio_channels);
         } else {
             return Err("Media backend is not available".into());
         }
@@ -214,6 +221,55 @@ impl VideoPlayerController {
         }
         let _ = self.store.save_to_dir(&self.storage_dir);
         Ok(())
+    }
+
+    pub fn is_task_running(&self) -> bool {
+        self.active_task_id
+            .as_deref()
+            .and_then(|id| self.store.get(id))
+            .map_or(false, |task| task.is_task_running)
+    }
+
+    pub fn start_task(&mut self) {
+        if let Some(task_id) = &self.active_task_id {
+            if let Some(task) = self.store.get_mut(task_id) {
+                task.is_task_running = true;
+            }
+            let _ = self.store.save_to_dir(&self.storage_dir);
+        }
+    }
+
+    pub fn pause_task(&mut self) {
+        if let Some(task_id) = &self.active_task_id {
+            if let Some(task) = self.store.get_mut(task_id) {
+                task.is_task_running = false;
+            }
+            let _ = self.store.save_to_dir(&self.storage_dir);
+        }
+    }
+
+    pub fn clear_and_restart_task(&mut self) {
+        self.subtitles.clear();
+        if let Some(task_id) = &self.active_task_id {
+            if let Some(task) = self.store.get_mut(task_id) {
+                task.subtitles = self.subtitles.clone();
+                task.is_task_running = true;
+            }
+            let _ = self.store.save_to_dir(&self.storage_dir);
+        }
+        self.last_manual_scroll = None;
+    }
+
+    pub fn apply_channel_routing(&mut self) {
+        if let Some(task_id) = &self.active_task_id {
+            if let Some(task) = self.store.get(task_id) {
+                let channels = task.audio_channels.clone();
+                if let Some(backend) = &mut self.backend {
+                    backend.set_channel_routing(&channels);
+                }
+            }
+            let _ = self.store.save_to_dir(&self.storage_dir);
+        }
     }
 
     pub fn delete_task(&mut self, task_id: &str) {
@@ -279,6 +335,20 @@ impl VideoPlayerController {
         if let Some(backend) = &mut self.backend {
             backend.tick();
 
+            // Synchronize detected audio channels from backend stream
+            if let Some(active_id) = &self.active_task_id {
+                if let Some(detected_count) = backend.get_audio_channel_count() {
+                    if detected_count > 0 {
+                        if let Some(task) = self.store.get_mut(active_id) {
+                            if task.audio_channels.len() != detected_count {
+                                task.audio_channels = AudioChannelItem::default_for_count(detected_count);
+                                backend.set_channel_routing(&task.audio_channels);
+                            }
+                        }
+                    }
+                }
+            }
+
             if self.show_subtitles && self.current_source.is_some() && backend.get_status() == PlaybackStatus::Playing {
                 let current_time_ms = backend.get_time_ms();
                 if let Some(cue) = self.subtitles.active_cue_at(current_time_ms) {
@@ -343,6 +413,10 @@ impl VideoPlayerController {
         orig: String,
         trans: Option<String>,
     ) {
+        if !self.is_task_running() {
+            return;
+        }
+
         let changed = self.subtitles.add_cue(SubtitleCue {
             id,
             start_ms,
@@ -395,14 +469,7 @@ fn parse_srt_to_timeline(srt_content: &str) -> SubtitleTimeline {
                 }
 
                 let (original_text, translated_text) = if text_lines.len() >= 2 {
-                    let second_line = text_lines[1..].join("\n");
-                    if first_line.is_empty() {
-                        (second_line, None)
-                    } else if second_line == first_line {
-                        (first_line, None)
-                    } else {
-                        (first_line, Some(second_line))
-                    }
+                    (first_line, Some(text_lines[1].to_string()))
                 } else {
                     (first_line, None)
                 };
@@ -421,13 +488,13 @@ fn parse_srt_to_timeline(srt_content: &str) -> SubtitleTimeline {
     timeline
 }
 
-fn parse_srt_time(s: &str) -> i64 {
-    let binding = s.replace(',', ".");
-    let parts: Vec<&str> = binding.split(':').collect();
+fn parse_srt_time(time_str: &str) -> i64 {
+    let parts: Vec<&str> = time_str.split(':').collect();
     if parts.len() == 3 {
         let h: f64 = parts[0].parse().unwrap_or(0.0);
         let m: f64 = parts[1].parse().unwrap_or(0.0);
-        let s: f64 = parts[2].parse().unwrap_or(0.0);
+        let s_part = parts[2].replace(',', ".");
+        let s: f64 = s_part.parse().unwrap_or(0.0);
         ((h * 3600.0 + m * 60.0 + s) * 1000.0) as i64
     } else {
         0
@@ -442,6 +509,20 @@ mod tests {
     fn controller_interplugin_export_and_ingest() {
         let mut controller = VideoPlayerController::default();
         assert_eq!(controller.volume, 1.0);
+
+        let mut task = VideoTask::new(
+            "Test Video".into(),
+            MediaSource::NetworkStream("http://test.com".into()),
+            "en".into(),
+            "zh".into(),
+            VideoSubtitleMode::RealtimeTranslation,
+            crate::client_settings::RecognitionSettings::default(),
+        );
+        task.is_task_running = true;
+        let task_id = task.id.clone();
+        controller.store.add_or_update(task);
+        controller.active_task_id = Some(task_id);
+
         controller.ingest_live_caption(
             "test_1".into(),
             500,
@@ -472,8 +553,8 @@ mod tests {
             "zh".into(),
             VideoSubtitleMode::RealtimeTranslation,
             crate::client_settings::RecognitionSettings {
-                background_noise: 0.15,
-                pause_tolerance: 0.5,
+                background_noise: 0.6,
+                pause_tolerance: 1.0,
                 continuous_recognition: false,
             },
         );

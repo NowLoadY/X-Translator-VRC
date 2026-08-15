@@ -13,7 +13,7 @@ use std::{
 
 use clap::Parser;
 
-const PROTECTED_TOP_LEVEL: &[&str] = &["models", "runtime", "config.json"];
+const PROTECTED_TOP_LEVEL: &[&str] = &["runtime", "config.json"];
 const RETRY_TIMEOUT: Duration = Duration::from_secs(45);
 
 #[derive(Debug, Parser)]
@@ -121,6 +121,10 @@ fn replace_entries(
     for entry in fs::read_dir(source).map_err(|error| error.to_string())? {
         let entry = entry.map_err(|error| error.to_string())?;
         let name = entry.file_name();
+        if name.eq_ignore_ascii_case(OsStr::new("models")) {
+            merge_models_directory(&entry.path(), &target.join(&name), target, backup)?;
+            continue;
+        }
         if is_protected(&name) {
             if name.eq_ignore_ascii_case(OsStr::new("config.json")) && !target.join(&name).exists()
             {
@@ -131,6 +135,42 @@ fn replace_entries(
         let destination = target.join(&name);
         backup_existing(&destination, target, backup)?;
         copy_path(&entry.path(), &destination)?;
+    }
+    Ok(())
+}
+
+fn merge_models_directory(
+    source_models: &Path,
+    target_models: &Path,
+    target_root: &Path,
+    backup: &Path,
+) -> Result<(), String> {
+    if !source_models.is_dir() {
+        return Ok(());
+    }
+    fs::create_dir_all(target_models).map_err(|error| error.to_string())?;
+    merge_directory_recursive(source_models, target_models, target_root, backup)
+}
+
+fn merge_directory_recursive(
+    source_dir: &Path,
+    target_dir: &Path,
+    target_root: &Path,
+    backup: &Path,
+) -> Result<(), String> {
+    for entry in fs::read_dir(source_dir).map_err(|error| error.to_string())? {
+        let entry = entry.map_err(|error| error.to_string())?;
+        let src_path = entry.path();
+        let dest_path = target_dir.join(entry.file_name());
+        if src_path.is_dir() {
+            fs::create_dir_all(&dest_path).map_err(|error| error.to_string())?;
+            merge_directory_recursive(&src_path, &dest_path, target_root, backup)?;
+        } else if src_path.is_file() {
+            if dest_path.exists() {
+                backup_existing(&dest_path, target_root, backup)?;
+            }
+            copy_path(&src_path, &dest_path)?;
+        }
     }
     Ok(())
 }
@@ -270,5 +310,55 @@ fn require_directory(path: &Path, label: &str) -> Result<(), Box<dyn Error>> {
         Ok(())
     } else {
         Err(format!("{label} directory does not exist: {}", path.display()).into())
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn merge_models_directory_adds_new_onnx_and_preserves_user_gguf() {
+        let temp = std::env::temp_dir().join(format!("xrt_updater_test_{}", std::process::id()));
+        let _ = fs::remove_dir_all(&temp);
+        let source = temp.join("source");
+        let target = temp.join("target");
+        let backup = temp.join("backup");
+
+        fs::create_dir_all(source.join("models/gtcrn")).unwrap();
+        fs::create_dir_all(source.join("models/silero-vad")).unwrap();
+        fs::write(source.join("models/gtcrn/gtcrn_simple.onnx"), b"new_denoise_onnx").unwrap();
+        fs::write(source.join("models/silero-vad/silero_vad.onnx"), b"updated_vad_onnx").unwrap();
+
+        fs::create_dir_all(target.join("models/silero-vad")).unwrap();
+        fs::create_dir_all(target.join("models/qwen3-asr")).unwrap();
+        fs::write(target.join("models/silero-vad/silero_vad.onnx"), b"old_vad_onnx").unwrap();
+        fs::write(target.join("models/qwen3-asr/qwen3.gguf"), b"huge_user_downloaded_gguf").unwrap();
+
+        let source_entries = source_entries(&source).unwrap();
+        replace_entries(&source, &target, &source_entries, &backup).unwrap();
+
+        // 1. New ONNX model is copied to target
+        assert_eq!(
+            fs::read(target.join("models/gtcrn/gtcrn_simple.onnx")).unwrap(),
+            b"new_denoise_onnx"
+        );
+        // 2. Updated ONNX model is updated in target
+        assert_eq!(
+            fs::read(target.join("models/silero-vad/silero_vad.onnx")).unwrap(),
+            b"updated_vad_onnx"
+        );
+        // 3. User's existing GGUF model is untouched and preserved
+        assert_eq!(
+            fs::read(target.join("models/qwen3-asr/qwen3.gguf")).unwrap(),
+            b"huge_user_downloaded_gguf"
+        );
+        // 4. Old VAD model was backed up
+        assert_eq!(
+            fs::read(backup.join("models/silero-vad/silero_vad.onnx")).unwrap(),
+            b"old_vad_onnx"
+        );
+
+        let _ = fs::remove_dir_all(&temp);
     }
 }

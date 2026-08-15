@@ -22,11 +22,13 @@ pub enum PlayerTranslationRequest {
         source_language: String,
         target_language: String,
         recognition: crate::client_settings::RecognitionSettings,
+        audio_channels: Vec<task::AudioChannelItem>,
     },
     LiveStream {
         source_language: String,
         target_language: String,
         recognition: crate::client_settings::RecognitionSettings,
+        audio_channels: Vec<task::AudioChannelItem>,
     },
 }
 
@@ -61,6 +63,7 @@ impl VideoPlayerPlugin {
 
     pub fn on_visibility_changed(&mut self, is_visible: bool) {
         if !is_visible || self.controller.route != controller::VideoPlayerRoute::Player {
+            self.controller.fullscreen_mode = false;
             if let Some(host) = &self.controller.native_host {
                 host.hide();
             }

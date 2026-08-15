@@ -27,36 +27,52 @@ pub fn render(
     context: OscPageContext<'_>,
 ) -> Vec<OscUiAction> {
     let mut actions = Vec::new();
-    ui.label(
-        egui::RichText::new(crate::i18n::tr(context.language, "VRChat OSC Studio"))
-            .size(22.0)
-            .color(crate::ui::theme::text_strong())
-            .strong(),
-    );
 
-    ui.add_space(12.0);
+    let bottom_bar_height = 70.0;
+    let scroll_height = (ui.available_height() - bottom_bar_height - 10.0).max(60.0);
 
-    if let Some(error) = context.last_error {
-        card(ui, |ui| {
-            ui.horizontal(|ui| {
-                ui.label(egui::RichText::new("⚠").color(egui::Color32::from_rgb(220, 38, 38)));
-                ui.label(egui::RichText::new(error).color(egui::Color32::from_rgb(220, 38, 38)));
-            });
+    egui::ScrollArea::vertical()
+        .id_salt("osc_page_scroll")
+        .auto_shrink([false, false])
+        .max_height(scroll_height)
+        .show(ui, |ui| {
+            ui.label(
+                egui::RichText::new(crate::i18n::tr(context.language, "VRChat OSC Studio"))
+                    .size(22.0)
+                    .color(crate::ui::theme::text_strong())
+                    .strong(),
+            );
+
+            ui.add_space(12.0);
+
+            if let Some(error) = context.last_error {
+                card(ui, |ui| {
+                    ui.horizontal(|ui| {
+                        ui.label(egui::RichText::new("⚠").color(egui::Color32::from_rgb(220, 38, 38)));
+                        ui.label(egui::RichText::new(error).color(egui::Color32::from_rgb(220, 38, 38)));
+                    });
+                });
+                ui.add_space(10.0);
+            }
+
+            toolbar::render_toolbar(
+                plugin,
+                ui,
+                context.language,
+                context.mute_gate_enabled,
+                &mut actions,
+            );
+
+            ui.add_space(12.0);
+
+            canvas::render_canvas(plugin, ui, context.language);
+            ui.add_space(8.0);
         });
-        ui.add_space(10.0);
-    }
 
-    toolbar::render_toolbar(
-        plugin,
-        ui,
-        context.language,
-        context.mute_gate_enabled,
-        &mut actions,
-    );
+    ui.add_space(10.0);
 
-    ui.add_space(12.0);
+    canvas::render_bottom_input_bar(plugin, ui, context.language);
 
-    canvas::render_canvas(plugin, ui, context.language);
     actions
 }
 

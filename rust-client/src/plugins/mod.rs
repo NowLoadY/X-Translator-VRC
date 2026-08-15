@@ -62,6 +62,7 @@ impl<'de> Deserialize<'de> for PluginId {
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum PluginScrollPolicy {
     /// The application shell provides the page's vertical scroll area.
+    #[allow(dead_code)]
     Host,
     /// The plugin manages its own nested or virtualized scroll regions.
     Plugin,
@@ -115,7 +116,7 @@ const PLUGIN_DESCRIPTORS: [PluginDescriptor; 3] = [
         },
         scroll_policy: PluginScrollPolicy::Plugin,
         settings_contribution: PluginSettingsContribution::EnablementOnly,
-        default_enabled: true,
+        default_enabled: false,
     },
     PluginDescriptor {
         id: PluginId::VIDEO_PLAYER,
@@ -128,7 +129,7 @@ const PLUGIN_DESCRIPTORS: [PluginDescriptor; 3] = [
         },
         scroll_policy: PluginScrollPolicy::Plugin,
         settings_contribution: PluginSettingsContribution::EnablementOnly,
-        default_enabled: true,
+        default_enabled: false,
     },
     PluginDescriptor {
         id: PluginId::OSC,
@@ -139,7 +140,7 @@ const PLUGIN_DESCRIPTORS: [PluginDescriptor; 3] = [
             uri: "bytes://plugins/osc/icon.svg",
             bytes: include_bytes!("../../resources/plugins/osc/icon.svg"),
         },
-        scroll_policy: PluginScrollPolicy::Host,
+        scroll_policy: PluginScrollPolicy::Plugin,
         settings_contribution: PluginSettingsContribution::Plugin,
         default_enabled: true,
     },
@@ -236,7 +237,8 @@ mod tests {
     fn builtin_preferences_enable_both_plugins() {
         let preferences = PluginPreferences::default();
         assert!(preferences.is_enabled(PluginId::OSC));
-        assert!(preferences.is_enabled(PluginId::MEETING));
+        assert!(!preferences.is_enabled(PluginId::MEETING));
+        assert!(!preferences.is_enabled(PluginId::VIDEO_PLAYER));
     }
 
     #[test]

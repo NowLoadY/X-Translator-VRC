@@ -661,7 +661,7 @@ fn render_input_adaptation(
                 ui,
                 &mut recognition.pause_tolerance,
                 0.0..=1.0,
-                0.40,
+                0.10,
                 pause_tolerance,
                 &[],
             );

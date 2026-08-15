@@ -463,6 +463,7 @@ fn retain_recognition_tail(entry: &mut RecognitionHistoryEntry) {
 
 pub const LANGUAGE_OPTIONS: &[(&str, &str)] = &[
     ("zh", "Chinese"),
+    ("zh-TW", "Traditional Chinese"),
     ("en", "English"),
     ("fr", "French"),
     ("pt", "Portuguese"),
@@ -491,7 +492,19 @@ fn language_label(ui_language: UiLanguage, code: &str) -> &'static str {
         .unwrap_or_else(|| i18n::tr(ui_language, "Unknown language"))
 }
 
-
+/// Returns true if the two language codes are mutually exclusive and should not
+/// both be selectable at the same time (e.g. zh and zh-TW are the same base
+/// language and would produce a no-op or circular translation route).
+pub fn languages_conflict(a: &str, b: &str) -> bool {
+    if a == b {
+        return true;
+    }
+    fn chinese_variant(code: &str) -> bool {
+        let c = code.trim().to_ascii_lowercase();
+        c == "zh" || c.starts_with("zh-")
+    }
+    chinese_variant(a) && chinese_variant(b)
+}
 
 fn capture_source_to_meeting(source: CaptureSource) -> MeetingAudioSource {
     match source {
@@ -549,13 +562,14 @@ struct XRTranslateApp {
     download_proxy_url: String,
     source_lang: String,
     target_lang: String,
+    denoise_enabled: bool,
     tts_enabled: bool,
     speaker_recognition_enabled: bool,
     osc_plugin: OscPlugin,
     meeting_plugin: MeetingPlugin,
     player_plugin: plugins::player::VideoPlayerPlugin,
     host_audio_import: Option<plugins::meeting::audio_file::AudioImportHandle>,
-    pending_audio_import: Option<(std::path::PathBuf, RecognitionSettings, plugins::meeting::audio_file::AudioImportPacing)>,
+    pending_audio_import: Option<(std::path::PathBuf, RecognitionSettings, Vec<usize>, plugins::meeting::audio_file::AudioImportPacing)>,
     plugin_preferences: PluginPreferences,
     service_config: service_config::ServiceConfigEditor,
     backend_manager: backend::BackendManager,
@@ -1076,6 +1090,7 @@ impl Default for XRTranslateApp {
             download_proxy_url: settings.download_proxy_url,
             source_lang: settings.source_lang,
             target_lang: settings.target_lang,
+            denoise_enabled: settings.denoise_enabled,
             tts_enabled: settings.tts_enabled,
             speaker_recognition_enabled: settings.speaker_recognition_enabled,
             osc_plugin,
@@ -1275,12 +1290,19 @@ impl XRTranslateApp {
                         source_language,
                         target_language,
                         recognition,
+                        audio_channels,
                     } => {
+                        let recognition_channels = audio_channels
+                            .iter()
+                            .filter(|c| c.recognition)
+                            .map(|c| c.index)
+                            .collect::<Vec<usize>>();
                         self.start_audio_file_translation(
                             path,
                             source_language,
                             target_language,
                             recognition,
+                            recognition_channels,
                             plugins::meeting::audio_file::AudioImportPacing::AsFastAsPossible,
                             Some(ctx),
                         );
@@ -1289,6 +1311,7 @@ impl XRTranslateApp {
                         source_language,
                         target_language,
                         recognition,
+                        audio_channels: _,
                     } => {
                         self.source_lang = source_language;
                         self.target_lang = target_language;
@@ -1306,6 +1329,7 @@ impl XRTranslateApp {
         source_language: String,
         target_language: String,
         recognition: RecognitionSettings,
+        recognition_channels: Vec<usize>,
         pacing: plugins::meeting::audio_file::AudioImportPacing,
         ctx: Option<eframe::egui::Context>,
     ) {
@@ -1313,10 +1337,10 @@ impl XRTranslateApp {
         self.target_lang = target_language;
         match self.backend_manager.prepare(&self.server_url) {
             Ok(backend::BackendStart::Ready) => {
-                self.start_audio_file_session(path, recognition, pacing, ctx);
+                self.start_audio_file_session(path, recognition, recognition_channels, pacing, ctx);
             }
             Ok(backend::BackendStart::Starting(stage)) => {
-                self.pending_audio_import = Some((path, recognition, pacing));
+                self.pending_audio_import = Some((path, recognition, recognition_channels, pacing));
                 self.backend_start_deadline =
                     Some(std::time::Instant::now() + std::time::Duration::from_secs(180));
                 self.set_connection_status(stage.message());
@@ -1331,6 +1355,7 @@ impl XRTranslateApp {
         &mut self,
         path: std::path::PathBuf,
         recognition: RecognitionSettings,
+        recognition_channels: Vec<usize>,
         pacing: plugins::meeting::audio_file::AudioImportPacing,
         ctx: Option<eframe::egui::Context>,
     ) {
@@ -1360,6 +1385,7 @@ impl XRTranslateApp {
             plugins::meeting::audio_file::AudioImportOptions {
                 chunk_frames: 1_600,
                 pacing,
+                recognition_channels,
             },
         ) {
             Ok(import) => {
@@ -1481,6 +1507,7 @@ impl XRTranslateApp {
             loopback_recognition: self.loopback_recognition.clone(),
             source_lang: self.source_lang.clone(),
             target_lang: self.target_lang.clone(),
+            denoise_enabled: self.denoise_enabled,
             tts_enabled: self.tts_enabled,
             speaker_recognition_enabled: self.speaker_recognition_enabled,
             mute_self_pauses_translation: self.mute_self_pauses_translation.load(Ordering::Relaxed),
@@ -1830,7 +1857,7 @@ impl XRTranslateApp {
                                 vad_silence_ms: pause_tolerance_to_ms(recognition.pause_tolerance),
                                 continuous_recognition: recognition.continuous_recognition,
                                 audio_source: *source,
-                                finish_when_audio_ends: true,
+                                finish_when_audio_ends: false,
                             },
                         );
                         if crate::feature_access::is_available(
@@ -1919,8 +1946,8 @@ impl XRTranslateApp {
         match self.backend_manager.status(&self.server_url) {
             backend::BackendStatus::Ready => {
                 self.backend_start_deadline = None;
-                if let Some((path, recognition, pacing)) = self.pending_audio_import.take() {
-                    self.start_audio_file_session(path, recognition, pacing, ctx);
+                if let Some((path, recognition, recognition_channels, pacing)) = self.pending_audio_import.take() {
+                    self.start_audio_file_session(path, recognition, recognition_channels, pacing, ctx);
                 } else if let Some(path) = self.meeting_plugin.pending_audio_import.take() {
                     self.start_audio_import_session(path, ctx);
                 } else {
@@ -2687,60 +2714,73 @@ impl eframe::App for XRTranslateApp {
             self.meeting_plugin.controller.poll_live_view();
         }
 
-        let expand_target = if self.navigation.collapsed { 0.0 } else { 1.0 };
-        let expand_factor = ui::animation::AnimationSystem::animate_value(
-            ui.ctx(),
-            egui::Id::new("sidebar_expand_anim"),
-            expand_target,
-            0.20,
-        );
-        let eased_expand = ui::animation::AnimationSystem::ease_out_cubic(expand_factor);
-        let sidebar_width = egui::lerp(54.0..=200.0, eased_expand);
-        let margin_x = egui::lerp(8.0..=12.0, eased_expand);
+        let is_player_fullscreen = self.navigation.page == Page::Plugin(PluginId::VIDEO_PLAYER)
+            && self.player_plugin.controller.fullscreen_mode;
 
-        let prev_collapsed = self.navigation.collapsed;
-        let prev_page = self.navigation.page;
+        if !is_player_fullscreen {
+            let expand_target = if self.navigation.collapsed { 0.0 } else { 1.0 };
+            let expand_factor = ui::animation::AnimationSystem::animate_value(
+                ui.ctx(),
+                egui::Id::new("sidebar_expand_anim"),
+                expand_target,
+                0.20,
+            );
+            let eased_expand = ui::animation::AnimationSystem::ease_out_cubic(expand_factor);
+            let sidebar_width = egui::lerp(54.0..=200.0, eased_expand);
+            let margin_x = egui::lerp(8.0..=12.0, eased_expand);
 
-        // 1. Native Sidebar Panel (Animated width, full height)
-        egui::Panel::left("sidebar_panel")
-            .resizable(false)
-            .exact_size(sidebar_width)
-            .frame(
-                egui::Frame::new()
-                    .fill(egui::Color32::WHITE)
-                    .stroke(egui::Stroke::new(
-                        1.0,
-                        egui::Color32::from_rgb(226, 232, 240),
-                    ))
-                    .inner_margin(egui::Margin::symmetric(margin_x.round() as i8, 14)),
-            )
-            .show(ui, |ui| {
-                ui::render_sidebar(
-                    ui,
-                    &mut self.navigation,
-                    &self.plugin_preferences,
-                    &mut self.modal_dialog,
-                    &mut self.first_run,
-                    &mut self.onboarding_page,
-                    self.ui_language,
-                    eased_expand,
-                );
-            });
+            let prev_collapsed = self.navigation.collapsed;
+            let prev_page = self.navigation.page;
 
-        if self.navigation.collapsed != prev_collapsed || self.navigation.page != prev_page {
-            self.save_settings();
-            self.player_plugin.on_visibility_changed(self.navigation.page == Page::Plugin(PluginId::VIDEO_PLAYER));
+            // 1. Native Sidebar Panel (Animated width, full height)
+            egui::Panel::left("sidebar_panel")
+                .resizable(false)
+                .exact_size(sidebar_width)
+                .frame(
+                    egui::Frame::new()
+                        .fill(egui::Color32::WHITE)
+                        .stroke(egui::Stroke::new(
+                            1.0,
+                            egui::Color32::from_rgb(226, 232, 240),
+                        ))
+                        .inner_margin(egui::Margin::symmetric(margin_x.round() as i8, 14)),
+                )
+                .show(ui, |ui| {
+                    ui::render_sidebar(
+                        ui,
+                        &mut self.navigation,
+                        &self.plugin_preferences,
+                        &mut self.modal_dialog,
+                        &mut self.first_run,
+                        &mut self.onboarding_page,
+                        self.ui_language,
+                        eased_expand,
+                    );
+                });
+
+            if self.navigation.collapsed != prev_collapsed || self.navigation.page != prev_page {
+                self.save_settings();
+                self.player_plugin.on_visibility_changed(self.navigation.page == Page::Plugin(PluginId::VIDEO_PLAYER));
+            }
         }
 
         // 2. Native Central Content Panel (Takes 100% of remaining width and height)
+        let central_frame = if is_player_fullscreen {
+            egui::Frame::new()
+                .fill(egui::Color32::from_rgb(10, 15, 26))
+                .inner_margin(egui::Margin::ZERO)
+        } else {
+            egui::Frame::new()
+                .fill(egui::Color32::from_rgb(248, 250, 252))
+                .inner_margin(egui::Margin::symmetric(24, 20))
+        };
+
         egui::CentralPanel::default()
-            .frame(
-                egui::Frame::new()
-                    .fill(egui::Color32::from_rgb(248, 250, 252))
-                    .inner_margin(egui::Margin::symmetric(24, 20)),
-            )
+            .frame(central_frame)
             .show(ui, |ui| {
-                ui::components::sparse_dot_background(ui);
+                if !is_player_fullscreen {
+                    ui::components::sparse_dot_background(ui);
+                }
                 let plugin_owned_scroll = match self.navigation.page {
                     Page::Plugin(id) => {
                         PluginRegistry::builtin()

@@ -25,6 +25,7 @@ use xrtranslate_assets::{
     ModelAssetId, ModelAssetsConfig, ModelCapability, ResolvedModelAssets, manifest_for,
 };
 use xrtranslate_config::AppConfig;
+use xrtranslate_denoise::GtcrnDenoiser;
 use xrtranslate_engine::{
     TranslationSegmentPair, remove_asr_stutters, remove_transcript_overlap,
     strip_filler_edges_for_lang, translation_segment_pairs_for_final_text_with_lang,
@@ -46,6 +47,7 @@ use xrtranslate_vad::{
 
 use crate::language::{
     AdaptiveLanguageRoute, AutoDecision, LanguageRoute, RecoveryDecision, SupportedLanguage,
+    is_traditional_chinese, to_traditional_chinese,
 };
 
 const SILERO_VAD_MODEL: &str = "models/silero-vad/src/silero_vad/data/silero_vad.onnx";
@@ -135,9 +137,11 @@ pub(crate) struct NativePipeline {
     vad: SileroVad,
     endpoint: EndpointDetector,
     endpoint_config: EndpointConfig,
+    denoiser: Option<GtcrnDenoiser>,
     streaming_speaker: Option<StreamingSpeakerSegmenter>,
     fixed_window: Option<FixedWindow>,
     pending_pcm: Vec<u8>,
+    pending_denoised_pcm: Vec<u8>,
     processed_samples: u64,
     vad_active: bool,
     vad_transitions: Vec<bool>,
@@ -443,6 +447,7 @@ impl NativePipeline {
             pre_roll_frames: 10,
             max_active_frames: frames_for_ms(config.asr.vad_max_utterance_ms),
             max_active_overlap_frames: frames_for_ms(config.asr.vad_overlap_ms),
+            min_speech_frames_to_start: 2,
         };
         let endpoint = EndpointDetector::new(endpoint_config).map_err(|error| error.to_string())?;
         let http =
@@ -518,13 +523,36 @@ impl NativePipeline {
             None
         };
 
+        let denoiser = if config.denoise.enabled {
+            let model_path = if config.denoise.model_path.is_absolute() {
+                config.denoise.model_path.clone()
+            } else {
+                project_root.join(&config.denoise.model_path)
+            };
+            if model_path.is_file() {
+                match GtcrnDenoiser::from_file(&model_path, config.denoise.intra_threads) {
+                    Ok(denoiser) => Some(denoiser),
+                    Err(error) => {
+                        warn!("failed to initialize GTCRN denoiser ({error}), continuing with bypass");
+                        None
+                    }
+                }
+            } else {
+                None
+            }
+        } else {
+            None
+        };
+
         Ok(Self {
             vad,
             endpoint,
             endpoint_config,
+            denoiser,
             streaming_speaker,
             fixed_window: None,
             pending_pcm: Vec::new(),
+            pending_denoised_pcm: Vec::new(),
             processed_samples: 0,
             vad_active: false,
             vad_transitions: Vec::new(),
@@ -553,17 +581,40 @@ impl NativePipeline {
         if !pcm.len().is_multiple_of(2) {
             return Err("PCM16LE audio must contain whole 16-bit samples".into());
         }
+        self.pending_pcm.extend_from_slice(pcm);
+        if let Some(denoiser) = self.denoiser.as_mut() {
+            let denoised_pcm = match denoiser.process_pcm16le(pcm) {
+                Ok(bytes) if !bytes.is_empty() => bytes,
+                _ => pcm.to_vec(),
+            };
+            self.pending_denoised_pcm.extend_from_slice(&denoised_pcm);
+        } else {
+            self.pending_denoised_pcm.extend_from_slice(pcm);
+        }
+
+        let complete_bytes = self
+            .pending_pcm
+            .len()
+            .min(self.pending_denoised_pcm.len())
+            / FRAME_BYTES
+            * FRAME_BYTES;
+        let raw_completed = self.pending_pcm.drain(..complete_bytes).collect::<Vec<_>>();
+        let denoised_completed = self
+            .pending_denoised_pcm
+            .drain(..complete_bytes)
+            .collect::<Vec<_>>();
+
         if self.fixed_window.is_some() {
-            self.pending_pcm.extend_from_slice(pcm);
-            let complete_bytes = self.pending_pcm.len() / FRAME_BYTES * FRAME_BYTES;
-            let completed = self.pending_pcm.drain(..complete_bytes).collect::<Vec<_>>();
             let mut utterances = Vec::new();
-            for frame in completed.chunks_exact(FRAME_BYTES) {
+            for (raw_frame, denoised_frame) in raw_completed
+                .chunks_exact(FRAME_BYTES)
+                .zip(denoised_completed.chunks_exact(FRAME_BYTES))
+            {
                 let probability = self
                     .vad
-                    .infer_pcm16le(frame)
+                    .infer_pcm16le(denoised_frame)
                     .map_err(|error| error.to_string())?;
-                let samples = decode_pcm16le_frame(frame).map_err(|error| error.to_string())?;
+                let raw_samples = decode_pcm16le_frame(raw_frame).map_err(|error| error.to_string())?;
                 self.processed_samples =
                     self.processed_samples.saturating_add(FRAME_SAMPLES as u64);
                 let threshold = self.endpoint_config.speech_threshold;
@@ -572,7 +623,7 @@ impl NativePipeline {
                 let window_events = self
                     .fixed_window
                     .as_mut()
-                    .map(|window| window.push(&samples, active))
+                    .map(|window| window.push(&raw_samples, active))
                     .unwrap_or_default();
                 for event in window_events {
                     match event {
@@ -596,32 +647,30 @@ impl NativePipeline {
             }
             return Ok(utterances);
         }
-        self.pending_pcm.extend_from_slice(pcm);
 
-        // Move all completed frames out once.  `split_off` once per 1 KiB
-        // frame copied the entire remaining tail and turned a large valid
-        // transport message into quadratic work.
-        let complete_bytes = self.pending_pcm.len() / FRAME_BYTES * FRAME_BYTES;
-        let completed = self.pending_pcm.drain(..complete_bytes).collect::<Vec<_>>();
         let mut utterances = Vec::new();
-        for frame in completed.chunks_exact(FRAME_BYTES) {
+        for (raw_frame, denoised_frame) in raw_completed
+            .chunks_exact(FRAME_BYTES)
+            .zip(denoised_completed.chunks_exact(FRAME_BYTES))
+        {
             let probability = self
                 .vad
-                .infer_pcm16le(frame)
+                .infer_pcm16le(denoised_frame)
                 .map_err(|error| error.to_string())?;
             let active = vad_is_active(
                 probability,
                 self.endpoint_config.speech_threshold,
             );
             self.observe_vad_activity(active);
-            let samples = decode_pcm16le_frame(frame).map_err(|error| error.to_string())?;
+            let raw_samples = decode_pcm16le_frame(raw_frame).map_err(|error| error.to_string())?;
+            let denoised_samples = decode_pcm16le_frame(denoised_frame).map_err(|error| error.to_string())?;
 
             let is_in_speech =
                 active || matches!(self.endpoint.state(), EndpointState::Speaking { .. });
 
             if let Some(streaming) = &mut self.streaming_speaker {
                 if is_in_speech {
-                    match streaming.push_speech_samples(&samples) {
+                    match streaming.push_speech_samples(&denoised_samples) {
                         Ok(Some(StreamingSpeakerEvent::SpeakerCut {
                             previous_speaker, ..
                         })) => {
@@ -644,7 +693,7 @@ impl NativePipeline {
 
             let event = self
                 .endpoint
-                .push(&samples, probability)
+                .push(&raw_samples, probability)
                 .map_err(|error| error.to_string())?;
             self.processed_samples = self.processed_samples.saturating_add(FRAME_SAMPLES as u64);
             if let EndpointEvent::Finalized(utterance) = event {
@@ -697,6 +746,7 @@ impl NativePipeline {
                 .processed_samples
                 .saturating_add(received_samples as u64);
         }
+        self.pending_denoised_pcm.clear();
         let speaker_id = if let Some(streaming) = &mut self.streaming_speaker {
             streaming.finalize_speech().map(|(_, id)| id)
         } else {
@@ -720,7 +770,11 @@ impl NativePipeline {
     pub(crate) fn reset(&mut self) {
         self.vad.reset();
         self.endpoint.reset();
+        if let Some(denoiser) = &mut self.denoiser {
+            denoiser.reset();
+        }
         self.pending_pcm.clear();
+        self.pending_denoised_pcm.clear();
         self.observe_vad_activity(false);
         if let Some(window) = &mut self.fixed_window {
             window.reset();
@@ -952,9 +1006,12 @@ impl NativeInference {
             }
         };
         let asr_elapsed = asr_started.elapsed();
-        let source_text = remove_asr_stutters(&transcript.text);
+        let mut source_text = remove_asr_stutters(&transcript.text);
         if source_text.is_empty() {
             return Ok(None);
+        }
+        if is_traditional_chinese(route.source.code()) {
+            source_text = to_traditional_chinese(&source_text);
         }
         Ok(Some(RecognizedOutput {
             segments: translation_segment_pairs_for_final_text_with_lang(
@@ -1031,6 +1088,18 @@ impl NativeInference {
         prompt_context: Option<String>,
     ) -> Result<TranslationOutput, String> {
         let route = translation_route(source_language, target_language);
+        if route.source_code == "zh" && is_traditional_chinese(&route.target_code) {
+            let mt_started = Instant::now();
+            let converted = to_traditional_chinese(&segment.translation_text);
+            return Ok(TranslationOutput {
+                source_text: segment.source_text.clone(),
+                translated_text: converted,
+                source_language: route.source_code,
+                target_language: route.target_code,
+                term_matches: Vec::new(),
+                mt_elapsed: mt_started.elapsed(),
+            });
+        }
         let mut options = TranslationOptions::new(route.source.clone(), route.target.clone());
         options.max_tokens = self.translation_max_output_tokens;
         if self.translation_supports_prompt_context {
@@ -1080,9 +1149,14 @@ impl NativeInference {
             return Err("translation output failed context-leak quality checks".into());
         }
 
+        let mut final_translated_text = translated.text;
+        if is_traditional_chinese(&route.target_code) {
+            final_translated_text = to_traditional_chinese(&final_translated_text);
+        }
+
         Ok(TranslationOutput {
             source_text: segment.source_text.clone(),
-            translated_text: translated.text,
+            translated_text: final_translated_text,
             source_language: route.source_code,
             target_language: route.target_code,
             term_matches: Vec::new(),

@@ -33,6 +33,8 @@ impl MpvHandle {
         instance.set_property_string("msg-level", "all=error")?;
         instance.set_property_string("input-default-bindings", "no")?;
         instance.set_property_string("input-vo-keyboard", "no")?;
+        instance.set_property_string("audio-channels", "stereo")?;
+        instance.set_property_string("audio-normalize-downmix", "yes")?;
         instance.set_property_string("osd-font-size", "28")?;
         instance.set_property_string("osd-color", "#FEF08A")?;
         instance.set_property_string("osd-border-color", "#000000")?;
@@ -212,6 +214,7 @@ pub struct MpvBackend {
     duration_ms: i64,
     cached_diagnostics: Mutex<super::PlayerDiagnostics>,
     last_diag_poll: Mutex<Instant>,
+    active_channels: Vec<super::super::task::AudioChannelItem>,
 }
 
 #[cfg(windows)]
@@ -250,6 +253,7 @@ impl MpvBackend {
             duration_ms: 0,
             cached_diagnostics: Mutex::new(super::PlayerDiagnostics::default()),
             last_diag_poll: Mutex::new(Instant::now() - Duration::from_secs(10)),
+            active_channels: Vec::new(),
         })
     }
 }
@@ -358,6 +362,10 @@ impl MediaBackend for MpvBackend {
                 if let Some(duration) = self.mpv.get_property_f64("duration") {
                     self.duration_ms = (duration * 1000.0) as i64;
                 }
+                if !self.active_channels.is_empty() {
+                    let channels = self.active_channels.clone();
+                    self.set_channel_routing(&channels);
+                }
             }
         }
 
@@ -388,11 +396,88 @@ impl MediaBackend for MpvBackend {
     fn show_osd_title(&mut self, title: &str) {
         let _ = self.mpv.command(&["show-text", title, "3000", "1"]);
     }
+
+    fn get_audio_channel_count(&self) -> Option<usize> {
+        let count = self.mpv.get_property_i64("audio-params/channel-count")?;
+        if count > 0 {
+            Some(count as usize)
+        } else {
+            None
+        }
+    }
+
+    fn get_audio_layout(&self) -> Option<String> {
+        self.mpv.get_property_string("audio-params/hr-channels")
+    }
+
+    fn set_channel_routing(&mut self, channels: &[super::super::task::AudioChannelItem]) {
+        self.active_channels = channels.to_vec();
+
+        if channels.is_empty() {
+            let _ = self.mpv.set_property_string("af", "");
+            return;
+        }
+
+        let all_enabled = channels.iter().all(|c| c.playback);
+        if all_enabled {
+            let _ = self.mpv.set_property_string("af", "");
+            return;
+        }
+
+        let mut left_terms = Vec::new();
+        let mut right_terms = Vec::new();
+
+        for ch in channels {
+            if !ch.playback {
+                continue;
+            }
+            let idx = ch.index;
+            if ch.is_left {
+                left_terms.push(format!("1.0*c{}", idx));
+            }
+            if ch.is_right {
+                right_terms.push(format!("1.0*c{}", idx));
+            }
+            if ch.is_center {
+                if ch.id == "fc" {
+                    left_terms.push(format!("0.707*c{}", idx));
+                    right_terms.push(format!("0.707*c{}", idx));
+                } else if ch.id == "lfe" {
+                    left_terms.push(format!("0.2*c{}", idx));
+                    right_terms.push(format!("0.2*c{}", idx));
+                } else {
+                    left_terms.push(format!("1.0*c{}", idx));
+                    right_terms.push(format!("1.0*c{}", idx));
+                }
+            }
+        }
+
+        let c0_expr = if left_terms.is_empty() {
+            "c0=0".to_string()
+        } else {
+            format!("c0={}", left_terms.join("+"))
+        };
+
+        let c1_expr = if right_terms.is_empty() {
+            "c1=0".to_string()
+        } else {
+            format!("c1={}", right_terms.join("+"))
+        };
+
+        let filter = format!("lavfi=[pan=stereo|{}|{}]", c0_expr, c1_expr);
+        let res = self.mpv.set_property_string("af", &filter);
+        if let Err(e) = res {
+            log::error!("Failed to apply MPV audio filter '{}': {}", filter, e);
+        } else {
+            log::info!("Applied MPV audio filter: {}", filter);
+        }
+    }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::plugins::player::task::AudioChannelItem;
 
     #[test]
     fn mpv_backend_initializes_when_dll_present() {
@@ -402,5 +487,73 @@ mod tests {
             let b = backend.unwrap();
             assert_eq!(b.get_status(), PlaybackStatus::Stopped);
         }
+    }
+
+    #[test]
+    fn test_mpv_channel_routing_filters() {
+        if !is_mpv_dll_available() {
+            return;
+        }
+
+        let mut backend = MpvBackend::new().expect("Failed to create MpvBackend");
+
+        // 1. Stereo - only Right channel enabled (FL off, FR on)
+        let mut stereo_channels = AudioChannelItem::default_for_count(2);
+        stereo_channels[0].playback = false; // FL off
+        stereo_channels[1].playback = true;  // FR on
+        backend.set_channel_routing(&stereo_channels);
+        let af = backend.mpv.get_property_string("af").unwrap_or_default();
+        assert!(
+            af.contains("pan=stereo") && af.contains("c0=0") && af.contains("c1=1.0*c1"),
+            "Unexpected af filter for Right-only stereo: {}",
+            af
+        );
+
+        // 2. Stereo - only Left channel enabled (FL on, FR off)
+        stereo_channels[0].playback = true;  // FL on
+        stereo_channels[1].playback = false; // FR off
+        backend.set_channel_routing(&stereo_channels);
+        let af = backend.mpv.get_property_string("af").unwrap_or_default();
+        assert!(
+            af.contains("pan=stereo") && af.contains("c0=1.0*c0") && af.contains("c1=0"),
+            "Unexpected af filter for Left-only stereo: {}",
+            af
+        );
+
+        // 3. Stereo - all off
+        stereo_channels[0].playback = false;
+        stereo_channels[1].playback = false;
+        backend.set_channel_routing(&stereo_channels);
+        let af = backend.mpv.get_property_string("af").unwrap_or_default();
+        assert!(
+            af.contains("c0=0") && af.contains("c1=0"),
+            "Unexpected af filter for all-off stereo: {}",
+            af
+        );
+
+        // 4. Stereo - all on (passthrough)
+        stereo_channels[0].playback = true;
+        stereo_channels[1].playback = true;
+        backend.set_channel_routing(&stereo_channels);
+        let af = backend.mpv.get_property_string("af").unwrap_or_default();
+        assert_eq!(af, "", "All channels on should result in empty filter string");
+
+        // 5. 5.1 Surround - only Center (FC) enabled
+        let mut surround_channels = AudioChannelItem::default_for_count(6);
+        for ch in &mut surround_channels {
+            ch.playback = ch.id == "fc";
+        }
+        backend.set_channel_routing(&surround_channels);
+        let af = backend.mpv.get_property_string("af").unwrap_or_default();
+        assert!(
+            af.contains("pan=stereo") && af.contains("0.707*c2"),
+            "Unexpected af filter for Center-only 5.1: {}",
+            af
+        );
+
+        // 6. Test dynamic filter change during playback without failure
+        let _ = backend.mpv.command(&["loadfile", "null://", "replace"]);
+        backend.set_channel_routing(&stereo_channels);
+        assert!(backend.mpv.get_property_string("af").is_some());
     }
 }

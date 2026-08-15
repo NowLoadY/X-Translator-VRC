@@ -26,6 +26,7 @@ pub struct AppConfig {
     pub server: ServerConfig,
     pub audio: AudioConfig,
     pub asr: AsrConfig,
+    pub denoise: DenoiseConfig,
     pub speaker: SpeakerConfig,
     pub prompt_context: PromptContextConfig,
     pub integrations: IntegrationsConfig,
@@ -67,6 +68,7 @@ impl AppConfig {
             server: typed.server,
             audio: typed.audio,
             asr: typed.asr,
+            denoise: typed.denoise,
             speaker: typed.speaker,
             prompt_context: typed.prompt_context,
             integrations: typed.integrations,
@@ -248,6 +250,8 @@ struct TypedConfig {
     #[serde(default)]
     asr: AsrConfig,
     #[serde(default)]
+    denoise: DenoiseConfig,
+    #[serde(default)]
     speaker: SpeakerConfig,
     #[serde(default)]
     prompt_context: PromptContextConfig,
@@ -346,6 +350,27 @@ impl Default for AsrConfig {
 impl AsrConfig {
     pub fn provider_config(&self, provider: &str) -> Option<&Value> {
         self.providers.get(provider)
+    }
+}
+
+/// Native GTCRN-Light v3 speech enhancement and background noise suppression settings.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct DenoiseConfig {
+    #[serde(default = "default_true")]
+    pub enabled: bool,
+    #[serde(default = "default_denoise_model_path")]
+    pub model_path: PathBuf,
+    #[serde(default = "default_denoise_intra_threads")]
+    pub intra_threads: usize,
+}
+
+impl Default for DenoiseConfig {
+    fn default() -> Self {
+        Self {
+            enabled: true,
+            model_path: default_denoise_model_path(),
+            intra_threads: default_denoise_intra_threads(),
+        }
     }
 }
 
@@ -718,6 +743,12 @@ const fn default_vad_max_utterance_ms() -> u32 {
 const fn default_vad_overlap_ms() -> u32 {
     256
 }
+fn default_denoise_model_path() -> PathBuf {
+    PathBuf::from("models/gtcrn/gtcrn_simple.onnx")
+}
+const fn default_denoise_intra_threads() -> usize {
+    1
+}
 fn default_speaker_model_path() -> PathBuf {
     PathBuf::from("models/3D-Speaker-ERes2NetV2/speaker_embedding.onnx")
 }
@@ -743,10 +774,10 @@ const fn default_log_retained_files() -> usize {
     2
 }
 const fn default_speaker_similarity_threshold() -> f64 {
-    0.52
+    0.56
 }
 const fn default_same_speaker_hysteresis() -> f64 {
-    0.10
+    0.16
 }
 const fn default_max_speakers() -> usize {
     8

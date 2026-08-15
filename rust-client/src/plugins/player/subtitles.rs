@@ -24,6 +24,10 @@ impl SubtitleTimeline {
         }
     }
 
+    pub fn clear(&mut self) {
+        self.cues.clear();
+    }
+
     pub fn add_cue(&mut self, cue: SubtitleCue) -> bool {
         if cue.original_text.trim().is_empty()
             && cue
@@ -63,7 +67,7 @@ impl SubtitleTimeline {
         }
         // Subtitle lead-in time: display subtitles slightly ahead of speech onset
         // (~250ms advance) to match natural human reading rhythm and visual perception.
-        const SUBTITLE_LEAD_IN_MS: i64 = 150;
+        const SUBTITLE_LEAD_IN_MS: i64 = 250;
         let query_ms = current_ms + SUBTITLE_LEAD_IN_MS;
         self.cues.iter().find(|cue| {
             let effective_end = if cue.end_ms <= cue.start_ms {

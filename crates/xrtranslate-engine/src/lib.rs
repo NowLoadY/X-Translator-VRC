@@ -13,11 +13,12 @@ use std::fmt;
 pub mod text_processing;
 
 pub use text_processing::{
-    TranslationSegmentPair, is_filler_segment, remove_asr_stutters, remove_transcript_overlap,
-    split_translation_segments, strip_filler_edges, strip_filler_edges_for_lang,
-    translation_segment_pairs_for_final_text, translation_segment_pairs_for_final_text_with_lang,
-    translation_segment_pairs_for_text, translation_segment_pairs_for_text_with_lang,
-    translation_segments_for_text, translation_segments_for_text_with_lang,
+    TranslationSegmentPair, collapse_asr_split_words, is_filler_segment, is_split_word_pair,
+    remove_asr_stutters, remove_transcript_overlap, split_translation_segments,
+    strip_filler_edges, strip_filler_edges_for_lang, translation_segment_pairs_for_final_text,
+    translation_segment_pairs_for_final_text_with_lang, translation_segment_pairs_for_text,
+    translation_segment_pairs_for_text_with_lang, translation_segments_for_text,
+    translation_segments_for_text_with_lang,
 };
 
 /// Monotonically increasing identity of a source/target language route.

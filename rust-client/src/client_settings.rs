@@ -68,6 +68,8 @@ pub struct ClientSettings {
     pub source_lang: String,
     #[serde(default = "default_target_lang")]
     pub target_lang: String,
+    #[serde(default = "default_true")]
+    pub denoise_enabled: bool,
     #[serde(default)]
     pub tts_enabled: bool,
     /// Enables speaker recognition and OSC speaker numbering.
@@ -143,6 +145,7 @@ impl Default for ClientSettings {
             loopback_recognition: RecognitionSettings::default(),
             source_lang: default_source_lang(),
             target_lang: default_target_lang(),
+            denoise_enabled: true,
             tts_enabled: false,
             speaker_recognition_enabled: false,
             mute_self_pauses_translation: false,

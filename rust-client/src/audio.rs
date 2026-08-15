@@ -289,11 +289,30 @@ impl AudioSystem {
                     let mono: Vec<f32> = data
                         .chunks(channels)
                         .map(|frame| {
-                            frame
-                                .iter()
-                                .map(|sample| f32::from_sample(*sample))
-                                .sum::<f32>()
-                                / frame.len() as f32
+                            if frame.len() >= 6 {
+                                // 5.1 / 7.1 Multi-channel Dialogue Isolation (Physical Noise Cancellation):
+                                // Layout: [0: Left, 1: Right, 2: Center, 3: LFE(Subwoofer), 4: Surround L, 5: Surround R]
+                                // - Center (frame[2]) contains 95%+ of actor dialogue.
+                                // - LFE (frame[3]) is pure low-frequency rumble/explosions (0% dialogue), completely discarded.
+                                // - Surround (frame[4], frame[5]) contains ambient/reverb (0% dialogue), heavily attenuated.
+                                // - Left & Right contain music & panning sound effects, kept at low ratio for rare off-center lines.
+                                let l = f32::from_sample(frame[0]);
+                                let r = f32::from_sample(frame[1]);
+                                let c = f32::from_sample(frame[2]);
+                                let ls = f32::from_sample(frame[4]);
+                                let rs = f32::from_sample(frame[5]);
+                                c * 0.85 + (l + r) * 0.12 + (ls + rs) * 0.03
+                            } else if frame.len() == 2 {
+                                let l = f32::from_sample(frame[0]);
+                                let r = f32::from_sample(frame[1]);
+                                (l + r) * 0.5
+                            } else {
+                                frame
+                                    .iter()
+                                    .map(|sample| f32::from_sample(*sample))
+                                    .sum::<f32>()
+                                    / frame.len() as f32
+                            }
                         })
                         .collect();
                     update_input_level(&mono, &level);
