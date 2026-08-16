@@ -6,10 +6,13 @@
 
 use std::path::PathBuf;
 
-use clap::{Parser, Subcommand, ValueEnum};
+use clap::{
+    Parser, Subcommand,
+    builder::{PossibleValue, PossibleValuesParser},
+};
 use xrtranslate_assets::{
-    ModelAssetId, ModelAssetsConfig, ModelCapability, NativeModelInstaller, ResolvedModelAssets,
-    manifest_for,
+    DEFAULT_GGUF_MANIFEST, ModelAssetId, ModelAssetsConfig, NativeModelInstaller,
+    ResolvedModelAssets,
 };
 use xrtranslate_config::AppConfig;
 
@@ -30,26 +33,28 @@ struct Arguments {
 #[derive(Debug, Subcommand)]
 enum Command {
     /// Download one immutable model package, verify it, and atomically enable it.
-    Install { package: Package },
+    Install {
+        #[arg(value_parser = package_value_parser())]
+        package: String,
+    },
     /// Read and hash installed packages without changing any active files.
-    Verify { package: Option<Package> },
+    Verify {
+        #[arg(value_parser = package_value_parser())]
+        package: Option<String>,
+    },
 }
 
-#[derive(Clone, Copy, Debug, ValueEnum)]
-enum Package {
-    Qwen3AsrGguf,
-    HyMt2,
-    HyMt2Big,
+fn package_value_parser() -> PossibleValuesParser {
+    PossibleValuesParser::new(
+        DEFAULT_GGUF_MANIFEST
+            .iter()
+            .map(|manifest| PossibleValue::new(manifest.id.as_str())),
+    )
 }
 
-impl From<Package> for ModelAssetId {
-    fn from(value: Package) -> Self {
-        match value {
-            Package::Qwen3AsrGguf => Self::Qwen3AsrGguf,
-            Package::HyMt2 => Self::HunyuanMtGguf,
-            Package::HyMt2Big => Self::HunyuanMt7bGguf,
-        }
-    }
+fn package_id(package: &str) -> ModelAssetId {
+    ModelAssetId::from_config_key(package)
+        .expect("clap package parser only accepts catalog model asset ids")
 }
 
 #[tokio::main]
@@ -62,25 +67,23 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         .filter(|path| !path.as_os_str().is_empty())
         .map(PathBuf::from)
         .unwrap_or_else(|| PathBuf::from("."));
-    let mut asset_config = ModelAssetsConfig {
-        models_directory: config.model_manager.models_directory.clone(),
-        qwen3_asr_gguf_directory: config.model_manager.qwen3_asr_gguf_directory.clone(),
-        hunyuan_mt_gguf_directory: config.model_manager.hunyuan_mt_gguf_directory.clone(),
-        ..ModelAssetsConfig::default()
-    };
+    let mut asset_config = ModelAssetsConfig::with_directory_overrides(
+        config.model_manager.models_directory.clone(),
+        config.model_manager.qwen3_asr_gguf_directory.clone(),
+        config.model_manager.hunyuan_mt_gguf_directory.clone(),
+    );
     for key in config.active_native_model_assets() {
         if let Some(id) = ModelAssetId::from_config_key(&key) {
-            match manifest_for(id).capability {
-                ModelCapability::Asr => asset_config.qwen3_asr_asset = Some(id),
-                ModelCapability::Translation => asset_config.hunyuan_mt_asset = Some(id),
-            }
+            asset_config.select_asset(id);
         }
     }
     let assets = asset_config.resolve(project_root);
 
     match args.command {
-        Command::Install { package } => install(assets, package.into()).await?,
-        Command::Verify { package } => verify(&assets, package.map(Into::into))?,
+        Command::Install { package } => install(assets, package_id(&package)).await?,
+        Command::Verify { package } => {
+            verify(&assets, package.as_deref().map(package_id))?;
+        }
     }
     Ok(())
 }

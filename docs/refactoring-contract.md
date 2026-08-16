@@ -62,6 +62,14 @@ shared domain/runtime/UI capability
   is an explicit fallback only when a trusted source publishes no digest.
 - UI rendering should consume a snapshot/controller and emit typed actions.
   Rendering code must not acquire unrelated runtime or persistence ownership.
+- Treat model package metadata and provider behavior as different domains.
+  Asset variants belong in the manifest catalogue; provider-specific prompt,
+  sampling, and cleanup rules belong in a provider profile; process/adaptor
+  creation belongs in the backend runtime plan. Pipelines and plugins consume
+  these contracts without matching provider or model names.
+- Query selectable models by provider and capability, including level only
+  when the operation requires it. A new size for an existing model family must
+  not require another fixed field or branch in every consumer.
 
 ## When to extract or split
 

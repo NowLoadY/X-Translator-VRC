@@ -2,7 +2,7 @@
 // SPDX-FileCopyrightText: 2026 NowLoadY
 // SPDX-License-Identifier: AGPL-3.0-only
 
-//! Default native audio pipeline: Silero endpointing, Qwen3-ASR, and Hy-MT2.
+//! Provider-neutral native audio pipeline and shared recognition policies.
 //!
 //! Every `NativePipeline` is owned by a single WebSocket session.  In
 //! particular, the Silero ONNX recurrent state must never be shared between
@@ -21,9 +21,6 @@ use std::{
 };
 use tracing::warn;
 
-use xrtranslate_assets::{
-    ModelAssetId, ModelAssetsConfig, ModelCapability, ResolvedModelAssets, manifest_for,
-};
 use xrtranslate_config::AppConfig;
 use xrtranslate_denoise::GtcrnDenoiser;
 use xrtranslate_engine::{
@@ -31,9 +28,8 @@ use xrtranslate_engine::{
     strip_filler_edges_for_lang, translation_segment_pairs_for_final_text_with_lang,
 };
 use xrtranslate_inference::{
-    AsrTranscript, InferenceError, Qwen3AsrAdapter, Qwen3AsrOptions, ReqwestClient,
-    TranslationAdapter, TranslationOptions, TranslationProvider, is_probable_asr_hallucination,
-    is_probable_translation_context_leak,
+    AsrTranscript, InferenceError, ReqwestClient, TranslationAdapter, TranslationOptions,
+    is_probable_asr_hallucination, is_probable_translation_context_leak,
 };
 use xrtranslate_protocol::AudioSource;
 use xrtranslate_speaker::{
@@ -49,6 +45,7 @@ use crate::language::{
     AdaptiveLanguageRoute, AutoDecision, LanguageRoute, SupportedLanguage, is_traditional_chinese,
     to_traditional_chinese,
 };
+use crate::model_runtime::{NativeAsrAdapter, NativeAsrOptions, NativeProviderPlan};
 
 const SILERO_VAD_MODEL: &str = "models/silero-vad/src/silero_vad/data/silero_vad.onnx";
 /// Largest binary WebSocket message accepted from a microphone client.
@@ -122,7 +119,7 @@ impl RecognizedOutput {
     }
 }
 
-/// A single Hunyuan translation emitted after a recognized source segment.
+/// A single provider translation emitted after a recognized source segment.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) struct TranslationOutput {
     pub(crate) source_text: String,
@@ -405,7 +402,7 @@ enum FixedWindowEvent {
 /// model HTTP calls from blocking WebSocket control and microphone intake.
 #[derive(Clone)]
 pub(crate) struct NativeInference {
-    asr: Qwen3AsrAdapter<ReqwestClient>,
+    asr: NativeAsrAdapter,
     translation: TranslationAdapter<ReqwestClient>,
     translation_supports_prompt_context: bool,
     asr_max_output_tokens: u32,
@@ -429,13 +426,12 @@ impl NativePipeline {
     /// The model servers themselves are deliberately not contacted here.  The
     /// first request reports a precise endpoint error while permitting the
     /// backend launcher to bring llama.cpp up concurrently with the client.
-    pub(crate) fn new(config: &AppConfig, project_root: &Path) -> Result<Self, String> {
-        let default_route = config.default_gguf().map_err(|error| error.to_string())?;
-        resolved_model_assets(config, project_root)
-            .check()
-            .into_result()
-            .map_err(|error| error.to_string())?;
-
+    pub(crate) fn new(
+        config: &AppConfig,
+        project_root: &Path,
+        model_plan: &NativeProviderPlan,
+    ) -> Result<Self, String> {
+        model_plan.check_assets()?;
         let vad_path = project_root.join(SILERO_VAD_MODEL);
         let vad = SileroVad::from_file(&vad_path)
             .map_err(|error| format!("cannot load Silero VAD {}: {error}", vad_path.display()))?;
@@ -455,22 +451,12 @@ impl NativePipeline {
         let endpoint = EndpointDetector::new(endpoint_config).map_err(|error| error.to_string())?;
         let http =
             ReqwestClient::with_default_direct_timeout().map_err(|error| error.to_string())?;
-        let asr = Qwen3AsrAdapter::new(http.clone(), default_route.asr_url, "qwen3-asr")
+        let asr = model_plan
+            .asr_adapter(http.clone())
             .map_err(|error| error.to_string())?;
-        let translation = TranslationAdapter::new(
-            http,
-            default_route.translation_url,
-            "hy-mt2",
-            TranslationProvider::Hunyuan,
-        )
-        .map_err(|error| error.to_string())?;
-        let translation_supports_prompt_context = config
-            .translation
-            .provider_config(&config.translation.provider)
-            .and_then(serde_json::Value::as_object)
-            .and_then(|provider| provider.get("supports_prompt_context"))
-            .and_then(serde_json::Value::as_bool)
-            .unwrap_or(false);
+        let translation = model_plan
+            .translation_adapter(http)
+            .map_err(|error| error.to_string())?;
         let speaker = if config.speaker.enabled {
             let model_path = if config.speaker.model_path.is_absolute() {
                 config.speaker.model_path.clone()
@@ -564,12 +550,13 @@ impl NativePipeline {
             inference: NativeInference {
                 asr,
                 translation,
-                translation_supports_prompt_context,
-                asr_max_output_tokens: default_route.asr_runtime.max_tokens,
-                translation_max_output_tokens: default_route.translation_runtime.max_tokens,
-                asr_context_window_tokens: default_route.asr_runtime.context_window_tokens,
-                translation_context_window_tokens: default_route
-                    .translation_runtime
+                translation_supports_prompt_context: model_plan
+                    .translation_supports_prompt_context(),
+                asr_max_output_tokens: model_plan.asr_runtime().max_tokens,
+                translation_max_output_tokens: model_plan.translation_runtime().max_tokens,
+                asr_context_window_tokens: model_plan.asr_runtime().context_window_tokens,
+                translation_context_window_tokens: model_plan
+                    .translation_runtime()
                     .context_window_tokens,
                 speaker,
             },
@@ -1057,7 +1044,7 @@ impl NativeInference {
             .asr
             .transcribe_pcm16(
                 pcm,
-                Qwen3AsrOptions {
+                NativeAsrOptions {
                     language: language.clone(),
                     prompt_context: prompt_context.clone(),
                     max_tokens,
@@ -1081,7 +1068,7 @@ impl NativeInference {
             .asr
             .transcribe_pcm16(
                 pcm,
-                Qwen3AsrOptions {
+                NativeAsrOptions {
                     language,
                     prompt_context: None,
                     max_tokens,
@@ -1120,6 +1107,7 @@ impl NativeInference {
             });
         }
         let mut options = TranslationOptions::new(route.source.clone(), route.target.clone());
+        options.context_window_tokens = self.translation_context_window_tokens;
         options.max_tokens = self.translation_max_output_tokens;
         if self.translation_supports_prompt_context {
             options.prompt_context = prompt_context;
@@ -1217,35 +1205,6 @@ fn frames_for_ms(milliseconds: u32) -> usize {
         .max(1)
 }
 
-/// Resolves every native model path once from the shared compatibility config.
-/// The desktop preflight and backend launcher use the same fields, so an
-/// installed content-addressed package cannot be accepted by one component and
-/// ignored by the other.
-pub(crate) fn resolved_model_assets(
-    config: &AppConfig,
-    project_root: &Path,
-) -> ResolvedModelAssets {
-    let mut asr_asset = None;
-    let mut translation_asset = None;
-    for key in config.active_native_model_assets() {
-        let Some(id) = ModelAssetId::from_config_key(&key) else {
-            continue;
-        };
-        match manifest_for(id).capability {
-            ModelCapability::Asr => asr_asset = Some(id),
-            ModelCapability::Translation => translation_asset = Some(id),
-        }
-    }
-    ModelAssetsConfig {
-        models_directory: config.model_manager.models_directory.clone(),
-        qwen3_asr_gguf_directory: config.model_manager.qwen3_asr_gguf_directory.clone(),
-        hunyuan_mt_gguf_directory: config.model_manager.hunyuan_mt_gguf_directory.clone(),
-        qwen3_asr_asset: asr_asset,
-        hunyuan_mt_asset: translation_asset,
-    }
-    .resolve(project_root)
-}
-
 /// The final source and target names for a translation request.
 #[derive(Debug, Clone, PartialEq, Eq)]
 struct TranslationRoute {
@@ -1310,7 +1269,7 @@ pub(crate) fn validate_input_sample_rate(sample_rate: u32) -> Result<(), String>
         Ok(())
     } else {
         Err(format!(
-            "the native Qwen3 route requires {SAMPLE_RATE_HZ} Hz mono PCM; received {sample_rate} Hz"
+            "the native ASR route requires {SAMPLE_RATE_HZ} Hz mono PCM; received {sample_rate} Hz"
         ))
     }
 }

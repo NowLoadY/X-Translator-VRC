@@ -2,6 +2,9 @@ use serde_json::{Map, Value};
 use std::path::PathBuf;
 
 use crate::ui::components;
+use provider_schema::{ProviderFieldEditor, provider_field_descriptor};
+
+mod provider_schema;
 
 #[derive(Clone, Copy, PartialEq, Eq)]
 enum JsonFieldKind {
@@ -316,7 +319,12 @@ impl ServiceConfigEditor {
                                                     let edit_w =
                                                         (ui.available_width() - 20.0).max(200.0);
                                                     if render_field_input(
-                                                        ui, field, edit_w, language,
+                                                        ui,
+                                                        field,
+                                                        edit_w,
+                                                        language,
+                                                        category_key,
+                                                        &provider_name,
                                                     ) {
                                                         self.dirty = true;
                                                     }
@@ -400,7 +408,14 @@ impl ServiceConfigEditor {
                                         }
                                         let edit_w =
                                             (ui.available_width() - 20.0).clamp(240.0, 360.0);
-                                        if render_field_input(ui, field, edit_w, language) {
+                                        if render_field_input(
+                                            ui,
+                                            field,
+                                            edit_w,
+                                            language,
+                                            category_key,
+                                            &provider_name,
+                                        ) {
                                             self.dirty = true;
                                         }
                                         ui.end_row();
@@ -488,14 +503,53 @@ impl ServiceConfigEditor {
             .map_err(|error| format!("Cannot serialize config.json: {error}"))?;
         let parsed = xrtranslate_config::AppConfig::from_value(self.document.clone())
             .map_err(|error| format!("Invalid configuration: {error}"))?;
-        parsed
-            .default_gguf()
+        let route = parsed
+            .native_model_route()
             .map_err(|error| format!("Invalid model settings: {error}"))?;
+        validate_native_provider_asset(&route.asr, xrtranslate_assets::ModelCapability::Asr)?;
+        validate_native_provider_asset(
+            &route.translation,
+            xrtranslate_assets::ModelCapability::Translation,
+        )?;
         std::fs::write(&self.path, format!("{formatted}\n"))
             .map_err(|error| format!("Cannot save {}: {error}", self.path.display()))?;
         self.dirty = false;
         Ok(())
     }
+}
+
+fn validate_native_provider_asset(
+    provider: &xrtranslate_config::NativeProviderConfig,
+    capability: xrtranslate_assets::ModelCapability,
+) -> Result<(), String> {
+    let manifest = if let Some(key) = provider.model_asset.as_deref() {
+        let id = xrtranslate_assets::ModelAssetId::from_config_key(key).ok_or_else(|| {
+            format!(
+                "Unknown model package {key} for provider {}.",
+                provider.provider
+            )
+        })?;
+        xrtranslate_assets::manifest_for(id)
+    } else {
+        xrtranslate_assets::manifests_for_capability(capability)
+            .find(|manifest| {
+                manifest.provider == provider.provider
+                    && manifest.level == xrtranslate_assets::ModelLevel::Normal
+            })
+            .ok_or_else(|| {
+                format!(
+                    "Provider {} has no default local model package.",
+                    provider.provider
+                )
+            })?
+    };
+    if manifest.provider != provider.provider || manifest.capability != capability {
+        return Err(format!(
+            "Model package {} does not belong to provider {} for {capability:?}.",
+            manifest.id, provider.provider
+        ));
+    }
+    Ok(())
 }
 
 fn provider_model_asset(provider: &ProviderCard) -> Option<String> {
@@ -524,7 +578,7 @@ fn render_provider_model_action(
     model_tasks: &mut crate::model_install::NativeModelTaskManager,
     request: ProviderModelAction<'_>,
 ) -> Option<String> {
-    use crate::model_install::{NativeModelTaskState, model_package_for_config_key};
+    use crate::model_install::{NativeModelTaskState, model_package_for_provider_config_key};
     use eframe::egui;
 
     let Some(model_asset) = request.model_asset else {
@@ -541,7 +595,18 @@ fn render_provider_model_action(
         });
     };
 
-    let package = match model_package_for_config_key(request.project_root, model_asset) {
+    let Some(capability) = model_capability_for_category(request.category_key) else {
+        return Some(format!(
+            "Unknown model capability for service category {}.",
+            request.category_key
+        ));
+    };
+    let package = match model_package_for_provider_config_key(
+        request.project_root,
+        request.provider_name,
+        capability,
+        model_asset,
+    ) {
         Ok(package) => package,
         Err(error) => return Some(error),
     };
@@ -628,28 +693,39 @@ fn render_field_input(
     field: &mut ConfigField,
     width: f32,
     language: crate::i18n::UiLanguage,
+    category_key: &str,
+    provider_name: &str,
 ) -> bool {
     use eframe::egui;
 
-    if field.name == "model_asset" {
+    let descriptor = provider_field_descriptor(&field.name);
+    if matches!(
+        descriptor.map(|descriptor| descriptor.editor),
+        Some(ProviderFieldEditor::ModelLevel)
+    ) {
         let Some(current_id) =
             xrtranslate_assets::ModelAssetId::from_config_key(field.value.trim())
         else {
             return false;
         };
         let current = xrtranslate_assets::manifest_for(current_id);
+        let capability = model_capability_for_category(category_key).unwrap_or(current.capability);
         let mut selected = current_id;
-        let response = egui::ComboBox::from_id_salt(("provider_model_level", current.capability))
-            .selected_text(crate::i18n::tr(language, current.level.as_str()))
-            .show_ui(ui, |ui| {
-                for manifest in xrtranslate_assets::manifests_for_capability(current.capability) {
-                    ui.selectable_value(
-                        &mut selected,
-                        manifest.id,
-                        crate::i18n::tr(language, manifest.level.as_str()),
-                    );
-                }
-            });
+        let response =
+            egui::ComboBox::from_id_salt(("provider_model_level", provider_name, capability))
+                .selected_text(crate::i18n::tr(language, current.level.as_str()))
+                .show_ui(ui, |ui| {
+                    for package in crate::model_install::model_level_packages_for_provider(
+                        provider_name,
+                        capability,
+                    ) {
+                        ui.selectable_value(
+                            &mut selected,
+                            package.id,
+                            crate::i18n::tr(language, package.level.as_str()),
+                        );
+                    }
+                });
         if response.response.changed() || selected != current_id {
             field.value = selected.as_str().to_owned();
             return true;
@@ -668,8 +744,20 @@ fn render_field_input(
                 false
             }
         }
-        JsonFieldKind::Number if provider_numeric_range(&field.name).is_some() => {
-            let (minimum, maximum) = provider_numeric_range(&field.name).expect("checked above");
+        JsonFieldKind::Number
+            if matches!(
+                descriptor.map(|descriptor| descriptor.editor),
+                Some(ProviderFieldEditor::UnsignedRange { .. })
+            ) =>
+        {
+            let Some(ProviderFieldEditor::UnsignedRange {
+                minimum,
+                maximum,
+                speed,
+            }) = descriptor.map(|descriptor| descriptor.editor)
+            else {
+                unreachable!("numeric editor checked above")
+            };
             let Ok(mut value) = field.value.trim().parse::<u32>() else {
                 return ui
                     .add(
@@ -682,11 +770,7 @@ fn render_field_input(
             let response = ui.add(
                 egui::DragValue::new(&mut value)
                     .range(minimum..=maximum)
-                    .speed(if field.name == "context_window_tokens" {
-                        128.0
-                    } else {
-                        1.0
-                    }),
+                    .speed(speed),
             );
             if response.changed() {
                 field.value = value.to_string();
@@ -696,13 +780,15 @@ fn render_field_input(
             }
         }
         _ => {
-            if field.name == "device" {
+            if let Some(ProviderFieldEditor::Options(options)) =
+                descriptor.map(|descriptor| descriptor.editor)
+            {
                 let mut changed = false;
                 let current = field.value.clone();
                 egui::ComboBox::from_id_salt(&field.name)
                     .selected_text(&current)
                     .show_ui(ui, |ui| {
-                        for opt in ["cuda", "cpu", "mps", "auto"] {
+                        for &opt in options {
                             if ui
                                 .selectable_value(&mut field.value, opt.to_string(), opt)
                                 .changed()
@@ -724,63 +810,33 @@ fn render_field_input(
     }
 }
 
-fn provider_numeric_range(name: &str) -> Option<(u32, u32)> {
-    match name {
-        "context_window_tokens" => Some((256, 32_768)),
-        "max_tokens" => Some((16, 4_096)),
-        "parallel_slots" => Some((1, 16)),
-        _ => None,
-    }
-}
-
 fn provider_field_label(language: crate::i18n::UiLanguage, name: &str) -> String {
-    let key = match name {
-        "context_window_tokens" => "Context tokens per request",
-        "max_tokens" => "Max output tokens",
-        "parallel_slots" => "Parallel requests",
-        "model_asset" => "Level",
-        "supports_prompt_context" => "Prompt context",
-        "supports_language" => "Language selection",
-        "supports_prompt" => "Custom prompt",
-        "prompt_field" => "Prompt field",
-        "url" => "Endpoint URL",
-        "model" => "Model",
-        _ => return name.to_owned(),
-    };
-    crate::i18n::tr(language, key).to_owned()
-}
-
-fn provider_field_is_visible(field: &ConfigField, native_model: bool) -> bool {
-    if native_model {
-        return matches!(
-            field.name.as_str(),
-            "model_asset" | "context_window_tokens" | "max_tokens"
-        );
-    }
-    !matches!(
-        field.name.as_str(),
-        "context_window_tokens"
-            | "max_tokens"
-            | "parallel_slots"
-            | "supports_prompt_context"
-            | "supports_language"
-            | "supports_prompt"
-            | "prompt_field"
+    provider_field_descriptor(name).map_or_else(
+        || name.to_owned(),
+        |descriptor| crate::i18n::tr(language, descriptor.label).to_owned(),
     )
 }
 
+fn provider_field_is_visible(field: &ConfigField, native_model: bool) -> bool {
+    provider_field_descriptor(&field.name).map_or(!native_model, |descriptor| {
+        descriptor.is_visible(native_model)
+    })
+}
+
 fn provider_field_help(language: crate::i18n::UiLanguage, name: &str) -> Option<&'static str> {
-    let key = match name {
-        "context_window_tokens" => {
-            "Input and output context available to each parallel model request."
-        }
-        "max_tokens" => "Maximum tokens generated for one result.",
-        "parallel_slots" => {
-            "Concurrent llama.cpp request slots. Total context cache is context tokens multiplied by this value."
-        }
-        _ => return None,
-    };
-    Some(crate::i18n::tr(language, key))
+    provider_field_descriptor(name)
+        .and_then(|descriptor| descriptor.help)
+        .map(|help| crate::i18n::tr(language, help))
+}
+
+fn model_capability_for_category(
+    category_key: &str,
+) -> Option<xrtranslate_assets::ModelCapability> {
+    match category_key {
+        "asr" => Some(xrtranslate_assets::ModelCapability::Asr),
+        "translation" => Some(xrtranslate_assets::ModelCapability::Translation),
+        _ => None,
+    }
 }
 
 fn project_config_path() -> PathBuf {
@@ -842,5 +898,44 @@ fn parse_value(value: &str, kind: JsonFieldKind) -> Result<Value, String> {
             .ok_or_else(|| format!("{value:?} must be a JSON number")),
         JsonFieldKind::Json => serde_json::from_str(value.trim())
             .map_err(|error| format!("Invalid JSON value {value:?}: {error}")),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::validate_native_provider_asset;
+    use xrtranslate_assets::ModelCapability;
+    use xrtranslate_config::{LocalModelRuntimeConfig, NativeProviderConfig};
+
+    fn provider(name: &str, model_asset: Option<&str>) -> NativeProviderConfig {
+        NativeProviderConfig {
+            provider: name.into(),
+            url: "http://127.0.0.1:8000/v1/chat/completions".into(),
+            model_asset: model_asset.map(str::to_owned),
+            runtime: LocalModelRuntimeConfig {
+                context_window_tokens: 2_048,
+                max_tokens: 128,
+                parallel_slots: 1,
+            },
+            supports_prompt_context: false,
+        }
+    }
+
+    #[test]
+    fn service_save_accepts_the_legacy_provider_default_asset() {
+        assert!(
+            validate_native_provider_asset(&provider("qwen3-gguf", None), ModelCapability::Asr)
+                .is_ok()
+        );
+    }
+
+    #[test]
+    fn service_save_rejects_an_asset_borrowed_from_another_provider() {
+        let error = validate_native_provider_asset(
+            &provider("future-provider", Some("hy-mt2")),
+            ModelCapability::Translation,
+        )
+        .unwrap_err();
+        assert!(error.contains("does not belong to provider future-provider"));
     }
 }

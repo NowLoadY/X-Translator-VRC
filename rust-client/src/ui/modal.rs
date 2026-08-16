@@ -6,6 +6,7 @@ use eframe::egui::{
 pub struct ModalPage {
     pub title: String,
     pub content: String,
+    pub footnote: Option<String>,
     pub is_code: bool,
 }
 
@@ -14,8 +15,14 @@ impl ModalPage {
         Self {
             title: title.into(),
             content: content.into(),
+            footnote: None,
             is_code: false,
         }
+    }
+
+    pub fn footnote(mut self, footnote: impl Into<String>) -> Self {
+        self.footnote = Some(footnote.into());
+        self
     }
 
     pub fn code(mut self) -> Self {
@@ -39,6 +46,7 @@ pub struct ModalDialog {
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum ModalAction {
     DownloadUpdate,
+    InstallUpdate,
 }
 
 impl Default for ModalDialog {
@@ -76,6 +84,33 @@ impl ModalDialog {
             cancel_label: crate::i18n::tr(language, "Later").into(),
             action: None,
             ok_action: Some(ModalAction::DownloadUpdate),
+        }
+    }
+
+    pub fn update_ready(version: &str, language: crate::i18n::UiLanguage) -> Self {
+        Self {
+            open: true,
+            pages: vec![
+                ModalPage::new(
+                    crate::i18n::tr(language, "Update ready"),
+                    format!(
+                        "v{}\n{}",
+                        version,
+                        crate::i18n::tr(language, "Install the update now?")
+                    ),
+                )
+                .footnote(crate::i18n::tr(
+                    language,
+                    "You can install it later from Settings > General.",
+                )),
+            ],
+            current_page: 0,
+            show_ok_button: true,
+            ok_label: crate::i18n::tr(language, "Install").into(),
+            show_cancel_button: true,
+            cancel_label: crate::i18n::tr(language, "Later").into(),
+            action: None,
+            ok_action: Some(ModalAction::InstallUpdate),
         }
     }
 
@@ -240,6 +275,14 @@ impl ModalDialog {
                                         .color(crate::ui::theme::text_normal()),
                                 );
                             }
+                            if let Some(footnote) = &page.footnote {
+                                ui.add_space(10.0);
+                                ui.label(
+                                    RichText::new(footnote)
+                                        .size(12.0)
+                                        .color(crate::ui::theme::text_weak()),
+                                );
+                            }
                         });
 
                     ui.add_space(10.0);
@@ -310,5 +353,25 @@ impl ModalDialog {
         if close_dialog {
             self.open = false;
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn ready_update_modal_offers_install_with_a_settings_hint() {
+        let modal = ModalDialog::update_ready("1.2.3", crate::i18n::UiLanguage::Chinese);
+
+        assert_eq!(modal.pages[0].title, "更新已下载");
+        assert!(modal.pages[0].content.contains("是否现在安装？"));
+        assert_eq!(
+            modal.pages[0].footnote.as_deref(),
+            Some("你也可以稍后在设置 → 常规中安装。")
+        );
+        assert_eq!(modal.ok_label, "安装");
+        assert_eq!(modal.cancel_label, "稍后");
+        assert_eq!(modal.ok_action, Some(ModalAction::InstallUpdate));
     }
 }

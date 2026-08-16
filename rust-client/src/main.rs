@@ -176,6 +176,7 @@ struct XRTranslateApp {
     runtime_installer: runtime_install::RuntimeInstaller,
     app_update_manager: app_update::AppUpdateManager,
     notified_update_version: Option<String>,
+    notified_ready_update_version: Option<String>,
     backend_start_deadline: Option<std::time::Instant>,
     pub settings_section: ui::pages::settings::SettingsSection,
     pub modal_dialog: ui::modal::ModalDialog,
@@ -700,6 +701,7 @@ impl Default for XRTranslateApp {
             runtime_installer,
             app_update_manager,
             notified_update_version: None,
+            notified_ready_update_version: None,
             backend_start_deadline: None,
             settings_section: ui::pages::settings::SettingsSection::default(),
             modal_dialog: ui::modal::ModalDialog::default(),
@@ -1208,6 +1210,17 @@ impl XRTranslateApp {
         self.notified_update_version = Some(info.version.clone());
         self.modal_dialog =
             ui::modal::ModalDialog::update_available(&info.version, self.ui_language);
+    }
+
+    fn show_ready_update(&mut self) {
+        let app_update::AppUpdateState::Ready(info) = self.app_update_manager.state() else {
+            return;
+        };
+        if self.notified_ready_update_version.as_deref() == Some(&info.version) {
+            return;
+        }
+        self.notified_ready_update_version = Some(info.version.clone());
+        self.modal_dialog = ui::modal::ModalDialog::update_ready(&info.version, self.ui_language);
     }
 
     pub fn download_update(&mut self) {
@@ -2326,6 +2339,7 @@ impl eframe::App for XRTranslateApp {
         }
 
         self.show_available_update();
+        self.show_ready_update();
 
         self.poll_backend_startup(Some(ui.ctx().clone()));
         self.poll_session_events();
@@ -2453,8 +2467,10 @@ impl eframe::App for XRTranslateApp {
             });
 
         self.modal_dialog.render(ui.ctx(), self.ui_language);
-        if self.modal_dialog.take_action() == Some(ui::modal::ModalAction::DownloadUpdate) {
-            self.download_update();
+        match self.modal_dialog.take_action() {
+            Some(ui::modal::ModalAction::DownloadUpdate) => self.download_update(),
+            Some(ui::modal::ModalAction::InstallUpdate) => self.install_update_and_restart(),
+            None => {}
         }
     }
 }

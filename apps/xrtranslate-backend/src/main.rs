@@ -5,7 +5,7 @@
 //! lets the remaining engine work land without another client protocol change.
 
 use std::{
-    net::{IpAddr, Ipv4Addr, SocketAddr},
+    net::SocketAddr,
     path::PathBuf,
     sync::{
         Arc,
@@ -32,7 +32,7 @@ use tokio::{
     sync::{mpsc, watch},
 };
 use tracing::{info, warn};
-use xrtranslate_config::{AppConfig, LocalModelRuntimeConfig};
+use xrtranslate_config::AppConfig;
 use xrtranslate_engine::RouteEpoch;
 use xrtranslate_inference::{AsyncHttpClient, HttpRequest, ReqwestClient};
 use xrtranslate_protocol::{
@@ -42,8 +42,7 @@ use xrtranslate_protocol::{
     SessionReady, VadActivity,
 };
 use xrtranslate_supervisor::{
-    LlamaServerEndpoint, LlamaServerLauncher, LlamaServerProcess, LlamaServerProcessHandle,
-    LlamaServerRole, LlamaServerSpec, StdLlamaServerLauncher,
+    LlamaServerLauncher, LlamaServerProcess, LlamaServerProcessHandle, StdLlamaServerLauncher,
 };
 use xrtranslate_vad::{FRAME_SAMPLES, SAMPLE_RATE_HZ, Utterance, UtteranceEndReason};
 
@@ -52,8 +51,7 @@ use crate::{
     language::AdaptiveLanguageRoute,
     pipeline::{
         NativeInference, NativePipeline, PipelineEvent, RecognizedOutput, TimedUtterance,
-        TranslationOutput, resolved_model_assets, validate_input_chunk_size,
-        validate_input_sample_rate,
+        TranslationOutput, validate_input_chunk_size, validate_input_sample_rate,
     },
     session::{SegmentContext, SessionAdapter, WireOutput},
     terminology::{rewrite_recognition_terms, rewrite_translation_terms},
@@ -61,10 +59,12 @@ use crate::{
 
 mod conversation_context;
 mod language;
+mod model_runtime;
 mod pipeline;
 mod scheduler;
 mod session;
 mod terminology;
+use model_runtime::NativeProviderPlan;
 use scheduler::InferenceScheduler;
 use xr_corpus_client::CorpusClient;
 use xr_corpus_protocol::{
@@ -250,6 +250,7 @@ struct Arguments {
 #[derive(Clone)]
 struct BackendState {
     config: AppConfig,
+    model_plan: Arc<NativeProviderPlan>,
     corpus_client: CorpusClient,
     project_root: PathBuf,
     next_session_id: Arc<AtomicU64>,
@@ -285,7 +286,8 @@ async fn run_backend() -> Result<(), Box<dyn std::error::Error>> {
         .filter(|path| !path.as_os_str().is_empty())
         .map(PathBuf::from)
         .unwrap_or_else(|| PathBuf::from("."));
-    validate_native_route(&config, &project_root)?;
+    let model_plan = Arc::new(NativeProviderPlan::resolve(&config, &project_root)?);
+    validate_native_route(&config, &project_root, &model_plan)?;
     let corpus_client = CorpusClient::new(&args.corpus_url)?;
     let corpus_health = corpus_client.ensure_compatible().await?;
     info!(
@@ -294,21 +296,26 @@ async fn run_backend() -> Result<(), Box<dyn std::error::Error>> {
         "connected to XR Corpus"
     );
     let _model_processes = if args.manage_llama_servers {
-        let mut processes = start_llama_servers(&config, &project_root)?;
-        wait_for_model_servers(&config, args.model_start_timeout_seconds, &mut processes).await?;
+        let mut processes = start_llama_servers(&model_plan)?;
+        wait_for_model_servers(
+            &model_plan,
+            args.model_start_timeout_seconds,
+            &mut processes,
+        )
+        .await?;
         info!("managed llama.cpp model servers are ready");
         Some(processes)
     } else {
         None
     };
     let address = format!("{}:{}", config.server.host, config.server.port);
-    let model_route = config.default_gguf()?;
     let inference_scheduler = InferenceScheduler::new(
-        usize::from(model_route.asr_runtime.parallel_slots),
-        usize::from(model_route.translation_runtime.parallel_slots),
+        usize::from(model_plan.asr_runtime().parallel_slots),
+        usize::from(model_plan.translation_runtime().parallel_slots),
     );
     let state = BackendState {
         config,
+        model_plan,
         corpus_client,
         project_root,
         next_session_id: Arc::new(AtomicU64::new(1)),
@@ -381,14 +388,15 @@ async fn serve_session(socket: WebSocket, state: BackendState) {
         outbound_receiver,
         generation_receiver.clone(),
     ));
-    let mut pipeline = match NativePipeline::new(&state.config, &state.project_root) {
-        Ok(pipeline) => pipeline,
-        Err(error) => {
-            warn!(%session_id, %error, "native pipeline initialization failed");
-            let _ = send_error(&outbound_sender, error).await;
-            return;
-        }
-    };
+    let mut pipeline =
+        match NativePipeline::new(&state.config, &state.project_root, &state.model_plan) {
+            Ok(pipeline) => pipeline,
+            Err(error) => {
+                warn!(%session_id, %error, "native pipeline initialization failed");
+                let _ = send_error(&outbound_sender, error).await;
+                return;
+            }
+        };
     let mut input_format = PcmFormat::mono_s16le(state.config.audio.sample_rate);
     let speaker_available = pipeline.inference().speaker_is_available();
     let speaker_recognition_enabled = Arc::new(AtomicBool::new(false));
@@ -751,13 +759,13 @@ async fn serve_session(socket: WebSocket, state: BackendState) {
     }
 }
 
-fn validate_native_route(config: &AppConfig, project_root: &std::path::Path) -> Result<(), String> {
-    config.default_gguf().map_err(|error| error.to_string())?;
+fn validate_native_route(
+    config: &AppConfig,
+    project_root: &std::path::Path,
+    model_plan: &NativeProviderPlan,
+) -> Result<(), String> {
     validate_input_sample_rate(config.audio.sample_rate)?;
-    resolved_model_assets(config, project_root)
-        .check()
-        .into_result()
-        .map_err(|error| error.to_string())?;
+    model_plan.check_assets()?;
     let vad_path = project_root.join("models/silero-vad/src/silero_vad/data/silero_vad.onnx");
     if !vad_path.is_file() {
         return Err(format!(
@@ -768,46 +776,25 @@ fn validate_native_route(config: &AppConfig, project_root: &std::path::Path) -> 
     Ok(())
 }
 
-fn start_llama_servers(
-    config: &AppConfig,
-    project_root: &std::path::Path,
-) -> Result<Vec<LlamaServerProcess>, String> {
-    let native = config.default_gguf().map_err(|error| error.to_string())?;
-    if !native.llama_server_path.is_file() {
+fn start_llama_servers(model_plan: &NativeProviderPlan) -> Result<Vec<LlamaServerProcess>, String> {
+    if !model_plan.llama_server_path().is_file() {
         return Err(format!(
             "llama-server executable is missing: {}",
-            native.llama_server_path.display()
+            model_plan.llama_server_path().display()
         ));
     }
 
-    let assets = resolved_model_assets(config, project_root);
-    assets
-        .check()
-        .into_result()
-        .map_err(|error| error.to_string())?;
-    let paths = assets.llama_cpp_paths();
-    let asr_port = local_endpoint_port(&native.asr_url)?;
-    let translation_port = local_endpoint_port(&native.translation_url)?;
+    model_plan.check_assets()?;
+    let asr_port = local_endpoint_port(model_plan.asr_url())?;
+    let translation_port = local_endpoint_port(model_plan.translation_url())?;
     if asr_port == translation_port {
         return Err(format!(
             "ASR and translation llama-server endpoints both use port {asr_port}"
         ));
     }
 
-    // Model endpoints are an implementation detail of this local backend;
-    // never expose their unauthenticated OpenAI-compatible APIs to the LAN.
-    let bind = |port| LlamaServerEndpoint::new(IpAddr::V4(Ipv4Addr::LOCALHOST), port);
-    let mut asr_spec = LlamaServerSpec::qwen3_asr_gguf(
-        &native.llama_server_path,
-        paths.qwen3_asr_model,
-        paths.qwen3_asr_mmproj,
-    )
-    .with_endpoint(bind(asr_port));
-    apply_model_runtime(&mut asr_spec, native.asr_runtime)?;
-    let mut translation_spec =
-        LlamaServerSpec::hunyuan_mt_gguf(&native.llama_server_path, paths.hunyuan_mt_model)
-            .with_endpoint(bind(translation_port));
-    apply_model_runtime(&mut translation_spec, native.translation_runtime)?;
+    let [asr_spec, translation_spec] =
+        model_plan.managed_server_specs(asr_port, translation_port)?;
 
     let launcher = StdLlamaServerLauncher;
     let asr = launcher
@@ -823,28 +810,15 @@ fn start_llama_servers(
     Ok(vec![asr, translation])
 }
 
-fn apply_model_runtime(
-    spec: &mut LlamaServerSpec,
-    runtime: LocalModelRuntimeConfig,
-) -> Result<(), String> {
-    spec.context_size = runtime
-        .context_window_tokens
-        .checked_mul(u32::from(runtime.parallel_slots))
-        .ok_or("model context_window_tokens × parallel_slots exceeds u32")?;
-    spec.parallel_slots = (runtime.parallel_slots > 1).then_some(runtime.parallel_slots);
-    Ok(())
-}
-
 async fn wait_for_model_servers(
-    config: &AppConfig,
+    model_plan: &NativeProviderPlan,
     timeout_seconds: u64,
     processes: &mut [LlamaServerProcess],
 ) -> Result<(), String> {
-    let native = config.default_gguf().map_err(|error| error.to_string())?;
-    let asr_health = health_url(&native.asr_url)?;
-    let translation_health = health_url(&native.translation_url)?;
-    let asr_models = models_url(&native.asr_url)?;
-    let translation_models = models_url(&native.translation_url)?;
+    let asr_health = health_url(model_plan.asr_url())?;
+    let translation_health = health_url(model_plan.translation_url())?;
+    let asr_models = models_url(model_plan.asr_url())?;
+    let translation_models = models_url(model_plan.translation_url())?;
     let client =
         ReqwestClient::new_direct(Duration::from_secs(2)).map_err(|error| error.to_string())?;
     let deadline = Instant::now() + Duration::from_secs(timeout_seconds);
@@ -865,14 +839,14 @@ async fn wait_for_model_servers(
             &client,
             &asr_health,
             &asr_models,
-            LlamaServerRole::Qwen3Asr.model_alias(),
+            model_plan.asr_model_alias(),
         )
         .await;
         let translation = check_model_ready(
             &client,
             &translation_health,
             &translation_models,
-            LlamaServerRole::HunyuanMt.model_alias(),
+            model_plan.translation_model_alias(),
         )
         .await;
         if asr.is_ok() && translation.is_ok() {
@@ -1949,16 +1923,14 @@ async fn shutdown_signal() {
 #[cfg(test)]
 mod tests {
     use super::{
-        AudioEpoch, PipelineGeneration, SessionInputState, StreamWindowContext,
-        apply_model_runtime, health_url, local_endpoint_port, model_alias_is_advertised,
-        models_url, outbound_is_current, segment_contexts,
+        AudioEpoch, PipelineGeneration, SessionInputState, StreamWindowContext, health_url,
+        local_endpoint_port, model_alias_is_advertised, models_url, outbound_is_current,
+        segment_contexts,
     };
-    use xrtranslate_config::LocalModelRuntimeConfig;
     use xrtranslate_engine::{
         EngineConfig, Language, LanguageRoute, SessionEngine, TranslationSegmentPair,
     };
     use xrtranslate_protocol::{SegmentBoundary, SegmentTiming};
-    use xrtranslate_supervisor::LlamaServerSpec;
 
     #[test]
     fn paused_sessions_keep_controls_but_reject_binary_audio() {
@@ -1968,22 +1940,6 @@ mod tests {
         assert!(SessionInputState::Paused.accepts_controls());
         assert!(!SessionInputState::Draining.accepts_audio());
         assert!(!SessionInputState::Draining.accepts_controls());
-    }
-
-    #[test]
-    fn per_request_context_is_multiplied_by_parallel_slots() {
-        let mut spec = LlamaServerSpec::hunyuan_mt_gguf("llama-server", "hy-mt2.gguf");
-        apply_model_runtime(
-            &mut spec,
-            LocalModelRuntimeConfig {
-                context_window_tokens: 2_048,
-                max_tokens: 256,
-                parallel_slots: 2,
-            },
-        )
-        .unwrap();
-        assert_eq!(spec.context_size, 4_096);
-        assert_eq!(spec.parallel_slots, Some(2));
     }
 
     #[test]

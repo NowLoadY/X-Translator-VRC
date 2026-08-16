@@ -4298,7 +4298,7 @@ dependencies = [
 
 [[package]]
 name = "rust-client"
-version = "0.2.5"
+version = "0.2.6"
 dependencies = [
  "audioadapter-buffers",
  "cpal",
@@ -6962,7 +6962,7 @@ dependencies = [
 
 [[package]]
 name = "xrtranslate-assets"
-version = "0.2.5"
+version = "0.2.6"
 dependencies = [
  "serde",
  "sha2",
@@ -6971,7 +6971,7 @@ dependencies = [
 
 [[package]]
 name = "xrtranslate-backend"
-version = "0.2.5"
+version = "0.2.6"
 dependencies = [
  "axum",
  "clap",
@@ -6998,7 +6998,7 @@ dependencies = [
 
 [[package]]
 name = "xrtranslate-config"
-version = "0.2.5"
+version = "0.2.6"
 dependencies = [
  "serde",
  "serde_json",
@@ -7007,7 +7007,7 @@ dependencies = [
 
 [[package]]
 name = "xrtranslate-denoise"
-version = "0.2.5"
+version = "0.2.6"
 dependencies = [
  "ndarray",
  "ort",
@@ -7016,7 +7016,7 @@ dependencies = [
 
 [[package]]
 name = "xrtranslate-download"
-version = "0.2.5"
+version = "0.2.6"
 dependencies = [
  "httpdate",
  "reqwest",
@@ -7026,11 +7026,11 @@ dependencies = [
 
 [[package]]
 name = "xrtranslate-engine"
-version = "0.2.5"
+version = "0.2.6"
 
 [[package]]
 name = "xrtranslate-inference"
-version = "0.2.5"
+version = "0.2.6"
 dependencies = [
  "base64 0.22.1",
  "reqwest",
@@ -7041,7 +7041,7 @@ dependencies = [
 
 [[package]]
 name = "xrtranslate-installer"
-version = "0.2.5"
+version = "0.2.6"
 dependencies = [
  "clap",
  "tokio",
@@ -7051,7 +7051,7 @@ dependencies = [
 
 [[package]]
 name = "xrtranslate-packager"
-version = "0.2.5"
+version = "0.2.6"
 dependencies = [
  "clap",
  "serde_json",
@@ -7063,7 +7063,7 @@ dependencies = [
 
 [[package]]
 name = "xrtranslate-protocol"
-version = "0.2.5"
+version = "0.2.6"
 dependencies = [
  "serde",
  "serde_json",
@@ -7072,7 +7072,7 @@ dependencies = [
 
 [[package]]
 name = "xrtranslate-speaker"
-version = "0.2.5"
+version = "0.2.6"
 dependencies = [
  "ndarray",
  "ort",
@@ -7080,11 +7080,11 @@ dependencies = [
 
 [[package]]
 name = "xrtranslate-supervisor"
-version = "0.2.5"
+version = "0.2.6"
 
 [[package]]
 name = "xrtranslate-updater"
-version = "0.2.5"
+version = "0.2.6"
 dependencies = [
  "clap",
  "serde_json",
@@ -7092,7 +7092,7 @@ dependencies = [
 
 [[package]]
 name = "xrtranslate-vad"
-version = "0.2.5"
+version = "0.2.6"
 dependencies = [
  "ndarray",
  "ort",

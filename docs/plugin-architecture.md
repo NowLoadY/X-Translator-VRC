@@ -98,6 +98,40 @@ plugin-specific model pool to make one importer faster. Extend the neutral
 workload/lifecycle contract when a genuinely different scheduling requirement
 appears.
 
+### Model providers and assets are separate extension points
+
+Model assets are immutable package metadata; providers are runtime behavior.
+Do not encode a model size as a new provider and do not scatter model IDs,
+prompt rules, launch arguments, or UI labels through plugin and host code.
+
+- `xrtranslate-assets` owns the manifest catalogue, active asset resolution,
+  installation metadata, and preflight checks. Consumers query by stable asset
+  ID or capability instead of matching fields such as “normal” and “big”.
+  Runtime files are selected by declared role (weights, projection, and future
+  roles), never by their position in a manifest array.
+- `xrtranslate-config` resolves the selected provider's common local-runtime
+  contract: endpoint, model asset, context window, output budget, and slots. It
+  does not decide which concrete inference family implements that provider.
+- The backend provider plan is the single composition boundary for model
+  family support. It validates provider/asset compatibility and creates model
+  servers and inference adapters. Pipelines consume the plan and never branch
+  on provider names.
+- `xrtranslate-inference::translation::profile` owns provider-specific prompts,
+  sampling parameters, and output cleanup. Transport and authentication remain
+  in the adapter.
+- Desktop model selection is keyed by provider plus capability (and level when
+  writing a choice). Provider setting fields use declarative descriptors;
+  unknown configuration fields retain the generic editor fallback.
+
+Adding another size or quantization for an existing family should normally be
+a catalogue-only change (stable asset ID plus manifest). Adding a genuinely
+different provider requires one inference profile and one backend runtime-plan
+registration, plus its manifest and configuration descriptor. It must not
+require changes to session plugins, the generic pipeline, or model-install UI
+control flow. A backend architecture test requires every catalogued provider to
+have a registered runtime profile, so the UI cannot expose an installable local
+provider that the backend cannot start.
+
 ## Ownership boundary
 
 The host owns capabilities shared by features or requiring exclusive access:

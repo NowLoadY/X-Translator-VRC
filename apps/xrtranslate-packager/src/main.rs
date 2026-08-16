@@ -18,8 +18,7 @@ use serde_json::{Map, Value, json};
 use sha2::{Digest, Sha256};
 use xr_corpus_core::load_markdown_directory;
 use xrtranslate_assets::{
-    ModelAssetId, ModelAssetManifest, ModelAssetsConfig, ModelCapability, ResolvedModelAssets,
-    manifest_for,
+    ModelAssetId, ModelAssetManifest, ModelAssetsConfig, ResolvedModelAssets,
 };
 use xrtranslate_config::AppConfig;
 
@@ -254,18 +253,14 @@ impl ReleasePlan {
         ensure_native_file("--denoise-model", &denoise_model)?;
 
         let config = AppConfig::from_path(&arguments.config)?;
-        let mut asset_config = ModelAssetsConfig {
-            models_directory: config.model_manager.models_directory.clone(),
-            qwen3_asr_gguf_directory: config.model_manager.qwen3_asr_gguf_directory.clone(),
-            hunyuan_mt_gguf_directory: config.model_manager.hunyuan_mt_gguf_directory.clone(),
-            ..ModelAssetsConfig::default()
-        };
+        let mut asset_config = ModelAssetsConfig::with_directory_overrides(
+            config.model_manager.models_directory.clone(),
+            config.model_manager.qwen3_asr_gguf_directory.clone(),
+            config.model_manager.hunyuan_mt_gguf_directory.clone(),
+        );
         for key in config.active_native_model_assets() {
             if let Some(id) = ModelAssetId::from_config_key(&key) {
-                match manifest_for(id).capability {
-                    ModelCapability::Asr => asset_config.qwen3_asr_asset = Some(id),
-                    ModelCapability::Translation => asset_config.hunyuan_mt_asset = Some(id),
-                }
+                asset_config.select_asset(id);
             }
         }
         let assets = asset_config.resolve(&project_root);
@@ -982,6 +977,11 @@ mod tests {
         write(&installer, b"installer");
         write(&updater, b"updater");
         write(&resources.join("docs/welcome.md"), b"native resource");
+        write(&resources.join("bin/mpv-2.dll"), b"runtime download");
+        write(
+            &resources.join("bin/future-runtime.dll"),
+            b"future runtime download",
+        );
         write(&corpora.join("README.md"), b"corpus root");
         write(&corpora.join("v1/SCHEMA.md"), b"corpus schema");
         write(
@@ -1075,6 +1075,8 @@ zh,en,fr,pt,es,ja,ru,ko,th,it,de,vi,id,pl,cs,nl
                 .is_file()
         );
         assert!(output.join("resources/docs/welcome.md").is_file());
+        assert!(!output.join("resources/bin/mpv-2.dll").exists());
+        assert!(!output.join("resources/bin/future-runtime.dll").exists());
         assert!(output.join("corpora/v1/SCHEMA.md").is_file());
         assert!(
             output

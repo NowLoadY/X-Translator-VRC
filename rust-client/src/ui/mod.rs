@@ -689,7 +689,8 @@ fn render_onboarding_runtime(app: &mut crate::XRTranslateApp, ui: &mut egui::Ui)
 
 fn render_onboarding_models(app: &mut crate::XRTranslateApp, ui: &mut egui::Ui) {
     use crate::model_install::{
-        NativeModelTaskState, configured_model_packages, model_level_packages, set_model_level,
+        NativeModelTaskState, configured_model_packages, model_level_packages_for_provider,
+        set_model_level,
     };
 
     let language = app.ui_language;
@@ -725,7 +726,10 @@ fn render_onboarding_models(app: &mut crate::XRTranslateApp, ui: &mut egui::Ui) 
                 OnboardingModelCard {
                     title: package.label,
                     selected_level: package.level,
-                    levels: &model_level_packages(package.capability),
+                    levels: &model_level_packages_for_provider(
+                        package.provider,
+                        package.capability,
+                    ),
                     action: if installed {
                         "Installed"
                     } else if retry {
@@ -838,7 +842,7 @@ fn render_onboarding_models(app: &mut crate::XRTranslateApp, ui: &mut egui::Ui) 
                 .size(12.0)
                 .color(Color32::from_rgb(5, 150, 105)),
         ),
-        NativeModelTaskState::Verified => ui.label(
+        NativeModelTaskState::Verified { .. } => ui.label(
             RichText::new(crate::i18n::tr(language, "Your model packages are ready."))
                 .size(12.0)
                 .color(Color32::from_rgb(5, 150, 105)),

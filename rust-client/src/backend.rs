@@ -309,22 +309,31 @@ impl BackendManager {
             "translation" => ModelCapability::Translation,
             _ => return Err(format!("Unknown model category: {category}")),
         };
-        let id = config
-            .active_native_model_assets()
-            .into_iter()
-            .filter_map(|key| ModelAssetId::from_config_key(&key))
-            .find(|id| manifest_for(*id).capability == capability)
-            .ok_or_else(|| format!("No local model is configured for {category}:{provider}."))?;
-        let mut asset_config = ModelAssetsConfig {
-            models_directory: config.model_manager.models_directory,
-            qwen3_asr_gguf_directory: config.model_manager.qwen3_asr_gguf_directory,
-            hunyuan_mt_gguf_directory: config.model_manager.hunyuan_mt_gguf_directory,
-            ..ModelAssetsConfig::default()
+        let providers = match capability {
+            ModelCapability::Asr => &config.asr.providers,
+            ModelCapability::Translation => &config.translation.providers,
         };
-        match capability {
-            ModelCapability::Asr => asset_config.qwen3_asr_asset = Some(id),
-            ModelCapability::Translation => asset_config.hunyuan_mt_asset = Some(id),
+        let model_asset = providers
+            .get(provider)
+            .and_then(serde_json::Value::as_object)
+            .and_then(|provider| provider.get("model_asset"))
+            .and_then(serde_json::Value::as_str)
+            .ok_or_else(|| format!("No local model is configured for {category}:{provider}."))?;
+        let id = ModelAssetId::from_config_key(model_asset).ok_or_else(|| {
+            format!("Unknown model package {model_asset} for {category}:{provider}.")
+        })?;
+        let manifest = manifest_for(id);
+        if manifest.capability != capability || manifest.provider != provider {
+            return Err(format!(
+                "Model package {model_asset} does not belong to {category}:{provider}."
+            ));
         }
+        let mut asset_config = ModelAssetsConfig::with_directory_overrides(
+            config.model_manager.models_directory,
+            config.model_manager.qwen3_asr_gguf_directory,
+            config.model_manager.hunyuan_mt_gguf_directory,
+        );
+        asset_config.select_asset(id);
         let assets = asset_config.resolve(&self.project_root);
         let preflight = assets.check();
         let diagnostics = preflight

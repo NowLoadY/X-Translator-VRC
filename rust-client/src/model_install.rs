@@ -33,7 +33,9 @@ pub enum NativeModelTaskState {
         asset_id: ModelAssetId,
         directory: PathBuf,
     },
-    Verified,
+    Verified {
+        ready: Vec<ModelAssetId>,
+    },
     Failed(String),
 }
 
@@ -43,6 +45,7 @@ pub struct NativeModelPackage {
     pub id: ModelAssetId,
     pub label: &'static str,
     pub download_bytes: u64,
+    pub provider: &'static str,
     pub capability: ModelCapability,
     pub level: ModelLevel,
 }
@@ -80,7 +83,9 @@ enum NativeModelTaskResult {
         asset_id: ModelAssetId,
         directory: PathBuf,
     },
-    Verified,
+    Verified {
+        ready: Vec<ModelAssetId>,
+    },
     Failed(String),
 }
 
@@ -158,7 +163,7 @@ impl NativeModelTaskManager {
                 },
                 requested,
             ) => *installed == requested,
-            (NativeModelTaskState::Verified, _) => true,
+            (NativeModelTaskState::Verified { ready }, requested) => ready.contains(&requested),
             _ => false,
         }
     }
@@ -179,7 +184,7 @@ impl NativeModelTaskManager {
                 },
                 requested,
             ) => *installed == requested,
-            (NativeModelTaskState::Verified, _) => true,
+            (NativeModelTaskState::Verified { ready }, requested) => ready.contains(&requested),
             _ => false,
         }
     }
@@ -213,7 +218,9 @@ impl NativeModelTaskManager {
                             asset_id,
                             directory,
                         },
-                        NativeModelTaskResult::Verified => NativeModelTaskState::Verified,
+                        NativeModelTaskResult::Verified { ready } => {
+                            NativeModelTaskState::Verified { ready }
+                        }
                         NativeModelTaskResult::Failed(error) => NativeModelTaskState::Failed(error),
                     };
                     finished = true;
@@ -333,7 +340,12 @@ fn verify_models(project_root: PathBuf) -> NativeModelTaskResult {
         Ok(assets) => {
             let preflight = assets.verify_integrity();
             if preflight.is_ready() {
-                NativeModelTaskResult::Verified
+                NativeModelTaskResult::Verified {
+                    ready: assets
+                        .active_assets()
+                        .map(|asset| asset.manifest().id)
+                        .collect(),
+                }
             } else {
                 NativeModelTaskResult::Failed(
                     preflight
@@ -351,30 +363,14 @@ fn verify_models(project_root: PathBuf) -> NativeModelTaskResult {
 
 fn load_assets(project_root: &std::path::Path) -> Result<ResolvedModelAssets, String> {
     let config = load_config(project_root)?;
-    let (asr_asset, translation_asset) = selected_asset_ids(&config)?;
-    Ok(ModelAssetsConfig {
-        models_directory: config.model_manager.models_directory,
-        qwen3_asr_gguf_directory: config.model_manager.qwen3_asr_gguf_directory,
-        hunyuan_mt_gguf_directory: config.model_manager.hunyuan_mt_gguf_directory,
-        qwen3_asr_asset: Some(asr_asset),
-        hunyuan_mt_asset: Some(translation_asset),
-    }
-    .resolve(project_root))
+    configured_assets(&config, project_root)
 }
 
 pub fn configured_model_packages(
     project_root: &std::path::Path,
 ) -> Result<Vec<NativeModelPackage>, String> {
     let config = load_config(project_root)?;
-    let (asr_asset, translation_asset) = selected_asset_ids(&config)?;
-    let assets = ModelAssetsConfig {
-        models_directory: config.model_manager.models_directory.clone(),
-        qwen3_asr_gguf_directory: config.model_manager.qwen3_asr_gguf_directory.clone(),
-        hunyuan_mt_gguf_directory: config.model_manager.hunyuan_mt_gguf_directory.clone(),
-        qwen3_asr_asset: Some(asr_asset),
-        hunyuan_mt_asset: Some(translation_asset),
-    }
-    .resolve(project_root);
+    let assets = configured_assets(&config, project_root)?;
     config
         .active_native_model_assets()
         .into_iter()
@@ -396,33 +392,47 @@ pub fn model_package_for_config_key(
     key: &str,
 ) -> Result<NativeModelPackage, String> {
     let config = load_config(project_root)?;
-    let (asr_asset, translation_asset) = selected_asset_ids(&config)?;
-    let assets = ModelAssetsConfig {
-        models_directory: config.model_manager.models_directory,
-        qwen3_asr_gguf_directory: config.model_manager.qwen3_asr_gguf_directory,
-        hunyuan_mt_gguf_directory: config.model_manager.hunyuan_mt_gguf_directory,
-        qwen3_asr_asset: Some(asr_asset),
-        hunyuan_mt_asset: Some(translation_asset),
-    }
-    .resolve(project_root);
+    let assets = configured_assets(&config, project_root)?;
     let id = ModelAssetId::from_config_key(key)
         .ok_or_else(|| format!("Unknown model_asset in provider configuration: {key}"))?;
     let manifest = assets.asset(id).manifest();
     Ok(package_from_manifest(manifest))
 }
 
+/// Resolves a package while preserving the provider and capability boundary
+/// of the provider card that requested it.
+pub fn model_package_for_provider_config_key(
+    project_root: &std::path::Path,
+    provider: &str,
+    capability: ModelCapability,
+    key: &str,
+) -> Result<NativeModelPackage, String> {
+    let package = model_package_for_config_key(project_root, key)?;
+    if package.provider != provider || package.capability != capability {
+        return Err(format!(
+            "Model package {key} does not belong to provider {provider} for {capability:?}."
+        ));
+    }
+    Ok(package)
+}
+
 fn package_from_manifest(manifest: &xrtranslate_assets::ModelAssetManifest) -> NativeModelPackage {
     NativeModelPackage {
         id: manifest.id,
         label: manifest.label,
+        provider: manifest.provider,
         capability: manifest.capability,
         level: manifest.level,
         download_bytes: manifest.required_files.iter().map(|file| file.bytes).sum(),
     }
 }
 
-pub fn model_level_packages(capability: ModelCapability) -> Vec<NativeModelPackage> {
+pub fn model_level_packages_for_provider(
+    provider: &str,
+    capability: ModelCapability,
+) -> Vec<NativeModelPackage> {
     manifests_for_capability(capability)
+        .filter(|manifest| manifest.provider == provider)
         .map(package_from_manifest)
         .collect()
 }
@@ -432,9 +442,6 @@ pub fn set_model_level(
     capability: ModelCapability,
     level: ModelLevel,
 ) -> Result<(), String> {
-    let manifest = manifests_for_capability(capability)
-        .find(|manifest| manifest.level == level)
-        .ok_or_else(|| format!("The selected model level is not available for {capability:?}."))?;
     let path = project_root.join("config.json");
     let contents = std::fs::read_to_string(&path)
         .map_err(|error| format!("Cannot read {}: {error}", path.display()))?;
@@ -453,6 +460,13 @@ pub fn set_model_level(
         .and_then(serde_json::Value::as_str)
         .ok_or_else(|| format!("Missing {section_name}.provider."))?
         .to_owned();
+    let manifest = manifests_for_capability(capability)
+        .find(|manifest| manifest.provider == provider && manifest.level == level)
+        .ok_or_else(|| {
+            format!(
+                "The selected model level is not available for provider {provider} and {capability:?}."
+            )
+        })?;
     let provider_config = section
         .get_mut("providers")
         .and_then(serde_json::Value::as_object_mut)
@@ -471,26 +485,72 @@ pub fn set_model_level(
         .map_err(|error| format!("Cannot save {}: {error}", path.display()))
 }
 
-fn selected_asset_ids(config: &AppConfig) -> Result<(ModelAssetId, ModelAssetId), String> {
-    let mut asr = None;
-    let mut translation = None;
+fn configured_assets(
+    config: &AppConfig,
+    project_root: &std::path::Path,
+) -> Result<ResolvedModelAssets, String> {
+    let mut assets = ModelAssetsConfig::with_directory_overrides(
+        config.model_manager.models_directory.clone(),
+        config.model_manager.qwen3_asr_gguf_directory.clone(),
+        config.model_manager.hunyuan_mt_gguf_directory.clone(),
+    );
+    let mut has_asr = false;
+    let mut has_translation = false;
     for key in config.active_native_model_assets() {
         let id = ModelAssetId::from_config_key(&key).ok_or_else(|| {
             format!("Unknown model_asset in active provider configuration: {key}")
         })?;
         match manifest_for(id).capability {
-            ModelCapability::Asr => asr = Some(id),
-            ModelCapability::Translation => translation = Some(id),
+            ModelCapability::Asr => has_asr = true,
+            ModelCapability::Translation => has_translation = true,
         }
+        assets.select_asset(id);
     }
-    Ok((
-        asr.ok_or("The active ASR provider has no model package.")?,
-        translation.ok_or("The active translation provider has no model package.")?,
-    ))
+    if !has_asr {
+        return Err("The active ASR provider has no model package.".into());
+    }
+    if !has_translation {
+        return Err("The active translation provider has no model package.".into());
+    }
+    Ok(assets.resolve(project_root))
 }
 
 fn load_config(project_root: &std::path::Path) -> Result<AppConfig, String> {
     let config_path = project_root.join("config.json");
     AppConfig::from_path(&config_path)
         .map_err(|error| format!("Cannot read {}: {error}", config_path.display()))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn model_levels_are_scoped_to_provider_and_capability() {
+        let hunyuan = model_level_packages_for_provider("hunyuan", ModelCapability::Translation);
+        assert_eq!(hunyuan.len(), 2);
+        assert!(hunyuan.iter().all(|package| package.provider == "hunyuan"
+            && package.capability == ModelCapability::Translation));
+
+        assert!(
+            model_level_packages_for_provider("qwen3-gguf", ModelCapability::Translation)
+                .is_empty()
+        );
+    }
+
+    #[test]
+    fn verified_state_is_scoped_to_the_packages_that_were_hashed() {
+        let manager = NativeModelTaskManager {
+            state: NativeModelTaskState::Verified {
+                ready: vec![ModelAssetId::Qwen3AsrGguf],
+            },
+            events: None,
+            proxy_url: None,
+        };
+
+        assert!(manager.is_model_ready(ModelAssetId::Qwen3AsrGguf));
+        assert!(manager.is_model_present(ModelAssetId::Qwen3AsrGguf));
+        assert!(!manager.is_model_ready(ModelAssetId::HunyuanMtGguf));
+        assert!(!manager.is_model_present(ModelAssetId::HunyuanMtGguf));
+    }
 }

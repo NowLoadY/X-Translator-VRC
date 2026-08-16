@@ -125,6 +125,10 @@ fn replace_entries(
             merge_models_directory(&entry.path(), &target.join(&name), target, backup)?;
             continue;
         }
+        if name.eq_ignore_ascii_case(OsStr::new("resources")) {
+            replace_resources_directory(&entry.path(), &target.join(&name), target, backup)?;
+            continue;
+        }
         if is_protected(&name) {
             if name.eq_ignore_ascii_case(OsStr::new("config.json")) && !target.join(&name).exists()
             {
@@ -137,6 +141,72 @@ fn replace_entries(
         copy_path(&entry.path(), &destination)?;
     }
     Ok(())
+}
+
+/// Replaces packaged resources while preserving locally installed native
+/// runtimes that the release intentionally does not carry.
+///
+/// Runtime installers place optional libraries under `resources/bin`. A new
+/// release is authoritative for every file it contains; only dynamic libraries
+/// absent from the release are migrated from the previous installation.
+fn replace_resources_directory(
+    source_resources: &Path,
+    target_resources: &Path,
+    target_root: &Path,
+    backup: &Path,
+) -> Result<(), String> {
+    backup_existing(target_resources, target_root, backup)?;
+    copy_path(source_resources, target_resources)?;
+
+    let relative = target_resources
+        .strip_prefix(target_root)
+        .map_err(|error| {
+            format!(
+                "invalid resources path {}: {error}",
+                target_resources.display()
+            )
+        })?;
+    restore_local_runtime_libraries(
+        &backup.join(relative).join("bin"),
+        &source_resources.join("bin"),
+        &target_resources.join("bin"),
+    )
+}
+
+fn restore_local_runtime_libraries(
+    previous: &Path,
+    release: &Path,
+    target: &Path,
+) -> Result<(), String> {
+    if !previous.is_dir() {
+        return Ok(());
+    }
+    for entry in fs::read_dir(previous).map_err(|error| error.to_string())? {
+        let entry = entry.map_err(|error| error.to_string())?;
+        let previous_path = entry.path();
+        let release_path = release.join(entry.file_name());
+        let target_path = target.join(entry.file_name());
+        if previous_path.is_dir() {
+            restore_local_runtime_libraries(&previous_path, &release_path, &target_path)?;
+        } else if previous_path.is_file()
+            && is_dynamic_runtime_library(&previous_path)
+            && !release_path.exists()
+        {
+            copy_path(&previous_path, &target_path)?;
+        }
+    }
+    Ok(())
+}
+
+fn is_dynamic_runtime_library(path: &Path) -> bool {
+    let Some(name) = path.file_name().and_then(OsStr::to_str) else {
+        return false;
+    };
+    let name = name.to_ascii_lowercase();
+    name.ends_with(".dll")
+        || name.ends_with(".dylib")
+        || name.ends_with(".so")
+        || name.contains(".so.")
 }
 
 fn merge_models_directory(
@@ -327,13 +397,29 @@ mod tests {
 
         fs::create_dir_all(source.join("models/gtcrn")).unwrap();
         fs::create_dir_all(source.join("models/silero-vad")).unwrap();
-        fs::write(source.join("models/gtcrn/gtcrn_simple.onnx"), b"new_denoise_onnx").unwrap();
-        fs::write(source.join("models/silero-vad/silero_vad.onnx"), b"updated_vad_onnx").unwrap();
+        fs::write(
+            source.join("models/gtcrn/gtcrn_simple.onnx"),
+            b"new_denoise_onnx",
+        )
+        .unwrap();
+        fs::write(
+            source.join("models/silero-vad/silero_vad.onnx"),
+            b"updated_vad_onnx",
+        )
+        .unwrap();
 
         fs::create_dir_all(target.join("models/silero-vad")).unwrap();
         fs::create_dir_all(target.join("models/qwen3-asr")).unwrap();
-        fs::write(target.join("models/silero-vad/silero_vad.onnx"), b"old_vad_onnx").unwrap();
-        fs::write(target.join("models/qwen3-asr/qwen3.gguf"), b"huge_user_downloaded_gguf").unwrap();
+        fs::write(
+            target.join("models/silero-vad/silero_vad.onnx"),
+            b"old_vad_onnx",
+        )
+        .unwrap();
+        fs::write(
+            target.join("models/qwen3-asr/qwen3.gguf"),
+            b"huge_user_downloaded_gguf",
+        )
+        .unwrap();
 
         let source_entries = source_entries(&source).unwrap();
         replace_entries(&source, &target, &source_entries, &backup).unwrap();
@@ -358,6 +444,60 @@ mod tests {
             fs::read(backup.join("models/silero-vad/silero_vad.onnx")).unwrap(),
             b"old_vad_onnx"
         );
+
+        let _ = fs::remove_dir_all(&temp);
+    }
+
+    #[test]
+    fn replacing_resources_preserves_only_target_local_runtime_libraries() {
+        let temp =
+            std::env::temp_dir().join(format!("xrt_updater_resources_test_{}", std::process::id()));
+        let _ = fs::remove_dir_all(&temp);
+        let source = temp.join("source");
+        let target = temp.join("target");
+        let backup = temp.join("backup");
+
+        fs::create_dir_all(source.join("resources/bin")).unwrap();
+        fs::write(source.join("resources/theme.json"), b"new theme").unwrap();
+        fs::write(source.join("resources/bin/release.dll"), b"new release dll").unwrap();
+
+        fs::create_dir_all(target.join("resources/bin/codecs")).unwrap();
+        fs::write(target.join("resources/theme.json"), b"old theme").unwrap();
+        fs::write(target.join("resources/removed.txt"), b"stale packaged file").unwrap();
+        fs::write(target.join("resources/bin/mpv-2.dll"), b"downloaded mpv").unwrap();
+        fs::write(
+            target.join("resources/bin/codecs/future-codec.dll"),
+            b"downloaded future codec",
+        )
+        .unwrap();
+        fs::write(target.join("resources/bin/release.dll"), b"old release dll").unwrap();
+        fs::write(
+            target.join("resources/bin/local-note.txt"),
+            b"not a runtime",
+        )
+        .unwrap();
+
+        let source_entries = source_entries(&source).unwrap();
+        replace_entries(&source, &target, &source_entries, &backup).unwrap();
+
+        assert_eq!(
+            fs::read(target.join("resources/bin/mpv-2.dll")).unwrap(),
+            b"downloaded mpv"
+        );
+        assert_eq!(
+            fs::read(target.join("resources/bin/codecs/future-codec.dll")).unwrap(),
+            b"downloaded future codec"
+        );
+        assert_eq!(
+            fs::read(target.join("resources/bin/release.dll")).unwrap(),
+            b"new release dll"
+        );
+        assert_eq!(
+            fs::read(target.join("resources/theme.json")).unwrap(),
+            b"new theme"
+        );
+        assert!(!target.join("resources/removed.txt").exists());
+        assert!(!target.join("resources/bin/local-note.txt").exists());
 
         let _ = fs::remove_dir_all(&temp);
     }

@@ -81,6 +81,58 @@ impl AppConfig {
         })
     }
 
+    /// Resolves the common configuration contract for the selected local ASR
+    /// and translation providers without knowing their concrete model family.
+    /// Provider factories in the backend decide which implementations they
+    /// support; this configuration crate only validates shared local-runtime
+    /// fields.
+    pub fn native_model_route(&self) -> Result<NativeModelRouteConfig, DefaultGgufValidationError> {
+        let mut issues = Vec::new();
+        if self.tts.provider.trim() != "none" {
+            issues.push(format!(
+                "tts.provider must be \"none\" for the default native route until that TTS provider is migrated (found {:?})",
+                self.tts.provider
+            ));
+        }
+        let llama_server_path = required_non_empty(
+            &self.model_manager.llama_server_path,
+            "model_manager.llama_server_path",
+            &mut issues,
+        );
+        let asr = active_native_provider(
+            &self.asr.provider,
+            &self.asr.providers,
+            "asr",
+            LocalModelRuntimeConfig {
+                context_window_tokens: 2_048,
+                max_tokens: 128,
+                parallel_slots: 1,
+            },
+            &mut issues,
+        );
+        let translation = active_native_provider(
+            &self.translation.provider,
+            &self.translation.providers,
+            "translation",
+            LocalModelRuntimeConfig {
+                context_window_tokens: 2_048,
+                max_tokens: 256,
+                parallel_slots: 2,
+            },
+            &mut issues,
+        );
+
+        if issues.is_empty() {
+            Ok(NativeModelRouteConfig {
+                llama_server_path: PathBuf::from(llama_server_path.expect("checked above")),
+                asr: asr.expect("checked above"),
+                translation: translation.expect("checked above"),
+            })
+        } else {
+            Err(DefaultGgufValidationError { issues })
+        }
+    }
+
     /// Validates the first native, Python-free GGUF route and returns the
     /// values necessary to launch its two `llama-server` children.
     ///
@@ -186,7 +238,7 @@ impl AppConfig {
             (&self.translation.provider, &self.translation.providers),
         ] {
             let Some(model_asset) = providers
-                .get(provider)
+                .get(provider.trim())
                 .and_then(Value::as_object)
                 .and_then(|model| model.get("model_asset"))
                 .and_then(Value::as_str)
@@ -640,6 +692,26 @@ pub struct DefaultGgufConfig {
     pub translation_runtime: LocalModelRuntimeConfig,
 }
 
+/// Provider-neutral local model route consumed by backend provider factories.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct NativeModelRouteConfig {
+    pub llama_server_path: PathBuf,
+    pub asr: NativeProviderConfig,
+    pub translation: NativeProviderConfig,
+}
+
+/// Common settings shared by every native model provider.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct NativeProviderConfig {
+    pub provider: String,
+    pub url: String,
+    /// Stable local package key. Older configurations may omit this and let
+    /// the backend provider profile choose its compatibility default.
+    pub model_asset: Option<String>,
+    pub runtime: LocalModelRuntimeConfig,
+    pub supports_prompt_context: bool,
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct LocalModelRuntimeConfig {
     pub context_window_tokens: u32,
@@ -783,6 +855,44 @@ const fn default_speaker_similarity_threshold() -> f64 {
 const fn default_same_speaker_hysteresis() -> f64 {
     0.14
 }
+
+fn active_native_provider(
+    selected_provider: &str,
+    providers: &ProviderConfigs,
+    section: &str,
+    defaults: LocalModelRuntimeConfig,
+    issues: &mut Vec<String>,
+) -> Option<NativeProviderConfig> {
+    let provider = selected_provider.trim();
+    if provider.is_empty() {
+        issues.push(format!("{section}.provider must be a non-empty string"));
+        return None;
+    }
+    let path = format!("{section}.providers.{provider}");
+    let url = required_provider_url(providers, provider, &format!("{path}.url"), issues);
+    let object = providers.get(provider).and_then(Value::as_object);
+    let model_asset = object
+        .and_then(|provider| provider.get("model_asset"))
+        .and_then(Value::as_str)
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .map(str::to_owned);
+    let runtime = provider_runtime_config(providers, provider, &path, defaults, issues);
+    let supports_prompt_context = object
+        .and_then(|provider| provider.get("supports_prompt_context"))
+        .and_then(Value::as_bool)
+        .unwrap_or(false);
+    match url {
+        Some(url) => Some(NativeProviderConfig {
+            provider: provider.to_owned(),
+            url,
+            model_asset,
+            runtime,
+            supports_prompt_context,
+        }),
+        None => None,
+    }
+}
 const fn default_speaker_switch_margin() -> f64 {
     0.04
 }
@@ -898,6 +1008,67 @@ mod tests {
         assert_eq!(gguf.translation_runtime.context_window_tokens, 2_048);
         assert_eq!(gguf.translation_runtime.max_tokens, 256);
         assert_eq!(gguf.translation_runtime.parallel_slots, 2);
+    }
+
+    #[test]
+    fn native_model_route_uses_the_selected_provider_contract() {
+        let config = AppConfig::from_json_str(include_str!("../../../config.json")).unwrap();
+        let route = config.native_model_route().unwrap();
+
+        assert_eq!(route.asr.provider, "qwen3-gguf");
+        assert_eq!(route.asr.model_asset.as_deref(), Some("qwen3-asr-gguf"));
+        assert_eq!(route.asr.runtime.context_window_tokens, 4_800);
+        assert_eq!(route.translation.provider, "hunyuan");
+        assert_eq!(route.translation.model_asset.as_deref(), Some("hy-mt2"));
+        assert_eq!(route.translation.runtime.parallel_slots, 2);
+    }
+
+    #[test]
+    fn native_model_route_does_not_assume_a_provider_family() {
+        let mut document: Value =
+            serde_json::from_str(include_str!("../../../config.json")).unwrap();
+        document["translation"]["provider"] = Value::from("future-local-provider");
+        document["translation"]["providers"]["future-local-provider"] = serde_json::json!({
+            "url": "http://127.0.0.1:8010/v1/chat/completions",
+            "model_asset": "future-translation-model",
+            "context_window_tokens": 4096,
+            "max_tokens": 512,
+            "parallel_slots": 3
+        });
+
+        let route = AppConfig::from_value(document)
+            .unwrap()
+            .native_model_route()
+            .unwrap();
+
+        assert_eq!(route.translation.provider, "future-local-provider");
+        assert_eq!(
+            route.translation.model_asset.as_deref(),
+            Some("future-translation-model")
+        );
+        assert_eq!(route.translation.runtime.parallel_slots, 3);
+    }
+
+    #[test]
+    fn native_model_route_accepts_legacy_providers_without_an_asset_key() {
+        let mut document: Value =
+            serde_json::from_str(include_str!("../../../config.json")).unwrap();
+        document["asr"]["providers"]["qwen3-gguf"]
+            .as_object_mut()
+            .unwrap()
+            .remove("model_asset");
+        document["translation"]["providers"]["hunyuan"]
+            .as_object_mut()
+            .unwrap()
+            .remove("model_asset");
+
+        let route = AppConfig::from_value(document)
+            .unwrap()
+            .native_model_route()
+            .unwrap();
+
+        assert_eq!(route.asr.model_asset, None);
+        assert_eq!(route.translation.model_asset, None);
     }
 
     #[test]

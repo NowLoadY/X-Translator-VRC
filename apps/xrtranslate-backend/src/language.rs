@@ -176,12 +176,21 @@ impl LanguagePair {
     }
 
     fn language_for_text(self, text: &str) -> Option<SupportedLanguage> {
-        match (
-            script_evidence(self.0[0], text),
-            script_evidence(self.0[1], text),
-        ) {
+        let first = script_evidence(self.0[0], text);
+        let second = script_evidence(self.0[1], text);
+        match (first, second) {
             (Evidence::Compatible, Evidence::Incompatible) => Some(self.0[0]),
             (Evidence::Incompatible, Evidence::Compatible) => Some(self.0[1]),
+            (Evidence::Compatible, Evidence::Unknown)
+                if has_substantial_language_evidence(self.0[0], text) =>
+            {
+                Some(self.0[0])
+            }
+            (Evidence::Unknown, Evidence::Compatible)
+                if has_substantial_language_evidence(self.0[1], text) =>
+            {
+                Some(self.0[1])
+            }
             _ => None,
         }
     }
@@ -265,9 +274,13 @@ impl AdaptiveLanguageRoute {
                 .flat_map(|label| label.split(','))
                 .filter_map(SupportedLanguage::from_model_label)
         };
+        // A model may return an ordered candidate list such as
+        // `Chinese,English`. Prefer a candidate whose script is positively
+        // supported by the transcript instead of accepting the first merely
+        // non-conflicting candidate.
         if let Some(language) = languages().find_map(|language| {
             let matched = pair.find_matching(language)?;
-            (script_evidence(matched, text) != Evidence::Incompatible).then_some(matched)
+            (script_evidence(matched, text) == Evidence::Compatible).then_some(matched)
         }) {
             self.confirm(language);
             return AutoDecision::Accept(pair.route(language));
@@ -302,9 +315,22 @@ impl AdaptiveLanguageRoute {
             }
         }
 
-        let language = pair
-            .language_for_text(text)
-            .or(self.anchor.and_then(|language| pair.find_matching(language)))
+        if let Some(language) = pair.language_for_text(text) {
+            return AutoDecision::Retry {
+                language,
+                candidate,
+            };
+        }
+        if let Some(language) = languages().find_map(|language| {
+            let matched = pair.find_matching(language)?;
+            (script_evidence(matched, text) == Evidence::Unknown).then_some(matched)
+        }) {
+            self.confirm(language);
+            return AutoDecision::Accept(pair.route(language));
+        }
+        let language = self
+            .anchor
+            .and_then(|language| pair.find_matching(language))
             .unwrap_or(pair.0[0]);
         AutoDecision::Retry {
             language,
@@ -600,6 +626,38 @@ mod tests {
             ));
         }
         assert_eq!(route.active_targets(""), "ja,en");
+    }
+
+    #[test]
+    fn chinese_english_pair_uses_transcript_evidence_over_ambiguous_label_order() {
+        let mut route = AdaptiveLanguageRoute::default();
+        route.configure("auto", "zh,en");
+
+        assert!(matches!(
+            route.classify(Some("Chinese,English"), "Do you play Overwatch?"),
+            AutoDecision::Accept(LanguageRoute { source, target })
+                if source == language("en") && target == language("zh")
+        ));
+    }
+
+    #[test]
+    fn substantial_english_recovers_without_defaulting_to_first_pair_language() {
+        let mut route = AdaptiveLanguageRoute::default();
+        route.configure("auto", "zh,en");
+
+        assert!(matches!(
+            route.classify(Some("Chinese"), "What's your name?"),
+            AutoDecision::Retry { language: source, candidate: None }
+                if source == language("en")
+        ));
+
+        let mut short = AdaptiveLanguageRoute::default();
+        short.configure("auto", "zh,en");
+        assert!(matches!(
+            short.classify(Some("Chinese"), "OK"),
+            AutoDecision::Accept(LanguageRoute { source, target })
+                if source == language("zh") && target == language("en")
+        ));
     }
 
     #[test]
