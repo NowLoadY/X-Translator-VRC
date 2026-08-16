@@ -274,7 +274,9 @@ impl AdaptiveLanguageRoute {
         }
 
         let candidate = languages().find(|language| {
-            !pair.contains(*language) && script_evidence(*language, text) != Evidence::Incompatible
+            !pair.contains(*language)
+                && script_evidence(*language, text) != Evidence::Incompatible
+                && has_substantial_language_evidence(*language, text)
         });
 
         if let Some(candidate) = candidate {
@@ -353,8 +355,65 @@ fn script_evidence(language: SupportedLanguage, text: &str) -> Evidence {
             || (language.0.script == Script::Japanese && *script == Script::Han)
     }) {
         Evidence::Compatible
+    } else if observed.iter().all(|script| *script == Script::Latin) {
+        // Latin letters, acronyms, and loanwords (e.g. "S1", "OK", "BGM") are common in Japanese, Chinese, etc.
+        // If Latin is the only alphabetic script present, do not treat it as strictly incompatible.
+        Evidence::Unknown
     } else {
         Evidence::Incompatible
+    }
+}
+
+fn has_substantial_language_evidence(language: SupportedLanguage, text: &str) -> bool {
+    let trimmed = text.trim();
+    if trimmed.is_empty() {
+        return false;
+    }
+    match language.0.script {
+        Script::Latin => {
+            let words: Vec<&str> = trimmed
+                .split_whitespace()
+                .filter(|w| w.chars().any(|c| c.is_ascii_alphabetic()))
+                .collect();
+            if words.is_empty() {
+                return false;
+            }
+            let total_alpha: usize = trimmed.chars().filter(|c| c.is_ascii_alphabetic()).count();
+            if total_alpha < 3 {
+                return false;
+            }
+            if words.len() == 1 {
+                let word = words[0];
+                let is_all_upper_or_digit = word
+                    .chars()
+                    .all(|c| c.is_ascii_uppercase() || c.is_ascii_digit() || !c.is_ascii_alphanumeric());
+                if is_all_upper_or_digit && word.len() <= 3 {
+                    return false;
+                }
+            }
+            true
+        }
+        Script::Han => {
+            let has_han = trimmed.chars().any(|c| ('\u{3400}'..='\u{9fff}').contains(&c));
+            let has_kana = trimmed.chars().any(|c| ('\u{3040}'..='\u{31ff}').contains(&c));
+            has_han && !has_kana
+        }
+        Script::Japanese => {
+            trimmed
+                .chars()
+                .any(|c| ('\u{3040}'..='\u{31ff}').contains(&c) || ('\u{3400}'..='\u{9fff}').contains(&c))
+        }
+        Script::Hangul => {
+            trimmed
+                .chars()
+                .any(|c| ('\u{1100}'..='\u{11ff}').contains(&c) || ('\u{ac00}'..='\u{d7af}').contains(&c))
+        }
+        Script::Cyrillic => {
+            trimmed.chars().any(|c| ('\u{0400}'..='\u{04ff}').contains(&c))
+        }
+        Script::Thai => {
+            trimmed.chars().any(|c| ('\u{0e00}'..='\u{0e7f}').contains(&c))
+        }
     }
 }
 
@@ -552,6 +611,95 @@ mod tests {
         route.configure("auto", "fr,de");
         assert_eq!(route.active_targets(""), "fr,de");
         assert!(route.recent_observations.is_empty());
+    }
+
+    #[test]
+    fn latin_noise_and_acronyms_never_switch_configured_pair() {
+        let mut route = AdaptiveLanguageRoute::default();
+        route.configure("auto", "ja,zh");
+
+        // 1. In-pair Japanese speech
+        assert!(matches!(
+            route.classify(Some("Japanese"), "おはようございます"),
+            AutoDecision::Accept(LanguageRoute { source, target })
+                if source == language("ja") && target == language("zh")
+        ));
+
+        // 2. Short noise / acronym "S1" detected as English -> should NOT count as candidate
+        let decision1 = route.classify(Some("English"), "S1");
+        assert!(matches!(
+            decision1,
+            AutoDecision::Retry {
+                candidate: None,
+                ..
+            }
+        ));
+        assert_eq!(route.active_targets(""), "ja,zh");
+
+        // 3. Repeated short tokens "OK", "BGM" detected as English -> still NO switch
+        let decision2 = route.classify(Some("English"), "OK");
+        assert!(matches!(
+            decision2,
+            AutoDecision::Retry {
+                candidate: None,
+                ..
+            }
+        ));
+        assert_eq!(route.active_targets(""), "ja,zh");
+
+        let decision3 = route.classify(Some("English"), "BGM");
+        assert!(matches!(
+            decision3,
+            AutoDecision::Retry {
+                candidate: None,
+                ..
+            }
+        ));
+        assert_eq!(route.active_targets(""), "ja,zh");
+
+        // 4. In-pair Japanese speech containing Latin word "これはS1です"
+        assert!(matches!(
+            route.classify(Some("Japanese"), "これはS1です"),
+            AutoDecision::Accept(LanguageRoute { source, target })
+                if source == language("ja") && target == language("zh")
+        ));
+        assert_eq!(route.active_targets(""), "ja,zh");
+
+        // 5. Pure Latin token "S1" with Japanese detection -> should be accepted via Unknown evidence
+        assert!(matches!(
+            route.classify(Some("Japanese"), "S1"),
+            AutoDecision::Accept(LanguageRoute { source, target })
+                if source == language("ja") && target == language("zh")
+        ));
+        assert_eq!(route.active_targets(""), "ja,zh");
+    }
+
+    #[test]
+    fn genuine_english_speech_switches_after_two_turns() {
+        let mut route = AdaptiveLanguageRoute::default();
+        route.configure("auto", "ja,zh");
+
+        // First genuine English utterance -> Retry
+        let decision1 = route.classify(Some("English"), "Hello everyone, can you hear me?");
+        assert!(matches!(
+            decision1,
+            AutoDecision::Retry {
+                candidate: Some(c),
+                ..
+            } if c == language("en")
+        ));
+        assert_eq!(route.active_targets(""), "ja,zh");
+
+        // Second genuine English utterance -> Switched!
+        let decision2 = route.classify(Some("English"), "Yes, I am speaking English now.");
+        assert!(matches!(
+            decision2,
+            AutoDecision::Switched {
+                route: LanguageRoute { source, .. },
+                ..
+            } if source == language("en")
+        ));
+        assert!(route.active_targets("").contains("en"));
     }
 
     #[test]
