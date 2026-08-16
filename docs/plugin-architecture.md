@@ -12,6 +12,7 @@ The host owns capabilities that are shared or exclusive across features:
 
 - backend and translation-session lifecycle;
 - microphone and system-audio capture;
+- streaming media-audio import and resampling;
 - navigation, settings persistence, localization, and the shared UI kit;
 - typed recognition/translation events and user-visible error reporting.
 
@@ -44,8 +45,11 @@ Runtime implementations remain in their plugin module:
 
 - `plugins::osc` owns OSC settings, UDP listener/writer, caption formatting,
   preview UI, and mute-state capability.
-- `plugins::meeting` owns meeting storage, controller, recording/import workers,
-  and meeting UI.
+- `plugins::meeting` owns meeting storage, controller, retained recording, and
+  meeting UI. It requests the host-owned `media_import` capability for external
+  audio.
+- `plugins::player` owns media tasks, playback, subtitle state, and player UI.
+  It uses the same host-owned `media_import` capability for transcription.
 
 Disabling a plugin hides its page and deactivates its background capability.
 Disabling a busy plugin is rejected until its active operation has ended. If a
@@ -70,3 +74,6 @@ the core Translation page.
 An independently distributed plugin ABI, sandbox, permission manifest, and
 version negotiation are intentionally out of scope. Those should be designed as
 a separate process protocol rather than loading arbitrary Rust dynamic libraries.
+
+Architecture cleanup and new plugin work must also follow the invariants and
+extraction gates in [the refactoring contract](refactoring-contract.md).

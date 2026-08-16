@@ -1,0 +1,442 @@
+use std::{collections::VecDeque, time::Instant};
+
+use crate::presentation::speaker::compact_speaker_label;
+
+use super::{
+    runtime::{OscFormatMode, OscMessageSeparator, OscSettings},
+    sys_info::SystemMetrics,
+};
+
+#[derive(Clone)]
+pub(super) struct HistoryMessage {
+    pub(super) stream_id: u64,
+    pub(super) source: String,
+    pub(super) translated: String,
+    pub(super) speaker_id: String,
+    pub(super) expires_at: Instant,
+}
+
+#[derive(Clone)]
+pub(super) struct ManualMessage {
+    pub(super) text: String,
+    pub(super) expires_at: Instant,
+}
+
+pub(super) fn build_chatbox_text(
+    history: &[HistoryMessage],
+    live: &[HistoryMessage],
+    manual_message: Option<&ManualMessage>,
+    settings: &OscSettings,
+    metrics: &SystemMetrics,
+) -> String {
+    let mut entries = history
+        .iter()
+        .chain(live.iter())
+        .cloned()
+        .collect::<VecDeque<_>>();
+    while entries.len() > 9 {
+        entries.pop_front();
+    }
+
+    if let Some(manual) = manual_message {
+        let manual_raw = manual.text.trim();
+        if !manual_raw.is_empty() {
+            let manual_tagged = format!("⌨️ {manual_raw}");
+            let manual_text = trim_text(&manual_tagged, settings.max_text_length);
+            let manual_len = manual_text.chars().count();
+            if entries.is_empty() || manual_len >= settings.max_text_length {
+                return manual_text;
+            }
+            let available_for_asr = settings.max_text_length.saturating_sub(manual_len + 1);
+            if available_for_asr == 0 {
+                return manual_text;
+            }
+            let asr_text = fit_asr_entries(&mut entries, available_for_asr, settings);
+            if asr_text.is_empty() {
+                return manual_text;
+            }
+            return format!("{asr_text}\n{manual_text}");
+        }
+    }
+
+    // Header and footer exist only while live messages remain and no manual message is active.
+    if entries.is_empty() {
+        return String::new();
+    }
+
+    let prefix = settings.header_config.render_text(metrics);
+    let suffix = settings.footer_config.render_text(metrics);
+
+    while let Some(first) = entries.front() {
+        let combined = compose_chatbox(&prefix, &render_entries(entries.iter(), settings), &suffix);
+
+        if combined.chars().count() <= settings.max_text_length {
+            return combined;
+        }
+        if entries.len() > 1 {
+            entries.pop_front();
+        } else {
+            return fit_single_entry(first, &prefix, &suffix, settings);
+        }
+    }
+
+    String::new()
+}
+
+fn fit_asr_entries(
+    entries: &mut VecDeque<HistoryMessage>,
+    limit: usize,
+    settings: &OscSettings,
+) -> String {
+    while let Some(first) = entries.front() {
+        let rendered = render_entries(entries.iter(), settings);
+        if rendered.chars().count() <= limit {
+            return rendered;
+        }
+        if entries.len() > 1 {
+            entries.pop_front();
+        } else {
+            return trim_text(&render_entry(first, settings), limit);
+        }
+    }
+    String::new()
+}
+
+fn render_entries<'a>(
+    entries: impl Iterator<Item = &'a HistoryMessage>,
+    settings: &OscSettings,
+) -> String {
+    if settings.format_mode == OscFormatMode::TargetOnly {
+        return entries
+            .map(|entry| render_entry(entry, settings))
+            .filter(|text| !text.is_empty())
+            .collect::<Vec<_>>()
+            .join(settings.message_separator.value());
+    }
+    if settings.message_separator == OscMessageSeparator::NewLine {
+        return entries
+            .map(|entry| render_entry(entry, settings))
+            .filter(|text| !text.is_empty())
+            .collect::<Vec<_>>()
+            .join(OscMessageSeparator::NewLine.value());
+    }
+
+    let mut sources = Vec::new();
+    let mut targets = Vec::new();
+    for entry in entries {
+        let source = entry.source.trim();
+        let target = entry.translated.trim();
+        let speaker = settings
+            .show_speaker_number
+            .then(|| compact_speaker_label(&entry.speaker_id))
+            .flatten();
+
+        if !source.is_empty() && !target.is_empty() && source != target {
+            sources.push(with_speaker(source, speaker.as_deref()));
+            targets.push(target.to_string());
+        } else if let Some(text) = (!target.is_empty())
+            .then_some(target)
+            .or_else(|| (!source.is_empty()).then_some(source))
+        {
+            match settings.format_mode {
+                OscFormatMode::BilingualTargetFirst => {
+                    targets.push(with_speaker(text, speaker.as_deref()));
+                }
+                OscFormatMode::BilingualSourceFirst | OscFormatMode::Inline => {
+                    sources.push(with_speaker(text, speaker.as_deref()));
+                }
+                OscFormatMode::TargetOnly => unreachable!(),
+            }
+        }
+    }
+
+    let sources = sources.join(" ");
+    let targets = targets.join(" ");
+    let (first, second, separator) = match settings.format_mode {
+        OscFormatMode::BilingualTargetFirst => (targets, sources, "\n"),
+        OscFormatMode::BilingualSourceFirst => (sources, targets, "\n"),
+        OscFormatMode::Inline => (sources, targets, " | "),
+        OscFormatMode::TargetOnly => unreachable!(),
+    };
+    [first, second]
+        .into_iter()
+        .filter(|text| !text.is_empty())
+        .collect::<Vec<_>>()
+        .join(separator)
+}
+
+fn with_speaker(text: &str, speaker: Option<&str>) -> String {
+    speaker.map_or_else(|| text.to_string(), |label| format!("[{label}] {text}"))
+}
+
+fn compose_chatbox(prefix: &str, content: &str, suffix: &str) -> String {
+    [prefix, content, suffix]
+        .into_iter()
+        .filter(|part| !part.is_empty())
+        .collect::<Vec<_>>()
+        .join("\n")
+}
+
+pub(super) fn render_entry(entry: &HistoryMessage, settings: &OscSettings) -> String {
+    let source = entry.source.trim();
+    let translated = entry.translated.trim();
+
+    let core_text = match settings.format_mode {
+        OscFormatMode::TargetOnly => {
+            if !translated.is_empty() {
+                translated.to_string()
+            } else {
+                source.to_string()
+            }
+        }
+        OscFormatMode::BilingualTargetFirst => {
+            if !source.is_empty() && !translated.is_empty() && source != translated {
+                format!("{}\n{}", translated, source)
+            } else if !translated.is_empty() {
+                translated.to_string()
+            } else {
+                source.to_string()
+            }
+        }
+        OscFormatMode::Inline => {
+            if !source.is_empty() && !translated.is_empty() && source != translated {
+                format!("{} | {}", source, translated)
+            } else if !translated.is_empty() {
+                translated.to_string()
+            } else {
+                source.to_string()
+            }
+        }
+        OscFormatMode::BilingualSourceFirst => {
+            if !source.is_empty() && !translated.is_empty() && source != translated {
+                format!("{}\n{}", source, translated)
+            } else if !translated.is_empty() {
+                translated.to_string()
+            } else {
+                source.to_string()
+            }
+        }
+    };
+
+    if core_text.is_empty() {
+        return String::new();
+    }
+
+    if settings.show_speaker_number
+        && let Some(label) = compact_speaker_label(&entry.speaker_id)
+    {
+        format!("[{label}] {core_text}")
+    } else {
+        core_text
+    }
+}
+
+fn fit_single_entry(
+    entry: &HistoryMessage,
+    prefix: &str,
+    suffix: &str,
+    settings: &OscSettings,
+) -> String {
+    let rendered = render_entry(entry, settings);
+    let limit = settings.max_text_length;
+    let mut prefix = prefix;
+    let mut suffix = suffix;
+
+    // Preserve speech before decorations when space is limited.
+    while decoration_length(prefix, suffix) >= limit {
+        if !suffix.is_empty() {
+            suffix = "";
+        } else if !prefix.is_empty() {
+            prefix = "";
+        } else {
+            break;
+        }
+    }
+    let content_limit = limit.saturating_sub(decoration_length(prefix, suffix));
+    let content = trim_text(&rendered, content_limit);
+    compose_chatbox(prefix, &content, suffix)
+}
+
+fn decoration_length(prefix: &str, suffix: &str) -> usize {
+    let text = prefix.chars().count() + suffix.chars().count();
+    let separators = usize::from(!prefix.is_empty()) + usize::from(!suffix.is_empty());
+    text + separators
+}
+
+fn trim_text(text: &str, limit: usize) -> String {
+    let value = text.trim();
+    if limit == 0 {
+        return String::new();
+    }
+    let chars = value.chars().collect::<Vec<_>>();
+    if chars.len() <= limit {
+        return value.into();
+    }
+    let tail = chars[chars.len() - limit..].iter().collect::<String>();
+    for marker in [
+        "。", "！", "？", ".", "!", "?", ";", ":", "；", "，", ",", " ",
+    ] {
+        if let Some(index) = tail.find(marker) {
+            let next = index + marker.len();
+            if next < tail.len() {
+                return tail[next..].trim_start().into();
+            }
+        }
+    }
+    tail.trim_start().into()
+}
+
+#[cfg(test)]
+mod tests {
+    use std::time::Duration;
+
+    use super::*;
+    use crate::plugins::osc::runtime::{BannerConfig, BannerContentType};
+
+    fn history_message(expires_at: Instant, text: &str) -> HistoryMessage {
+        HistoryMessage {
+            stream_id: 0,
+            source: text.into(),
+            translated: String::new(),
+            speaker_id: String::new(),
+            expires_at,
+        }
+    }
+
+    #[test]
+    fn messages_are_compacted_by_language_and_evicted_as_pairs() {
+        let now = Instant::now();
+        let mut first = history_message(now + Duration::from_secs(10), "first source");
+        first.translated = "first target".into();
+        let mut second = history_message(now + Duration::from_secs(10), "second source");
+        second.translated = "second target".into();
+        let history = vec![first, second];
+        let metrics = SystemMetrics::default();
+        let mut settings = OscSettings {
+            format_mode: OscFormatMode::BilingualSourceFirst,
+            ..OscSettings::default()
+        };
+
+        assert_eq!(
+            build_chatbox_text(&history, &[], None, &settings, &metrics),
+            "first source\nfirst target\nsecond source\nsecond target"
+        );
+        settings.message_separator = OscMessageSeparator::Space;
+        assert_eq!(
+            build_chatbox_text(&history, &[], None, &settings, &metrics),
+            "first source second source\nfirst target second target"
+        );
+        settings.format_mode = OscFormatMode::BilingualTargetFirst;
+        assert_eq!(
+            build_chatbox_text(&history, &[], None, &settings, &metrics),
+            "first target second target\nfirst source second source"
+        );
+        settings.format_mode = OscFormatMode::Inline;
+        assert_eq!(
+            build_chatbox_text(&history, &[], None, &settings, &metrics),
+            "first source second source | first target second target"
+        );
+        settings.max_text_length = 39;
+        assert_eq!(
+            build_chatbox_text(&history, &[], None, &settings, &metrics),
+            "second source | second target"
+        );
+        settings.format_mode = OscFormatMode::TargetOnly;
+        settings.max_text_length = 144;
+        settings.message_separator = OscMessageSeparator::NewLine;
+        assert_eq!(
+            build_chatbox_text(&history, &[], None, &settings, &metrics),
+            "first target\nsecond target"
+        );
+        settings.message_separator = OscMessageSeparator::Space;
+        assert_eq!(
+            build_chatbox_text(&history, &[], None, &settings, &metrics),
+            "first target second target"
+        );
+    }
+
+    #[test]
+    fn long_single_message_is_trimmed_without_silently_dropping_banners() {
+        let now = Instant::now();
+        let history = vec![history_message(now + Duration::from_secs(10), "0123456789")];
+        let settings = OscSettings {
+            max_text_length: 12,
+            header_config: BannerConfig {
+                content_type: BannerContentType::CustomText,
+                custom_text: "H".into(),
+                show_device_name: false,
+            },
+            footer_config: BannerConfig {
+                content_type: BannerContentType::CustomText,
+                custom_text: "F".into(),
+                show_device_name: false,
+            },
+            ..OscSettings::default()
+        };
+
+        let text = build_chatbox_text(&history, &[], None, &settings, &SystemMetrics::default());
+        assert_eq!(text, "H\n23456789\nF");
+        assert_eq!(text.chars().count(), settings.max_text_length);
+    }
+
+    #[test]
+    fn manual_message_occupies_bottom_and_shrinks_asr_space_without_banners() {
+        let now = Instant::now();
+        let history = vec![history_message(now + Duration::from_secs(10), "hello ASR")];
+        let settings = OscSettings {
+            max_text_length: 40,
+            header_config: BannerConfig {
+                content_type: BannerContentType::CustomText,
+                custom_text: "HEADER".into(),
+                show_device_name: false,
+            },
+            footer_config: BannerConfig {
+                content_type: BannerContentType::CustomText,
+                custom_text: "FOOTER".into(),
+                show_device_name: false,
+            },
+            ..OscSettings::default()
+        };
+        let metrics = SystemMetrics::default();
+
+        // 1. Without manual message: Header and footer are shown
+        let normal_text = build_chatbox_text(&history, &[], None, &settings, &metrics);
+        assert!(normal_text.contains("HEADER"));
+        assert!(normal_text.contains("FOOTER"));
+        assert!(normal_text.contains("hello ASR"));
+
+        // 2. With manual message: Header and footer are suppressed, manual message is at bottom with ⌨️ tag
+        let manual = ManualMessage {
+            text: "typing note".into(),
+            expires_at: now + Duration::from_secs(10),
+        };
+        let combined = build_chatbox_text(&history, &[], Some(&manual), &settings, &metrics);
+        assert!(!combined.contains("HEADER"));
+        assert!(!combined.contains("FOOTER"));
+        assert_eq!(combined, "hello ASR\n⌨️ typing note");
+
+        // 3. When manual message takes most space, ASR space shrinks accordingly
+        let tight_settings = OscSettings {
+            max_text_length: 20,
+            ..settings
+        };
+        let tight_combined =
+            build_chatbox_text(&history, &[], Some(&manual), &tight_settings, &metrics);
+        assert_eq!(tight_combined, "ASR\n⌨️ typing note");
+        assert!(tight_combined.chars().count() <= 20);
+    }
+
+    #[test]
+    fn speaker_number_prefix_uses_the_assigned_voiceprint_id_and_can_be_disabled() {
+        let mut entry = history_message(Instant::now(), "hello");
+        entry.speaker_id = "speaker-02".into();
+        let mut settings = OscSettings::default();
+
+        assert_eq!(render_entry(&entry, &settings), "hello");
+        settings.show_speaker_number = true;
+        assert_eq!(render_entry(&entry, &settings), "[S2] hello");
+
+        entry.speaker_id = "speaker-unknown".into();
+        assert_eq!(render_entry(&entry, &settings), "[S?] hello");
+    }
+}

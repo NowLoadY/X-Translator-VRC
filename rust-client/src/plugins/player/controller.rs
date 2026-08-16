@@ -1,5 +1,5 @@
 use super::{
-    backend::{window::NativeVideoHost, MediaBackend, MediaSource, PlaybackStatus},
+    backend::{MediaBackend, MediaSource, PlaybackStatus, window::NativeVideoHost},
     subtitles::{SubtitleCue, SubtitleTimeline},
     task::{AudioChannelItem, VideoSubtitleMode, VideoTask, VideoTaskStore},
 };
@@ -150,10 +150,10 @@ impl VideoPlayerController {
     pub fn start_draft_task(&mut self) -> Result<String, String> {
         let input = self.draft_source.trim();
         if input.is_empty() {
-            return Err("Please enter a video stream URL or select a local file".into());
+            return Err("Please enter a media stream URL or select a local file".into());
         }
 
-        let (source, default_title) = if input.starts_with("http://")
+        let (source, default_title, media_type) = if input.starts_with("http://")
             || input.starts_with("https://")
             || input.starts_with("rtsp://")
             || input.starts_with("rtmp://")
@@ -167,17 +167,22 @@ impl VideoPlayerController {
                 .filter(|s| !s.is_empty())
                 .unwrap_or("Network Stream")
                 .to_string();
-            (MediaSource::NetworkStream(input.to_string()), title)
+            (
+                MediaSource::NetworkStream(input.to_string()),
+                title,
+                super::task::MediaType::Video,
+            )
         } else {
             let path = PathBuf::from(input);
             if !path.is_file() {
-                return Err("Local video file does not exist or URL is invalid".into());
+                return Err("Local media file does not exist or URL is invalid".into());
             }
             let title = path
                 .file_name()
                 .map(|s| s.to_string_lossy().to_string())
-                .unwrap_or_else(|| "Local Video".into());
-            (MediaSource::LocalFile(path), title)
+                .unwrap_or_else(|| "Local Media".into());
+            let media_type = super::task::detect_media_type(&path);
+            (MediaSource::LocalFile(path), title, media_type)
         };
 
         let title = if self.draft_title.trim().is_empty() {
@@ -186,9 +191,10 @@ impl VideoPlayerController {
             self.draft_title.trim().to_string()
         };
 
-        let mut task = VideoTask::new(
+        let mut task = VideoTask::new_with_media_type(
             title,
             source.clone(),
+            media_type,
             self.draft_source_lang.clone(),
             self.draft_target_lang.clone(),
             self.draft_subtitle_mode.clone(),
@@ -217,7 +223,14 @@ impl VideoPlayerController {
         self.route = VideoPlayerRoute::Player;
         self.error = None;
 
+        if task.media_type == super::task::MediaType::AudioOnly {
+            if let Some(host) = &self.native_host {
+                host.hide();
+            }
+        }
+
         if let Some(backend) = &mut self.backend {
+            backend.set_audio_only_mode(task.media_type == super::task::MediaType::AudioOnly);
             match &task.source {
                 MediaSource::LocalFile(path) => {
                     backend.load_local_file(path.clone())?;
@@ -240,6 +253,15 @@ impl VideoPlayerController {
         }
         let _ = self.store.save_to_dir(&self.storage_dir);
         Ok(())
+    }
+
+    pub fn is_audio_only_task(&self) -> bool {
+        self.active_task_id
+            .as_deref()
+            .and_then(|id| self.store.get(id))
+            .map_or(false, |task| {
+                task.media_type == super::task::MediaType::AudioOnly
+            })
     }
 
     pub fn is_task_running(&self) -> bool {
@@ -315,13 +337,24 @@ impl VideoPlayerController {
     }
 
     pub fn toggle_play(&mut self) {
-        if self.current_source.is_none() {
+        let Some(source) = &self.current_source else {
             return;
-        }
+        };
         if let Some(backend) = &mut self.backend {
             if backend.get_status() == PlaybackStatus::Playing {
                 backend.pause();
             } else {
+                if backend.get_status() == PlaybackStatus::Stopped && backend.get_duration_ms() == 0
+                {
+                    match source {
+                        MediaSource::LocalFile(p) => {
+                            let _ = backend.load_local_file(p.clone());
+                        }
+                        MediaSource::NetworkStream(u) => {
+                            let _ = backend.load_stream_url(u.clone());
+                        }
+                    }
+                }
                 backend.play();
             }
         }
@@ -384,6 +417,9 @@ impl VideoPlayerController {
             }
         }
 
+        let is_audio_only = self.is_audio_only_task();
+        let show_subs = self.show_subtitles && !is_audio_only && self.current_source.is_some();
+
         if let Some(backend) = &mut self.backend {
             backend.tick();
 
@@ -393,7 +429,8 @@ impl VideoPlayerController {
                     if detected_count > 0 {
                         if let Some(task) = self.store.get_mut(active_id) {
                             if task.audio_channels.len() != detected_count {
-                                task.audio_channels = AudioChannelItem::default_for_count(detected_count);
+                                task.audio_channels =
+                                    AudioChannelItem::default_for_count(detected_count);
                                 backend.set_channel_routing(&task.audio_channels);
                             }
                         }
@@ -401,7 +438,7 @@ impl VideoPlayerController {
                 }
             }
 
-            if self.show_subtitles && self.current_source.is_some() && backend.get_status() == PlaybackStatus::Playing {
+            if show_subs && backend.get_status() == PlaybackStatus::Playing {
                 let current_time_ms = backend.get_time_ms();
                 if let Some(cue) = self.subtitles.active_cue_at(current_time_ms) {
                     let text = if let Some(trans) = &cue.translated_text {
@@ -442,11 +479,17 @@ impl VideoPlayerController {
     }
 
     pub fn get_duration_ms(&self) -> i64 {
-        self.backend.as_ref().map(|b| b.get_duration_ms()).unwrap_or(0)
+        self.backend
+            .as_ref()
+            .map(|b| b.get_duration_ms())
+            .unwrap_or(0)
     }
 
     pub fn get_status(&self) -> PlaybackStatus {
-        self.backend.as_ref().map(|b| b.get_status()).unwrap_or(PlaybackStatus::Stopped)
+        self.backend
+            .as_ref()
+            .map(|b| b.get_status())
+            .unwrap_or(PlaybackStatus::Stopped)
     }
 
     pub fn get_diagnostics(&self) -> super::backend::PlayerDiagnostics {
@@ -497,9 +540,17 @@ fn parse_srt_to_timeline(srt_content: &str) -> SubtitleTimeline {
     let normalized = srt_content.replace("\r\n", "\n");
     let blocks = normalized.split("\n\n");
     for (idx, block) in blocks.enumerate() {
-        let lines: Vec<&str> = block.lines().map(|l| l.trim()).filter(|l| !l.is_empty()).collect();
+        let lines: Vec<&str> = block
+            .lines()
+            .map(|l| l.trim())
+            .filter(|l| !l.is_empty())
+            .collect();
         if lines.len() >= 2 {
-            let time_line = if lines[0].contains("-->") { lines[0] } else { lines[1] };
+            let time_line = if lines[0].contains("-->") {
+                lines[0]
+            } else {
+                lines[1]
+            };
             let text_start = if lines[0].contains("-->") { 1 } else { 2 };
             let times: Vec<&str> = time_line.split("-->").collect();
             if times.len() == 2 && text_start < lines.len() {
@@ -629,5 +680,12 @@ mod tests {
         assert!(controller.active_task_id.is_none());
         assert!(controller.current_source.is_none());
         assert!(controller.store.get(&task_id).is_none());
+    }
+
+    #[test]
+    fn test_toggle_play_replay_when_stopped() {
+        let mut controller = VideoPlayerController::default();
+        controller.current_source = Some(MediaSource::LocalFile(PathBuf::from("test.mp4")));
+        controller.toggle_play();
     }
 }

@@ -3,7 +3,7 @@
     "provider": "qwen3-gguf",
     "providers": {
       "qwen3-gguf": {
-        "context_window_tokens": 3200,
+        "context_window_tokens": 4800,
         "max_tokens": 128,
         "model_asset": "qwen3-asr-gguf",
         "parallel_slots": 1,
@@ -108,8 +108,8 @@
     "max_speakers": 8,
     "min_utterance_ms": 750,
     "model_path": "models/3D-Speaker-ERes2NetV2/speaker_embedding.onnx",
-    "same_speaker_hysteresis": 0.16,
-    "similarity_threshold": 0.52
+    "same_speaker_hysteresis": 0.14,
+    "similarity_threshold": 0.5
   },
   "storage": {
     "log_dir": "runtime/logs",

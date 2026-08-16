@@ -6,9 +6,11 @@ pub mod subtitles;
 pub mod task;
 pub mod ui;
 
-use std::path::PathBuf;
 use crate::i18n::UiLanguage;
 use controller::VideoPlayerController;
+use std::path::PathBuf;
+#[allow(unused_imports)]
+pub use task::MediaType;
 pub use task::VideoSubtitleMode;
 
 #[derive(Clone, Debug)]
@@ -58,7 +60,11 @@ impl VideoPlayerPlugin {
         }
     }
 
-    pub fn render_page(&mut self, snapshot: &VideoPlayerUiSnapshot, ui: &mut eframe::egui::Ui) -> VideoPlayerAction {
+    pub fn render_page(
+        &mut self,
+        snapshot: &VideoPlayerUiSnapshot,
+        ui: &mut eframe::egui::Ui,
+    ) -> VideoPlayerAction {
         ui::render(self, snapshot, ui)
     }
 
@@ -80,13 +86,7 @@ impl VideoPlayerPlugin {
         source: String,
         translated: Option<String>,
     ) {
-        self.controller.ingest_live_caption(
-            id,
-            start_ms,
-            end_ms,
-            speaker,
-            source,
-            translated,
-        );
+        self.controller
+            .ingest_live_caption(id, start_ms, end_ms, speaker, source, translated);
     }
 }

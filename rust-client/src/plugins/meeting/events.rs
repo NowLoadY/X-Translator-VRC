@@ -5,9 +5,11 @@
 //! segment upserts, guaranteeing that terminal state is committed only after
 //! all previously observed transcript events.
 
-use super::controller::SharedMeetingCapture;
+use super::{
+    controller::SharedMeetingCapture,
+    store::{MeetingStore, NewSegment, SegmentSource},
+};
 use crossbeam_channel::{Sender, unbounded};
-use rust_client::{MeetingStore, NewSegment, SegmentSource};
 use std::sync::Arc;
 
 #[derive(Clone, Copy, Debug)]
@@ -204,8 +206,8 @@ fn speaker_label(speaker_id: &str) -> Option<String> {
 #[cfg(test)]
 mod tests {
     use super::super::controller::ActiveMeetingCapture;
+    use super::super::store::{MeetingStatus, NewMeeting};
     use super::*;
-    use rust_client::{MeetingStatus, NewMeeting};
     use std::sync::Mutex;
 
     #[test]

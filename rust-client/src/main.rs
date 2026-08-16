@@ -15,7 +15,9 @@ mod backend;
 mod child_process;
 mod client_settings;
 mod feature_access;
+mod history;
 mod i18n;
+pub(crate) mod media_import;
 mod model_install;
 mod network;
 mod overlay_ipc;
@@ -23,6 +25,7 @@ mod overlay_manager;
 #[cfg(windows)]
 mod overlay_native;
 mod plugins;
+mod presentation;
 mod runtime_install;
 mod service_config;
 pub mod session_coordinator;
@@ -32,6 +35,10 @@ pub mod version;
 
 use audio::{AudioSystem, InputConfigInfo, InputDevice};
 use client_settings::{CaptureSource, ClientSettings, RecognitionSettings};
+use history::{
+    PendingFinalAsr, PendingRecognitionWindow, RecognitionHistoryEntry, TranslationHistoryEntry,
+    collect_recognition_window, merge_stream_recognition, merge_stream_translation,
+};
 use i18n::UiLanguage;
 use network::{ExternalAudioGate, SessionConfig, SessionEvent, SessionHandle, start_session};
 use plugins::meeting::{
@@ -40,426 +47,9 @@ use plugins::meeting::{
 };
 use plugins::osc::{OscPageContext, OscPlugin, OscUiAction};
 use plugins::{PluginId, PluginPreferences, PluginRegistry, PluginScrollPolicy};
+pub(crate) use presentation::speaker::compact_speaker_label;
 use session_coordinator::TranslationSessionOwner;
 use ui::{NavigationState, Page};
-
-const STREAM_TEXT_LIMIT: usize = 4_096;
-
-#[derive(Clone, Debug, PartialEq)]
-struct RecognitionHistoryEntry {
-    stream_id: Option<u64>,
-    live: bool,
-    text: String,
-    turn_id: String,
-    speaker_id: String,
-    source_start_ms: f64,
-    source_end_ms: f64,
-    activation_matches: Vec<xrtranslate_protocol::CorpusTermMatch>,
-    context_matches: Vec<xrtranslate_protocol::CorpusTermMatch>,
-    revisable: bool,
-    overlap_ratio: f32,
-    revision: Option<crate::streaming::RevisableText>,
-}
-
-struct PendingRecognitionWindow {
-    stream_id: u64,
-    continuous: bool,
-    turn_id: String,
-    segment_count: u32,
-    segments: Vec<(u32, RecognitionHistoryEntry)>,
-}
-
-#[derive(Clone, Debug, PartialEq, Eq)]
-struct PendingFinalAsr {
-    text: String,
-    turn_id: String,
-}
-
-#[derive(Clone, Debug, PartialEq)]
-struct TranslationHistoryEntry {
-    stream_id: Option<u64>,
-    audio_source: CaptureSource,
-    live: bool,
-    source: String,
-    translated: String,
-    speaker_id: String,
-    source_start_ms: f64,
-    source_end_ms: f64,
-    term_matches: Vec<xrtranslate_protocol::CorpusTermMatch>,
-    revisable: bool,
-    overlap_ratio: f32,
-    source_revision: Option<crate::streaming::RevisableText>,
-    translated_revision: Option<crate::streaming::RevisableText>,
-}
-
-struct StreamMerge {
-    entry: TranslationHistoryEntry,
-    rolled_over: bool,
-    changed: bool,
-}
-
-fn collect_recognition_window(
-    pending: &mut Vec<PendingRecognitionWindow>,
-    stream_id: u64,
-    continuous: bool,
-    segment_index: u32,
-    segment_count: u32,
-    entry: RecognitionHistoryEntry,
-) -> Option<RecognitionHistoryEntry> {
-    let turn_id = entry.turn_id.clone();
-    let index = pending
-        .iter()
-        .position(|window| window.stream_id == stream_id && window.turn_id == turn_id)
-        .unwrap_or_else(|| {
-            if pending.len() >= 32 {
-                pending.remove(0);
-            }
-            pending.push(PendingRecognitionWindow {
-                stream_id,
-                continuous,
-                turn_id,
-                segment_count: segment_count.max(1),
-                segments: Vec::new(),
-            });
-            pending.len() - 1
-        });
-    let window = &mut pending[index];
-    window.segment_count = window.segment_count.max(segment_count.max(1));
-    if let Some((_, existing)) = window
-        .segments
-        .iter_mut()
-        .find(|(index, _)| *index == segment_index)
-    {
-        *existing = entry;
-    } else {
-        window.segments.push((segment_index, entry));
-    }
-    if window.segments.len() < window.segment_count as usize {
-        return None;
-    }
-
-    let mut window = pending.remove(index);
-    window.segments.sort_by_key(|(index, _)| *index);
-    let (_, first) = window.segments.first()?.clone();
-    let mut combined = RecognitionHistoryEntry {
-        stream_id: window.continuous.then_some(window.stream_id),
-        live: window.continuous,
-        text: String::new(),
-        source_start_ms: first.source_start_ms,
-        source_end_ms: first.source_end_ms,
-        activation_matches: Vec::new(),
-        context_matches: Vec::new(),
-        revision: None,
-        ..first
-    };
-    for (_, segment) in window.segments {
-        let position = crate::streaming::append_segment(&mut combined.text, &segment.text);
-        crate::streaming::append_term_matches(
-            &mut combined.activation_matches,
-            &segment.activation_matches,
-            position,
-        );
-        crate::streaming::append_term_matches(
-            &mut combined.context_matches,
-            &segment.context_matches,
-            position,
-        );
-        if !segment.speaker_id.is_empty() {
-            combined.speaker_id = segment.speaker_id;
-        }
-        combined.source_start_ms = combined.source_start_ms.min(segment.source_start_ms);
-        combined.source_end_ms = combined.source_end_ms.max(segment.source_end_ms);
-    }
-    Some(combined)
-}
-
-fn merge_stream_recognition(
-    history: &mut Vec<RecognitionHistoryEntry>,
-    stream_id: u64,
-    mut fragment: RecognitionHistoryEntry,
-) {
-    retain_recognition_tail(&mut fragment);
-    let Some(current) = history
-        .iter_mut()
-        .rfind(|entry| entry.stream_id == Some(stream_id) && entry.live)
-    else {
-        initialize_recognition_revision(&mut fragment);
-        history.push(fragment);
-        return;
-    };
-
-    let stable = current
-        .revision
-        .as_ref()
-        .map(crate::streaming::RevisableText::stable_text)
-        .filter(|text| !text.is_empty())
-        .unwrap_or(&current.text);
-    if crate::streaming::should_roll_caption(
-        stable,
-        current.source_start_ms,
-        fragment.source_end_ms,
-    ) {
-        let handoff = current.revision.as_ref().map_or_else(
-            || {
-                crate::streaming::handoff_text(
-                    &current.text,
-                    &fragment.text,
-                    fragment.overlap_ratio,
-                )
-            },
-            |revision| revision.handoff(&fragment.text, fragment.overlap_ratio),
-        );
-        if !handoff.text.trim().is_empty() {
-            current.live = false;
-            fragment.text = handoff.text;
-            fragment.activation_matches =
-                trimmed_term_matches(&fragment.activation_matches, handoff.source_start);
-            fragment.context_matches =
-                trimmed_term_matches(&fragment.context_matches, handoff.source_start);
-            initialize_recognition_revision(&mut fragment);
-            history.push(fragment);
-            return;
-        }
-    }
-
-    if fragment.revisable {
-        let update = current
-            .revision
-            .get_or_insert_with(|| crate::streaming::RevisableText::new(&current.text))
-            .update(&fragment.text, fragment.overlap_ratio);
-        merge_revision_matches(
-            &mut current.activation_matches,
-            &fragment.activation_matches,
-            update.hypothesis_start,
-        );
-        merge_revision_matches(
-            &mut current.context_matches,
-            &fragment.context_matches,
-            update.hypothesis_start,
-        );
-        current.text = update.text;
-    } else {
-        let position = crate::streaming::append_text(&mut current.text, &fragment.text);
-        crate::streaming::append_term_matches(
-            &mut current.activation_matches,
-            &fragment.activation_matches,
-            position,
-        );
-        crate::streaming::append_term_matches(
-            &mut current.context_matches,
-            &fragment.context_matches,
-            position,
-        );
-    }
-    if !fragment.speaker_id.is_empty() {
-        current.speaker_id = fragment.speaker_id;
-    }
-    current.source_start_ms = current.source_start_ms.min(fragment.source_start_ms);
-    current.source_end_ms = current.source_end_ms.max(fragment.source_end_ms);
-    retain_recognition_tail(current);
-}
-
-fn initialize_recognition_revision(entry: &mut RecognitionHistoryEntry) {
-    if entry.revisable {
-        entry.revision = Some(crate::streaming::RevisableText::new(&entry.text));
-    }
-}
-
-fn merge_stream_translation(
-    history: &mut Vec<TranslationHistoryEntry>,
-    stream_id: u64,
-    mut fragment: TranslationHistoryEntry,
-) -> StreamMerge {
-    crate::streaming::retain_tail(&mut fragment.source, None, STREAM_TEXT_LIMIT);
-    crate::streaming::retain_tail(
-        &mut fragment.translated,
-        Some(&mut fragment.term_matches),
-        STREAM_TEXT_LIMIT,
-    );
-    let Some(current) = history
-        .iter_mut()
-        .rfind(|entry| entry.stream_id == Some(stream_id) && entry.live)
-    else {
-        initialize_revision(&mut fragment);
-        history.push(fragment.clone());
-        return StreamMerge {
-            entry: fragment,
-            rolled_over: false,
-            changed: true,
-        };
-    };
-
-    let stable_source = current
-        .source_revision
-        .as_ref()
-        .map(crate::streaming::RevisableText::stable_text)
-        .filter(|text| !text.is_empty())
-        .unwrap_or(&current.source);
-    if crate::streaming::should_roll_caption(
-        stable_source,
-        current.source_start_ms,
-        fragment.source_end_ms,
-    ) {
-        let source = current.source_revision.as_ref().map_or_else(
-            || {
-                crate::streaming::handoff_text(
-                    &current.source,
-                    &fragment.source,
-                    fragment.overlap_ratio,
-                )
-            },
-            |revision| revision.handoff(&fragment.source, fragment.overlap_ratio),
-        );
-        if !source.text.trim().is_empty() {
-            let translated = current.translated_revision.as_ref().map_or_else(
-                || {
-                    crate::streaming::handoff_text(
-                        &current.translated,
-                        &fragment.translated,
-                        fragment.overlap_ratio,
-                    )
-                },
-                |revision| revision.handoff(&fragment.translated, fragment.overlap_ratio),
-            );
-            current.live = false;
-            fragment.source = source.text;
-            fragment.translated = translated.text;
-            fragment.term_matches =
-                trimmed_term_matches(&fragment.term_matches, translated.source_start);
-            initialize_revision(&mut fragment);
-            history.push(fragment.clone());
-            return StreamMerge {
-                entry: fragment,
-                rolled_over: true,
-                changed: true,
-            };
-        }
-    }
-
-    let (source_changed, translated_changed) = if fragment.revisable {
-        let old_source = current.source.clone();
-        let old_translated = current.translated.clone();
-        let source = current
-            .source_revision
-            .get_or_insert_with(|| crate::streaming::RevisableText::new(&current.source))
-            .update(&fragment.source, fragment.overlap_ratio);
-        let translated = current
-            .translated_revision
-            .get_or_insert_with(|| crate::streaming::RevisableText::new(&current.translated))
-            .update(&fragment.translated, fragment.overlap_ratio);
-        current.source = source.text;
-        current.translated = translated.text;
-        merge_revision_matches(
-            &mut current.term_matches,
-            &fragment.term_matches,
-            translated.hypothesis_start,
-        );
-        (
-            current.source != old_source,
-            current.translated != old_translated,
-        )
-    } else {
-        let source_changed =
-            crate::streaming::append_text(&mut current.source, &fragment.source).is_some();
-        let translated_offset =
-            crate::streaming::append_text(&mut current.translated, &fragment.translated);
-        let translated_changed = translated_offset.is_some();
-        crate::streaming::append_term_matches(
-            &mut current.term_matches,
-            &fragment.term_matches,
-            translated_offset,
-        );
-        (source_changed, translated_changed)
-    };
-    crate::streaming::retain_tail(&mut current.source, None, STREAM_TEXT_LIMIT);
-    crate::streaming::retain_tail(
-        &mut current.translated,
-        Some(&mut current.term_matches),
-        STREAM_TEXT_LIMIT,
-    );
-    if !fragment.speaker_id.is_empty() {
-        current.speaker_id = fragment.speaker_id;
-    }
-    current.source_start_ms = current.source_start_ms.min(fragment.source_start_ms);
-    current.source_end_ms = current.source_end_ms.max(fragment.source_end_ms);
-    StreamMerge {
-        entry: current.clone(),
-        rolled_over: false,
-        changed: source_changed || translated_changed,
-    }
-}
-
-fn initialize_revision(entry: &mut TranslationHistoryEntry) {
-    if entry.revisable {
-        entry.source_revision = Some(crate::streaming::RevisableText::new(&entry.source));
-        entry.translated_revision = Some(crate::streaming::RevisableText::new(&entry.translated));
-    }
-}
-
-fn shifted_term_matches(
-    matches: &[xrtranslate_protocol::CorpusTermMatch],
-    offset: usize,
-) -> Vec<xrtranslate_protocol::CorpusTermMatch> {
-    let Ok(offset) = u32::try_from(offset) else {
-        return Vec::new();
-    };
-    matches
-        .iter()
-        .cloned()
-        .filter_map(|mut term| {
-            term.start_byte = term.start_byte.checked_add(offset)?;
-            term.end_byte = term.end_byte.checked_add(offset)?;
-            Some(term)
-        })
-        .collect()
-}
-
-fn trimmed_term_matches(
-    matches: &[xrtranslate_protocol::CorpusTermMatch],
-    source_start: usize,
-) -> Vec<xrtranslate_protocol::CorpusTermMatch> {
-    let Ok(source_start) = u32::try_from(source_start) else {
-        return Vec::new();
-    };
-    matches
-        .iter()
-        .cloned()
-        .filter_map(|mut term| {
-            if term.start_byte < source_start {
-                return None;
-            }
-            term.start_byte = term.start_byte.checked_sub(source_start)?;
-            term.end_byte = term.end_byte.checked_sub(source_start)?;
-            Some(term)
-        })
-        .collect()
-}
-
-fn merge_revision_matches(
-    current: &mut Vec<xrtranslate_protocol::CorpusTermMatch>,
-    incoming: &[xrtranslate_protocol::CorpusTermMatch],
-    hypothesis_start: usize,
-) {
-    let Ok(stable_end) = u32::try_from(hypothesis_start) else {
-        current.clear();
-        return;
-    };
-    current.retain(|term| term.end_byte <= stable_end);
-    current.extend(shifted_term_matches(incoming, hypothesis_start));
-}
-
-fn retain_recognition_tail(entry: &mut RecognitionHistoryEntry) {
-    let original_len = entry.text.len();
-    crate::streaming::retain_tail(
-        &mut entry.text,
-        Some(&mut entry.activation_matches),
-        STREAM_TEXT_LIMIT,
-    );
-    let removed = original_len.saturating_sub(entry.text.len());
-    if removed > 0 {
-        entry.context_matches = trimmed_term_matches(&entry.context_matches, removed);
-    }
-}
 
 pub const LANGUAGE_OPTIONS: &[(&str, &str)] = &[
     ("zh", "Chinese"),
@@ -568,8 +158,13 @@ struct XRTranslateApp {
     osc_plugin: OscPlugin,
     meeting_plugin: MeetingPlugin,
     player_plugin: plugins::player::VideoPlayerPlugin,
-    host_audio_import: Option<plugins::meeting::audio_file::AudioImportHandle>,
-    pending_audio_import: Option<(std::path::PathBuf, RecognitionSettings, Vec<usize>, plugins::meeting::audio_file::AudioImportPacing)>,
+    host_audio_import: Option<media_import::AudioImportHandle>,
+    pending_audio_import: Option<(
+        std::path::PathBuf,
+        RecognitionSettings,
+        Vec<usize>,
+        media_import::AudioImportPacing,
+    )>,
     plugin_preferences: PluginPreferences,
     service_config: service_config::ServiceConfigEditor,
     backend_manager: backend::BackendManager,
@@ -703,11 +298,9 @@ impl Default for XRTranslateApp {
                             loopback_vad_active_clone.store(false, Ordering::Relaxed);
                             let previous_remaining = if terminal_meeting_disconnect {
                                 meeting_sessions_remaining_for_events
-                                    .fetch_update(
-                                        Ordering::AcqRel,
-                                        Ordering::Acquire,
-                                        |value| value.checked_sub(1),
-                                    )
+                                    .fetch_update(Ordering::AcqRel, Ordering::Acquire, |value| {
+                                        value.checked_sub(1)
+                                    })
                                     .unwrap_or(0)
                             } else {
                                 0
@@ -924,6 +517,7 @@ impl Default for XRTranslateApp {
                                 continue;
                             }
                             let fragment = TranslationHistoryEntry {
+                                turn_id: turn_id.clone(),
                                 stream_id: continuous.then_some(stream_id),
                                 audio_source,
                                 live: continuous,
@@ -968,7 +562,22 @@ impl Default for XRTranslateApp {
                                     &fragment.speaker_id,
                                     false,
                                 );
-                                state.translations.push(fragment);
+                                if let Some(last) = state.translations.last_mut() {
+                                    if !fragment.turn_id.is_empty()
+                                        && last.turn_id == fragment.turn_id
+                                    {
+                                        *last = fragment;
+                                    } else if last.source == fragment.source
+                                        && (last.source_start_ms - fragment.source_start_ms).abs()
+                                            <= 2500.0
+                                    {
+                                        *last = fragment;
+                                    } else {
+                                        state.translations.push(fragment);
+                                    }
+                                } else {
+                                    state.translations.push(fragment);
+                                }
                             }
                             if state.translations.len() > 100 {
                                 state.translations.remove(0);
@@ -1311,7 +920,7 @@ impl XRTranslateApp {
                             target_language,
                             recognition,
                             recognition_channels,
-                            plugins::meeting::audio_file::AudioImportPacing::AsFastAsPossible,
+                            media_import::AudioImportPacing::AsFastAsPossible,
                             Some(ctx),
                         );
                     }
@@ -1338,7 +947,7 @@ impl XRTranslateApp {
         target_language: String,
         recognition: RecognitionSettings,
         recognition_channels: Vec<usize>,
-        pacing: plugins::meeting::audio_file::AudioImportPacing,
+        pacing: media_import::AudioImportPacing,
         ctx: Option<eframe::egui::Context>,
     ) {
         self.source_lang = source_language;
@@ -1364,7 +973,7 @@ impl XRTranslateApp {
         path: std::path::PathBuf,
         recognition: RecognitionSettings,
         recognition_channels: Vec<usize>,
-        pacing: plugins::meeting::audio_file::AudioImportPacing,
+        pacing: media_import::AudioImportPacing,
         ctx: Option<eframe::egui::Context>,
     ) {
         let (audio_tx, audio_rx) = crossbeam_channel::bounded::<Vec<f32>>(64);
@@ -1387,10 +996,10 @@ impl XRTranslateApp {
                 finish_when_audio_ends: true,
             },
         );
-        match plugins::meeting::audio_file::import_audio_file(
+        match media_import::import_audio_file(
             path,
             audio_tx,
-            plugins::meeting::audio_file::AudioImportOptions {
+            media_import::AudioImportOptions {
                 chunk_frames: 1_600,
                 pacing,
                 recognition_channels,
@@ -1401,7 +1010,12 @@ impl XRTranslateApp {
                 self.host_audio_import = Some(import);
                 self.audio_txs.clear();
                 self.session_owner = TranslationSessionOwner::VideoPlayer {
-                    task_id: self.player_plugin.controller.active_task_id.clone().unwrap_or_default(),
+                    task_id: self
+                        .player_plugin
+                        .controller
+                        .active_task_id
+                        .clone()
+                        .unwrap_or_default(),
                 };
                 self.is_translating = true;
                 if let Ok(mut state) = self.shared_session_state.lock() {
@@ -1716,10 +1330,10 @@ impl XRTranslateApp {
                 finish_when_audio_ends: true,
             },
         );
-        match plugins::meeting::audio_file::import_audio_file(
+        match media_import::import_audio_file(
             path,
             audio_tx,
-            plugins::meeting::audio_file::AudioImportOptions::default(),
+            media_import::AudioImportOptions::default(),
         ) {
             Ok(import) => {
                 self.sessions = vec![session];
@@ -1962,8 +1576,16 @@ impl XRTranslateApp {
         match self.backend_manager.status(&self.server_url) {
             backend::BackendStatus::Ready => {
                 self.backend_start_deadline = None;
-                if let Some((path, recognition, recognition_channels, pacing)) = self.pending_audio_import.take() {
-                    self.start_audio_file_session(path, recognition, recognition_channels, pacing, ctx);
+                if let Some((path, recognition, recognition_channels, pacing)) =
+                    self.pending_audio_import.take()
+                {
+                    self.start_audio_file_session(
+                        path,
+                        recognition,
+                        recognition_channels,
+                        pacing,
+                        ctx,
+                    );
                 } else if let Some(path) = self.meeting_plugin.pending_audio_import.take() {
                     self.start_audio_import_session(path, ctx);
                 } else {
@@ -2070,28 +1692,24 @@ impl XRTranslateApp {
         let mut terminal_error = None;
         for event in events {
             match event {
-                plugins::meeting::audio_file::AudioImportEvent::Started(info) => {
+                media_import::AudioImportEvent::Started(info) => {
                     self.set_connection_status(format!(
                         "Processing {} Hz, {} channel audio",
                         info.source_sample_rate, info.source_channels
                     ));
                 }
-                plugins::meeting::audio_file::AudioImportEvent::Progress(progress) => {
+                media_import::AudioImportEvent::Progress(progress) => {
                     let percentage = progress.fraction.map(|value| value * 100.0);
                     self.set_connection_status(percentage.map_or_else(
                         || format!("Processing audio · {}s", progress.position.as_secs()),
                         |value| format!("Processing audio · {value:.0}%"),
                     ));
                 }
-                plugins::meeting::audio_file::AudioImportEvent::Completed { .. } => {
-                    completed = true
-                }
-                plugins::meeting::audio_file::AudioImportEvent::Stopped { .. } => {
+                media_import::AudioImportEvent::Completed { .. } => completed = true,
+                media_import::AudioImportEvent::Stopped { .. } => {
                     terminal_error = Some("Audio import stopped".to_owned())
                 }
-                plugins::meeting::audio_file::AudioImportEvent::Error(error) => {
-                    terminal_error = Some(error)
-                }
+                media_import::AudioImportEvent::Error(error) => terminal_error = Some(error),
             }
         }
         if completed {
@@ -2130,49 +1748,61 @@ impl XRTranslateApp {
         let mut host_completed = false;
         for event in host_events {
             match event {
-                plugins::meeting::audio_file::AudioImportEvent::Started(info) => {
+                media_import::AudioImportEvent::Started(info) => {
                     self.set_connection_status(format!(
                         "Processing media audio ({} Hz)",
                         info.source_sample_rate
                     ));
                 }
-                plugins::meeting::audio_file::AudioImportEvent::Progress(progress) => {
+                media_import::AudioImportEvent::Progress(progress) => {
                     let percentage = progress.fraction.map(|value| value * 100.0);
                     match progress.stage {
-                        plugins::meeting::audio_file::AudioImportStage::Extracting => {
+                        media_import::AudioImportStage::Extracting => {
                             self.player_plugin.controller.is_extracting = true;
                             self.player_plugin.controller.extraction_progress = progress.fraction;
-                            self.player_plugin.controller.extract_position = Some(progress.position);
+                            self.player_plugin.controller.extract_position =
+                                Some(progress.position);
                             self.player_plugin.controller.extract_duration = progress.duration;
                             self.set_connection_status(percentage.map_or_else(
-                                || format!("Extracting media audio · {}s", progress.position.as_secs()),
+                                || {
+                                    format!(
+                                        "Extracting media audio · {}s",
+                                        progress.position.as_secs()
+                                    )
+                                },
                                 |value| format!("Extracting media audio · {value:.0}%"),
                             ));
                         }
-                        plugins::meeting::audio_file::AudioImportStage::Recognizing => {
+                        media_import::AudioImportStage::Recognizing => {
                             self.player_plugin.controller.is_extracting = false;
                             self.player_plugin.controller.extraction_progress = Some(1.0);
                             self.player_plugin.controller.recognition_progress = progress.fraction;
-                            self.player_plugin.controller.recognize_position = Some(progress.position);
+                            self.player_plugin.controller.recognize_position =
+                                Some(progress.position);
                             self.player_plugin.controller.recognize_duration = progress.duration;
                             self.set_connection_status(percentage.map_or_else(
-                                || format!("Transcribing media audio · {}s", progress.position.as_secs()),
+                                || {
+                                    format!(
+                                        "Transcribing media audio · {}s",
+                                        progress.position.as_secs()
+                                    )
+                                },
                                 |value| format!("Transcribing media audio · {value:.0}%"),
                             ));
                         }
                     }
                 }
-                plugins::meeting::audio_file::AudioImportEvent::Completed { .. } => {
+                media_import::AudioImportEvent::Completed { .. } => {
                     self.player_plugin.controller.is_extracting = false;
                     self.player_plugin.controller.extraction_progress = Some(1.0);
                     self.player_plugin.controller.recognition_progress = Some(1.0);
                     host_completed = true;
                 }
-                plugins::meeting::audio_file::AudioImportEvent::Stopped { .. } => {
+                media_import::AudioImportEvent::Stopped { .. } => {
                     self.player_plugin.controller.is_extracting = false;
                     self.host_audio_import = None;
                 }
-                plugins::meeting::audio_file::AudioImportEvent::Error(error) => {
+                media_import::AudioImportEvent::Error(error) => {
                     log::error!("Host audio import error: {error}");
                     self.player_plugin.controller.is_extracting = false;
                     self.player_plugin.controller.error = Some(error.clone());
@@ -2488,7 +2118,7 @@ impl XRTranslateApp {
         else {
             return;
         };
-        let markdown = rust_client::render_markdown(bundle);
+        let markdown = plugins::meeting::store::render_markdown(bundle);
         if let Err(error) = std::fs::write(path, markdown) {
             self.meeting_plugin.controller.error =
                 Some(format!("Could not export meeting: {error}"));
@@ -2624,22 +2254,6 @@ fn vad_threshold_for_background_noise(value: f32) -> f32 {
     value.clamp(0.2, 0.8)
 }
 
-fn compact_speaker_label(speaker_id: &str) -> Option<String> {
-    let value = speaker_id.trim();
-    if value.is_empty() {
-        return None;
-    }
-    let suffix = value.strip_prefix("speaker-").unwrap_or(value);
-    if suffix.eq_ignore_ascii_case("unknown") {
-        return Some("S?".into());
-    }
-    let sequence = suffix.trim_start_matches('0');
-    Some(format!(
-        "S{}",
-        if sequence.is_empty() { "0" } else { sequence }
-    ))
-}
-
 #[allow(clippy::too_many_arguments)]
 fn persist_meeting_segment(
     sink: &plugins::meeting::events::MeetingEventSink,
@@ -2719,7 +2333,7 @@ impl XRTranslateApp {
         }
 
         if let Ok(state) = self.shared_session_state.lock() {
-            for (idx, entry) in state.translations.iter().enumerate() {
+            for entry in &state.translations {
                 if entry.audio_source != CaptureSource::SystemAudio {
                     continue;
                 }
@@ -2729,10 +2343,12 @@ impl XRTranslateApp {
                 } else {
                     Some(entry.speaker_id.clone())
                 };
-                let cue_id = if let Some(sid) = entry.stream_id {
+                let cue_id = if !entry.turn_id.is_empty() {
+                    format!("turn_{}", entry.turn_id)
+                } else if let Some(sid) = entry.stream_id {
                     format!("stream_{}_{}", sid, entry.source_start_ms.round() as i64)
                 } else {
-                    format!("cue_{}_{}", idx, entry.source_start_ms.round() as i64)
+                    format!("cue_{}", entry.source_start_ms.round() as i64)
                 };
                 self.player_plugin.on_translation_segment(
                     cue_id,
@@ -2758,7 +2374,8 @@ impl eframe::App for XRTranslateApp {
             .set_proxy_url(Some(self.download_proxy_url.clone()));
         self.poll_audio_device_refresh();
         self.poll_audio_import();
-        self.player_plugin.on_visibility_changed(self.navigation.page == Page::Plugin(PluginId::VIDEO_PLAYER));
+        self.player_plugin
+            .on_visibility_changed(self.navigation.page == Page::Plugin(PluginId::VIDEO_PLAYER));
         ui.ctx()
             .request_repaint_after(std::time::Duration::from_millis(100));
         if self.first_run {
@@ -2821,7 +2438,9 @@ impl eframe::App for XRTranslateApp {
 
             if self.navigation.collapsed != prev_collapsed || self.navigation.page != prev_page {
                 self.save_settings();
-                self.player_plugin.on_visibility_changed(self.navigation.page == Page::Plugin(PluginId::VIDEO_PLAYER));
+                self.player_plugin.on_visibility_changed(
+                    self.navigation.page == Page::Plugin(PluginId::VIDEO_PLAYER),
+                );
             }
         }
 
@@ -3019,65 +2638,7 @@ fn configure_cjk_fonts(ctx: &egui::Context) {
 
 #[cfg(test)]
 mod tests {
-    use super::{
-        CaptureSource, PendingRecognitionWindow, RecognitionHistoryEntry, TranslationHistoryEntry,
-        collect_recognition_window, compact_speaker_label, merge_stream_recognition,
-        merge_stream_translation, vad_threshold_for_background_noise,
-    };
-
-    fn fragment(stream_id: u64, source: &str, translated: &str) -> TranslationHistoryEntry {
-        TranslationHistoryEntry {
-            stream_id: Some(stream_id),
-            audio_source: CaptureSource::Microphone,
-            live: true,
-            source: source.into(),
-            translated: translated.into(),
-            speaker_id: String::new(),
-            source_start_ms: 0.0,
-            source_end_ms: 1.0,
-            term_matches: Vec::new(),
-            revisable: false,
-            overlap_ratio: 0.0,
-            source_revision: None,
-            translated_revision: None,
-        }
-    }
-
-    fn snapshot(stream_id: u64, source: &str, translated: &str) -> TranslationHistoryEntry {
-        TranslationHistoryEntry {
-            revisable: true,
-            overlap_ratio: 0.34,
-            ..fragment(stream_id, source, translated)
-        }
-    }
-
-    fn recognition_snapshot(stream_id: u64, turn_id: &str, text: &str) -> RecognitionHistoryEntry {
-        RecognitionHistoryEntry {
-            stream_id: Some(stream_id),
-            live: true,
-            text: text.into(),
-            turn_id: turn_id.into(),
-            speaker_id: String::new(),
-            source_start_ms: 0.0,
-            source_end_ms: 1_000.0,
-            activation_matches: Vec::new(),
-            context_matches: Vec::new(),
-            revisable: true,
-            overlap_ratio: 0.34,
-            revision: None,
-        }
-    }
-
-    #[test]
-    fn compact_speaker_labels_are_stable_and_human_readable() {
-        assert_eq!(compact_speaker_label("speaker-01").as_deref(), Some("S1"));
-        assert_eq!(compact_speaker_label("speaker-12").as_deref(), Some("S12"));
-        assert_eq!(
-            compact_speaker_label("speaker-unknown").as_deref(),
-            Some("S?")
-        );
-        assert_eq!(compact_speaker_label(""), None);
-    }
+    use super::vad_threshold_for_background_noise;
 
     #[test]
     fn noisier_environment_uses_a_stricter_vad_threshold() {
@@ -3087,137 +2648,5 @@ mod tests {
 
         assert!(quiet < medium);
         assert!(medium < noisy);
-    }
-
-    #[test]
-    fn streaming_translation_updates_each_audio_source_in_place() {
-        let mut history = Vec::new();
-        merge_stream_translation(&mut history, 1, fragment(1, "Hello", "你好"));
-        merge_stream_translation(&mut history, 2, fragment(2, "Music", "音乐"));
-        let microphone =
-            merge_stream_translation(&mut history, 1, fragment(1, "world", "你好世界"));
-
-        assert_eq!(history.len(), 2);
-        assert_eq!(microphone.entry.source, "Hello world");
-        assert_eq!(microphone.entry.translated, "你好世界");
-        assert_eq!(history[1].source, "Music");
-    }
-
-    #[test]
-    fn streaming_translation_rolls_a_finished_caption_into_history() {
-        let mut history = Vec::new();
-        let mut first = fragment(
-            1,
-            "This is a complete first sentence with enough stable words to roll cleanly.",
-            "这是完整的第一句。",
-        );
-        first.source_end_ms = 4_000.0;
-        merge_stream_translation(&mut history, 1, first);
-        let mut next = fragment(1, "Next", "下一句");
-        next.source_start_ms = 4_000.0;
-        next.source_end_ms = 5_000.0;
-        let update = merge_stream_translation(&mut history, 1, next);
-
-        assert!(update.rolled_over);
-        assert_eq!(history.len(), 2);
-        assert!(!history[0].live);
-        assert!(history[1].live);
-    }
-
-    #[test]
-    fn revisable_windows_replace_the_unstable_tail() {
-        let mut history = Vec::new();
-        merge_stream_translation(
-            &mut history,
-            1,
-            snapshot(1, "we walk across the central street", "我们走过中央大街"),
-        );
-        let update = merge_stream_translation(
-            &mut history,
-            1,
-            snapshot(1, "the central station and turn left", "中央车站然后左转"),
-        );
-
-        assert_eq!(
-            update.entry.source,
-            "we walk across the central station and turn left"
-        );
-        assert_eq!(update.entry.translated, "我们走过中央车站然后左转");
-        assert_eq!(history.len(), 1);
-    }
-
-    #[test]
-    fn provisional_window_punctuation_does_not_roll_a_live_caption() {
-        let mut history = Vec::new();
-        let mut first = snapshot(1, "A short provisional sentence.", "一个临时短句。");
-        first.source_end_ms = 2_000.0;
-        merge_stream_translation(&mut history, 1, first);
-
-        let mut next = snapshot(1, "provisional sentence continues here", "临时短句仍在继续");
-        next.source_start_ms = 1_000.0;
-        next.source_end_ms = 5_000.0;
-        let update = merge_stream_translation(&mut history, 1, next);
-
-        assert!(!update.rolled_over);
-        assert_eq!(history.len(), 1);
-    }
-
-    #[test]
-    fn caption_rollover_consumes_the_shared_window_prefix() {
-        let mut history = Vec::new();
-        let mut first = snapshot(
-            1,
-            "I frown, but you use it to end the sentence with a period.",
-            "I frown, but you use it to end the sentence with a period.",
-        );
-        first.source_end_ms = 4_000.0;
-        merge_stream_translation(&mut history, 1, first);
-
-        let mut next = snapshot(
-            1,
-            "use it to end the sentence with a period. I can only say I admit it.",
-            "use it to end the sentence with a period. I can only say I admit it.",
-        );
-        next.source_start_ms = 2_500.0;
-        next.source_end_ms = 5_500.0;
-        let update = merge_stream_translation(&mut history, 1, next);
-
-        assert!(update.rolled_over);
-        assert_eq!(history.len(), 2);
-        assert_eq!(history[1].source, "I can only say I admit it.");
-        assert_eq!(history[1].translated, "I can only say I admit it.");
-    }
-
-    #[test]
-    fn recognition_window_combines_all_segments_before_display() {
-        let mut pending = Vec::<PendingRecognitionWindow>::new();
-        let second = recognition_snapshot(7, "turn-1", "我的台词全念一遍。");
-        let first = recognition_snapshot(7, "turn-1", "准备好的台词。");
-
-        assert!(collect_recognition_window(&mut pending, 7, true, 2, 2, second).is_none());
-        let combined = collect_recognition_window(&mut pending, 7, true, 1, 2, first).unwrap();
-
-        assert_eq!(combined.text, "准备好的台词。我的台词全念一遍。");
-        assert!(pending.is_empty());
-    }
-
-    #[test]
-    fn recognition_history_revises_the_shared_audio_window_in_place() {
-        let mut history = Vec::new();
-        merge_stream_recognition(
-            &mut history,
-            7,
-            recognition_snapshot(7, "turn-1", "你停在了这条我们熟悉的街。"),
-        );
-        let mut next = recognition_snapshot(7, "turn-2", "熟悉的街。然后继续向前走。");
-        next.source_start_ms = 1_000.0;
-        next.source_end_ms = 3_000.0;
-        merge_stream_recognition(&mut history, 7, next);
-
-        assert_eq!(history.len(), 1);
-        assert_eq!(
-            history[0].text,
-            "你停在了这条我们熟悉的街。然后继续向前走。"
-        );
     }
 }

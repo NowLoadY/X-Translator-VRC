@@ -1,3 +1,4 @@
+mod chatbox;
 pub mod runtime;
 mod sys_info;
 pub mod ui;

@@ -1,16 +1,18 @@
 //! Built-in meeting-record plugin.
 //!
 //! This module is the boundary between the host application and meeting-specific
-//! storage, capture bookkeeping, audio import/recording, and UI state. The host
+//! storage, capture bookkeeping, retained recording, and UI state. The host
 //! supplies a small immutable snapshot and executes the returned actions; the
-//! meeting UI never receives the host application itself.
+//! meeting UI never receives the host application itself. External audio import
+//! is a host capability shared with other media consumers.
 
-pub mod audio_file;
+pub(crate) use crate::media_import as audio_file;
 pub mod controller;
 pub mod events;
 pub mod i18n;
 pub mod recording;
-pub mod ui;
+pub(crate) mod store;
+mod ui;
 
 use std::{
     path::{Path, PathBuf},

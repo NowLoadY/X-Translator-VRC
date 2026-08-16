@@ -1,8 +1,8 @@
 pub mod mpv;
 pub mod window;
 
-use std::path::PathBuf;
 use serde::{Deserialize, Serialize};
+use std::path::PathBuf;
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub enum MediaSource {
@@ -16,7 +16,7 @@ impl MediaSource {
             Self::LocalFile(path) => path
                 .file_name()
                 .and_then(|name| name.to_str())
-                .unwrap_or("Local Video")
+                .unwrap_or("Local Media")
                 .to_string(),
             Self::NetworkStream(url) => url.clone(),
         }
@@ -43,25 +43,27 @@ pub struct PlayerDiagnostics {
 pub trait MediaBackend: Send {
     fn load_local_file(&mut self, path: PathBuf) -> Result<(), String>;
     fn load_stream_url(&mut self, url: String) -> Result<(), String>;
-    
+
     fn play(&mut self);
     fn pause(&mut self);
     fn stop(&mut self);
     fn seek(&mut self, ms: i64);
-    
+
     fn set_volume(&mut self, volume: f32);
     fn set_mute(&mut self, mute: bool);
-    
+
     fn get_time_ms(&self) -> i64;
     fn get_duration_ms(&self) -> i64;
     fn get_status(&self) -> PlaybackStatus;
     fn get_diagnostics(&self) -> PlayerDiagnostics;
-    
+
     fn tick(&mut self);
     fn attach_native_host(&mut self, host_handle: *mut std::ffi::c_void);
     fn set_osd_subtitle(&mut self, text: &str);
     fn show_osd_title(&mut self, title: &str);
     fn get_audio_channel_count(&self) -> Option<usize>;
+    #[allow(dead_code)]
     fn get_audio_layout(&self) -> Option<String>;
     fn set_channel_routing(&mut self, channels: &[super::task::AudioChannelItem]);
+    fn set_audio_only_mode(&mut self, enabled: bool);
 }

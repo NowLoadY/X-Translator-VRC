@@ -1,9 +1,9 @@
 use super::{
     MeetingAudioSource, MeetingInputRequest, MeetingStartRequest, MeetingUiSnapshot, recording,
-};
-use rust_client::{
-    MarkerKind, Meeting, MeetingBundle, MeetingSourceKind, MeetingStatus, MeetingStore,
-    MeetingStoreError, NewMeeting, SegmentMarker,
+    store::{
+        MarkerKind, Meeting, MeetingBundle, MeetingSourceKind, MeetingStatus, MeetingStore,
+        MeetingStoreError, NewMeeting, SegmentMarker,
+    },
 };
 use std::{
     collections::HashMap,
@@ -332,7 +332,6 @@ impl MeetingController {
             }
         }
     }
-
 
     pub fn create_topic(&mut self) {
         let Some(meeting_id) = self.bundle.as_ref().map(|bundle| bundle.meeting.id.clone()) else {

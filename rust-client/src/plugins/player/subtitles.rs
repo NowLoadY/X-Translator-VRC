@@ -38,27 +38,33 @@ impl SubtitleTimeline {
             return false;
         }
 
+        // 1. Check exact ID match (turn_id or stream_id based)
         if let Some(existing) = self.cues.iter_mut().find(|c| c.id == cue.id) {
             if *existing == cue {
                 return false;
             }
             *existing = cue;
-            true
-        } else if let Some(existing) = self
-            .cues
-            .iter_mut()
-            .find(|c| (c.start_ms - cue.start_ms).abs() <= 600)
-        {
+            return true;
+        }
+
+        // 2. Check semantic & temporal duplication:
+        // If identical text within 3500ms OR overlapping time window within 1000ms
+        let cue_orig = cue.original_text.trim();
+        if let Some(existing) = self.cues.iter_mut().find(|c| {
+            let time_diff = (c.start_ms - cue.start_ms).abs();
+            (time_diff <= 3500 && c.original_text.trim() == cue_orig) || time_diff <= 1000
+        }) {
             if *existing == cue {
                 return false;
             }
             *existing = cue;
-            true
-        } else {
-            self.cues.push(cue);
-            self.cues.sort_by_key(|c| c.start_ms);
-            true
+            return true;
         }
+
+        // 3. New distinct subtitle
+        self.cues.push(cue);
+        self.cues.sort_by_key(|c| c.start_ms);
+        true
     }
 
     pub fn active_cue_at(&self, current_ms: i64) -> Option<&SubtitleCue> {
@@ -93,14 +99,15 @@ impl SubtitleTimeline {
             let start = format_timestamp_srt(cue.start_ms);
             let end = format_timestamp_srt(cue.end_ms.max(cue.start_ms + 2000));
             out.push_str(&format!("{}\n{} --> {}\n", idx + 1, start, end));
-            if let Some(speaker) = &cue.speaker_name {
-                out.push_str(&format!("[{}] ", speaker));
+            let orig = cue.original_text.trim();
+            if !orig.is_empty() {
+                out.push_str(orig);
+                out.push('\n');
             }
-            out.push_str(&cue.original_text);
-            out.push('\n');
             if let Some(trans) = &cue.translated_text {
-                if trans != &cue.original_text && !trans.trim().is_empty() {
-                    out.push_str(trans);
+                let trans_trim = trans.trim();
+                if trans_trim != orig && !trans_trim.is_empty() {
+                    out.push_str(trans_trim);
                     out.push('\n');
                 }
             }
@@ -108,6 +115,42 @@ impl SubtitleTimeline {
         }
         out
     }
+
+    pub fn export_lrc(&self, title: Option<&str>) -> String {
+        let mut out = String::new();
+        if let Some(t) = title {
+            let clean = t.trim();
+            if !clean.is_empty() {
+                out.push_str(&format!("[ti:{}]\n", clean));
+            }
+        }
+        for cue in self.cues() {
+            let time_tag = format_timestamp_lrc(cue.start_ms);
+            let orig = cue.original_text.trim();
+            if !orig.is_empty() {
+                out.push_str(&time_tag);
+                out.push_str(orig);
+                out.push('\n');
+            }
+            if let Some(trans) = &cue.translated_text {
+                let trans_trim = trans.trim();
+                if trans_trim != orig && !trans_trim.is_empty() {
+                    out.push_str(&time_tag);
+                    out.push_str(trans_trim);
+                    out.push('\n');
+                }
+            }
+        }
+        out
+    }
+}
+
+fn format_timestamp_lrc(ms: i64) -> String {
+    let ms_max = ms.max(0);
+    let mins = ms_max / 60000;
+    let secs = (ms_max % 60000) / 1000;
+    let hundredths = (ms_max % 1000) / 10;
+    format!("[{:02}:{:02}.{:02}]", mins, secs, hundredths)
 }
 
 fn format_timestamp_srt(ms: i64) -> String {
@@ -145,6 +188,7 @@ mod tests {
         let srt = timeline.export_srt();
         assert!(srt.contains("Hello world"));
         assert!(srt.contains("你好世界"));
+        assert!(!srt.contains("[Speaker]"));
     }
 
     #[test]
@@ -171,7 +215,10 @@ mod tests {
         });
         assert_eq!(timeline.count(), 1);
         assert_eq!(timeline.cues()[0].original_text, "に願い愛を。");
-        assert_eq!(timeline.cues()[0].translated_text.as_deref(), Some("将愿望寄托在爱。"));
+        assert_eq!(
+            timeline.cues()[0].translated_text.as_deref(),
+            Some("将愿望寄托在爱。")
+        );
 
         // Final streaming revision arrives
         timeline.add_cue(SubtitleCue {
@@ -184,5 +231,74 @@ mod tests {
         });
         assert_eq!(timeline.count(), 1);
         assert_eq!(timeline.cues()[0].original_text, "に願い愛一つ。");
+    }
+
+    #[test]
+    fn test_lrc_export() {
+        let mut timeline = SubtitleTimeline::new();
+        timeline.add_cue(SubtitleCue {
+            id: "1".into(),
+            start_ms: 13504,
+            end_ms: 16480,
+            speaker_name: None,
+            original_text: "Now I'm seventeen.".into(),
+            translated_text: Some("我现在十七岁了。".into()),
+        });
+        timeline.add_cue(SubtitleCue {
+            id: "2".into(),
+            start_ms: 16544,
+            end_ms: 18544,
+            speaker_name: None,
+            original_text: "My sky.".into(),
+            translated_text: Some("我的天空。".into()),
+        });
+
+        let lrc = timeline.export_lrc(Some("17 - 椎名林檎"));
+        assert!(lrc.contains("[ti:17 - 椎名林檎]"));
+        assert!(lrc.contains("[00:13.50]Now I'm seventeen."));
+        assert!(lrc.contains("[00:13.50]我现在十七岁了。"));
+        assert!(lrc.contains("[00:16.54]My sky."));
+        assert!(lrc.contains("[00:16.54]我的天空。"));
+    }
+
+    #[test]
+    fn test_subtitles_deduplication_on_repeated_events() {
+        let mut timeline = SubtitleTimeline::new();
+        // Turn 1 first interim
+        timeline.add_cue(SubtitleCue {
+            id: "turn_1".into(),
+            start_ms: 109000,
+            end_ms: 111000,
+            speaker_name: Some("speaker-04".into()),
+            original_text: "You uh talked".into(),
+            translated_text: Some("你刚才讨论了".into()),
+        });
+        assert_eq!(timeline.count(), 1);
+
+        // Turn 1 second interim with slightly refined start timestamp
+        timeline.add_cue(SubtitleCue {
+            id: "turn_1".into(),
+            start_ms: 109200,
+            end_ms: 112000,
+            speaker_name: Some("speaker-04".into()),
+            original_text: "You uh talked to Louis about Sunday.".into(),
+            translated_text: Some("你刚才和路易斯讨论了周日的事。".into()),
+        });
+        assert_eq!(timeline.count(), 1);
+        assert_eq!(
+            timeline.cues()[0].original_text,
+            "You uh talked to Louis about Sunday."
+        );
+
+        // Semantic duplicate with different transient ID but same text and timestamp within 3.5s
+        timeline.add_cue(SubtitleCue {
+            id: "cue_109200".into(),
+            start_ms: 109200,
+            end_ms: 112000,
+            speaker_name: Some("speaker-04".into()),
+            original_text: "You uh talked to Louis about Sunday.".into(),
+            translated_text: Some("你刚才和路易斯讨论了周日的事。".into()),
+        });
+        assert_eq!(timeline.count(), 1);
     }
 }

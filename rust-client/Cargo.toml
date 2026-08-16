@@ -3,9 +3,6 @@ name = "rust-client"
 version.workspace = true
 edition.workspace = true
 
-[lib]
-path = "src/plugins/meeting/store.rs"
-
 [dependencies]
 cpal = "0.18.1"
 crossbeam-channel = "0.5.16"

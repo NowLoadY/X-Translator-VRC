@@ -5,13 +5,17 @@ pub fn tr(language: UiLanguage, text: &'static str) -> &'static str {
         UiLanguage::English => text,
         UiLanguage::Chinese => match text {
             "Media Player" => "视频播放器",
-            "Play video files and streams with real-time synchronized subtitles." => "播放视频文件及网络流，支持实时同步字幕与全屏模式。",
+            "Play video files and streams with real-time synchronized subtitles." => {
+                "播放视频文件及网络流，支持实时同步字幕与全屏模式。"
+            }
             "Video Player" => "视频播放器",
             "Video Tasks" => "视频任务库",
             "New Video" => "新建视频任务",
             "Search videos..." => "搜索视频任务...",
             "No video tasks yet" => "暂无视频任务",
-            "Create a new video playback and translation task to get started." => "点击上方“新建视频任务”，配置音轨识别或导入字幕开始播放。",
+            "Create a new video playback and translation task to get started." => {
+                "点击上方“新建视频任务”，配置音轨识别或导入字幕开始播放。"
+            }
             "Task Configuration" => "任务配置",
             "Task Title" => "任务标题",
             "Enter optional custom title..." => "输入自定义标题（可选）...",
@@ -35,7 +39,9 @@ pub fn tr(language: UiLanguage, text: &'static str) -> &'static str {
             "Local Video" => "本地视频",
             "Choose Video File" => "选择视频文件",
             "No video loaded" => "暂未加载视频文件或流",
-            "Select a local video file or enter a network stream URL to start playback." => "请在上方选择本地视频文件，或输入网络流 URL 开始播放与字幕同步。",
+            "Select a local video file or enter a network stream URL to start playback." => {
+                "请在上方选择本地视频文件，或输入网络流 URL 开始播放与字幕同步。"
+            }
             "Play" => "播放",
             "Pause" => "暂停",
             "Mute" => "静音",
@@ -48,6 +54,7 @@ pub fn tr(language: UiLanguage, text: &'static str) -> &'static str {
             "Hide Subtitles" => "隐藏字幕",
             "Export Subtitles" => "导出字幕",
             "Export SRT" => "导出 SRT",
+            "Export LRC" => "导出 LRC 歌词",
             "Reprocess in Meeting" => "导入会议插件",
             "VIDEO FILE" => "视频文件",
             "STREAM" => "网络流",
@@ -76,8 +83,18 @@ pub fn tr(language: UiLanguage, text: &'static str) -> &'static str {
             "Recognition Settings" => "语音识别设置",
             "VAD Sensitivity" => "人声识别灵敏度",
             "VAD Sensitivity / Background Audio" => "人声识别灵敏度 / 背景音设置",
-            "Lower threshold improves recognition under heavy BGM and music, while higher threshold filters background noise." => "较低阈值可大幅提升高BGM和音乐伴奏下的识别率，较高阈值可过滤环境杂音。",
+            "Lower threshold improves recognition under heavy BGM and music, while higher threshold filters background noise." => {
+                "较低阈值可大幅提升高BGM和音乐伴奏下的识别率，较高阈值可过滤环境杂音。"
+            }
             "High (0.15 - Heavy BGM / Music)" => "高灵敏度 (0.15 - 强BGM/音乐)",
+            "Pause Tolerance & Sentence Continuity" => "断句停顿与连贯性 (停顿容忍度)",
+            "Higher values prevent broken sentences during natural pauses, breathing, or background music; lower values output subtitles with shorter turnarounds." => {
+                "调大可防止说话换气、轻微停顿或BGM干扰时句子被断续切碎；调小可让字幕切分更碎、生成更快 (240ms ~ 1200ms)。"
+            }
+            "Quick / Short (0.30 - 528ms)" => "快速短句 (0.30 - 528ms)",
+            "Balanced (0.60 - 816ms)" => "标准均衡 (0.60 - 816ms)",
+            "Continuous (1.00 - 1200ms)" => "抗断续/长句 (1.00 - 1200ms)",
+            "Custom Interval:" => "自定义断句间隔:",
             "Start Task" => "开始识别任务",
             "Pause Task" => "暂停识别任务",
             "Clear & Restart" => "清空字幕并重启",
@@ -102,7 +119,9 @@ pub fn tr(language: UiLanguage, text: &'static str) -> &'static str {
             "Audio Layout" => "检测到音轨布局",
             "Create & Play" => "创建并进入播放",
             "Video Player Runtime Missing" => "播放器核心组件未就绪",
-            "Video playback and multi-track audio extraction require the mpv runtime library (mpv-2.dll). You can click the button below to download and configure it directly from the GitHub repository." => "播放视频及多音轨分离需要 mpv 动态运行库（mpv-2.dll）。您可以点击下方按钮，一键从 GitHub 仓库下载并就地自动配置。",
+            "Video playback and multi-track audio extraction require the mpv runtime library (mpv-2.dll). You can click the button below to download and configure it directly from the GitHub repository." => {
+                "播放视频及多音轨分离需要 mpv 动态运行库（mpv-2.dll）。您可以点击下方按钮，一键从 GitHub 仓库下载并就地自动配置。"
+            }
             "Download Player Runtime (46.8 MB)" => "一键下载播放器组件 (46.8 MB)",
             "Downloading runtime..." => "正在从仓库下载组件...",
             "Extracting and installing player runtime..." => "正在解压并安装播放器组件...",
@@ -119,27 +138,43 @@ pub fn tr(language: UiLanguage, text: &'static str) -> &'static str {
             "Recognition Completed" => "语音识别已完成",
             "Ready" => "就绪",
             "cues generated" => "条字幕已生成",
+            "AUDIO FILE" => "音频文件",
+            "Audio file detected" => "已识别为纯音频文件",
+            "Audio Playback" => "音频播放",
+            "Media Source" => "媒体来源",
+            "Enter stream URL or choose local media file..." => "输入流地址或选择本地媒体文件...",
+            "New Media Task" => "新建媒体任务",
+            "Local Audio" => "本地音频",
+            "Choose Audio File" => "选择音频文件",
             _ => text,
         },
         UiLanguage::Japanese => match text {
             "Media Player" => "動画プレーヤー",
-            "Play video files and streams with real-time synchronized subtitles." => "リアルタイム同期字幕と全画面表示に対応した動画プレーヤー。",
+            "Play video files and streams with real-time synchronized subtitles." => {
+                "リアルタイム同期字幕と全画面表示に対応した動画プレーヤー。"
+            }
             "Video Player" => "動画プレーヤー",
             "Video Tasks" => "動画タスク一覧",
             "New Video" => "新規タスク",
             "Search videos..." => "動画を検索...",
             "No video tasks yet" => "タスクがありません",
-            "Create a new video playback and translation task to get started." => "「新規タスク」をクリックして動画の翻訳・再生を開始します。",
+            "Create a new video playback and translation task to get started." => {
+                "「新規タスク」をクリックして動画の翻訳・再生を開始します。"
+            }
             "Task Configuration" => "タスク設定",
             "Task Title" => "タスク名",
             "Enter optional custom title..." => "タイトルを入力（任意）...",
             "Video Source" => "動画ソース",
-            "Enter stream URL or choose local file..." => "ストリームURLを入力またはファイルを参照...",
+            "Enter stream URL or choose local file..." => {
+                "ストリームURLを入力またはファイルを参照..."
+            }
             "Browse File" => "参照",
             "Source Language" => "入力言語",
             "Target Language" => "翻訳先言語",
             "Subtitle Mode" => "字幕モード",
-            "Real-time speech recognition & translation" => "リアルタイム音声認識・翻訳（動画と同期）",
+            "Real-time speech recognition & translation" => {
+                "リアルタイム音声認識・翻訳（動画と同期）"
+            }
             "Use imported/existing subtitles" => "既存の字幕（SRT）を使用",
             "No subtitles (Video playback only)" => "字幕なし（動画再生のみ）",
             "Choose SRT File" => "SRTファイルを選択",
@@ -152,7 +187,9 @@ pub fn tr(language: UiLanguage, text: &'static str) -> &'static str {
             "Local Video" => "ローカル動画",
             "Choose Video File" => "動画ファイルを選択",
             "No video loaded" => "動画が読み込まれていません",
-            "Select a local video file or enter a network stream URL to start playback." => "ローカル動画ファイルを選択するかURLを入力して再生を開始します。",
+            "Select a local video file or enter a network stream URL to start playback." => {
+                "ローカル動画ファイルを選択するかURLを入力して再生を開始します。"
+            }
             "Play" => "再生",
             "Pause" => "一時停止",
             "Mute" => "消音",
@@ -165,6 +202,7 @@ pub fn tr(language: UiLanguage, text: &'static str) -> &'static str {
             "Hide Subtitles" => "字幕非表示",
             "Export Subtitles" => "字幕エクスポート",
             "Export SRT" => "SRTエクスポート",
+            "Export LRC" => "LRCエクスポート",
             "Reprocess in Meeting" => "ミーティングへ転送",
             "VIDEO FILE" => "動画ファイル",
             "STREAM" => "配信",
@@ -180,7 +218,9 @@ pub fn tr(language: UiLanguage, text: &'static str) -> &'static str {
             "Reprocess Audio with Meeting Plugin" => "ミーティングプラグインへ音声出力",
             "Invalid stream URL" => "無効なストリームURL",
             "Failed to load video file" => "動画ファイルの読み込みに失敗しました",
-            "Please choose a valid video file or stream URL" => "有効な動画ファイルまたはURLを指定してください",
+            "Please choose a valid video file or stream URL" => {
+                "有効な動画ファイルまたはURLを指定してください"
+            }
             "Local video file does not exist" => "動画ファイルが存在しません",
             "Task not found" => "タスクが見つかりません",
             "Subtitles Count" => "字幕件数",
@@ -193,8 +233,18 @@ pub fn tr(language: UiLanguage, text: &'static str) -> &'static str {
             "Recognition Settings" => "音声認識設定",
             "VAD Sensitivity" => "音声検出感度",
             "VAD Sensitivity / Background Audio" => "音声検出感度 / BGM設定",
-            "Lower threshold improves recognition under heavy BGM and music, while higher threshold filters background noise." => "しきい値を下げるとBGMや音楽の中でも認識しやすくなり、上げるとノイズを抑えます。",
+            "Lower threshold improves recognition under heavy BGM and music, while higher threshold filters background noise." => {
+                "しきい値を下げるとBGMや音楽の中でも認識しやすくなり、上げるとノイズを抑えます。"
+            }
             "High (0.15 - Heavy BGM / Music)" => "高感度 (0.15 - 強いBGM/音楽)",
+            "Pause Tolerance & Sentence Continuity" => "区切りと連続性 (間の許容度)",
+            "Higher values prevent broken sentences during natural pauses, breathing, or background music; lower values output subtitles with shorter turnarounds." => {
+                "値を上げると息継ぎやBGMによる途切れ・細切れを防ぎ、下げると短い間隔で素早く字幕化します (240ms - 1200ms)。"
+            }
+            "Quick / Short (0.30 - 528ms)" => "速切短文 (0.30 - 528ms)",
+            "Balanced (0.60 - 816ms)" => "標準均衡 (0.60 - 816ms)",
+            "Continuous (1.00 - 1200ms)" => "途切れ防止/長文 (1.00 - 1200ms)",
+            "Custom Interval:" => "カスタム間隔:",
             "Medium (0.35 - Light BGM)" => "中感度 (0.35 - 軽いBGM)",
             "Standard (0.50 - Pure Speech)" => "標準 (0.50 - 音声のみ)",
             "Custom Threshold:" => "カスタムしきい値：",
@@ -214,17 +264,31 @@ pub fn tr(language: UiLanguage, text: &'static str) -> &'static str {
             "Recognition Completed" => "音声認識完了",
             "Ready" => "待機中",
             "cues generated" => "件の字幕を生成済み",
+            "AUDIO FILE" => "音声ファイル",
+            "Audio file detected" => "音声ファイルを検出",
+            "Audio Playback" => "音声再生",
+            "Media Source" => "メディアソース",
+            "Enter stream URL or choose local media file..." => {
+                "ストリームURLまたはローカルファイルを選択..."
+            }
+            "New Media Task" => "新規メディアタスク",
+            "Local Audio" => "ローカル音声",
+            "Choose Audio File" => "音声ファイルを選択",
             _ => text,
         },
         UiLanguage::Korean => match text {
             "Media Player" => "비디오 플레이어",
-            "Play video files and streams with real-time synchronized subtitles." => "실시간 동기화 자막 및 전체 화면을 지원하는 비디오 플레이어.",
+            "Play video files and streams with real-time synchronized subtitles." => {
+                "실시간 동기화 자막 및 전체 화면을 지원하는 비디오 플레이어."
+            }
             "Video Player" => "비디오 플레이어",
             "Video Tasks" => "비디오 작업 목록",
             "New Video" => "새 비디오 작업",
             "Search videos..." => "비디오 검색...",
             "No video tasks yet" => "비디오 작업이 없습니다",
-            "Create a new video playback and translation task to get started." => "새 비디오 작업을 생성하여 번역 및 재생을 시작하세요.",
+            "Create a new video playback and translation task to get started." => {
+                "새 비디오 작업을 생성하여 번역 및 재생을 시작하세요."
+            }
             "Task Configuration" => "작업 설정",
             "Task Title" => "작업 제목",
             "Enter optional custom title..." => "사용자 지정 제목 입력(선택 사항)...",
@@ -235,7 +299,9 @@ pub fn tr(language: UiLanguage, text: &'static str) -> &'static str {
             "Source Language" => "음성 인식 언어",
             "Target Language" => "번역 대상 언어",
             "Subtitle Mode" => "자막 모드",
-            "Real-time speech recognition & translation" => "실시간 음성 인식 및 번역(비디오 동기화)",
+            "Real-time speech recognition & translation" => {
+                "실시간 음성 인식 및 번역(비디오 동기화)"
+            }
             "Use imported/existing subtitles" => "가져온/기존 자막(SRT) 사용",
             "No subtitles (Video playback only)" => "자막 없음(비디오만 재생)",
             "Choose SRT File" => "SRT 파일 선택",
@@ -248,7 +314,9 @@ pub fn tr(language: UiLanguage, text: &'static str) -> &'static str {
             "Local Video" => "로컬 비디오",
             "Choose Video File" => "비디오 파일 선택",
             "No video loaded" => "로드된 비디오가 없습니다",
-            "Select a local video file or enter a network stream URL to start playback." => "로컬 비디오 파일을 선택하거나 스트림 URL을 입력하여 재생을 시작하세요.",
+            "Select a local video file or enter a network stream URL to start playback." => {
+                "로컬 비디오 파일을 선택하거나 스트림 URL을 입력하여 재생을 시작하세요."
+            }
             "Play" => "재생",
             "Pause" => "일시정지",
             "Mute" => "음소거",
@@ -261,6 +329,7 @@ pub fn tr(language: UiLanguage, text: &'static str) -> &'static str {
             "Hide Subtitles" => "자막 숨기기",
             "Export Subtitles" => "자막 내보내기",
             "Export SRT" => "SRT 내보내기",
+            "Export LRC" => "LRC 내보내기",
             "Reprocess in Meeting" => "회의로 전달",
             "VIDEO FILE" => "비디오 파일",
             "STREAM" => "스트림",
@@ -276,7 +345,9 @@ pub fn tr(language: UiLanguage, text: &'static str) -> &'static str {
             "Reprocess Audio with Meeting Plugin" => "회의 플러그인으로 오디오 전달",
             "Invalid stream URL" => "유효하지 않은 스트림 URL",
             "Failed to load video file" => "비디오 파일을 불러오지 못했습니다",
-            "Please choose a valid video file or stream URL" => "유효한 비디오 파일 또는 스트림 URL을 선택하세요",
+            "Please choose a valid video file or stream URL" => {
+                "유효한 비디오 파일 또는 스트림 URL을 선택하세요"
+            }
             "Local video file does not exist" => "로컬 비디오 파일이 존재하지 않습니다",
             "Task not found" => "작업을 찾을 수 없습니다",
             "Subtitles Count" => "자막 수",
@@ -289,8 +360,18 @@ pub fn tr(language: UiLanguage, text: &'static str) -> &'static str {
             "Recognition Settings" => "음성 인식 설정",
             "VAD Sensitivity" => "음성 감지 민감도",
             "VAD Sensitivity / Background Audio" => "음성 감지 민감도 / 배경음 설정",
-            "Lower threshold improves recognition under heavy BGM and music, while higher threshold filters background noise." => "임계값을 낮추면 강한 BGM과 음악에서도 인식이 향상되며, 높이면 배경 소음을 차단합니다.",
+            "Lower threshold improves recognition under heavy BGM and music, while higher threshold filters background noise." => {
+                "임계값을 낮추면 강한 BGM과 음악에서도 인식이 향상되며, 높이면 배경 소음을 차단합니다."
+            }
             "High (0.15 - Heavy BGM / Music)" => "높은 감도 (0.15 - 강한 BGM/음악)",
+            "Pause Tolerance & Sentence Continuity" => "문장 연속성 및 일시 정지 허용",
+            "Higher values prevent broken sentences during natural pauses, breathing, or background music; lower values output subtitles with shorter turnarounds." => {
+                "값을 높이면 호흡이나 BGM으로 인한 끊김을 방지하고, 낮추면 더 빠르게 자막을 생성합니다 (240ms - 1200ms)."
+            }
+            "Quick / Short (0.30 - 528ms)" => "빠른 분할 (0.30 - 528ms)",
+            "Balanced (0.60 - 816ms)" => "표준 균형 (0.60 - 816ms)",
+            "Continuous (1.00 - 1200ms)" => "끊김 방지/긴 문장 (1.00 - 1200ms)",
+            "Custom Interval:" => "사용자 지정 간격:",
             "Medium (0.35 - Light BGM)" => "중간 감도 (0.35 - 가벼운 BGM)",
             "Standard (0.50 - Pure Speech)" => "표준 (0.50 - 순수 음성)",
             "Custom Threshold:" => "사용자 지정 임계값:",
@@ -310,17 +391,29 @@ pub fn tr(language: UiLanguage, text: &'static str) -> &'static str {
             "Recognition Completed" => "음성 인식 완료",
             "Ready" => "대기 중",
             "cues generated" => "개 자막 생성됨",
+            "AUDIO FILE" => "오디오 파일",
+            "Audio file detected" => "오디오 파일 감지됨",
+            "Audio Playback" => "오디오 재생",
+            "Media Source" => "미디어 소스",
+            "Enter stream URL or choose local media file..." => "스트림 URL 또는 로컬 파일 선택...",
+            "New Media Task" => "새 미디어 작업",
+            "Local Audio" => "로컬 오디오",
+            "Choose Audio File" => "오디오 파일 선택",
             _ => text,
         },
         UiLanguage::Russian => match text {
             "Media Player" => "Видеоплеер",
-            "Play video files and streams with real-time synchronized subtitles." => "Проигрыватель видеофайлов и стримов с синхронными субтитрами.",
+            "Play video files and streams with real-time synchronized subtitles." => {
+                "Проигрыватель видеофайлов и стримов с синхронными субтитрами."
+            }
             "Video Player" => "Видеоплеер",
             "Video Tasks" => "Задачи видео",
             "New Video" => "Новое видео",
             "Search videos..." => "Поиск видео...",
             "No video tasks yet" => "Нет видеозадач",
-            "Create a new video playback and translation task to get started." => "Создайте задачу для воспроизведения и перевода видео.",
+            "Create a new video playback and translation task to get started." => {
+                "Создайте задачу для воспроизведения и перевода видео."
+            }
             "Task Configuration" => "Настройка задачи",
             "Task Title" => "Название задачи",
             "Enter optional custom title..." => "Введите название...",
@@ -331,7 +424,9 @@ pub fn tr(language: UiLanguage, text: &'static str) -> &'static str {
             "Source Language" => "Язык оригинала",
             "Target Language" => "Язык перевода",
             "Subtitle Mode" => "Режим субтитров",
-            "Real-time speech recognition & translation" => "Распознавание и перевод в реальном времени",
+            "Real-time speech recognition & translation" => {
+                "Распознавание и перевод в реальном времени"
+            }
             "Use imported/existing subtitles" => "Использовать существующие субтитры (SRT)",
             "No subtitles (Video playback only)" => "Без субтитров (только видео)",
             "Choose SRT File" => "Выбрать файл SRT",
@@ -344,7 +439,9 @@ pub fn tr(language: UiLanguage, text: &'static str) -> &'static str {
             "Local Video" => "Локальное видео",
             "Choose Video File" => "Выбрать видеофайл",
             "No video loaded" => "Видео не загружено",
-            "Select a local video file or enter a network stream URL to start playback." => "Выберите видеофайл или введите URL потока для начала воспроизведения.",
+            "Select a local video file or enter a network stream URL to start playback." => {
+                "Выберите видеофайл или введите URL потока для начала воспроизведения."
+            }
             "Play" => "Воспроизвести",
             "Pause" => "Пауза",
             "Mute" => "Выключить звук",
@@ -357,6 +454,7 @@ pub fn tr(language: UiLanguage, text: &'static str) -> &'static str {
             "Hide Subtitles" => "Скрыть субтитры",
             "Export Subtitles" => "Экспорт субтитров",
             "Export SRT" => "Экспорт SRT",
+            "Export LRC" => "Экспорт LRC",
             "Reprocess in Meeting" => "Передать в встречи",
             "VIDEO FILE" => "Видеофайл",
             "STREAM" => "Стрим",
@@ -372,7 +470,9 @@ pub fn tr(language: UiLanguage, text: &'static str) -> &'static str {
             "Reprocess Audio with Meeting Plugin" => "Передать аудио в плагин встреч",
             "Invalid stream URL" => "Недействительный URL потока",
             "Failed to load video file" => "Не удалось загрузить видеофайл",
-            "Please choose a valid video file or stream URL" => "Выберите корректный видеофайл или URL",
+            "Please choose a valid video file or stream URL" => {
+                "Выберите корректный видеофайл или URL"
+            }
             "Local video file does not exist" => "Файл видео не найден",
             "Task not found" => "Задача не найдена",
             "Subtitles Count" => "Количество субтитров",
@@ -385,8 +485,18 @@ pub fn tr(language: UiLanguage, text: &'static str) -> &'static str {
             "Recognition Settings" => "Настройки распознавания",
             "VAD Sensitivity" => "Чувствительность VAD",
             "VAD Sensitivity / Background Audio" => "Чувствительность VAD / Фон",
-            "Lower threshold improves recognition under heavy BGM and music, while higher threshold filters background noise." => "Низкий порог улучшает распознавание при громкой музыке/BGM, высокий — фильтрует шум.",
+            "Lower threshold improves recognition under heavy BGM and music, while higher threshold filters background noise." => {
+                "Низкий порог улучшает распознавание при громкой музыке/BGM, высокий — фильтрует шум."
+            }
             "High (0.15 - Heavy BGM / Music)" => "Высокая (0.15 - Громкая музыка)",
+            "Pause Tolerance & Sentence Continuity" => "Связность речи и допуск пауз",
+            "Higher values prevent broken sentences during natural pauses, breathing, or background music; lower values output subtitles with shorter turnarounds." => {
+                "Увеличение предотвращает разрыв ф装 при вдохах и музыке; уменьшение ускоряет вывод субтитров (240мс - 1200мс)."
+            }
+            "Quick / Short (0.30 - 528ms)" => "Быстрый вывод (0.30 - 528мс)",
+            "Balanced (0.60 - 816ms)" => "Стандарт (0.60 - 816мс)",
+            "Continuous (1.00 - 1200ms)" => "Без разрывов/Длинные (1.00 - 1200мс)",
+            "Custom Interval:" => "Интервал:",
             "Medium (0.35 - Light BGM)" => "Средняя (0.35 - Легкий фон)",
             "Standard (0.50 - Pure Speech)" => "Стандарт (0.50 - Только речь)",
             "Custom Threshold:" => "Пользовательский порог:",
@@ -406,6 +516,16 @@ pub fn tr(language: UiLanguage, text: &'static str) -> &'static str {
             "Recognition Completed" => "Распознавание речи завершено",
             "Ready" => "Готово",
             "cues generated" => "субтитров создано",
+            "AUDIO FILE" => "Аудиофайл",
+            "Audio file detected" => "Обнаружен аудиофайл",
+            "Audio Playback" => "Воспроизведение аудио",
+            "Media Source" => "Источник медиа",
+            "Enter stream URL or choose local media file..." => {
+                "Введите URL или выберите медиафайл..."
+            }
+            "New Media Task" => "Новая медиазадача",
+            "Local Audio" => "Локальное аудио",
+            "Choose Audio File" => "Выбрать аудиофайл",
             _ => text,
         },
     }

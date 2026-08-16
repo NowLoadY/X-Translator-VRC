@@ -11,6 +11,25 @@ pub enum VideoSubtitleMode {
     None,
 }
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize, Default)]
+pub enum MediaType {
+    #[default]
+    Video,
+    AudioOnly,
+}
+
+pub const AUDIO_EXTENSIONS: &[&str] = &[
+    "mp3", "wav", "flac", "aac", "ogg", "m4a", "opus", "wma", "ape", "alac",
+];
+
+pub fn detect_media_type(path: &Path) -> MediaType {
+    path.extension()
+        .and_then(|ext| ext.to_str())
+        .map(|ext| ext.to_lowercase())
+        .filter(|ext| AUDIO_EXTENSIONS.contains(&ext.as_str()))
+        .map_or(MediaType::Video, |_| MediaType::AudioOnly)
+}
+
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct AudioChannelItem {
     pub index: usize,
@@ -26,18 +45,16 @@ pub struct AudioChannelItem {
 impl AudioChannelItem {
     pub fn default_for_count(count: usize) -> Vec<AudioChannelItem> {
         match count {
-            1 => vec![
-                AudioChannelItem {
-                    index: 0,
-                    id: "mono".to_string(),
-                    name: "Mono (单声道)".to_string(),
-                    is_left: true,
-                    is_right: true,
-                    is_center: true,
-                    playback: true,
-                    recognition: true,
-                }
-            ],
+            1 => vec![AudioChannelItem {
+                index: 0,
+                id: "mono".to_string(),
+                name: "Mono (单声道)".to_string(),
+                is_left: true,
+                is_right: true,
+                is_center: true,
+                playback: true,
+                recognition: true,
+            }],
             2 => vec![
                 AudioChannelItem {
                     index: 0,
@@ -351,6 +368,8 @@ pub struct VideoTask {
     pub id: String,
     pub title: String,
     pub source: MediaSource,
+    #[serde(default)]
+    pub media_type: MediaType,
     pub source_language: String,
     pub target_language: String,
     pub subtitle_mode: VideoSubtitleMode,
@@ -375,9 +394,34 @@ fn default_video_recognition() -> RecognitionSettings {
 }
 
 impl VideoTask {
+    #[allow(dead_code)]
     pub fn new(
         title: String,
         source: MediaSource,
+        source_lang: String,
+        target_lang: String,
+        subtitle_mode: VideoSubtitleMode,
+        recognition: RecognitionSettings,
+    ) -> Self {
+        let media_type = match &source {
+            MediaSource::LocalFile(p) => detect_media_type(p),
+            MediaSource::NetworkStream(_) => MediaType::Video,
+        };
+        Self::new_with_media_type(
+            title,
+            source,
+            media_type,
+            source_lang,
+            target_lang,
+            subtitle_mode,
+            recognition,
+        )
+    }
+
+    pub fn new_with_media_type(
+        title: String,
+        source: MediaSource,
+        media_type: MediaType,
         source_lang: String,
         target_lang: String,
         subtitle_mode: VideoSubtitleMode,
@@ -392,6 +436,7 @@ impl VideoTask {
             id: uuid::Uuid::new_v4().to_string(),
             title,
             source,
+            media_type,
             source_language: source_lang,
             target_language: target_lang,
             subtitle_mode,
@@ -448,5 +493,64 @@ impl VideoTaskStore {
 
     pub fn get_mut(&mut self, id: &str) -> Option<&mut VideoTask> {
         self.tasks.iter_mut().find(|t| t.id == id)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_detect_media_type() {
+        assert_eq!(
+            detect_media_type(Path::new("song.mp3")),
+            MediaType::AudioOnly
+        );
+        assert_eq!(
+            detect_media_type(Path::new("audio.wav")),
+            MediaType::AudioOnly
+        );
+        assert_eq!(
+            detect_media_type(Path::new("track.flac")),
+            MediaType::AudioOnly
+        );
+        assert_eq!(
+            detect_media_type(Path::new("voice.m4a")),
+            MediaType::AudioOnly
+        );
+        assert_eq!(
+            detect_media_type(Path::new("podcast.ogg")),
+            MediaType::AudioOnly
+        );
+        assert_eq!(
+            detect_media_type(Path::new("record.opus")),
+            MediaType::AudioOnly
+        );
+        assert_eq!(
+            detect_media_type(Path::new("music.aac")),
+            MediaType::AudioOnly
+        );
+        assert_eq!(detect_media_type(Path::new("video.mp4")), MediaType::Video);
+        assert_eq!(detect_media_type(Path::new("movie.mkv")), MediaType::Video);
+        assert_eq!(detect_media_type(Path::new("clip.webm")), MediaType::Video);
+    }
+
+    #[test]
+    fn test_video_task_backwards_compatible_deserialization() {
+        let json_without_media_type = r#"{
+            "id": "test-123",
+            "title": "Old Task",
+            "source": {"LocalFile": "test.mp4"},
+            "source_language": "ja",
+            "target_language": "zh",
+            "subtitle_mode": "RealtimeTranslation",
+            "created_at_sec": 1000,
+            "last_played_sec": 1000,
+            "duration_ms": 5000,
+            "subtitles": {"cues": [], "enabled": true}
+        }"#;
+
+        let task: VideoTask = serde_json::from_str(json_without_media_type).unwrap();
+        assert_eq!(task.media_type, MediaType::Video);
     }
 }

@@ -30,6 +30,7 @@ impl MpvHandle {
 
         let instance = Self { handle };
         instance.set_property_string("hwdec", "auto-safe")?;
+        instance.set_property_string("keep-open", "always")?;
         instance.set_property_string("msg-level", "all=error")?;
         instance.set_property_string("input-default-bindings", "no")?;
         instance.set_property_string("input-vo-keyboard", "no")?;
@@ -55,7 +56,8 @@ impl MpvHandle {
     fn command(&self, args: &[&str]) -> Result<(), String> {
         let cstrings: Result<Vec<CString>, _> = args.iter().map(|s| CString::new(*s)).collect();
         let cstrings = cstrings.map_err(|e| e.to_string())?;
-        let mut ptrs: Vec<*const std::os::raw::c_char> = cstrings.iter().map(|cs| cs.as_ptr()).collect();
+        let mut ptrs: Vec<*const std::os::raw::c_char> =
+            cstrings.iter().map(|cs| cs.as_ptr()).collect();
         ptrs.push(std::ptr::null());
 
         let err = unsafe { libmpv_sys::mpv_command(self.handle, ptrs.as_mut_ptr()) };
@@ -260,20 +262,25 @@ impl MpvBackend {
 
 impl MediaBackend for MpvBackend {
     fn load_local_file(&mut self, path: PathBuf) -> Result<(), String> {
-        self.mpv
-            .command(&["loadfile", &path.to_string_lossy()])?;
+        self.mpv.command(&["loadfile", &path.to_string_lossy()])?;
         self.status = PlaybackStatus::Playing;
         Ok(())
     }
 
     fn load_stream_url(&mut self, url: String) -> Result<(), String> {
-        self.mpv
-            .command(&["loadfile", &url])?;
+        self.mpv.command(&["loadfile", &url])?;
         self.status = PlaybackStatus::Playing;
         Ok(())
     }
 
     fn play(&mut self) {
+        if let Some(eof) = self.mpv.get_property_bool("eof-reached") {
+            if eof {
+                let _ = self.mpv.command(&["seek", "0", "absolute"]);
+            }
+        } else if self.status == PlaybackStatus::Stopped {
+            let _ = self.mpv.command(&["seek", "0", "absolute"]);
+        }
         let _ = self.mpv.set_property_bool("pause", false);
         self.status = PlaybackStatus::Playing;
     }
@@ -289,8 +296,11 @@ impl MediaBackend for MpvBackend {
     }
 
     fn seek(&mut self, ms: i64) {
-        let secs = ms as f64 / 1000.0;
+        let secs = (ms.max(0) as f64) / 1000.0;
         let _ = self.mpv.command(&["seek", &secs.to_string(), "absolute"]);
+        if self.status == PlaybackStatus::Stopped {
+            self.status = PlaybackStatus::Paused;
+        }
     }
 
     fn set_volume(&mut self, volume: f32) {
@@ -321,22 +331,32 @@ impl MediaBackend for MpvBackend {
         let now = Instant::now();
         if now.duration_since(*last_poll) >= Duration::from_millis(250) {
             *last_poll = now;
-            let hwdec_current = self.mpv
+            let hwdec_current = self
+                .mpv
                 .get_property_string("hwdec-current")
                 .unwrap_or_else(|| "no".to_string());
-            let video_codec = self.mpv
+            let video_codec = self
+                .mpv
                 .get_property_string("video-format")
-                .unwrap_or_else(|| self.mpv.get_property_string("video-codec").unwrap_or_default());
-            let width = self.mpv
+                .unwrap_or_else(|| {
+                    self.mpv
+                        .get_property_string("video-codec")
+                        .unwrap_or_default()
+                });
+            let width = self
+                .mpv
                 .get_property_i64("dwidth")
                 .unwrap_or_else(|| self.mpv.get_property_i64("video-params/w").unwrap_or(0));
-            let height = self.mpv
+            let height = self
+                .mpv
                 .get_property_i64("dheight")
                 .unwrap_or_else(|| self.mpv.get_property_i64("video-params/h").unwrap_or(0));
-            let fps = self.mpv
+            let fps = self
+                .mpv
                 .get_property_f64("estimated-vf-fps")
                 .unwrap_or_else(|| self.mpv.get_property_f64("container-fps").unwrap_or(0.0));
-            let dropped_frames = self.mpv
+            let dropped_frames = self
+                .mpv
                 .get_property_i64("vo-drop-frame-count")
                 .unwrap_or_else(|| self.mpv.get_property_i64("drop-frame-count").unwrap_or(0));
 
@@ -360,7 +380,9 @@ impl MediaBackend for MpvBackend {
                 self.status = PlaybackStatus::Stopped;
             } else if event_id == libmpv_sys::mpv_event_id_MPV_EVENT_PLAYBACK_RESTART {
                 if let Some(duration) = self.mpv.get_property_f64("duration") {
-                    self.duration_ms = (duration * 1000.0) as i64;
+                    if duration > 0.0 {
+                        self.duration_ms = (duration * 1000.0) as i64;
+                    }
                 }
                 if !self.active_channels.is_empty() {
                     let channels = self.active_channels.clone();
@@ -369,10 +391,18 @@ impl MediaBackend for MpvBackend {
             }
         }
 
+        if let Some(eof) = self.mpv.get_property_bool("eof-reached") {
+            if eof && self.status == PlaybackStatus::Playing {
+                self.status = PlaybackStatus::Stopped;
+            }
+        }
+
         if let Some(paused) = self.mpv.get_property_bool("pause") {
             if paused && self.status == PlaybackStatus::Playing {
                 self.status = PlaybackStatus::Paused;
-            } else if !paused && self.status == PlaybackStatus::Paused {
+            } else if !paused
+                && (self.status == PlaybackStatus::Paused || self.status == PlaybackStatus::Stopped)
+            {
                 self.status = PlaybackStatus::Playing;
             }
         }
@@ -472,6 +502,12 @@ impl MediaBackend for MpvBackend {
             log::info!("Applied MPV audio filter: {}", filter);
         }
     }
+
+    fn set_audio_only_mode(&mut self, enabled: bool) {
+        let _ = self
+            .mpv
+            .set_property_string("vid", if enabled { "no" } else { "auto" });
+    }
 }
 
 #[cfg(test)]
@@ -483,7 +519,11 @@ mod tests {
     fn mpv_backend_initializes_when_dll_present() {
         if is_mpv_dll_available() {
             let backend = MpvBackend::new();
-            assert!(backend.is_ok(), "MpvBackend::new() failed: {:?}", backend.err());
+            assert!(
+                backend.is_ok(),
+                "MpvBackend::new() failed: {:?}",
+                backend.err()
+            );
             let b = backend.unwrap();
             assert_eq!(b.get_status(), PlaybackStatus::Stopped);
         }
@@ -500,7 +540,7 @@ mod tests {
         // 1. Stereo - only Right channel enabled (FL off, FR on)
         let mut stereo_channels = AudioChannelItem::default_for_count(2);
         stereo_channels[0].playback = false; // FL off
-        stereo_channels[1].playback = true;  // FR on
+        stereo_channels[1].playback = true; // FR on
         backend.set_channel_routing(&stereo_channels);
         let af = backend.mpv.get_property_string("af").unwrap_or_default();
         assert!(
@@ -510,7 +550,7 @@ mod tests {
         );
 
         // 2. Stereo - only Left channel enabled (FL on, FR off)
-        stereo_channels[0].playback = true;  // FL on
+        stereo_channels[0].playback = true; // FL on
         stereo_channels[1].playback = false; // FR off
         backend.set_channel_routing(&stereo_channels);
         let af = backend.mpv.get_property_string("af").unwrap_or_default();
@@ -536,7 +576,10 @@ mod tests {
         stereo_channels[1].playback = true;
         backend.set_channel_routing(&stereo_channels);
         let af = backend.mpv.get_property_string("af").unwrap_or_default();
-        assert_eq!(af, "", "All channels on should result in empty filter string");
+        assert_eq!(
+            af, "",
+            "All channels on should result in empty filter string"
+        );
 
         // 5. 5.1 Surround - only Center (FC) enabled
         let mut surround_channels = AudioChannelItem::default_for_count(6);
