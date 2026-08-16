@@ -113,7 +113,7 @@ pub fn render_toolbar(
                         {
                             plugin.draft_mut().show_speaker_number = speaker_number_enabled;
                             let _ = plugin.apply_draft();
-                            actions.push(super::OscUiAction::SetSpeakerRecognitionEnabled(
+                            actions.push(super::OscUiAction::SetSpeakerNumberVisible(
                                 speaker_number_enabled,
                             ));
                             actions.push(super::OscUiAction::SaveSettings);

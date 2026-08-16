@@ -10,9 +10,7 @@ mod plugin_session;
 mod subscriber;
 
 pub use owner::{PluginSessionOwner, TranslationSessionOwner};
-pub use plugin_session::{
-    PluginSessionBinding, SessionOutputPolicy, SpeakerRecognitionPolicy, TranslationSessionPlugin,
-};
+pub use plugin_session::{PluginSessionBinding, SessionOutputPolicy, TranslationSessionPlugin};
 pub use subscriber::{
     CaptionUpdate, HostOutputEvent, HostOutputSubscriber, SessionEventSubscriber,
 };
@@ -68,5 +66,16 @@ mod architecture_tests {
                 "shared infrastructure must not import a concrete plugin: {path}"
             );
         }
+    }
+
+    #[test]
+    fn plugin_session_contract_cannot_disable_recognition_metadata() {
+        let contract = include_str!("plugin_session.rs");
+        assert!(!contract.contains("SpeakerRecognition"));
+        assert!(!contract.contains("speaker_recognition"));
+
+        let osc_ui = include_str!("../plugins/osc/ui/mod.rs");
+        assert!(osc_ui.contains("SetSpeakerNumberVisible"));
+        assert!(!osc_ui.contains("SetSpeakerRecognitionEnabled"));
     }
 }

@@ -13,7 +13,7 @@ use tokio_tungstenite::{
     tungstenite::{self, Message},
 };
 use xrtranslate_protocol::{
-    CorpusTermMatch, DrainReason, SegmentBoundary, SegmentTiming,
+    CorpusTermMatch, DrainReason, InferenceWorkload, SegmentBoundary, SegmentTiming,
     ServerEvent as ProtocolServerEvent,
 };
 
@@ -119,6 +119,7 @@ pub enum SessionEvent {
 
 pub struct SessionHandle {
     stop_requested: Arc<AtomicBool>,
+    cancel_requested: Arc<AtomicBool>,
     paused: Arc<AtomicBool>,
     command_tx: mpsc::Sender<SessionCommand>,
 }
@@ -144,10 +145,10 @@ enum SessionCommand {
         target_lang: String,
     },
     SetTtsEnabled(bool),
-    SetSpeakerRecognitionEnabled(bool),
     Pause,
     Resume,
     Finish,
+    Cancel,
 }
 
 impl SessionCommand {
@@ -183,10 +184,10 @@ impl SessionCommand {
 }
 
 impl SessionHandle {
-    /// Gracefully finishes the session. Kept as the compatibility entrypoint
-    /// used by the existing translation UI.
+    /// Immediately cancels pending inference. Finite inputs use [`Self::finish`]
+    /// at EOF when their complete ordered output is required.
     pub fn stop(&self) {
-        self.finish();
+        self.cancel();
     }
 
     /// Flushes the current VAD turn while retaining the live WebSocket,
@@ -218,6 +219,15 @@ impl SessionHandle {
         let _ = self.command_tx.try_send(SessionCommand::Finish);
     }
 
+    pub fn cancel(&self) {
+        if self.stop_requested.swap(true, Ordering::AcqRel) {
+            return;
+        }
+        self.cancel_requested.store(true, Ordering::Release);
+        self.paused.store(true, Ordering::Release);
+        let _ = self.command_tx.try_send(SessionCommand::Cancel);
+    }
+
     pub fn update_language_route(&self, source_lang: String, target_lang: String) {
         let _ = self
             .command_tx
@@ -231,12 +241,6 @@ impl SessionHandle {
         let _ = self
             .command_tx
             .try_send(SessionCommand::SetTtsEnabled(enabled));
-    }
-
-    pub fn set_speaker_recognition_enabled(&self, enabled: bool) {
-        let _ = self
-            .command_tx
-            .try_send(SessionCommand::SetSpeakerRecognitionEnabled(enabled));
     }
 
     /// Reconfigure the backend audio stream after replacing the local capture
@@ -286,7 +290,6 @@ pub struct SessionConfig {
     pub server_url: String,
     pub source_lang: String,
     pub target_lang: String,
-    pub speaker_recognition_enabled: bool,
     pub external_audio_gate: ExternalAudioGate,
     /// Controls presentation in the host translation UI and external caption
     /// plugins. Domain plugins still receive the typed segment stream.
@@ -311,6 +314,8 @@ pub fn start_session(
     let stream_id = NEXT_STREAM_ID.fetch_add(1, Ordering::Relaxed);
     let stop_requested = Arc::new(AtomicBool::new(false));
     let runtime_stop = Arc::clone(&stop_requested);
+    let cancel_requested = Arc::new(AtomicBool::new(false));
+    let runtime_cancel = Arc::clone(&cancel_requested);
     let paused = Arc::new(AtomicBool::new(false));
     let runtime_paused = Arc::clone(&paused);
     // Bound pending configuration updates.
@@ -335,6 +340,7 @@ pub fn start_session(
                 event_tx,
                 config,
                 runtime_stop,
+                runtime_cancel,
                 runtime_paused,
                 command_rx,
                 stream_id,
@@ -344,6 +350,7 @@ pub fn start_session(
 
     SessionHandle {
         stop_requested,
+        cancel_requested,
         paused,
         command_tx,
     }
@@ -354,6 +361,7 @@ async fn run_session(
     event_tx: Sender<SessionEvent>,
     config: SessionConfig,
     stop_requested: Arc<AtomicBool>,
+    cancel_requested: Arc<AtomicBool>,
     paused: Arc<AtomicBool>,
     mut command_rx: mpsc::Receiver<SessionCommand>,
     stream_id: u64,
@@ -362,7 +370,6 @@ async fn run_session(
         server_url,
         source_lang,
         target_lang,
-        speaker_recognition_enabled,
         external_audio_gate,
         publish_to_host_outputs,
         tts: tts_handle,
@@ -373,6 +380,11 @@ async fn run_session(
         mut audio_source,
         finish_when_audio_ends,
     } = config;
+    let workload = if finish_when_audio_ends {
+        InferenceWorkload::Offline
+    } else {
+        InferenceWorkload::Realtime
+    };
     let _ = event_tx.send(SessionEvent::Status("Connecting to backend…".into()));
     let (stream, _) = match connect_async(&server_url).await {
         Ok(connection) => connection,
@@ -408,7 +420,7 @@ async fn run_session(
         json!({
             "action": "toggle_feature",
             "feature": "speaker_recognition",
-            "enabled": speaker_recognition_enabled,
+            "enabled": true,
         }),
     )
     .await
@@ -429,6 +441,7 @@ async fn run_session(
             "vad_silence_ms": vad_silence_ms,
             "continuous_recognition": continuous_recognition,
             "audio_source": audio_source_name(audio_source),
+            "workload": workload,
         }),
     )
     .await
@@ -468,6 +481,10 @@ async fn run_session(
     loop {
         tokio::select! {
             _ = ticker.tick() => {
+                if cancel_requested.load(Ordering::Acquire) {
+                    let _ = write.close().await;
+                    return;
+                }
                 if stop_requested.load(Ordering::Acquire) {
                     if !finish_sent {
                         if let Err(error) = send_json(&mut write, json!({"event": "finish"})).await {
@@ -479,6 +496,10 @@ async fn run_session(
                 }
             }
             Some(command) = command_rx.recv() => {
+                if matches!(command, SessionCommand::Cancel) {
+                    let _ = write.close().await;
+                    return;
+                }
                 let is_finish = matches!(&command, SessionCommand::Finish);
                 let is_resume = matches!(&command, SessionCommand::Resume);
                 if command.resets_recognition_stream() {
@@ -622,17 +643,6 @@ where
             )
             .await
         }
-        SessionCommand::SetSpeakerRecognitionEnabled(enabled) => {
-            send_json(
-                write,
-                json!({
-                    "action": "toggle_feature",
-                    "feature": "speaker_recognition",
-                    "enabled": enabled,
-                }),
-            )
-            .await
-        }
         SessionCommand::ResetAudioPipeline {
             source_lang,
             target_lang,
@@ -679,6 +689,7 @@ where
         SessionCommand::Pause => send_json(write, json!({"event": "pause"})).await,
         SessionCommand::Resume => send_json(write, json!({"event": "resume"})).await,
         SessionCommand::Finish => send_json(write, json!({"event": "finish"})).await,
+        SessionCommand::Cancel => unreachable!("cancel closes the WebSocket before dispatch"),
     }
 }
 

@@ -9,12 +9,12 @@
 ```text
 PCM16/16 kHz
   -> Silero VAD（含预卷与硬切片重叠）
-  -> 绝对音频时间戳
-  -> Qwen3-ASR
-  -> 仅在转写有效且统一开关开启时：
+  -> 仅对 VAD 活跃语音：
   -> 80 维 Kaldi FBank + CMN
   -> ERes2NetV2 ONNX（L2 归一化声纹）
-  -> 有界在线余弦聚类（speaker-01、speaker-02…）
+  -> 稳定候选确认 + 有界在线余弦聚类（speaker-01、speaker-02…）
+  -> 说话人边界与绝对音频时间戳
+  -> Qwen3-ASR
   -> 源文本分段与单调时间分配
   -> Hy-MT2 两路有序并发翻译
   -> WebSocket / UI / OSC
@@ -70,7 +70,7 @@ models/3D-Speaker-ERes2NetV2/speaker_embedding.onnx
 
 时间相对于当前 audio generation。ASR 目前不返回词级时间戳，因此一个 VAD 片段被拆成多句时，会按各句 Unicode 字符数比例分配连续区间；这保证顺序、边界和说话人元数据一致，但不是强制对齐结果。
 
-Rust 客户端会在 Recognition History 与 Translation History 中显示紧凑的 `S1`、`S2` 标签和对应时间范围。OSC 工作台的“启用声纹识别并显示编号”是统一开关：开启后才加载并运行声纹模型，同时给 VRChat Chatbox 添加 `[S1]` 形式的前缀；关闭后既不计算声纹，也不占用额外字符。
+Rust 客户端会在 Recognition History 与 Translation History 中显示紧凑的 `S1`、`S2` 标签和对应时间范围。声纹身份是识别基础设施提供的标准元数据，在服务端配置允许且模型可用时随识别工作流运行。OSC 工作台的“说话人编号”只控制 VRChat Chatbox 是否添加 `[S1]` 形式的前缀；关闭仅节省 OSC 字符，不会关闭声纹计算，也不会移除其他消费者收到的身份元数据。
 
 ## 能力边界
 

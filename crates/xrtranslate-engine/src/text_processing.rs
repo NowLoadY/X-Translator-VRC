@@ -6,6 +6,11 @@
 //! across all supported languages (including Cyrillic, Latin script with accents,
 //! CJK, Kana, Hangul, etc.) based on the active translation task.
 
+mod sentence_boundary;
+
+pub use sentence_boundary::ends_at_sentence_boundary;
+use sentence_boundary::is_translation_boundary;
+
 /// Maximum number of Unicode scalar values held before a comma may split an
 /// otherwise unfinished translation segment.
 pub const TRANSLATION_SOFT_SEGMENT_LIMIT: usize = 72;
@@ -53,9 +58,10 @@ fn split_translation_segments_internal(text: &str, emit_unterminated: bool) -> V
 
     let mut segments = Vec::new();
     let mut buffer = Vec::new();
-    for character in value.chars() {
+    let characters = value.chars().collect::<Vec<_>>();
+    for (index, &character) in characters.iter().enumerate() {
         buffer.push(character);
-        if HARD_TRANSLATION_BOUNDARIES.contains(&character) {
+        if is_translation_boundary(&characters, index) {
             push_translation_segment(&mut segments, &buffer, emit_unterminated);
             buffer.clear();
             continue;
@@ -119,7 +125,8 @@ pub fn remove_transcript_overlap(previous: &str, current: &str) -> String {
     let matched = (1..=maximum).rev().find(|&count| {
         let left = &previous_tokens[previous_tokens.len() - count..];
         let right = &current_tokens[..count];
-        let exact_match = left.iter()
+        let exact_match = left
+            .iter()
             .zip(right)
             .all(|(left, right)| left.normalized == right.normalized);
         if exact_match {
@@ -137,7 +144,10 @@ pub fn remove_transcript_overlap(previous: &str, current: &str) -> String {
 
         // Subword / concatenated match
         let left_concat: String = left.iter().map(|token| token.normalized.as_str()).collect();
-        let right_concat: String = right.iter().map(|token| token.normalized.as_str()).collect();
+        let right_concat: String = right
+            .iter()
+            .map(|token| token.normalized.as_str())
+            .collect();
         if left_concat == right_concat && (left_concat.chars().count() >= 4 || count >= 2) {
             return true;
         }
@@ -654,12 +664,53 @@ pub fn is_split_word_pair(left: &str, right: &str) -> bool {
             "er" | "est" => {
                 if matches!(
                     l.as_str(),
-                    "fast" | "slow" | "high" | "low" | "big" | "bigg" | "small" | "larg" | "great"
-                        | "bett" | "furth" | "earli" | "lat" | "long" | "short" | "old" | "young"
-                        | "new" | "hard" | "easi" | "clear" | "simpl" | "strong" | "smart" | "cool"
-                        | "warm" | "deep" | "rich" | "poor" | "tall" | "quick" | "dark" | "bright"
-                        | "hot" | "hott" | "cold" | "clean" | "fresh" | "tough" | "rough" | "light"
-                        | "heavi" | "wid" | "saf" | "fin" | "nic" | "clos"
+                    "fast"
+                        | "slow"
+                        | "high"
+                        | "low"
+                        | "big"
+                        | "bigg"
+                        | "small"
+                        | "larg"
+                        | "great"
+                        | "bett"
+                        | "furth"
+                        | "earli"
+                        | "lat"
+                        | "long"
+                        | "short"
+                        | "old"
+                        | "young"
+                        | "new"
+                        | "hard"
+                        | "easi"
+                        | "clear"
+                        | "simpl"
+                        | "strong"
+                        | "smart"
+                        | "cool"
+                        | "warm"
+                        | "deep"
+                        | "rich"
+                        | "poor"
+                        | "tall"
+                        | "quick"
+                        | "dark"
+                        | "bright"
+                        | "hot"
+                        | "hott"
+                        | "cold"
+                        | "clean"
+                        | "fresh"
+                        | "tough"
+                        | "rough"
+                        | "light"
+                        | "heavi"
+                        | "wid"
+                        | "saf"
+                        | "fin"
+                        | "nic"
+                        | "clos"
                 ) {
                     return true;
                 }
@@ -1017,22 +1068,10 @@ mod tests {
             remove_transcript_overlap("今天我们去公园", "去公园然后吃饭"),
             "然后吃饭"
         );
-        assert_eq!(
-            remove_transcript_overlap("今天天气真好", "好"),
-            ""
-        );
-        assert_eq!(
-            remove_transcript_overlap("今日はいい天気ですね", "ね"),
-            ""
-        );
-        assert_eq!(
-            remove_transcript_overlap("ありがとうございます", "す"),
-            ""
-        );
-        assert_eq!(
-            remove_transcript_overlap("I saw a dog", "dog"),
-            ""
-        );
+        assert_eq!(remove_transcript_overlap("今天天气真好", "好"), "");
+        assert_eq!(remove_transcript_overlap("今日はいい天気ですね", "ね"), "");
+        assert_eq!(remove_transcript_overlap("ありがとうございます", "す"), "");
+        assert_eq!(remove_transcript_overlap("I saw a dog", "dog"), "");
         assert_eq!(
             remove_transcript_overlap("yes", "yes, yes we can"),
             "yes, yes we can"
@@ -1117,6 +1156,53 @@ mod tests {
     }
 
     #[test]
+    fn dotted_abbreviations_do_not_fragment_translation_segments() {
+        assert_eq!(
+            split_translation_segments(
+                "The status is O.K. and the clock says 3 p.m. today. Next sentence."
+            ),
+            vec![
+                "The status is O.K. and the clock says 3 p.m. today.",
+                "Next sentence."
+            ]
+        );
+        assert_eq!(
+            split_translation_segments("The U.S. Army recognizes a Ph.D. degree."),
+            vec!["The U.S. Army recognizes a Ph.D. degree."]
+        );
+        assert_eq!(
+            split_translation_segments("Everything is O.K."),
+            vec!["Everything is O.K."]
+        );
+    }
+
+    #[test]
+    fn structural_period_rules_cover_numbers_domains_initials_and_ellipsis() {
+        assert_eq!(
+            split_translation_segments(
+                "Version 3.14 is hosted at example.org. J. K. Rowling agrees... Next."
+            ),
+            vec![
+                "Version 3.14 is hosted at example.org.",
+                "J. K. Rowling agrees...",
+                "Next."
+            ]
+        );
+        assert!(!ends_at_sentence_boundary("Everything remains O.K."));
+        assert!(!ends_at_sentence_boundary("Meet me at 3 p.m."));
+        assert!(ends_at_sentence_boundary("Everything remains okay."));
+        assert!(ends_at_sentence_boundary("Wait..."));
+    }
+
+    #[test]
+    fn ambiguous_abbreviation_followed_by_a_capital_is_kept_with_context() {
+        assert_eq!(
+            split_translation_segments("Meet at 5 p.m. Tomorrow we leave."),
+            vec!["Meet at 5 p.m. Tomorrow we leave."]
+        );
+    }
+
+    #[test]
     fn matches_python_terminal_boundary_filtering() {
         assert_eq!(
             split_translation_segments("unterminated tail"),
@@ -1139,17 +1225,16 @@ mod tests {
             "worked really well"
         );
         assert_eq!(
-            collapse_asr_split_words("So, literally, what reinforcement learning does is it goes to the ones that worked real ly well."),
+            collapse_asr_split_words(
+                "So, literally, what reinforcement learning does is it goes to the ones that worked real ly well."
+            ),
             "So, literally, what reinforcement learning does is it goes to the ones that worked really well."
         );
         assert_eq!(
             collapse_asr_split_words("reinforce ment learn ing"),
             "reinforcement learning"
         );
-        assert_eq!(
-            collapse_asr_split_words("nine ty-seven"),
-            "ninety-seven"
-        );
+        assert_eq!(collapse_asr_split_words("nine ty-seven"), "ninety-seven");
         assert_eq!(
             collapse_asr_split_words("every thing can not be done with out you"),
             "everything cannot be done without you"
@@ -1158,23 +1243,14 @@ mod tests {
             collapse_asr_split_words("un der stand ing"),
             "understanding"
         );
-        assert_eq!(
-            collapse_asr_split_words("REAL LY GOOD"),
-            "REALLY GOOD"
-        );
-        assert_eq!(
-            collapse_asr_split_words("Real ly Good"),
-            "Really Good"
-        );
+        assert_eq!(collapse_asr_split_words("REAL LY GOOD"), "REALLY GOOD");
+        assert_eq!(collapse_asr_split_words("Real ly Good"), "Really Good");
     }
 
     #[test]
     fn removes_transcript_overlap_with_split_and_partial_words() {
         assert_eq!(
-            remove_transcript_overlap(
-                "So it worked real",
-                "really well, then we left."
-            ),
+            remove_transcript_overlap("So it worked real", "really well, then we left."),
             "well, then we left."
         );
         assert_eq!(
@@ -1185,12 +1261,8 @@ mod tests {
             "well, and then we turned."
         );
         assert_eq!(
-            remove_transcript_overlap(
-                "reinforce ment",
-                "reinforcement learning"
-            ),
+            remove_transcript_overlap("reinforce ment", "reinforcement learning"),
             "learning"
         );
     }
 }
-

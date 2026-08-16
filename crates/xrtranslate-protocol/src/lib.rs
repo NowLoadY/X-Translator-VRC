@@ -181,6 +181,8 @@ pub enum EventControl {
         vad_silence_ms: Option<u32>,
         #[serde(default, skip_serializing_if = "is_false")]
         continuous_recognition: bool,
+        #[serde(default, skip_serializing_if = "is_realtime_workload")]
+        workload: InferenceWorkload,
     },
     /// Flushes the active turn and temporarily rejects further binary audio.
     /// The WebSocket, timeline, and speaker state remain alive.
@@ -199,6 +201,16 @@ pub enum EventControl {
     TurnStarted { turn_id: String },
 }
 
+/// Scheduling intent for a stream. It affects admission and fairness, never
+/// recognition or translation semantics.
+#[derive(Debug, Default, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum InferenceWorkload {
+    #[default]
+    Realtime,
+    Offline,
+}
+
 /// Session features that can be changed while connected.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
@@ -209,6 +221,10 @@ pub enum Feature {
 
 const fn is_default_audio_source(source: &AudioSource) -> bool {
     matches!(source, AudioSource::Microphone)
+}
+
+const fn is_realtime_workload(workload: &InferenceWorkload) -> bool {
+    matches!(workload, InferenceWorkload::Realtime)
 }
 
 /// JSON events sent from the backend to a WebSocket client.
@@ -374,9 +390,13 @@ pub struct RecognitionStreamEnded {
 /// Latency values reported to the client in milliseconds.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 pub struct LatencyMetrics {
+    #[serde(default)]
+    pub queue_ms: u64,
     pub asr_ms: u64,
     pub mt_ms: u64,
     pub tts_ms: u64,
+    #[serde(default)]
+    pub total_ms: u64,
 }
 
 /// Signals that the preceding binary TTS audio has been fully sent.
@@ -445,9 +465,30 @@ mod tests {
                 vad_threshold: None,
                 vad_silence_ms: None,
                 continuous_recognition: false,
+                workload: InferenceWorkload::Realtime,
             })
         );
         assert_eq!(serde_json::to_string(&control).unwrap(), json);
+    }
+
+    #[test]
+    fn offline_workload_is_explicit_while_realtime_stays_wire_compatible() {
+        let control = ClientControl::Event(EventControl::ConfigAudio {
+            sample_rate: 16_000,
+            source_lang: "ja".into(),
+            target_lang: "zh".into(),
+            audio_source: AudioSource::SystemAudio,
+            vad_threshold: None,
+            vad_silence_ms: None,
+            continuous_recognition: false,
+            workload: InferenceWorkload::Offline,
+        });
+        let json = serde_json::to_string(&control).unwrap();
+        assert!(json.contains(r#""workload":"offline""#));
+        assert_eq!(
+            serde_json::from_str::<ClientControl>(&json).unwrap(),
+            control
+        );
     }
 
     #[test]
@@ -528,9 +569,11 @@ mod tests {
                 clone_audio_path: String::new(),
                 tts_audio_path: String::new(),
                 metrics: LatencyMetrics {
+                    queue_ms: 0,
                     asr_ms: 12,
                     mt_ms: 34,
                     tts_ms: 0,
+                    total_ms: 0,
                 },
             })
         );

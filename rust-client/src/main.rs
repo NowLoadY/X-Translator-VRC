@@ -74,6 +74,10 @@ pub const LANGUAGE_OPTIONS: &[(&str, &str)] = &[
     ("nl", "Dutch"),
 ];
 
+/// Capture callbacks never block. A bounded handoff prevents an overloaded
+/// network/model path from turning old audio into ever-growing live latency.
+const LIVE_AUDIO_QUEUE_CAPACITY: usize = 64;
+
 fn language_label(ui_language: UiLanguage, code: &str) -> &'static str {
     if code == "auto" {
         return i18n::tr(ui_language, "Auto (bidirectional)");
@@ -155,7 +159,6 @@ struct XRTranslateApp {
     target_lang: String,
     denoise_enabled: bool,
     tts_enabled: bool,
-    speaker_recognition_enabled: bool,
     osc_plugin: OscPlugin,
     meeting_plugin: MeetingPlugin,
     player_plugin: plugins::player::VideoPlayerPlugin,
@@ -685,7 +688,6 @@ impl Default for XRTranslateApp {
             target_lang: settings.target_lang,
             denoise_enabled: settings.denoise_enabled,
             tts_enabled: settings.tts_enabled,
-            speaker_recognition_enabled: settings.speaker_recognition_enabled,
             osc_plugin,
             meeting_plugin,
             player_plugin,
@@ -755,10 +757,6 @@ impl XRTranslateApp {
     ) -> SessionConfig {
         let publish_to_host_outputs =
             plugin.is_none_or(PluginSessionBinding::publish_to_host_outputs);
-        let speaker_recognition_enabled = plugin
-            .map_or(self.speaker_recognition_enabled, |binding| {
-                binding.speaker_recognition_enabled(self.speaker_recognition_enabled)
-            });
         let host_tts = plugin.is_none_or(|binding| binding.host_tts);
         let external_audio_gate = plugin.is_none_or(|binding| binding.external_audio_gate);
         let finish_when_audio_ends = plugin.is_some_and(|binding| binding.finish_when_audio_ends);
@@ -767,7 +765,6 @@ impl XRTranslateApp {
             server_url: self.server_url.clone(),
             source_lang: self.source_lang.clone(),
             target_lang: self.target_lang.clone(),
-            speaker_recognition_enabled,
             external_audio_gate: if external_audio_gate {
                 ExternalAudioGate::new(
                     self.osc_plugin.mute_state(),
@@ -790,10 +787,6 @@ impl XRTranslateApp {
             audio_source,
             finish_when_audio_ends,
         }
-    }
-
-    pub(crate) fn meeting_session_active(&self) -> bool {
-        self.meeting_plugin.controller.active_meeting_id().is_some()
     }
 
     pub(crate) fn open_plugin(&mut self, id: PluginId) {
@@ -866,8 +859,8 @@ impl XRTranslateApp {
                 OscUiAction::SetMuteGateEnabled(enabled) => {
                     self.set_mute_self_pauses_translation(enabled)
                 }
-                OscUiAction::SetSpeakerRecognitionEnabled(enabled) => {
-                    self.set_osc_speaker_number_enabled(enabled)
+                OscUiAction::SetSpeakerNumberVisible(enabled) => {
+                    self.set_osc_speaker_number_visible(enabled)
                 }
                 OscUiAction::SaveSettings => self.save_settings(),
                 OscUiAction::SettingsApplied(result) => match result {
@@ -1156,7 +1149,6 @@ impl XRTranslateApp {
             target_lang: self.target_lang.clone(),
             denoise_enabled: self.denoise_enabled,
             tts_enabled: self.tts_enabled,
-            speaker_recognition_enabled: self.speaker_recognition_enabled,
             mute_self_pauses_translation: self.mute_self_pauses_translation.load(Ordering::Relaxed),
             ui_language: self.ui_language,
             first_run: self.first_run,
@@ -1419,7 +1411,7 @@ impl XRTranslateApp {
             .is_none_or(PluginSessionBinding::publish_to_host_outputs);
         let session_channels = routes
             .iter()
-            .map(|_| unbounded::<Vec<f32>>())
+            .map(|_| bounded::<Vec<f32>>(LIVE_AUDIO_QUEUE_CAPACITY))
             .collect::<Vec<_>>();
         let recording_sink = self.start_meeting_recording();
         let mut meeting_audio_routers = Vec::new();
@@ -1944,17 +1936,11 @@ impl XRTranslateApp {
         }
     }
 
-    /// Updates the unified speaker-recognition setting.
-    fn set_osc_speaker_number_enabled(&mut self, enabled: bool) {
+    /// Controls only whether OSC presentation includes the infrastructure-provided ID.
+    fn set_osc_speaker_number_visible(&mut self, enabled: bool) {
         let enabled = enabled
             && crate::feature_access::is_available(crate::feature_access::Feature::SpeakerNumbers);
-        self.speaker_recognition_enabled = enabled;
         self.osc_plugin.draft_mut().show_speaker_number = enabled;
-        if !self.meeting_session_active() {
-            for session in &self.sessions {
-                session.set_speaker_recognition_enabled(enabled);
-            }
-        }
         match self.osc_plugin.apply_draft() {
             Ok(()) => self.last_error = None,
             Err(error) => self.last_error = Some(error),
@@ -2109,10 +2095,10 @@ impl XRTranslateApp {
         self.host_audio_import = None;
         self.pending_audio_import = None;
         self.backend_start_deadline = None;
-        // Closing every capture sender and finishing sessions ensures background
-        // import/network threads drain and exit cleanly.
+        // User-initiated stop cancels queued inference. Natural finite-input
+        // EOF still uses the ordered drain path in the network session.
         for session in &self.sessions {
-            session.finish();
+            session.cancel();
         }
         self.sessions.clear();
         if let Some(recording) = self.meeting_plugin.meeting_recording.take()
@@ -2237,7 +2223,7 @@ fn spawn_meeting_audio_router(
     recording: plugins::meeting::recording::RecordingSink,
     source: CaptureSource,
 ) -> (Sender<Vec<f32>>, std::thread::JoinHandle<()>) {
-    let (capture_tx, capture_rx) = unbounded::<Vec<f32>>();
+    let (capture_tx, capture_rx) = bounded::<Vec<f32>>(LIVE_AUDIO_QUEUE_CAPACITY);
     let track = match source {
         CaptureSource::Microphone => plugins::meeting::recording::RecordingTrack::Microphone,
         CaptureSource::SystemAudio => plugins::meeting::recording::RecordingTrack::SystemAudio,

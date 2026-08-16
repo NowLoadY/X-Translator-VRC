@@ -7,6 +7,8 @@
 
 #![forbid(unsafe_code)]
 
+mod stability;
+
 use std::{
     error::Error,
     f32::consts::PI,
@@ -17,6 +19,7 @@ use std::{
 
 use ndarray::Array3;
 use ort::{session::Session, value::Value};
+use stability::{StableIdentityDecision, StableIdentityTracker};
 
 pub const SAMPLE_RATE_HZ: u32 = 16_000;
 pub const FEATURE_DIMENSIONS: usize = 80;
@@ -175,6 +178,18 @@ pub struct SpeakerAssignment {
 }
 
 #[derive(Debug)]
+struct SpeakerObservation {
+    embedding: Vec<f32>,
+    matched_index: Option<usize>,
+    best_index: Option<usize>,
+    similarity: f32,
+}
+
+fn speaker_id(index: usize) -> String {
+    format!("speaker-{:02}", index + 1)
+}
+
+#[derive(Debug)]
 struct SpeakerCentroid {
     embedding: Vec<f32>,
     observations: u32,
@@ -210,32 +225,40 @@ impl OnlineSpeakerTracker {
     }
 
     pub fn assign(&mut self, embedding: &[f32]) -> Result<SpeakerAssignment, SpeakerError> {
+        let observation = self.observe(embedding, true)?;
+        self.commit(observation)
+    }
+
+    fn observe(
+        &self,
+        embedding: &[f32],
+        prefer_previous: bool,
+    ) -> Result<SpeakerObservation, SpeakerError> {
         let embedding = normalize_embedding(embedding.to_vec())?;
-        let scores = self
-            .centroids
-            .iter()
-            .enumerate()
-            .map(|(index, centroid)| (index, cosine(&embedding, &centroid.embedding)))
-            .collect::<Vec<_>>();
-        let best = scores
-            .iter()
-            .copied()
-            .max_by(|left, right| left.1.total_cmp(&right.1));
+        let mut best = None;
+        let mut previous_similarity = None;
+        for (index, centroid) in self.centroids.iter().enumerate() {
+            let similarity = cosine(&embedding, &centroid.embedding);
+            if self.previous_speaker == Some(index) {
+                previous_similarity = Some(similarity);
+            }
+            if best.is_none_or(|(_, best_similarity)| similarity > best_similarity) {
+                best = Some((index, similarity));
+            }
+        }
 
         // A nearest-centroid decision is unstable when two profiles score
         // almost equally. Preserve temporal continuity while the previous
         // speaker is still above its hysteresis threshold, and switch only
         // when another profile has a meaningful cosine advantage.
-        let preferred = match (self.previous_speaker, best) {
+        let preferred = match (
+            prefer_previous.then_some(self.previous_speaker).flatten(),
+            best,
+        ) {
             (Some(previous_index), Some((best_index, best_similarity)))
                 if best_index != previous_index =>
             {
-                let previous_similarity = scores
-                    .iter()
-                    .find_map(|(index, similarity)| {
-                        (*index == previous_index).then_some(*similarity)
-                    })
-                    .unwrap_or(f32::NEG_INFINITY);
+                let previous_similarity = previous_similarity.unwrap_or(f32::NEG_INFINITY);
                 let continuation_threshold =
                     self.config.similarity_threshold - self.config.same_speaker_hysteresis;
                 if previous_similarity >= continuation_threshold
@@ -250,7 +273,7 @@ impl OnlineSpeakerTracker {
         };
 
         let accepted = preferred.filter(|(index, similarity)| {
-            let threshold = if self.previous_speaker == Some(*index) {
+            let threshold = if prefer_previous && self.previous_speaker == Some(*index) {
                 self.config.similarity_threshold - self.config.same_speaker_hysteresis
             } else {
                 self.config.similarity_threshold
@@ -258,30 +281,46 @@ impl OnlineSpeakerTracker {
             *similarity >= threshold
         });
 
-        let (index, similarity, is_new) = if let Some((index, similarity)) = accepted {
-            self.update_centroid(index, &embedding)?;
-            (index, similarity, false)
+        Ok(SpeakerObservation {
+            embedding,
+            matched_index: accepted.map(|(index, _)| index),
+            best_index: best.map(|(index, _)| index),
+            similarity: accepted.or(best).map_or(0.0, |(_, similarity)| similarity),
+        })
+    }
+
+    fn commit(
+        &mut self,
+        observation: SpeakerObservation,
+    ) -> Result<SpeakerAssignment, SpeakerError> {
+        let (index, similarity, is_new) = if let Some(index) = observation.matched_index {
+            self.update_centroid(index, &observation.embedding)?;
+            (index, observation.similarity, false)
         } else if self.centroids.len() < self.config.max_speakers {
             let index = self.centroids.len();
             self.centroids.push(SpeakerCentroid {
-                embedding,
+                embedding: observation.embedding,
                 observations: 1,
             });
             (index, 1.0, true)
-        } else if let Some((index, similarity)) = best {
+        } else if let Some(index) = observation.best_index {
             // The configured memory bound is strict. Once full, choose the
             // nearest known speaker but do not contaminate its centroid with a
             // below-threshold observation.
-            (index, similarity, false)
+            (index, observation.similarity, false)
         } else {
             return Err(SpeakerError::EmptyEmbedding);
         };
         self.previous_speaker = Some(index);
         Ok(SpeakerAssignment {
-            speaker_id: format!("speaker-{:02}", index + 1),
+            speaker_id: speaker_id(index),
             similarity,
             is_new,
         })
+    }
+
+    fn is_full(&self) -> bool {
+        self.centroids.len() >= self.config.max_speakers
     }
 
     fn update_centroid(&mut self, index: usize, embedding: &[f32]) -> Result<(), SpeakerError> {
@@ -458,7 +497,8 @@ pub struct StreamingDiarizerConfig {
     pub window_samples: usize,
     /// Minimum initial speech samples before evaluating speaker identity (e.g. 500ms = 8000 samples)
     pub min_speech_samples: usize,
-    /// Number of consecutive different speaker observations required to trigger a cut
+    /// Minimum coherent observations required to trigger a cut. Confirmation
+    /// also requires evidence spanning most of an analysis window.
     pub consecutive_confirmations: usize,
     /// Target duty cycle for the adaptive throttle
     pub target_duty_cycle: f32,
@@ -481,13 +521,10 @@ impl Default for StreamingDiarizerConfig {
 pub enum StreamingSpeakerEvent {
     /// Speech continues with currently assigned speaker.
     Continues { speaker_id: String },
-    /// A speaker change was detected. Returns the samples for the previous speaker turn,
-    /// the speaker IDs, and the cut offset.
+    /// A speaker change was confirmed from temporally separated observations.
     SpeakerCut {
-        finalized_samples: Vec<i16>,
         previous_speaker: String,
         new_speaker: String,
-        cut_sample_offset: usize,
     },
 }
 
@@ -500,11 +537,11 @@ pub struct StreamingSpeakerSegmenter {
     throttle: AdaptiveSpeakerThrottle,
     config: StreamingDiarizerConfig,
     active_samples: Vec<i16>,
-    current_speaker_id: Option<String>,
-    pending_speaker_id: Option<String>,
-    consecutive_pending_count: usize,
+    identity: StableIdentityTracker,
     samples_since_last_evaluation: usize,
-    total_turn_samples: usize,
+    turn_speech_samples: usize,
+    speech_clock: usize,
+    silence_samples: usize,
 }
 
 impl StreamingSpeakerSegmenter {
@@ -519,11 +556,11 @@ impl StreamingSpeakerSegmenter {
             throttle,
             config,
             active_samples: Vec::with_capacity(config.window_samples * 2),
-            current_speaker_id: None,
-            pending_speaker_id: None,
-            consecutive_pending_count: 0,
+            identity: StableIdentityTracker::default(),
             samples_since_last_evaluation: 0,
-            total_turn_samples: 0,
+            turn_speech_samples: 0,
+            speech_clock: 0,
+            silence_samples: usize::MAX,
         }
     }
 
@@ -545,7 +582,7 @@ impl StreamingSpeakerSegmenter {
     }
 
     pub fn current_speaker_id(&self) -> Option<&str> {
-        self.current_speaker_id.as_deref()
+        self.identity.current.as_deref()
     }
 
     pub fn active_sample_count(&self) -> usize {
@@ -557,19 +594,29 @@ impl StreamingSpeakerSegmenter {
         &mut self,
         samples: &[i16],
     ) -> Result<Option<StreamingSpeakerEvent>, SpeakerError> {
+        const CONTINUITY_GAP_SAMPLES: usize = SAMPLE_RATE_HZ as usize * 3 / 2;
+        if self.turn_speech_samples == 0 {
+            self.identity
+                .begin_turn(self.silence_samples <= CONTINUITY_GAP_SAMPLES);
+        }
         self.active_samples.extend_from_slice(samples);
         self.samples_since_last_evaluation = self
             .samples_since_last_evaluation
             .saturating_add(samples.len());
-        self.total_turn_samples = self.total_turn_samples.saturating_add(samples.len());
+        self.turn_speech_samples = self.turn_speech_samples.saturating_add(samples.len());
+        self.speech_clock = self.speech_clock.saturating_add(samples.len());
+        self.silence_samples = 0;
 
-        // Circuit breaker: skip online slice evaluation under extreme load, fallback to whole turn
+        // Stop further model work under extreme load. A turn without enough
+        // trusted evidence is reported as unknown instead of guessing an ID.
         if self.throttle.is_circuit_broken() {
-            return Ok(self.current_speaker_id.as_ref().map(|id| {
-                StreamingSpeakerEvent::Continues {
+            return Ok(self
+                .identity
+                .current
+                .as_ref()
+                .map(|id| StreamingSpeakerEvent::Continues {
                     speaker_id: id.clone(),
-                }
-            }));
+                }));
         }
 
         let step_threshold = self.throttle.current_step_samples();
@@ -586,90 +633,55 @@ impl StreamingSpeakerSegmenter {
         let window = &self.active_samples[window_start..];
 
         let start_time = Instant::now();
-        let assignment = self.diarizer.identify(window)?;
+        let embedding = self.diarizer.model_mut().extract(window)?;
         let elapsed = start_time.elapsed();
         self.throttle.record_inference_duration(elapsed);
-
-        if self.current_speaker_id.is_none() {
-            self.current_speaker_id = Some(assignment.speaker_id.clone());
-            return Ok(Some(StreamingSpeakerEvent::Continues {
-                speaker_id: assignment.speaker_id,
-            }));
-        }
-
-        let current = self.current_speaker_id.as_ref().unwrap();
-        if assignment.speaker_id == *current {
-            self.pending_speaker_id = None;
-            self.consecutive_pending_count = 0;
-            return Ok(Some(StreamingSpeakerEvent::Continues {
-                speaker_id: assignment.speaker_id,
-            }));
-        }
-
-        // New speaker candidate observed
-        if self.pending_speaker_id.as_deref() == Some(&assignment.speaker_id) {
-            self.consecutive_pending_count = self.consecutive_pending_count.saturating_add(1);
-        } else {
-            self.pending_speaker_id = Some(assignment.speaker_id.clone());
-            self.consecutive_pending_count = 1;
-        }
-
-        if self.consecutive_pending_count >= self.config.consecutive_confirmations {
-            let step_back = step_threshold * self.consecutive_pending_count;
-            let cut_offset = self.active_samples.len().saturating_sub(step_back);
-            let min_cut = self
-                .config
-                .min_speech_samples
-                .min(self.active_samples.len());
-            let safe_cut = cut_offset.max(min_cut / 2).min(self.active_samples.len());
-
-            let finalized_samples = self.active_samples[..safe_cut].to_vec();
-            let remaining_samples = self.active_samples[safe_cut..].to_vec();
-            self.active_samples = remaining_samples;
-
-            let previous_speaker = self.current_speaker_id.take().unwrap();
-            self.current_speaker_id = Some(assignment.speaker_id.clone());
-            self.pending_speaker_id = None;
-            self.consecutive_pending_count = 0;
-            self.samples_since_last_evaluation = 0;
-
-            return Ok(Some(StreamingSpeakerEvent::SpeakerCut {
-                finalized_samples,
-                previous_speaker,
-                new_speaker: assignment.speaker_id,
-                cut_sample_offset: safe_cut,
-            }));
-        }
-
-        Ok(None)
+        let decision = self.identity.observe(
+            self.diarizer.tracker_mut(),
+            &embedding,
+            self.speech_clock,
+            self.config.window_samples,
+            self.config.consecutive_confirmations,
+        )?;
+        Ok(match decision {
+            StableIdentityDecision::Pending => None,
+            StableIdentityDecision::Continues(speaker_id) => {
+                Some(StreamingSpeakerEvent::Continues { speaker_id })
+            }
+            StableIdentityDecision::Switch { previous, new } => {
+                if self.active_samples.len() > self.config.window_samples {
+                    let retain_from = self.active_samples.len() - self.config.window_samples;
+                    self.active_samples.drain(..retain_from);
+                }
+                self.samples_since_last_evaluation = 0;
+                Some(StreamingSpeakerEvent::SpeakerCut {
+                    previous_speaker: previous,
+                    new_speaker: new,
+                })
+            }
+        })
     }
 
-    /// Completes the speech turn and returns the finalized speaker ID along with remaining samples.
-    pub fn finalize_speech(&mut self) -> Option<(Vec<i16>, String)> {
-        if self.active_samples.is_empty() {
-            self.reset_turn();
-            return None;
-        }
-        let samples = std::mem::take(&mut self.active_samples);
-        let speaker_id = self
-            .current_speaker_id
-            .take()
-            .unwrap_or_else(|| "speaker-01".to_string());
-        self.reset_turn();
-        Some((samples, speaker_id))
+    pub fn observe_silence(&mut self, samples: usize) {
+        self.silence_samples = self.silence_samples.saturating_add(samples);
     }
 
-    pub fn reset_turn(&mut self) {
+    /// Completes a speech turn without inventing an identity for insufficient evidence.
+    pub fn finalize_speech(&mut self) -> Option<String> {
+        let speaker_id = self.identity.finish_turn();
         self.active_samples.clear();
-        self.current_speaker_id = None;
-        self.pending_speaker_id = None;
-        self.consecutive_pending_count = 0;
         self.samples_since_last_evaluation = 0;
-        self.total_turn_samples = 0;
+        self.turn_speech_samples = 0;
+        speaker_id
     }
 
     pub fn reset(&mut self) {
-        self.reset_turn();
+        self.active_samples.clear();
+        self.samples_since_last_evaluation = 0;
+        self.turn_speech_samples = 0;
+        self.speech_clock = 0;
+        self.silence_samples = usize::MAX;
+        self.identity.reset();
         self.diarizer.reset();
         self.throttle.reset();
     }

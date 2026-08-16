@@ -1,5 +1,6 @@
 use xrtranslate_engine::{
-    collapse_asr_split_words, is_split_word_pair, remove_transcript_overlap,
+    collapse_asr_split_words, ends_at_sentence_boundary, is_split_word_pair,
+    remove_transcript_overlap,
 };
 use xrtranslate_protocol::CorpusTermMatch;
 
@@ -441,14 +442,6 @@ fn text_units(text: &str) -> usize {
     units
 }
 
-fn ends_at_sentence_boundary(source: &str) -> bool {
-    source
-        .trim_end()
-        .chars()
-        .last()
-        .is_some_and(|character| matches!(character, '.' | '!' | '?' | '。' | '！' | '？'))
-}
-
 fn needs_separator(current: &str, addition: &str) -> bool {
     if current.is_empty() || addition.is_empty() {
         return false;
@@ -607,6 +600,16 @@ mod tests {
     }
 
     #[test]
+    fn caption_rollover_does_not_treat_a_dotted_abbreviation_as_a_sentence() {
+        let abbreviation =
+            "This complete caption has enough stable source words but remains entirely O.K.";
+        assert!(!should_roll_caption(abbreviation, 0.0, 5_000.0));
+
+        let sentence = "This complete caption has enough stable source words and ends normally with extra context.";
+        assert!(should_roll_caption(sentence, 0.0, 5_000.0));
+    }
+
+    #[test]
     fn revisable_text_keeps_stable_prefix_and_rewrites_overlap() {
         let mut text = RevisableText::new("we walk across the central street");
         let update = text.update("the central station and turn left", 0.34);
@@ -625,7 +628,9 @@ mod tests {
 
     #[test]
     fn revisable_text_repairs_split_words_and_revises_partial_tokens() {
-        let mut text = RevisableText::new("So, literally, what reinforcement learning does is it goes to the ones that worked real");
+        let mut text = RevisableText::new(
+            "So, literally, what reinforcement learning does is it goes to the ones that worked real",
+        );
         let update = text.update("the ones that worked really well.", 0.34);
         assert_eq!(
             update.text,
@@ -634,10 +639,7 @@ mod tests {
 
         let mut split_text = RevisableText::new("the ones that worked real ly");
         let update2 = split_text.update("worked really well.", 0.34);
-        assert_eq!(
-            update2.text,
-            "the ones that worked really well."
-        );
+        assert_eq!(update2.text, "the ones that worked really well.");
     }
 
     #[test]

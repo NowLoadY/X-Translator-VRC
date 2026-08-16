@@ -33,7 +33,7 @@ The neutral session contracts live under `session_coordinator`:
 
 - `TranslationSessionPlugin` lets a plugin describe an active session through
   `PluginSessionBinding`; the binding carries an opaque owner, output policy,
-  and recognition requirements rather than a Meeting/Player enum variant.
+  and lifecycle requirements rather than a Meeting/Player enum variant.
 - `SessionEventSubscriber` receives the generic `SessionEvent` stream. A plugin
   adapter must enqueue blocking persistence work on its own worker.
 - `HostOutputSubscriber` receives captions after host history merging. External
@@ -66,6 +66,27 @@ is also not exposed as speaker confidence: it is an internal clustering score,
 not a calibrated probability. If a future recognizer provides genuine token or
 word timestamps, add them as an optional neutral alignment contract rather than
 embedding subtitle rules in the backend.
+
+Speaker identity is part of the recognition result, not a plugin capability
+toggle. Session plugins cannot enable or disable diarization. Presentation
+plugins such as OSC may independently decide whether to render the supplied ID.
+
+### Scheduling is a shared infrastructure policy
+
+Plugins never choose model thread counts, queue sizes, or concrete scheduler
+implementations. A neutral session is classified as `realtime` or `offline`
+from its lifecycle contract: live capture is latency-sensitive, while finite
+media input is throughput-oriented. The backend schedules both classes against
+the configured ASR and translation slot counts, prioritizes realtime work, and
+periodically admits offline work so it cannot starve.
+
+Queueing remains bounded in every mode. Natural EOF and an explicit graceful
+finish preserve ordered results and drain queued work; user cancellation or a
+task switch closes the session and discards work that has not completed. Do not
+turn an overload error into a larger hidden queue, and do not add a
+plugin-specific model pool to make one importer faster. Extend the neutral
+workload/lifecycle contract when a genuinely different scheduling requirement
+appears.
 
 ## Ownership boundary
 

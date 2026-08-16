@@ -41,8 +41,8 @@ use xrtranslate_speaker::{
     StreamingSpeakerSegmenter, TrackerConfig,
 };
 use xrtranslate_vad::{
-    EndpointConfig, EndpointDetector, EndpointEvent, EndpointState, FRAME_BYTES, FRAME_SAMPLES,
-    SAMPLE_RATE_HZ, SileroVad, Utterance, UtteranceEndReason, decode_pcm16le_frame,
+    EndpointConfig, EndpointDetector, EndpointEvent, FRAME_BYTES, FRAME_SAMPLES, SAMPLE_RATE_HZ,
+    SileroVad, Utterance, UtteranceEndReason, decode_pcm16le_frame,
 };
 
 use crate::language::{
@@ -140,6 +140,7 @@ pub(crate) struct NativePipeline {
     endpoint_config: EndpointConfig,
     denoiser: Option<GtcrnDenoiser>,
     streaming_speaker: Option<StreamingSpeakerSegmenter>,
+    speaker_recognition_enabled: bool,
     fixed_window: Option<FixedWindow>,
     pending_pcm: Vec<u8>,
     pending_denoised_pcm: Vec<u8>,
@@ -509,12 +510,10 @@ impl NativePipeline {
         let streaming_speaker = if let Some(speaker_cfg) = &speaker {
             let streaming_cfg = StreamingDiarizerConfig {
                 tracker: speaker_cfg.tracker,
-                window_samples: (SAMPLE_RATE_HZ as f32 * 0.8) as usize,
                 min_speech_samples: (SAMPLE_RATE_HZ as f32
                     * (speaker_cfg.min_utterance_ms as f32 / 1000.0))
                     .max(4800.0) as usize,
-                consecutive_confirmations: 2,
-                target_duty_cycle: 0.30,
+                ..StreamingDiarizerConfig::default()
             };
             StreamingSpeakerSegmenter::from_file(
                 &speaker_cfg.model_path,
@@ -555,6 +554,7 @@ impl NativePipeline {
             endpoint_config,
             denoiser,
             streaming_speaker,
+            speaker_recognition_enabled: false,
             fixed_window: None,
             pending_pcm: Vec::new(),
             pending_denoised_pcm: Vec::new(),
@@ -665,11 +665,10 @@ impl NativePipeline {
             let denoised_samples =
                 decode_pcm16le_frame(denoised_frame).map_err(|error| error.to_string())?;
 
-            let is_in_speech =
-                active || matches!(self.endpoint.state(), EndpointState::Speaking { .. });
-
-            if let Some(streaming) = &mut self.streaming_speaker {
-                if is_in_speech {
+            if self.speaker_recognition_enabled
+                && let Some(streaming) = &mut self.streaming_speaker
+            {
+                if active {
                     match streaming.push_speech_samples(&denoised_samples) {
                         Ok(Some(StreamingSpeakerEvent::SpeakerCut {
                             previous_speaker, ..
@@ -688,6 +687,8 @@ impl NativePipeline {
                             warn!("streaming speaker recognition error: {error}");
                         }
                     }
+                } else {
+                    streaming.observe_silence(denoised_samples.len());
                 }
             }
 
@@ -697,8 +698,12 @@ impl NativePipeline {
                 .map_err(|error| error.to_string())?;
             self.processed_samples = self.processed_samples.saturating_add(FRAME_SAMPLES as u64);
             if let EndpointEvent::Finalized(utterance) = event {
-                let speaker_id = if let Some(streaming) = &mut self.streaming_speaker {
-                    streaming.finalize_speech().map(|(_, id)| id)
+                let speaker_id = if self.speaker_recognition_enabled {
+                    self.streaming_speaker.as_mut().map(|streaming| {
+                        streaming
+                            .finalize_speech()
+                            .unwrap_or_else(|| "speaker-unknown".into())
+                    })
                 } else {
                     None
                 };
@@ -752,8 +757,12 @@ impl NativePipeline {
                 .saturating_add(received_samples as u64);
         }
         self.pending_denoised_pcm.clear();
-        let speaker_id = if let Some(streaming) = &mut self.streaming_speaker {
-            streaming.finalize_speech().map(|(_, id)| id)
+        let speaker_id = if self.speaker_recognition_enabled {
+            self.streaming_speaker.as_mut().map(|streaming| {
+                streaming
+                    .finalize_speech()
+                    .unwrap_or_else(|| "speaker-unknown".into())
+            })
         } else {
             None
         };
@@ -788,6 +797,16 @@ impl NativePipeline {
             streaming.reset();
         }
         self.processed_samples = 0;
+    }
+
+    pub(crate) fn set_speaker_recognition_enabled(&mut self, enabled: bool) {
+        if self.speaker_recognition_enabled == enabled {
+            return;
+        }
+        self.speaker_recognition_enabled = enabled;
+        if let Some(streaming) = &mut self.streaming_speaker {
+            streaming.reset();
+        }
     }
 
     pub(crate) fn take_vad_transitions(&mut self) -> Vec<bool> {

@@ -72,9 +72,6 @@ pub struct ClientSettings {
     pub denoise_enabled: bool,
     #[serde(default)]
     pub tts_enabled: bool,
-    /// Enables speaker recognition and OSC speaker numbering.
-    #[serde(default)]
-    pub speaker_recognition_enabled: bool,
     #[serde(default)]
     pub mute_self_pauses_translation: bool,
     #[serde(default)]
@@ -147,7 +144,6 @@ impl Default for ClientSettings {
             target_lang: default_target_lang(),
             denoise_enabled: true,
             tts_enabled: false,
-            speaker_recognition_enabled: false,
             mute_self_pauses_translation: false,
             ui_language: UiLanguage::default(),
             first_run: true,
@@ -228,11 +224,6 @@ impl ClientSettings {
             settings.background_noise = settings.background_noise.clamp(0.2, 0.8);
             settings.pause_tolerance = settings.pause_tolerance.clamp(0.0, 1.0);
         }
-        let speaker_numbers_enabled =
-            self.speaker_recognition_enabled || self.osc_settings.show_speaker_number;
-        self.speaker_recognition_enabled = speaker_numbers_enabled;
-        self.osc_settings.show_speaker_number = speaker_numbers_enabled;
-
         // Persisted preferences remain subject to feature availability.
         self.tts_enabled &=
             crate::feature_access::is_available(crate::feature_access::Feature::TtsPlayback);
@@ -240,9 +231,8 @@ impl ClientSettings {
             crate::feature_access::is_available(crate::feature_access::Feature::FloatingSubtitles);
         self.osc_settings.enabled &=
             crate::feature_access::is_available(crate::feature_access::Feature::OscChatbox);
-        self.speaker_recognition_enabled &=
+        self.osc_settings.show_speaker_number &=
             crate::feature_access::is_available(crate::feature_access::Feature::SpeakerNumbers);
-        self.osc_settings.show_speaker_number = self.speaker_recognition_enabled;
         self.mute_self_pauses_translation &=
             crate::feature_access::is_available(crate::feature_access::Feature::MuteSync);
     }
@@ -332,7 +322,6 @@ mod tests {
             selected_device_id: "mic-1".into(),
             selected_loopback_device_id: "loopback-1".into(),
             tts_enabled: true,
-            speaker_recognition_enabled: true,
             source_lang: "en".into(),
             download_proxy_url: "socks5://127.0.0.1:1080".into(),
             sidebar_collapsed: true,
@@ -352,7 +341,6 @@ mod tests {
         assert_eq!(loaded.selected_device_id, "mic-1");
         assert_eq!(loaded.selected_loopback_device_id, "loopback-1");
         assert!(!loaded.tts_enabled);
-        assert!(loaded.speaker_recognition_enabled);
         assert_eq!(loaded.source_lang, "en");
         assert_eq!(loaded.download_proxy_url, "socks5://127.0.0.1:1080");
         assert!(loaded.sidebar_collapsed);
@@ -381,12 +369,11 @@ mod tests {
     }
 
     #[test]
-    fn legacy_split_speaker_toggles_are_merged_on_load() {
-        let root = std::env::temp_dir().join("xrtranslate_test_speaker_toggle_migration");
+    fn osc_speaker_number_visibility_is_independent() {
+        let root = std::env::temp_dir().join("xrtranslate_test_speaker_number_visibility");
         let _ = std::fs::remove_dir_all(&root);
         std::fs::create_dir_all(root.join("runtime")).unwrap();
         let settings = ClientSettings {
-            speaker_recognition_enabled: false,
             osc_settings: OscSettings {
                 show_speaker_number: true,
                 ..OscSettings::default()
@@ -396,8 +383,9 @@ mod tests {
         settings.save(&root).unwrap();
 
         let loaded = ClientSettings::load(&root);
-        assert!(loaded.speaker_recognition_enabled);
         assert!(loaded.osc_settings.show_speaker_number);
+        let serialized = serde_json::to_value(&loaded).unwrap();
+        assert!(serialized.get("speaker_recognition_enabled").is_none());
         let _ = std::fs::remove_dir_all(root);
     }
 

@@ -8,8 +8,7 @@ pub mod ui;
 
 use crate::i18n::UiLanguage;
 use crate::session_coordinator::{
-    PluginSessionBinding, PluginSessionOwner, SessionOutputPolicy, SpeakerRecognitionPolicy,
-    TranslationSessionPlugin,
+    PluginSessionBinding, PluginSessionOwner, SessionOutputPolicy, TranslationSessionPlugin,
 };
 use controller::VideoPlayerController;
 use std::path::PathBuf;
@@ -112,11 +111,6 @@ impl TranslationSessionPlugin for VideoPlayerPlugin {
                 "Media Player owns the active translation session",
             ),
             output_policy: SessionOutputPolicy::Host,
-            speaker_recognition: if is_file {
-                SpeakerRecognitionPolicy::Disabled
-            } else {
-                SpeakerRecognitionPolicy::HostDefault
-            },
             host_tts: !is_file,
             external_audio_gate: !is_file,
             finish_when_audio_ends: is_file,
@@ -137,7 +131,6 @@ mod session_binding_tests {
 
         let binding = plugin.translation_session_binding().unwrap();
         assert!(binding.publish_to_host_outputs());
-        assert!(!binding.speaker_recognition_enabled(true));
         assert!(!binding.host_tts);
         assert!(!binding.external_audio_gate);
         assert!(binding.finish_when_audio_ends);
@@ -152,8 +145,6 @@ mod session_binding_tests {
         ));
 
         let binding = plugin.translation_session_binding().unwrap();
-        assert!(binding.speaker_recognition_enabled(true));
-        assert!(!binding.speaker_recognition_enabled(false));
         assert!(binding.host_tts);
         assert!(binding.external_audio_gate);
         assert!(!binding.finish_when_audio_ends);

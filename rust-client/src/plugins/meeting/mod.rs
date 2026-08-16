@@ -20,8 +20,7 @@ use std::{
 };
 
 use crate::session_coordinator::{
-    PluginSessionBinding, PluginSessionOwner, SessionOutputPolicy, SpeakerRecognitionPolicy,
-    TranslationSessionPlugin,
+    PluginSessionBinding, PluginSessionOwner, SessionOutputPolicy, TranslationSessionPlugin,
 };
 use controller::MeetingController;
 
@@ -168,7 +167,6 @@ impl TranslationSessionPlugin for MeetingPlugin {
                 "A meeting owns the active audio session",
             ),
             output_policy: SessionOutputPolicy::PluginOnly,
-            speaker_recognition: SpeakerRecognitionPolicy::Enabled,
             host_tts: false,
             external_audio_gate: false,
             finish_when_audio_ends: active.imported_audio,

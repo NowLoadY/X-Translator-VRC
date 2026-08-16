@@ -16,7 +16,7 @@ pub struct OscPageContext<'a> {
 pub enum OscUiAction {
     ClearHostHistory,
     SetMuteGateEnabled(bool),
-    SetSpeakerRecognitionEnabled(bool),
+    SetSpeakerNumberVisible(bool),
     SaveSettings,
     SettingsApplied(Result<(), String>),
 }
@@ -48,8 +48,12 @@ pub fn render(
             if let Some(error) = context.last_error {
                 card(ui, |ui| {
                     ui.horizontal(|ui| {
-                        ui.label(egui::RichText::new("⚠").color(egui::Color32::from_rgb(220, 38, 38)));
-                        ui.label(egui::RichText::new(error).color(egui::Color32::from_rgb(220, 38, 38)));
+                        ui.label(
+                            egui::RichText::new("⚠").color(egui::Color32::from_rgb(220, 38, 38)),
+                        );
+                        ui.label(
+                            egui::RichText::new(error).color(egui::Color32::from_rgb(220, 38, 38)),
+                        );
                     });
                 });
                 ui.add_space(10.0);

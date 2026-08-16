@@ -150,9 +150,11 @@ impl SessionAdapter {
             source_text,
             translated_text,
             LatencyMetrics {
+                queue_ms: 0,
                 asr_ms: 0,
                 mt_ms: 0,
                 tts_ms: 0,
+                total_ms: 0,
             },
         )
     }
@@ -335,9 +337,11 @@ impl SessionAdapter {
                             .pop_front()
                             .unwrap_or(TranslationMetadata {
                                 metrics: LatencyMetrics {
+                                    queue_ms: 0,
                                     asr_ms: 0,
                                     mt_ms: 0,
                                     tts_ms: 0,
+                                    total_ms: 0,
                                 },
                                 context: SegmentContext {
                                     segment_index: 1,
@@ -452,9 +456,11 @@ mod tests {
                 "one.".into(),
                 "一。".into(),
                 LatencyMetrics {
+                    queue_ms: 0,
                     asr_ms: 4,
                     mt_ms: 5,
                     tts_ms: 0,
+                    total_ms: 0,
                 },
                 2,
                 3,
@@ -494,9 +500,11 @@ mod tests {
                     "translation".into(),
                     Vec::new(),
                     LatencyMetrics {
+                        queue_ms: 0,
                         asr_ms: 1,
                         mt_ms: 2,
                         tts_ms: 0,
+                        total_ms: 0,
                     },
                     SegmentContext {
                         turn_id: "turn-before".into(),

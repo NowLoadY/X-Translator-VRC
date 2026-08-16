@@ -36,9 +36,10 @@ use xrtranslate_config::{AppConfig, LocalModelRuntimeConfig};
 use xrtranslate_engine::RouteEpoch;
 use xrtranslate_inference::{AsyncHttpClient, HttpRequest, ReqwestClient};
 use xrtranslate_protocol::{
-    ActionControl, ClientControl, DrainReason, ErrorEvent, EventControl, Feature, LatencyMetrics,
-    PcmFormat, PcmFrame, PipelineDrained, RecognitionStreamEnded, RouteChanged, SegmentBoundary,
-    SegmentTiming, ServerEvent, SessionReady, VadActivity,
+    ActionControl, ClientControl, DrainReason, ErrorEvent, EventControl, Feature,
+    InferenceWorkload, LatencyMetrics, PcmFormat, PcmFrame, PipelineDrained,
+    RecognitionStreamEnded, RouteChanged, SegmentBoundary, SegmentTiming, ServerEvent,
+    SessionReady, VadActivity,
 };
 use xrtranslate_supervisor::{
     LlamaServerEndpoint, LlamaServerLauncher, LlamaServerProcess, LlamaServerProcessHandle,
@@ -59,23 +60,28 @@ use crate::{
 
 mod language;
 mod pipeline;
+mod scheduler;
 mod session;
 mod terminology;
+use scheduler::InferenceScheduler;
 use xr_corpus_client::CorpusClient;
 use xr_corpus_protocol::{
     ContextBudgets, PrepareAsrRequest, PrepareTranslationRequest, RecordTranslationRequest,
     SegmentContext as CorpusSegmentContext,
 };
 
-const INFERENCE_QUEUE_CAPACITY: usize = 64;
+/// Complete turns awaiting the per-session worker. Awaited sends retain media
+/// throughput, so a deep queue only hides overload and increases cancellation
+/// cost without improving model utilization.
+const INFERENCE_QUEUE_CAPACITY: usize = 4;
 /// Results awaiting the only WebSocket writer. This protects backend memory
 /// when a client socket stops consuming messages.
 const INFERENCE_RESULT_CAPACITY: usize = 32;
 /// The socket writer owns this bounded queue. Keeping it separate from model
 /// results makes the WebSocket write path explicit and preserves event order.
 const OUTBOUND_MESSAGE_CAPACITY: usize = 64;
-/// A managed Hy-MT2 server exposes four slots. One session uses at most two so
-/// multi-sentence turns overlap without monopolizing all capacity.
+/// Per-turn fan-out is additionally bounded by the global scheduler, whose
+/// capacity comes from the configured model runtime.
 const TRANSLATION_CONCURRENCY_PER_SESSION: usize = 2;
 
 #[derive(Clone, Copy)]
@@ -115,6 +121,8 @@ struct UtteranceJob {
     source_language: String,
     target_language: String,
     speaker_id: Option<String>,
+    workload: InferenceWorkload,
+    enqueued_at: Instant,
 }
 
 enum InferenceJob {
@@ -143,7 +151,9 @@ enum InferenceEvent {
     },
     Translation {
         generation: PipelineGeneration,
+        queue_elapsed: Duration,
         asr_elapsed: Duration,
+        total_elapsed: Duration,
         context: SegmentContext,
         output: Result<TranslationOutput, String>,
     },
@@ -241,6 +251,7 @@ struct BackendState {
     corpus_client: CorpusClient,
     project_root: PathBuf,
     next_session_id: Arc<AtomicU64>,
+    inference_scheduler: InferenceScheduler,
 }
 
 #[derive(Serialize)]
@@ -289,11 +300,17 @@ async fn run_backend() -> Result<(), Box<dyn std::error::Error>> {
         None
     };
     let address = format!("{}:{}", config.server.host, config.server.port);
+    let model_route = config.default_gguf()?;
+    let inference_scheduler = InferenceScheduler::new(
+        usize::from(model_route.asr_runtime.parallel_slots),
+        usize::from(model_route.translation_runtime.parallel_slots),
+    );
     let state = BackendState {
         config,
         corpus_client,
         project_root,
         next_session_id: Arc::new(AtomicU64::new(1)),
+        inference_scheduler,
     };
     let app = Router::new()
         .route("/healthz", get(health))
@@ -383,6 +400,7 @@ async fn serve_session(socket: WebSocket, state: BackendState) {
         result_sender,
         generation_receiver,
         state.corpus_client.clone(),
+        state.inference_scheduler.clone(),
         Arc::clone(&speaker_recognition_enabled),
         Arc::clone(&speaker_state_revision),
     ));
@@ -390,6 +408,7 @@ async fn serve_session(socket: WebSocket, state: BackendState) {
     let mut input_state = SessionInputState::Running;
     let mut graceful_shutdown = false;
     let mut next_utterance_sequence = 1_u64;
+    let mut workload = InferenceWorkload::Realtime;
 
     if send_event(
         &outbound_sender,
@@ -482,6 +501,7 @@ async fn serve_session(socket: WebSocket, state: BackendState) {
                             vad_threshold,
                             vad_silence_ms,
                             continuous_recognition,
+                            workload: configured_workload,
                         })) => {
                             if let Err(error) = validate_input_sample_rate(sample_rate) {
                                 if send_error(&outbound_sender, error).await.is_err() {
@@ -508,6 +528,7 @@ async fn serve_session(socket: WebSocket, state: BackendState) {
                                 continue;
                             }
                             pipeline.reset();
+                            workload = configured_workload;
                             generation.route_epoch = session.route_epoch();
                             generation.audio_epoch.advance();
                             generation_sender.send_replace(generation);
@@ -521,6 +542,7 @@ async fn serve_session(socket: WebSocket, state: BackendState) {
                                     sender,
                                     &session,
                                     generation,
+                                    workload,
                                     DrainReason::Paused,
                                     &mut next_utterance_sequence,
                                 )
@@ -567,8 +589,9 @@ async fn serve_session(socket: WebSocket, state: BackendState) {
                                 &mut pipeline,
                                 sender,
                                 &session,
-                                generation,
-                                reason,
+                                    generation,
+                                    workload,
+                                    reason,
                                 &mut next_utterance_sequence,
                             )
                             .await
@@ -618,6 +641,7 @@ async fn serve_session(socket: WebSocket, state: BackendState) {
                                     {
                                         speaker_state_revision.fetch_add(1, Ordering::AcqRel);
                                     }
+                                    pipeline.set_speaker_recognition_enabled(enabled);
                                 }
                             }
                             info!(%session_id, ?feature, enabled, "session feature configured");
@@ -669,6 +693,7 @@ async fn serve_session(socket: WebSocket, state: BackendState) {
                                             sender,
                                             &session,
                                             generation,
+                                            workload,
                                             utterances,
                                             &mut next_utterance_sequence,
                                         )
@@ -974,11 +999,18 @@ async fn enqueue_utterances(
     sender: &mpsc::Sender<InferenceJob>,
     session: &SessionAdapter,
     generation: PipelineGeneration,
+    workload: InferenceWorkload,
     utterances: Vec<PipelineEvent>,
     next_utterance_sequence: &mut u64,
 ) -> Result<(), String> {
     debug_assert_eq!(generation.route_epoch, session.route_epoch());
-    let jobs = inference_jobs(session, generation, utterances, next_utterance_sequence)?;
+    let jobs = inference_jobs(
+        session,
+        generation,
+        workload,
+        utterances,
+        next_utterance_sequence,
+    )?;
     for job in jobs {
         sender
             .send(job)
@@ -991,6 +1023,7 @@ async fn enqueue_utterances(
 fn inference_jobs(
     session: &SessionAdapter,
     generation: PipelineGeneration,
+    workload: InferenceWorkload,
     utterances: Vec<PipelineEvent>,
     next_utterance_sequence: &mut u64,
 ) -> Result<Vec<InferenceJob>, String> {
@@ -1043,6 +1076,8 @@ fn inference_jobs(
             source_language: source_language.clone(),
             target_language: target_language.clone(),
             speaker_id,
+            workload,
+            enqueued_at: Instant::now(),
         }));
     }
     Ok(jobs)
@@ -1056,6 +1091,7 @@ async fn queue_pipeline_drain(
     sender: &mpsc::Sender<InferenceJob>,
     session: &SessionAdapter,
     generation: PipelineGeneration,
+    workload: InferenceWorkload,
     reason: DrainReason,
     next_utterance_sequence: &mut u64,
 ) -> Result<(), String> {
@@ -1064,6 +1100,7 @@ async fn queue_pipeline_drain(
             for job in inference_jobs(
                 session,
                 generation,
+                workload,
                 vec![utterance],
                 next_utterance_sequence,
             )? {
@@ -1090,6 +1127,7 @@ async fn run_inference_worker(
     events: mpsc::Sender<InferenceEvent>,
     generation: watch::Receiver<PipelineGeneration>,
     corpus_client: CorpusClient,
+    scheduler: InferenceScheduler,
     speaker_recognition_enabled: Arc<AtomicBool>,
     speaker_state_revision: Arc<AtomicU64>,
 ) {
@@ -1113,13 +1151,42 @@ async fn run_inference_worker(
             return;
         }
     };
-    'jobs: while let Some(job) = jobs.recv().await {
+    let mut pending_translation: Option<tokio::task::JoinHandle<Vec<InferenceEvent>>> = None;
+    loop {
+        let job = if let Some(pending) = pending_translation.as_mut() {
+            tokio::select! {
+                job = jobs.recv() => job,
+                completed = pending => {
+                    pending_translation = None;
+                    let Ok(batch) = completed else { break };
+                    if !send_inference_batch(&events, batch).await {
+                        break;
+                    }
+                    continue;
+                }
+            }
+        } else {
+            jobs.recv().await
+        };
+        let Some(job) = job else {
+            if let Some(pending) = pending_translation.take() {
+                let Ok(batch) = pending.await else { break };
+                let _ = send_inference_batch(&events, batch).await;
+            }
+            break;
+        };
         let job = match job {
             InferenceJob::Utterance(job) => job,
             InferenceJob::StreamEnded {
                 generation: event_generation,
                 turn_id,
             } => {
+                if let Some(pending) = pending_translation.take() {
+                    let Ok(batch) = pending.await else { break };
+                    if !send_inference_batch(&events, batch).await {
+                        break;
+                    }
+                }
                 if *generation.borrow() == event_generation
                     && events
                         .send(InferenceEvent::StreamEnded {
@@ -1137,6 +1204,12 @@ async fn run_inference_worker(
                 generation: event_generation,
                 reason,
             } => {
+                if let Some(pending) = pending_translation.take() {
+                    let Ok(batch) = pending.await else { break };
+                    if !send_inference_batch(&events, batch).await {
+                        break;
+                    }
+                }
                 if *generation.borrow() == event_generation
                     && events
                         .send(InferenceEvent::Drained {
@@ -1153,6 +1226,14 @@ async fn run_inference_worker(
         };
         if *generation.borrow() != job.generation {
             continue;
+        }
+        let job_queue_elapsed = job.enqueued_at.elapsed();
+        if job_queue_elapsed >= Duration::from_millis(100) {
+            warn!(
+                queue_ms = job_queue_elapsed.as_millis(),
+                workload = ?job.workload,
+                "utterance waited for inference worker"
+            );
         }
         if previous_transcript
             .as_ref()
@@ -1215,7 +1296,17 @@ async fn run_inference_worker(
                 continue;
             }
         };
-        let mut recognized = match inference
+        let asr_slot_started = Instant::now();
+        let asr_permit = scheduler.acquire_asr(job.workload).await;
+        let asr_slot_wait = asr_slot_started.elapsed();
+        if asr_slot_wait >= Duration::from_millis(25) {
+            info!(
+                wait_ms = asr_slot_wait.as_millis(),
+                workload = ?job.workload,
+                "ASR waited for a scheduled model slot"
+            );
+        }
+        let recognized_result = inference
             .transcribe(
                 &job.utterance.samples,
                 &job.source_language,
@@ -1224,8 +1315,9 @@ async fn run_inference_worker(
                 asr_context.prompt,
                 &asr_context.echo_guard,
             )
-            .await
-        {
+            .await;
+        drop(asr_permit);
+        let mut recognized = match recognized_result {
             Ok(Some(recognized)) => recognized,
             Ok(None) => {
                 if events
@@ -1290,6 +1382,18 @@ async fn run_inference_worker(
             .is_err()
         {
             break;
+        }
+        // ASR for this turn ran while the previous turn translated. Commit the
+        // prior translation before selecting this turn's corpus context so
+        // prompt history and emitted events retain strict stream order.
+        if let Some(pending) = pending_translation.take() {
+            let Ok(batch) = pending.await else { break };
+            if !send_inference_batch(&events, batch).await {
+                break;
+            }
+        }
+        if *generation.borrow() != job.generation {
+            continue;
         }
         let translation_context = match corpus_session
             .prepare_translation(&PrepareTranslationRequest {
@@ -1438,77 +1542,97 @@ async fn run_inference_worker(
         {
             break;
         }
-        let translations = futures_util::stream::iter(
-            segments
-                .into_iter()
-                .zip(segment_contexts)
-                .zip(translation_context.segments),
-        )
-        .map(|((segment, segment_context), corpus_context)| {
-            let inference = inference.clone();
-            let source_language = source_language.clone();
-            let target_language = target_language.clone();
-            let source_for_terms = segment.translation_text.clone();
-            let prompt_terms = corpus_context.prompt_terms.clone();
-            async move {
-                let output = inference
-                    .translate_segment(
-                        &segment,
-                        &source_language,
-                        &target_language,
-                        corpus_context.prompt,
-                    )
-                    .await;
-                (segment_context, source_for_terms, prompt_terms, output)
-            }
-        })
-        .buffered(TRANSLATION_CONCURRENCY_PER_SESSION);
-        tokio::pin!(translations);
-        while let Some((segment_context, source_for_terms, prompt_terms, mut output)) =
-            translations.next().await
-        {
-            if *generation.borrow() != job.generation {
-                continue 'jobs;
-            }
-            if let Ok(translated) = &mut output {
-                let rewrite = rewrite_translation_terms(
-                    &source_for_terms,
-                    &translated.translated_text,
-                    &translated.target_language,
-                    &prompt_terms,
-                );
-                translated.translated_text = rewrite.translated_text;
-                translated.term_matches = rewrite.term_matches;
-                match corpus_session
-                    .record_translation(&RecordTranslationRequest {
-                        context_id: translation_context.context_id,
-                        source_language: translated.source_language.clone(),
-                        target_language: translated.target_language.clone(),
-                        source_text: translated.source_text.clone(),
-                        translated_text: translated.translated_text.clone(),
-                    })
-                    .await
-                {
-                    Ok(_) => {}
-                    Err(message) => {
-                        warn!(%message, "could not record XR Corpus translation context")
+        let translation_generation = generation.clone();
+        let event_generation = job.generation;
+        let workload = job.workload;
+        let turn_started_at = job.enqueued_at;
+        let queue_elapsed = job_queue_elapsed;
+        let context_id = translation_context.context_id;
+        let corpus_session = corpus_session.clone();
+        let inference = inference.clone();
+        let scheduler = scheduler.clone();
+        pending_translation = Some(tokio::spawn(async move {
+            let translations = futures_util::stream::iter(
+                segments
+                    .into_iter()
+                    .zip(segment_contexts)
+                    .zip(translation_context.segments),
+            )
+            .map(|((segment, segment_context), corpus_context)| {
+                let inference = inference.clone();
+                let scheduler = scheduler.clone();
+                let source_language = source_language.clone();
+                let target_language = target_language.clone();
+                let source_for_terms = segment.translation_text.clone();
+                let prompt_terms = corpus_context.prompt_terms.clone();
+                async move {
+                    let _permit = scheduler.acquire_translation(workload).await;
+                    let output = inference
+                        .translate_segment(
+                            &segment,
+                            &source_language,
+                            &target_language,
+                            corpus_context.prompt,
+                        )
+                        .await;
+                    (segment_context, source_for_terms, prompt_terms, output)
+                }
+            })
+            .buffered(TRANSLATION_CONCURRENCY_PER_SESSION);
+            tokio::pin!(translations);
+            let mut batch = Vec::new();
+            while let Some((segment_context, source_for_terms, prompt_terms, mut output)) =
+                translations.next().await
+            {
+                if *translation_generation.borrow() != event_generation {
+                    break;
+                }
+                if let Ok(translated) = &mut output {
+                    let rewrite = rewrite_translation_terms(
+                        &source_for_terms,
+                        &translated.translated_text,
+                        &translated.target_language,
+                        &prompt_terms,
+                    );
+                    translated.translated_text = rewrite.translated_text;
+                    translated.term_matches = rewrite.term_matches;
+                    if let Err(message) = corpus_session
+                        .record_translation(&RecordTranslationRequest {
+                            context_id,
+                            source_language: translated.source_language.clone(),
+                            target_language: translated.target_language.clone(),
+                            source_text: translated.source_text.clone(),
+                            translated_text: translated.translated_text.clone(),
+                        })
+                        .await
+                    {
+                        warn!(%message, "could not record XR Corpus translation context");
                     }
                 }
-            }
-            if events
-                .send(InferenceEvent::Translation {
-                    generation: job.generation,
+                batch.push(InferenceEvent::Translation {
+                    generation: event_generation,
+                    queue_elapsed,
                     asr_elapsed,
+                    total_elapsed: turn_started_at.elapsed(),
                     context: segment_context,
                     output,
-                })
-                .await
-                .is_err()
-            {
-                break 'jobs;
+                });
             }
+            batch
+        }));
+    }
+}
+
+async fn send_inference_batch(
+    events: &mpsc::Sender<InferenceEvent>,
+    batch: Vec<InferenceEvent>,
+) -> bool {
+    for event in batch {
+        if events.send(event).await.is_err() {
+            return false;
         }
     }
+    true
 }
 
 async fn handle_inference_event(
@@ -1565,7 +1689,9 @@ async fn handle_inference_event(
         }
         InferenceEvent::Translation {
             generation,
+            queue_elapsed,
             asr_elapsed,
+            total_elapsed,
             context,
             output,
         } => {
@@ -1584,9 +1710,11 @@ async fn handle_inference_event(
                     output.translated_text,
                     output.term_matches,
                     LatencyMetrics {
+                        queue_ms: millis(queue_elapsed),
                         asr_ms: millis(asr_elapsed),
                         mt_ms: millis(output.mt_elapsed),
                         tts_ms: 0,
+                        total_ms: millis(total_elapsed),
                     },
                     context,
                 )
