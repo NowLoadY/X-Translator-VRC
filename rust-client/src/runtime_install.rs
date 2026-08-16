@@ -17,6 +17,7 @@ use xrtranslate_config::{AppConfig, LlamaCppRuntimeConfig};
 use xrtranslate_download::{DownloadClient, DownloadSpec};
 
 const MIN_CUDA_COMPUTE_CAPABILITY: (u16, u16) = (6, 0);
+const TURING_COMPUTE_CAPABILITY: (u16, u16) = (7, 5);
 const BLACKWELL_MINIMUM_CUDA: (u16, u16) = (12, 8);
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -264,6 +265,7 @@ async fn install(
     let target = project_root.join("runtime").join("llama.cpp");
     let executable = target.join("llama-server.exe");
     if executable.is_file() {
+        validate_runtime_files(&target, selection.backend)?;
         return crate::backend::BackendManager::persist_llama_server_path(
             &project_root,
             &executable,
@@ -290,16 +292,14 @@ async fn install(
     let mut completed = 0_u64;
     for asset in &selection.assets {
         let archive = downloads.join(&asset.name);
-        let partial = downloads.join(format!("{}.part", asset.name));
         client
-            .download(
-                DownloadSpec {
-                    label: &asset.name,
-                    url: &asset.browser_download_url,
-                    bytes: asset.size,
-                    sha256: &asset.sha256,
-                },
-                &partial,
+            .download_to(
+                DownloadSpec::verified(
+                    &asset.name,
+                    &asset.browser_download_url,
+                    asset.size,
+                    &asset.sha256,
+                ),
                 &archive,
                 |progress| {
                     let _ = sender.send(Event::Downloading {
@@ -491,7 +491,13 @@ fn select_assets_for_hardware(
             )
         })?;
         let minimum = minimum_cuda_for_compute_capability(nvidia.compute_capability);
-        let runtime = best_cuda_asset(assets, supported, minimum).ok_or_else(|| {
+        let runtime = best_cuda_asset(
+            assets,
+            supported,
+            minimum,
+            nvidia.compute_capability,
+        )
+        .ok_or_else(|| {
             format!(
                 "NVIDIA GPU {} (compute capability {}) requires CUDA {} or newer, and the driver supports up to CUDA {}, but the configured llama.cpp download list has no compatible Windows x64 CUDA package. Update the NVIDIA driver, update config.json, or install llama.cpp manually.",
                 nvidia.gpu,
@@ -534,6 +540,7 @@ fn best_cuda_asset(
     assets: &[ReleaseAsset],
     supported: (u16, u16),
     minimum: (u16, u16),
+    compute_capability: (u16, u16),
 ) -> Option<ReleaseAsset> {
     assets
         .iter()
@@ -543,7 +550,10 @@ fn best_cuda_asset(
             }
             let version = cuda_suffix(&asset.name)?;
             let version = parse_version(version)?;
-            (version >= minimum && version <= supported).then_some((version, asset.clone()))
+            (version >= minimum
+                && version <= supported
+                && cuda_supports_compute_capability(version, compute_capability))
+            .then_some((version, asset.clone()))
         })
         .max_by_key(|(version, _)| *version)
         .map(|(_, asset)| asset)
@@ -558,7 +568,15 @@ fn cuda_suffix(name: &str) -> Option<&str> {
 
 fn parse_version(value: &str) -> Option<(u16, u16)> {
     let mut parts = value.split('.');
-    Some((parts.next()?.parse().ok()?, parts.next()?.parse().ok()?))
+    let version = (parts.next()?.parse().ok()?, parts.next()?.parse().ok()?);
+    parts.next().is_none().then_some(version)
+}
+
+fn cuda_supports_compute_capability(
+    cuda_version: (u16, u16),
+    compute_capability: (u16, u16),
+) -> bool {
+    cuda_version.0 < 13 || compute_capability >= TURING_COMPUTE_CAPABILITY
 }
 
 fn format_version(version: (u16, u16)) -> String {
@@ -849,6 +867,41 @@ mod tests {
                 "cudart-llama-bin-win-cuda-13.3-x64.zip"
             ]
         );
+    }
+
+    #[test]
+    fn pre_turing_gpu_never_selects_cuda_13() {
+        let assets = vec![
+            asset("llama-b1-bin-win-cuda-12.4-x64.zip"),
+            asset("cudart-llama-bin-win-cuda-12.4-x64.zip"),
+            asset("llama-b1-bin-win-cuda-13.3-x64.zip"),
+            asset("cudart-llama-bin-win-cuda-13.3-x64.zip"),
+        ];
+        for (gpu, compute_capability) in [
+            ("NVIDIA GeForce GTX 1080", (6, 1)),
+            ("NVIDIA TITAN V", (7, 0)),
+        ] {
+            let selected = select_assets_for_hardware(
+                &assets,
+                Some(&NvidiaCuda {
+                    gpu: gpu.into(),
+                    compute_capability,
+                    driver_cuda: "13.3".into(),
+                }),
+            )
+            .unwrap();
+            assert_eq!(
+                selected.assets[0].name,
+                "llama-b1-bin-win-cuda-12.4-x64.zip"
+            );
+        }
+    }
+
+    #[test]
+    fn turing_and_newer_can_select_cuda_13() {
+        assert!(!cuda_supports_compute_capability((13, 3), (7, 0)));
+        assert!(cuda_supports_compute_capability((13, 3), (7, 5)));
+        assert!(cuda_supports_compute_capability((13, 3), (8, 9)));
     }
 
     #[test]

@@ -5,28 +5,22 @@
 //! to `xrtranslate-updater` so Windows can swap the executable after exit.
 
 use crossbeam_channel::{Receiver, TryRecvError, unbounded};
-use reqwest::{
-    StatusCode,
-    header::{ACCEPT, ACCEPT_ENCODING, CONTENT_RANGE, HeaderValue, RANGE},
-};
+use reqwest::header::{ACCEPT, ACCEPT_ENCODING, HeaderValue};
 use serde::Deserialize;
-use sha2::{Digest, Sha256};
 use std::{
-    fs,
-    io::{self, Read},
+    fs, io,
     path::{Path, PathBuf},
     process::Command,
     thread,
     time::Duration,
 };
-use tokio::io::AsyncWriteExt;
+use xrtranslate_download::{DownloadClient, DownloadSpec};
 
 const LATEST_RELEASE_URL: &str =
     "https://api.github.com/repos/NowLoadY/XRTranslate/releases/latest";
 const LATEST_RELEASE_PAGE: &str = "https://github.com/NowLoadY/XRTranslate/releases/latest";
 const RELEASE_DOWNLOAD_BASE: &str = "https://github.com/NowLoadY/XRTranslate/releases/download/";
 const USER_AGENT: &str = concat!("XRTranslate updater/", env!("CARGO_PKG_VERSION"));
-const MAX_DOWNLOAD_ATTEMPTS: u32 = 4;
 const GITHUB_API_VERSION: &str = "2022-11-28";
 
 #[derive(Clone, Debug)]
@@ -425,14 +419,22 @@ async fn download_and_stage(
     reset_directory(&payload)?;
 
     let archive = download_dir.join(&asset.name);
-    let partial = download_dir.join(format!("{}.part", asset.name));
-    let client = http_client(proxy_url)?;
-    download_asset(&client, &asset, &partial, &archive, |downloaded, total| {
-        let _ = sender.send(Event::Downloading { downloaded, total });
-    })
-    .await?;
+    let client = DownloadClient::with_proxy(USER_AGENT, proxy_url)
+        .map_err(|error| format!("Cannot initialize update download: {error}"))?;
+    let spec = asset.sha256.as_deref().map_or_else(
+        || DownloadSpec::size_only(&asset.name, &asset.download_url, asset.size),
+        |sha256| DownloadSpec::verified(&asset.name, &asset.download_url, asset.size, sha256),
+    );
+    client
+        .download_to(spec, &archive, |progress| {
+            let _ = sender.send(Event::Downloading {
+                downloaded: progress.downloaded_bytes,
+                total: progress.total_bytes,
+            });
+        })
+        .await
+        .map_err(|error| format!("Cannot download update: {error}"))?;
 
-    verify_downloaded_asset(&archive, &asset)?;
     extract_zip(&archive, &payload)?;
     let source = release_source_directory(&payload)?;
     let updater_entrypoint = validate_staged_release(&source)?;
@@ -441,192 +443,6 @@ async fn download_and_stage(
         updater_entrypoint,
         info: asset.info(),
     })
-}
-
-async fn download_asset(
-    client: &reqwest::Client,
-    asset: &ReleaseAsset,
-    partial: &Path,
-    complete: &Path,
-    mut on_progress: impl FnMut(u64, u64),
-) -> Result<(), String> {
-    if complete.is_file() && file_size(complete)? == asset.size {
-        on_progress(asset.size, asset.size);
-        return Ok(());
-    }
-    if complete.exists() {
-        let _ = fs::remove_file(complete);
-    }
-    if file_size(partial).unwrap_or(0) > asset.size {
-        let _ = fs::remove_file(partial);
-    }
-    for attempt in 1..=MAX_DOWNLOAD_ATTEMPTS {
-        match transfer_once(client, asset, partial, &mut on_progress).await {
-            Ok(()) => {
-                tokio::fs::rename(partial, complete)
-                    .await
-                    .map_err(|error| format!("Cannot save update package: {error}"))?;
-                return Ok(());
-            }
-            Err(_error) if attempt < MAX_DOWNLOAD_ATTEMPTS => {
-                tokio::time::sleep(Duration::from_secs(1 << (attempt - 1).min(4))).await;
-            }
-            Err(error) => return Err(error.message),
-        }
-    }
-    unreachable!("download loop always returns")
-}
-
-struct TransferError {
-    message: String,
-}
-
-async fn transfer_once(
-    client: &reqwest::Client,
-    asset: &ReleaseAsset,
-    partial: &Path,
-    on_progress: &mut impl FnMut(u64, u64),
-) -> Result<(), TransferError> {
-    let existing = file_size(partial).unwrap_or(0).min(asset.size);
-    let mut request = client
-        .get(&asset.download_url)
-        .header(ACCEPT_ENCODING, "identity");
-    if existing > 0 {
-        request = request.header(RANGE, format!("bytes={existing}-"));
-    }
-    let response = match request.send().await {
-        Ok(response) => response,
-        Err(error) => {
-            return Err(TransferError {
-                message: format!("Cannot download update: {error}"),
-            });
-        }
-    };
-    if !response.status().is_success() {
-        return Err(TransferError {
-            message: format!("Update download returned HTTP {}.", response.status()),
-        });
-    }
-
-    let append = if existing > 0 && response.status() == StatusCode::PARTIAL_CONTENT {
-        validate_content_range(&response, existing, asset.size)
-            .map_err(|message| TransferError { message })?;
-        true
-    } else {
-        existing == 0
-    };
-    let mut downloaded = if append { existing } else { 0 };
-    if let Some(parent) = partial.parent()
-        && let Err(error) = tokio::fs::create_dir_all(parent).await
-    {
-        return Err(TransferError {
-            message: format!("Cannot create update download folder: {error}"),
-        });
-    }
-    let mut output = match tokio::fs::OpenOptions::new()
-        .create(true)
-        .write(true)
-        .append(append)
-        .truncate(!append)
-        .open(partial)
-        .await
-    {
-        Ok(output) => output,
-        Err(error) => {
-            return Err(TransferError {
-                message: format!("Cannot write update package: {error}"),
-            });
-        }
-    };
-    on_progress(downloaded, asset.size);
-    let mut response = response;
-    loop {
-        let chunk = match response.chunk().await {
-            Ok(chunk) => chunk,
-            Err(error) => {
-                let _ = output.flush().await;
-                return Err(TransferError {
-                    message: format!("Update download was interrupted: {error}"),
-                });
-            }
-        };
-        let Some(chunk) = chunk else { break };
-        downloaded = downloaded.saturating_add(chunk.len() as u64);
-        if downloaded > asset.size {
-            let _ = output.flush().await;
-            let _ = fs::remove_file(partial);
-            return Err(TransferError {
-                message: "The update package is larger than expected.".into(),
-            });
-        }
-        if let Err(error) = output.write_all(&chunk).await {
-            return Err(TransferError {
-                message: format!("Cannot write update package: {error}"),
-            });
-        }
-        on_progress(downloaded, asset.size);
-    }
-    if let Err(error) = output.flush().await {
-        return Err(TransferError {
-            message: format!("Cannot finish update package: {error}"),
-        });
-    }
-    if let Err(error) = output.sync_all().await {
-        return Err(TransferError {
-            message: format!("Cannot finish update package: {error}"),
-        });
-    }
-    if downloaded != asset.size {
-        return Err(TransferError {
-            message: format!(
-                "Update download stopped at {} of {} bytes.",
-                downloaded, asset.size
-            ),
-        });
-    }
-    Ok(())
-}
-
-fn validate_content_range(
-    response: &reqwest::Response,
-    expected_start: u64,
-    expected_total: u64,
-) -> Result<(), String> {
-    let value = response
-        .headers()
-        .get(CONTENT_RANGE)
-        .and_then(|value| value.to_str().ok())
-        .unwrap_or_default();
-    let parsed = value
-        .strip_prefix("bytes ")
-        .and_then(|value| value.split_once('/'))
-        .and_then(|(range, total)| {
-            let (start, _) = range.split_once('-')?;
-            Some((start.parse::<u64>().ok()?, total.parse::<u64>().ok()?))
-        });
-    if parsed == Some((expected_start, expected_total)) {
-        Ok(())
-    } else {
-        Err("The update server returned an invalid resume response.".into())
-    }
-}
-
-fn verify_downloaded_asset(path: &Path, asset: &ReleaseAsset) -> Result<(), String> {
-    let actual_size = file_size(path)?;
-    if actual_size != asset.size {
-        return Err(format!(
-            "The update package has {actual_size} bytes; expected {}.",
-            asset.size
-        ));
-    }
-    if let Some(expected) = &asset.sha256 {
-        let actual = sha256_file(path)
-            .map_err(|error| format!("Cannot verify update package {}: {error}", path.display()))?;
-        if !actual.eq_ignore_ascii_case(expected) {
-            return Err("The update package did not pass verification.".into());
-        }
-    }
-    Ok(())
 }
 
 fn extract_zip(archive: &Path, destination: &Path) -> Result<(), String> {
@@ -844,26 +660,6 @@ fn reset_directory(path: &Path) -> Result<(), String> {
     fs::create_dir_all(path).map_err(|error| format!("Cannot create {}: {error}", path.display()))
 }
 
-fn file_size(path: &Path) -> Result<u64, String> {
-    fs::metadata(path)
-        .map(|metadata| metadata.len())
-        .map_err(|error| format!("Cannot inspect {}: {error}", path.display()))
-}
-
-fn sha256_file(path: &Path) -> io::Result<String> {
-    let mut file = fs::File::open(path)?;
-    let mut hasher = Sha256::new();
-    let mut buffer = vec![0_u8; 1024 * 1024];
-    loop {
-        let count = file.read(&mut buffer)?;
-        if count == 0 {
-            break;
-        }
-        hasher.update(&buffer[..count]);
-    }
-    Ok(format!("{:x}", hasher.finalize()))
-}
-
 fn safe_path_segment(value: &str) -> String {
     value
         .chars()
@@ -924,10 +720,9 @@ mod tests {
 
     #[test]
     fn extracts_release_tag_from_latest_redirect() {
-        let url = reqwest::Url::parse(
-            "https://github.com/NowLoadY/XRTranslate/releases/tag/v0.2.5",
-        )
-        .unwrap();
+        let url =
+            reqwest::Url::parse("https://github.com/NowLoadY/XRTranslate/releases/tag/v0.2.5")
+                .unwrap();
         assert_eq!(release_tag_from_url(&url).as_deref(), Some("v0.2.5"));
 
         let unexpected =

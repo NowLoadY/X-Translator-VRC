@@ -83,7 +83,10 @@ impl MpvInstaller {
                     .build()
                     .map_err(|error| format!("Cannot create download runtime: {error}"))
                     .and_then(|runtime| {
-                        runtime.block_on(download_and_install_mpv(sender.clone(), proxy_url.as_deref()))
+                        runtime.block_on(download_and_install_mpv(
+                            sender.clone(),
+                            proxy_url.as_deref(),
+                        ))
                     });
                 let _ = sender.send(Event::Finished(result));
             })
@@ -151,24 +154,27 @@ async fn download_and_install_mpv(
     proxy_url: Option<&str>,
 ) -> Result<(), String> {
     let temp_dir = std::env::temp_dir().join(format!("xrtranslate_mpv_{}", std::process::id()));
-    fs::create_dir_all(&temp_dir)
-        .map_err(|e| format!("Cannot create temporary directory {}: {e}", temp_dir.display()))?;
+    fs::create_dir_all(&temp_dir).map_err(|e| {
+        format!(
+            "Cannot create temporary directory {}: {e}",
+            temp_dir.display()
+        )
+    })?;
 
-    let partial_path = temp_dir.join("mpv-2.zip.part");
     let complete_path = temp_dir.join("mpv-2.zip");
 
     let client = DownloadClient::with_proxy("XRTranslate", proxy_url)
         .map_err(|e| format!("Cannot initialize download client: {e}"))?;
 
-    let spec = DownloadSpec {
-        label: "mpv-2.zip",
-        url: MPV_DOWNLOAD_URL,
-        bytes: MPV_DOWNLOAD_BYTES,
-        sha256: MPV_DOWNLOAD_SHA256,
-    };
+    let spec = DownloadSpec::verified(
+        "mpv-2.zip",
+        MPV_DOWNLOAD_URL,
+        MPV_DOWNLOAD_BYTES,
+        MPV_DOWNLOAD_SHA256,
+    );
 
     client
-        .download(spec, &partial_path, &complete_path, |progress: DownloadProgress| {
+        .download_to(spec, &complete_path, |progress: DownloadProgress| {
             let _ = sender.send(Event::Downloading {
                 downloaded: progress.downloaded_bytes,
                 total: progress.total_bytes,
@@ -208,7 +214,9 @@ fn extract_mpv_zip(archive_path: &Path, target_dir: &Path) -> Result<(), String>
     let file = fs::File::open(archive_path).map_err(|e| format!("Cannot open archive: {e}"))?;
     let mut zip = zip::ZipArchive::new(file).map_err(|e| format!("Invalid zip archive: {e}"))?;
     for i in 0..zip.len() {
-        let mut entry = zip.by_index(i).map_err(|e| format!("Failed reading zip entry: {e}"))?;
+        let mut entry = zip
+            .by_index(i)
+            .map_err(|e| format!("Failed reading zip entry: {e}"))?;
         let Some(name) = entry.enclosed_name() else {
             continue;
         };
@@ -239,7 +247,8 @@ mod tests {
 
     #[test]
     fn extract_mpv_zip_extracts_and_creates_libmpv_copy() {
-        let temp = std::env::temp_dir().join(format!("xrt_mpv_extract_test_{}", std::process::id()));
+        let temp =
+            std::env::temp_dir().join(format!("xrt_mpv_extract_test_{}", std::process::id()));
         let _ = fs::remove_dir_all(&temp);
         fs::create_dir_all(&temp).unwrap();
 
@@ -272,4 +281,3 @@ mod tests {
         let _ = fs::remove_dir_all(&temp);
     }
 }
-

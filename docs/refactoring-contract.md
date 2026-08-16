@@ -55,6 +55,11 @@ shared domain/runtime/UI capability
 - Generic event pumps broadcast to registered subscribers. Conversion from a
   generic session event into plugin-domain data belongs in that plugin's event
   adapter, not in the pump or networking layer.
+- All immutable remote-file transfers use `xrtranslate-download`. Feature
+  modules own artifact selection, extraction, installation, and UI state, but
+  must not implement their own HTTP chunk loop, range-resume, retry, proxy, or
+  checksum policy. SHA-256 verification is the default; size-only verification
+  is an explicit fallback only when a trusted source publishes no digest.
 - UI rendering should consume a snapshot/controller and emit typed actions.
   Rendering code must not acquire unrelated runtime or persistence ownership.
 

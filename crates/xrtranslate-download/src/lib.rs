@@ -1,8 +1,15 @@
+//! Shared immutable-artifact transfer infrastructure.
+//!
+//! Model, runtime, plugin-component, and application-update installers select
+//! their own artifacts and own extraction/activation. They all delegate HTTPS,
+//! proxying, retries, resume validation, cache recovery, progress, and integrity
+//! checks to this crate so those guarantees cannot drift between features.
+
 #![forbid(unsafe_code)]
 
 use reqwest::{
     StatusCode,
-    header::{ACCEPT_ENCODING, CONTENT_RANGE, RANGE},
+    header::{ACCEPT_ENCODING, CONTENT_RANGE, RANGE, RETRY_AFTER},
 };
 use sha2::{Digest, Sha256};
 use std::{
@@ -22,10 +29,39 @@ pub struct DownloadProgress {
 
 #[derive(Clone, Copy, Debug)]
 pub struct DownloadSpec<'a> {
-    pub label: &'a str,
-    pub url: &'a str,
-    pub bytes: u64,
-    pub sha256: &'a str,
+    label: &'a str,
+    url: &'a str,
+    bytes: u64,
+    integrity: DownloadIntegrity<'a>,
+}
+
+#[derive(Clone, Copy, Debug)]
+enum DownloadIntegrity<'a> {
+    Sha256(&'a str),
+    SizeOnly,
+}
+
+impl<'a> DownloadSpec<'a> {
+    /// Creates an immutable artifact contract verified by length and SHA-256.
+    pub const fn verified(label: &'a str, url: &'a str, bytes: u64, sha256: &'a str) -> Self {
+        Self {
+            label,
+            url,
+            bytes,
+            integrity: DownloadIntegrity::Sha256(sha256),
+        }
+    }
+
+    /// Creates a length-only contract for a trusted HTTPS source that does not
+    /// publish a digest. Prefer [`Self::verified`] whenever a digest exists.
+    pub const fn size_only(label: &'a str, url: &'a str, bytes: u64) -> Self {
+        Self {
+            label,
+            url,
+            bytes,
+            integrity: DownloadIntegrity::SizeOnly,
+        }
+    }
 }
 
 #[derive(Clone, Copy, Debug)]
@@ -34,6 +70,8 @@ pub struct DownloadPolicy {
     pub connect_timeout: Duration,
     pub read_timeout: Duration,
     pub retry_delay: Duration,
+    /// Do not leave a UI-owned worker sleeping indefinitely on a server hint.
+    pub max_automatic_retry_delay: Duration,
 }
 
 impl Default for DownloadPolicy {
@@ -43,6 +81,7 @@ impl Default for DownloadPolicy {
             connect_timeout: Duration::from_secs(15),
             read_timeout: Duration::from_secs(45),
             retry_delay: Duration::from_secs(1),
+            max_automatic_retry_delay: Duration::from_secs(60),
         }
     }
 }
@@ -92,6 +131,25 @@ impl DownloadClient {
         Ok(Self { client, policy })
     }
 
+    /// Downloads beside `complete` using a deterministic `.part` sibling.
+    pub async fn download_to(
+        &self,
+        spec: DownloadSpec<'_>,
+        complete: &Path,
+        on_progress: impl FnMut(DownloadProgress),
+    ) -> Result<(), DownloadError> {
+        let file_name = complete.file_name().ok_or_else(|| {
+            DownloadError::InvalidSpec(format!(
+                "download {} destination has no file name",
+                spec.label
+            ))
+        })?;
+        let mut partial_name = file_name.to_os_string();
+        partial_name.push(".part");
+        let partial = complete.with_file_name(partial_name);
+        self.download(spec, &partial, complete, on_progress).await
+    }
+
     pub async fn download(
         &self,
         spec: DownloadSpec<'_>,
@@ -110,8 +168,16 @@ impl DownloadClient {
                     return Ok(());
                 }
                 Err(error) => {
-                    let _ = fs::remove_file(complete);
-                    return Err(error);
+                    fs::remove_file(complete).map_err(|source| DownloadError::FileIo {
+                        path: complete.to_path_buf(),
+                        source,
+                    })?;
+                    if !matches!(
+                        error,
+                        DownloadError::Size { .. } | DownloadError::Integrity { .. }
+                    ) {
+                        return Err(error);
+                    }
                 }
             }
         }
@@ -129,6 +195,17 @@ impl DownloadClient {
                 Ok(()) => {
                     if let Err(error) = verify_file(partial, spec) {
                         let _ = fs::remove_file(partial);
+                        if matches!(
+                            error,
+                            DownloadError::Size { .. } | DownloadError::Integrity { .. }
+                        ) && attempt < self.policy.max_attempts
+                        {
+                            let Some(delay) = self.retry_delay(&error, attempt) else {
+                                return Err(error);
+                            };
+                            tokio::time::sleep(delay).await;
+                            continue;
+                        }
                         return Err(error);
                     }
                     tokio::fs::rename(partial, complete)
@@ -140,13 +217,23 @@ impl DownloadClient {
                     return Ok(());
                 }
                 Err(error) if error.is_retryable() && attempt < self.policy.max_attempts => {
-                    let multiplier = 1_u32 << (attempt - 1).min(4);
-                    tokio::time::sleep(self.policy.retry_delay.saturating_mul(multiplier)).await;
+                    let Some(delay) = self.retry_delay(&error, attempt) else {
+                        return Err(error.with_attempts(attempt));
+                    };
+                    tokio::time::sleep(delay).await;
                 }
                 Err(error) => return Err(error.with_attempts(attempt)),
             }
         }
         unreachable!("a non-zero retry policy always returns from the loop")
+    }
+
+    fn retry_delay(&self, error: &DownloadError, attempt: u32) -> Option<Duration> {
+        let delay = error.retry_after().unwrap_or_else(|| {
+            let multiplier = 1_u32 << (attempt - 1).min(4);
+            self.policy.retry_delay.saturating_mul(multiplier)
+        });
+        (delay <= self.policy.max_automatic_retry_delay).then_some(delay)
     }
 
     async fn transfer_once(
@@ -155,16 +242,15 @@ impl DownloadClient {
         partial: &Path,
         on_progress: &mut impl FnMut(DownloadProgress),
     ) -> Result<(), DownloadError> {
-        let existing = fs::metadata(partial)
+        let mut existing = fs::metadata(partial)
             .map(|metadata| metadata.len())
             .unwrap_or(0);
         if existing > spec.bytes {
-            let _ = fs::remove_file(partial);
-            return Err(DownloadError::Size {
+            fs::remove_file(partial).map_err(|source| DownloadError::FileIo {
                 path: partial.to_path_buf(),
-                expected: spec.bytes,
-                actual: existing,
-            });
+                source,
+            })?;
+            existing = 0;
         }
         if existing == spec.bytes {
             return Ok(());
@@ -190,6 +276,7 @@ impl DownloadClient {
             return Err(DownloadError::HttpStatus {
                 label: spec.label.to_owned(),
                 status,
+                retry_after: parse_retry_after(&response),
                 attempts: 0,
             });
         }
@@ -307,6 +394,7 @@ pub enum DownloadError {
     HttpStatus {
         label: String,
         status: StatusCode,
+        retry_after: Option<Duration>,
         attempts: u32,
     },
     Transfer {
@@ -346,6 +434,11 @@ impl DownloadError {
     fn is_retryable(&self) -> bool {
         match self {
             Self::Transfer { .. } | Self::Incomplete { .. } => true,
+            Self::HttpStatus {
+                status: StatusCode::FORBIDDEN,
+                retry_after: Some(_),
+                ..
+            } => true,
             Self::HttpStatus { status, .. } => matches!(
                 *status,
                 StatusCode::REQUEST_TIMEOUT
@@ -356,6 +449,13 @@ impl DownloadError {
                     | StatusCode::GATEWAY_TIMEOUT
             ),
             _ => false,
+        }
+    }
+
+    fn retry_after(&self) -> Option<Duration> {
+        match self {
+            Self::HttpStatus { retry_after, .. } => *retry_after,
+            _ => None,
         }
     }
 
@@ -387,11 +487,18 @@ impl fmt::Display for DownloadError {
             Self::HttpStatus {
                 label,
                 status,
+                retry_after,
                 attempts,
-            } => write!(
-                formatter,
-                "download {label} returned HTTP {status} after {attempts} attempt(s); retry to resume"
-            ),
+            } => {
+                write!(
+                    formatter,
+                    "download {label} returned HTTP {status} after {attempts} attempt(s)"
+                )?;
+                if let Some(delay) = retry_after {
+                    write!(formatter, "; server requested a {}s delay", delay.as_secs())?;
+                }
+                formatter.write_str("; retry to resume")
+            }
             Self::Transfer {
                 label,
                 message,
@@ -457,9 +564,19 @@ impl Error for DownloadError {
 }
 
 fn validate_spec(spec: DownloadSpec<'_>) -> Result<(), DownloadError> {
-    if !spec.url.starts_with("https://") {
+    let url = reqwest::Url::parse(spec.url).map_err(|error| {
+        DownloadError::InvalidSpec(format!(
+            "download {} has an invalid URL: {error}",
+            spec.label
+        ))
+    })?;
+    if url.scheme() != "https"
+        || url.host_str().is_none()
+        || !url.username().is_empty()
+        || url.password().is_some()
+    {
         return Err(DownloadError::InvalidSpec(format!(
-            "download {} must use HTTPS",
+            "download {} must use an HTTPS URL without embedded credentials",
             spec.label
         )));
     }
@@ -469,7 +586,9 @@ fn validate_spec(spec: DownloadSpec<'_>) -> Result<(), DownloadError> {
             spec.label
         )));
     }
-    if spec.sha256.len() != 64 || !spec.sha256.bytes().all(|byte| byte.is_ascii_hexdigit()) {
+    if let DownloadIntegrity::Sha256(sha256) = spec.integrity
+        && (sha256.len() != 64 || !sha256.bytes().all(|byte| byte.is_ascii_hexdigit()))
+    {
         return Err(DownloadError::InvalidSpec(format!(
             "download {} has an invalid SHA-256",
             spec.label
@@ -520,18 +639,35 @@ fn verify_file(path: &Path, spec: DownloadSpec<'_>) -> Result<(), DownloadError>
             actual: actual_size,
         });
     }
-    let actual = sha256_file(path).map_err(|source| DownloadError::FileIo {
-        path: path.to_path_buf(),
-        source,
-    })?;
-    if !actual.eq_ignore_ascii_case(spec.sha256) {
-        return Err(DownloadError::Integrity {
+    if let DownloadIntegrity::Sha256(expected) = spec.integrity {
+        let actual = sha256_file(path).map_err(|source| DownloadError::FileIo {
             path: path.to_path_buf(),
-            expected: spec.sha256.to_owned(),
-            actual,
-        });
+            source,
+        })?;
+        if !actual.eq_ignore_ascii_case(expected) {
+            return Err(DownloadError::Integrity {
+                path: path.to_path_buf(),
+                expected: expected.to_owned(),
+                actual,
+            });
+        }
     }
     Ok(())
+}
+
+fn parse_retry_after(response: &reqwest::Response) -> Option<Duration> {
+    let value = response.headers().get(RETRY_AFTER)?.to_str().ok()?;
+    parse_retry_after_value(value, std::time::SystemTime::now())
+}
+
+fn parse_retry_after_value(value: &str, now: std::time::SystemTime) -> Option<Duration> {
+    if let Ok(seconds) = value.parse::<u64>() {
+        return Some(Duration::from_secs(seconds));
+    }
+    httpdate::parse_http_date(value)
+        .ok()?
+        .duration_since(now)
+        .ok()
 }
 
 fn sha256_file(path: &Path) -> io::Result<String> {
@@ -546,4 +682,86 @@ fn sha256_file(path: &Path) -> io::Result<String> {
         hasher.update(&buffer[..count]);
     }
     Ok(format!("{:x}", hasher.finalize()))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn validates_verified_and_explicit_size_only_contracts() {
+        assert!(
+            validate_spec(DownloadSpec::verified(
+                "artifact",
+                "https://example.com/file.zip",
+                42,
+                &"a".repeat(64),
+            ))
+            .is_ok()
+        );
+        assert!(
+            validate_spec(DownloadSpec::size_only(
+                "artifact",
+                "https://example.com/file.zip",
+                42,
+            ))
+            .is_ok()
+        );
+        assert!(
+            validate_spec(DownloadSpec::size_only(
+                "artifact",
+                "https://user:secret@example.com/file.zip",
+                42,
+            ))
+            .is_err()
+        );
+    }
+
+    #[test]
+    fn retry_after_accepts_seconds_and_http_dates() {
+        let now = std::time::UNIX_EPOCH + Duration::from_secs(1_000);
+        assert_eq!(
+            parse_retry_after_value("17", now),
+            Some(Duration::from_secs(17))
+        );
+        let later = now + Duration::from_secs(30);
+        let date = httpdate::fmt_http_date(later);
+        assert_eq!(
+            parse_retry_after_value(&date, now),
+            Some(Duration::from_secs(30))
+        );
+
+        let client = DownloadClient {
+            client: reqwest::Client::new(),
+            policy: DownloadPolicy::default(),
+        };
+        let excessive = DownloadError::HttpStatus {
+            label: "artifact".into(),
+            status: StatusCode::TOO_MANY_REQUESTS,
+            retry_after: Some(Duration::from_secs(600)),
+            attempts: 0,
+        };
+        assert_eq!(client.retry_delay(&excessive, 1), None);
+    }
+
+    #[test]
+    fn size_only_skips_hashing_but_still_enforces_length() {
+        let path = std::env::temp_dir().join(format!(
+            "xrtranslate-download-contract-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        fs::write(&path, b"payload").unwrap();
+        let spec = DownloadSpec::size_only("artifact", "https://example.com/file", 7);
+        assert!(verify_file(&path, spec).is_ok());
+        let wrong_size = DownloadSpec::size_only("artifact", "https://example.com/file", 8);
+        assert!(matches!(
+            verify_file(&path, wrong_size),
+            Err(DownloadError::Size { .. })
+        ));
+        fs::remove_file(path).unwrap();
+    }
 }

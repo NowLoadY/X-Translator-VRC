@@ -4317,7 +4317,6 @@ dependencies = [
  "rusqlite",
  "serde",
  "serde_json",
- "sha2",
  "symphonia",
  "tokio",
  "tokio-tungstenite 0.30.0",
@@ -7018,6 +7017,7 @@ dependencies = [
 name = "xrtranslate-download"
 version = "0.2.5"
 dependencies = [
+ "httpdate",
  "reqwest",
  "sha2",
  "tokio",

@@ -686,17 +686,10 @@ impl NativeModelInstaller {
         on_progress: &mut impl FnMut(DownloadProgress),
     ) -> Result<(), ModelDownloadError> {
         let complete = context.staging.join(file.relative_path);
-        let partial = context.staging.join(format!("{}.part", file.relative_path));
         let url = context.source.hugging_face_resolve_url(file.relative_path);
         self.client
-            .download(
-                DownloadSpec {
-                    label: file.purpose,
-                    url: &url,
-                    bytes: file.bytes,
-                    sha256: file.sha256,
-                },
-                &partial,
+            .download_to(
+                DownloadSpec::verified(file.purpose, &url, file.bytes, file.sha256),
                 &complete,
                 |progress| {
                     on_progress(DownloadProgress {
