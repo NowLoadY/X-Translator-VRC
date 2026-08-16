@@ -19,6 +19,10 @@ use std::{
     sync::Arc,
 };
 
+use crate::session_coordinator::{
+    PluginSessionBinding, PluginSessionOwner, SessionOutputPolicy, SpeakerRecognitionPolicy,
+    TranslationSessionPlugin,
+};
 use controller::MeetingController;
 
 /// Audio inputs understood by the meeting plugin.
@@ -143,5 +147,31 @@ impl MeetingPlugin {
         ui: &mut eframe::egui::Ui,
     ) -> MeetingAction {
         ui::render(self, snapshot, ui)
+    }
+}
+
+impl TranslationSessionPlugin for MeetingPlugin {
+    fn translation_session_binding(&self) -> Option<PluginSessionBinding> {
+        let active = self.controller.active_capture.lock().ok()?;
+        let active = active.as_ref()?;
+        let display_name_key = if active.imported_audio {
+            "Meeting Audio Import"
+        } else {
+            "Meeting Notes"
+        };
+        Some(PluginSessionBinding {
+            owner: PluginSessionOwner::new(
+                super::PluginId::MEETING.as_str(),
+                active.meeting_id.clone(),
+                display_name_key,
+                "Open meeting controls",
+                "A meeting owns the active audio session",
+            ),
+            output_policy: SessionOutputPolicy::PluginOnly,
+            speaker_recognition: SpeakerRecognitionPolicy::Enabled,
+            host_tts: false,
+            external_audio_gate: false,
+            finish_when_audio_ends: active.imported_audio,
+        })
     }
 }

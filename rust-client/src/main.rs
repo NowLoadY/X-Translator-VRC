@@ -44,12 +44,14 @@ use i18n::UiLanguage;
 use network::{ExternalAudioGate, SessionConfig, SessionEvent, SessionHandle, start_session};
 use plugins::meeting::{
     MeetingAction, MeetingAudioSource, MeetingInputRequest, MeetingPlugin, MeetingUiSnapshot,
-    events::{MeetingSegmentEvent, MeetingSegmentSource},
 };
 use plugins::osc::{OscPageContext, OscPlugin, OscUiAction};
 use plugins::{PluginId, PluginPreferences, PluginRegistry, PluginScrollPolicy};
 pub(crate) use presentation::speaker::compact_speaker_label;
-use session_coordinator::TranslationSessionOwner;
+use session_coordinator::{
+    CaptionUpdate, HostOutputEvent, HostOutputSubscriber, PluginSessionBinding,
+    SessionEventSubscriber, TranslationSessionOwner, TranslationSessionPlugin,
+};
 use ui::{NavigationState, Page};
 
 pub const LANGUAGE_OPTIONS: &[(&str, &str)] = &[
@@ -141,8 +143,6 @@ struct XRTranslateApp {
     loopback_vad_active: Arc<AtomicBool>,
     sessions: Vec<SessionHandle>,
     meeting_audio_routers: Vec<std::thread::JoinHandle<()>>,
-    meeting_sessions_remaining: Arc<AtomicUsize>,
-    meeting_end_requested: Arc<AtomicBool>,
     event_tx: Sender<SessionEvent>,
     connection_status: String,
     partial_text: String,
@@ -209,6 +209,12 @@ struct SharedSessionState {
     pending_route_change: Option<(String, String)>,
 }
 
+fn publish_host_output(subscribers: &[Box<dyn HostOutputSubscriber>], event: HostOutputEvent<'_>) {
+    for subscriber in subscribers {
+        subscriber.on_host_output(event);
+    }
+}
+
 impl Default for XRTranslateApp {
     fn default() -> Self {
         let audio_system = AudioSystem::new();
@@ -256,8 +262,6 @@ impl Default for XRTranslateApp {
         let loopback_vad_active = Arc::new(AtomicBool::new(false));
         let input_level = Arc::new(AtomicU32::new(0.0_f32.to_bits()));
         let loopback_level = Arc::new(AtomicU32::new(0.0_f32.to_bits()));
-        let meeting_sessions_remaining = Arc::new(AtomicUsize::new(0));
-        let meeting_end_requested = Arc::new(AtomicBool::new(false));
 
         // Background session event pump thread
         let shared_state_clone = Arc::clone(&shared_session_state);
@@ -268,15 +272,18 @@ impl Default for XRTranslateApp {
         let microphone_vad_active_clone = Arc::clone(&microphone_vad_active);
         let loopback_vad_active_clone = Arc::clone(&loopback_vad_active);
         let rx = event_rx.clone();
-        let meeting_event_sink = meeting_plugin.event_sink.clone();
-        let osc_publisher = osc_plugin.publisher();
-        let meeting_sessions_remaining_for_events = Arc::clone(&meeting_sessions_remaining);
-        let meeting_end_requested_for_events = Arc::clone(&meeting_end_requested);
+        let session_event_subscribers: Vec<Box<dyn SessionEventSubscriber>> =
+            vec![Box::new(meeting_plugin.event_sink.clone())];
+        let host_output_subscribers: Vec<Box<dyn HostOutputSubscriber>> =
+            vec![Box::new(osc_plugin.publisher())];
 
         std::thread::Builder::new()
             .name("session-event-pump".into())
             .spawn(move || {
                 while let Ok(event) = rx.recv() {
+                    for subscriber in &session_event_subscribers {
+                        subscriber.on_session_event(&event);
+                    }
                     let mut state = shared_state_clone.lock().unwrap();
                     match event {
                         SessionEvent::Connected => {
@@ -284,8 +291,7 @@ impl Default for XRTranslateApp {
                             state.is_translating = true;
                         }
                         SessionEvent::Disconnected(reason) => {
-                            osc_publisher.clear_chatbox();
-                            let terminal_meeting_disconnect = reason == "Finished";
+                            publish_host_output(&host_output_subscribers, HostOutputEvent::Clear);
                             state.connection_status = reason;
                             state.is_translating = false;
                             for entry in &mut state.translations {
@@ -297,25 +303,6 @@ impl Default for XRTranslateApp {
                             state.pending_recognition_windows.clear();
                             microphone_vad_active_clone.store(false, Ordering::Relaxed);
                             loopback_vad_active_clone.store(false, Ordering::Relaxed);
-                            let previous_remaining = if terminal_meeting_disconnect {
-                                meeting_sessions_remaining_for_events
-                                    .fetch_update(Ordering::AcqRel, Ordering::Acquire, |value| {
-                                        value.checked_sub(1)
-                                    })
-                                    .unwrap_or(0)
-                            } else {
-                                0
-                            };
-                            let last_meeting_session = previous_remaining == 1;
-                            if terminal_meeting_disconnect && last_meeting_session {
-                                let should_finish = meeting_event_sink.active_is_imported()
-                                    || meeting_end_requested_for_events.load(Ordering::Acquire);
-                                if should_finish {
-                                    meeting_event_sink.finish_active();
-                                    meeting_end_requested_for_events
-                                        .store(false, Ordering::Release);
-                                }
-                            }
                         }
                         SessionEvent::Status(status) => state.connection_status = status,
                         SessionEvent::VadActivity { source, active } => match source {
@@ -339,8 +326,16 @@ impl Default for XRTranslateApp {
                                 continue;
                             }
                             if kind == "partial" && !continuous && !text.is_empty() {
-                                osc_publisher
-                                    .add_message_for_stream(stream_id, &text, "", "", true);
+                                publish_host_output(
+                                    &host_output_subscribers,
+                                    HostOutputEvent::Caption {
+                                        stream_id,
+                                        source: &text,
+                                        translated: "",
+                                        speaker: "",
+                                        update: CaptionUpdate::Replace,
+                                    },
+                                );
                             }
                             if kind == "final" && !text.is_empty() {
                                 state.pending_final_asr.push(PendingFinalAsr {
@@ -365,6 +360,8 @@ impl Default for XRTranslateApp {
                                         speaker_id: String::new(),
                                         source_start_ms: 0.0,
                                         source_end_ms: 0.0,
+                                        timing: xrtranslate_protocol::SegmentTiming::Unknown,
+                                        boundary: xrtranslate_protocol::SegmentBoundary::Unknown,
                                         activation_matches: Vec::new(),
                                         context_matches: Vec::new(),
                                         revisable: false,
@@ -384,7 +381,7 @@ impl Default for XRTranslateApp {
                         }
                         SessionEvent::SourceSegment {
                             stream_id,
-                            audio_source,
+                            audio_source: _,
                             continuous,
                             publish_to_host_outputs,
                             text,
@@ -394,6 +391,8 @@ impl Default for XRTranslateApp {
                             speaker_id,
                             source_start_ms,
                             source_end_ms,
+                            timing,
+                            boundary,
                             segment_index,
                             segment_count,
                             revisable,
@@ -402,18 +401,6 @@ impl Default for XRTranslateApp {
                             if text.is_empty() {
                                 continue;
                             }
-                            persist_meeting_segment(
-                                &meeting_event_sink,
-                                audio_source,
-                                &turn_id,
-                                segment_index,
-                                &text,
-                                None,
-                                &speaker_id,
-                                source_start_ms,
-                                source_end_ms,
-                                !revisable,
-                            );
                             if !publish_to_host_outputs {
                                 continue;
                             }
@@ -456,6 +443,8 @@ impl Default for XRTranslateApp {
                                 speaker_id,
                                 source_start_ms,
                                 source_end_ms,
+                                timing,
+                                boundary,
                                 activation_matches,
                                 context_matches,
                                 revisable,
@@ -498,22 +487,12 @@ impl Default for XRTranslateApp {
                             speaker_id,
                             source_start_ms,
                             source_end_ms,
+                            timing,
+                            boundary,
                             term_matches,
                             revisable,
                             overlap_ratio,
                         } => {
-                            persist_meeting_segment(
-                                &meeting_event_sink,
-                                audio_source,
-                                &turn_id,
-                                segment_index,
-                                &source,
-                                Some(&translated),
-                                &speaker_id,
-                                source_start_ms,
-                                source_end_ms,
-                                !revisable,
-                            );
                             if !publish_to_host_outputs {
                                 continue;
                             }
@@ -528,6 +507,8 @@ impl Default for XRTranslateApp {
                                 speaker_id,
                                 source_start_ms,
                                 source_end_ms,
+                                timing,
+                                boundary,
                                 term_matches,
                                 revisable,
                                 overlap_ratio,
@@ -541,28 +522,38 @@ impl Default for XRTranslateApp {
                                     fragment,
                                 );
                                 if merged.rolled_over {
-                                    osc_publisher.roll_stream_for(
-                                        stream_id,
-                                        &merged.entry.source,
-                                        &merged.entry.translated,
-                                        &merged.entry.speaker_id,
+                                    publish_host_output(
+                                        &host_output_subscribers,
+                                        HostOutputEvent::Caption {
+                                            stream_id,
+                                            source: &merged.entry.source,
+                                            translated: &merged.entry.translated,
+                                            speaker: &merged.entry.speaker_id,
+                                            update: CaptionUpdate::RollOver,
+                                        },
                                     );
                                 } else if merged.changed {
-                                    osc_publisher.add_message_for_stream(
-                                        stream_id,
-                                        &merged.entry.source,
-                                        &merged.entry.translated,
-                                        &merged.entry.speaker_id,
-                                        true,
+                                    publish_host_output(
+                                        &host_output_subscribers,
+                                        HostOutputEvent::Caption {
+                                            stream_id,
+                                            source: &merged.entry.source,
+                                            translated: &merged.entry.translated,
+                                            speaker: &merged.entry.speaker_id,
+                                            update: CaptionUpdate::Replace,
+                                        },
                                     );
                                 }
                             } else {
-                                osc_publisher.add_message_for_stream(
-                                    stream_id,
-                                    &fragment.source,
-                                    &fragment.translated,
-                                    &fragment.speaker_id,
-                                    false,
+                                publish_host_output(
+                                    &host_output_subscribers,
+                                    HostOutputEvent::Caption {
+                                        stream_id,
+                                        source: &fragment.source,
+                                        translated: &fragment.translated,
+                                        speaker: &fragment.speaker_id,
+                                        update: CaptionUpdate::Append,
+                                    },
                                 );
                                 upsert_completed_translation(&mut state.translations, fragment);
                             }
@@ -594,7 +585,10 @@ impl Default for XRTranslateApp {
                             state
                                 .pending_recognition_windows
                                 .retain(|window| window.stream_id != stream_id);
-                            osc_publisher.end_stream_for(stream_id);
+                            publish_host_output(
+                                &host_output_subscribers,
+                                HostOutputEvent::StreamEnded(stream_id),
+                            );
                         }
                         SessionEvent::RouteChanged {
                             source_lang,
@@ -607,10 +601,7 @@ impl Default for XRTranslateApp {
                             state.last_error = Some(error);
                         }
                         SessionEvent::Error(error) => {
-                            osc_publisher.clear_chatbox();
-                            meeting_event_sink.fail_active(error.clone());
-                            meeting_sessions_remaining_for_events.store(0, Ordering::Release);
-                            meeting_end_requested_for_events.store(false, Ordering::Release);
+                            publish_host_output(&host_output_subscribers, HostOutputEvent::Clear);
                             state.last_error = Some(error);
                             state.connection_status = "Connection error".into();
                             state.is_translating = false;
@@ -682,8 +673,6 @@ impl Default for XRTranslateApp {
             loopback_vad_active,
             sessions: Vec::new(),
             meeting_audio_routers: Vec::new(),
-            meeting_sessions_remaining,
-            meeting_end_requested,
             event_tx,
             connection_status: "Ready".into(),
             partial_text: String::new(),
@@ -745,20 +734,71 @@ impl XRTranslateApp {
         PluginRegistry::builtin().is_enabled(&self.plugin_preferences, id)
     }
 
+    /// Selects the first plugin currently requesting the exclusive translation
+    /// capability. Concrete plugins implement the same neutral contract; the
+    /// session infrastructure consumes only the returned binding.
+    fn active_plugin_session(&self) -> Option<PluginSessionBinding> {
+        let plugins: [&dyn TranslationSessionPlugin; 2] =
+            [&self.meeting_plugin, &self.player_plugin];
+        plugins
+            .into_iter()
+            .find_map(TranslationSessionPlugin::translation_session_binding)
+    }
+
+    fn session_config(
+        &mut self,
+        plugin: Option<&PluginSessionBinding>,
+        recognition: &RecognitionSettings,
+        audio_source: CaptureSource,
+        vad_threshold: f32,
+        ctx: Option<eframe::egui::Context>,
+    ) -> SessionConfig {
+        let publish_to_host_outputs =
+            plugin.is_none_or(PluginSessionBinding::publish_to_host_outputs);
+        let speaker_recognition_enabled = plugin
+            .map_or(self.speaker_recognition_enabled, |binding| {
+                binding.speaker_recognition_enabled(self.speaker_recognition_enabled)
+            });
+        let host_tts = plugin.is_none_or(|binding| binding.host_tts);
+        let external_audio_gate = plugin.is_none_or(|binding| binding.external_audio_gate);
+        let finish_when_audio_ends = plugin.is_some_and(|binding| binding.finish_when_audio_ends);
+
+        SessionConfig {
+            server_url: self.server_url.clone(),
+            source_lang: self.source_lang.clone(),
+            target_lang: self.target_lang.clone(),
+            speaker_recognition_enabled,
+            external_audio_gate: if external_audio_gate {
+                ExternalAudioGate::new(
+                    self.osc_plugin.mute_state(),
+                    Arc::clone(&self.mute_self_pauses_translation),
+                )
+            } else {
+                ExternalAudioGate::default()
+            },
+            publish_to_host_outputs,
+            tts: (host_tts
+                && crate::feature_access::is_available(
+                    crate::feature_access::Feature::TtsPlayback,
+                ))
+            .then(|| self.audio_system.tts_handle())
+            .flatten(),
+            egui_ctx: ctx,
+            vad_threshold,
+            vad_silence_ms: pause_tolerance_to_ms(recognition.pause_tolerance),
+            continuous_recognition: recognition.continuous_recognition,
+            audio_source,
+            finish_when_audio_ends,
+        }
+    }
+
     pub(crate) fn meeting_session_active(&self) -> bool {
         self.meeting_plugin.controller.active_meeting_id().is_some()
     }
 
-    pub(crate) fn open_meeting_plugin(&mut self) {
-        if self.plugin_enabled(PluginId::MEETING) {
-            self.navigation.page = Page::Plugin(PluginId::MEETING);
-            self.save_settings();
-        }
-    }
-
-    pub(crate) fn open_video_player_plugin(&mut self) {
-        if self.plugin_enabled(PluginId::VIDEO_PLAYER) {
-            self.navigation.page = Page::Plugin(PluginId::VIDEO_PLAYER);
+    pub(crate) fn open_plugin(&mut self, id: PluginId) {
+        if self.plugin_enabled(id) {
+            self.navigation.page = Page::Plugin(id);
             self.save_settings();
         }
     }
@@ -770,7 +810,9 @@ impl XRTranslateApp {
                 .disable_block_reason()
                 .map(str::to_owned),
             PluginId::VIDEO_PLAYER => {
-                if self.session_owner.is_video_player()
+                if self
+                    .session_owner
+                    .is_plugin(PluginId::VIDEO_PLAYER.as_str())
                     || self.player_plugin.controller.active_task_id.is_some()
                 {
                     Some("Stop the active video playback before disabling this plugin".into())
@@ -963,26 +1005,22 @@ impl XRTranslateApp {
         pacing: media_import::AudioImportPacing,
         ctx: Option<eframe::egui::Context>,
     ) {
+        let Some(plugin_session) = self.player_plugin.translation_session_binding() else {
+            self.set_startup_error(
+                "Media import failed",
+                "Media Player did not provide an active session binding".into(),
+            );
+            return;
+        };
         let (audio_tx, audio_rx) = crossbeam_channel::bounded::<Vec<f32>>(64);
-        let session = start_session(
-            audio_rx,
-            self.event_tx.clone(),
-            SessionConfig {
-                server_url: self.server_url.clone(),
-                source_lang: self.source_lang.clone(),
-                target_lang: self.target_lang.clone(),
-                speaker_recognition_enabled: false,
-                external_audio_gate: ExternalAudioGate::default(),
-                publish_to_host_outputs: true,
-                tts: None,
-                egui_ctx: ctx,
-                vad_threshold: recognition.background_noise.clamp(0.02, 0.95),
-                vad_silence_ms: pause_tolerance_to_ms(recognition.pause_tolerance),
-                continuous_recognition: recognition.continuous_recognition,
-                audio_source: CaptureSource::SystemAudio,
-                finish_when_audio_ends: true,
-            },
+        let config = self.session_config(
+            Some(&plugin_session),
+            &recognition,
+            CaptureSource::SystemAudio,
+            recognition.background_noise.clamp(0.02, 0.95),
+            ctx,
         );
+        let session = start_session(audio_rx, self.event_tx.clone(), config);
         match media_import::import_audio_file(
             path,
             audio_tx,
@@ -996,14 +1034,7 @@ impl XRTranslateApp {
                 self.sessions = vec![session];
                 self.host_audio_import = Some(import);
                 self.audio_txs.clear();
-                self.session_owner = TranslationSessionOwner::VideoPlayer {
-                    task_id: self
-                        .player_plugin
-                        .controller
-                        .active_task_id
-                        .clone()
-                        .unwrap_or_default(),
-                };
+                self.session_owner = TranslationSessionOwner::Plugin(plugin_session.owner);
                 self.is_translating = true;
                 if let Ok(mut state) = self.shared_session_state.lock() {
                     state.is_translating = true;
@@ -1035,7 +1066,8 @@ impl XRTranslateApp {
         match action {
             MeetingAction::None => {}
             MeetingAction::CreateAndStart(request) => {
-                if self.is_translating && !self.session_owner.is_meeting() {
+                if self.is_translating && !self.session_owner.is_plugin(PluginId::MEETING.as_str())
+                {
                     self.stop();
                 }
                 self.source_lang = request.source_language.clone();
@@ -1058,7 +1090,8 @@ impl XRTranslateApp {
                 }
             }
             MeetingAction::Continue(id) => {
-                if self.is_translating && !self.session_owner.is_meeting() {
+                if self.is_translating && !self.session_owner.is_plugin(PluginId::MEETING.as_str())
+                {
                     self.stop();
                 }
                 let resumed_in_place = self
@@ -1083,7 +1116,7 @@ impl XRTranslateApp {
             }
             MeetingAction::Pause => self.pause_active_meeting(),
             MeetingAction::End => {
-                self.meeting_end_requested.store(true, Ordering::Release);
+                self.meeting_plugin.event_sink.request_finish();
                 self.stop();
             }
             MeetingAction::Export(meeting_id) => {
@@ -1091,7 +1124,8 @@ impl XRTranslateApp {
                 self.export_open_meeting_markdown();
             }
             MeetingAction::Reprocess(request) => {
-                if self.is_translating && !self.session_owner.is_meeting() {
+                if self.is_translating && !self.session_owner.is_plugin(PluginId::MEETING.as_str())
+                {
                     self.stop();
                 }
                 if self
@@ -1294,29 +1328,22 @@ impl XRTranslateApp {
         path: std::path::PathBuf,
         ctx: Option<eframe::egui::Context>,
     ) {
-        self.meeting_sessions_remaining.store(1, Ordering::Release);
-        self.meeting_end_requested.store(false, Ordering::Release);
+        let Some(plugin_session) = self.meeting_plugin.translation_session_binding() else {
+            self.meeting_plugin.controller.error =
+                Some("Meeting did not provide an active session binding".into());
+            return;
+        };
+        self.meeting_plugin.event_sink.begin_sessions(1);
         let (audio_tx, audio_rx) = crossbeam_channel::bounded::<Vec<f32>>(32);
         let recognition = self.loopback_recognition.clone();
-        let session = start_session(
-            audio_rx,
-            self.event_tx.clone(),
-            SessionConfig {
-                server_url: self.server_url.clone(),
-                source_lang: self.source_lang.clone(),
-                target_lang: self.target_lang.clone(),
-                speaker_recognition_enabled: true,
-                external_audio_gate: ExternalAudioGate::default(),
-                publish_to_host_outputs: false,
-                tts: None,
-                egui_ctx: ctx,
-                vad_threshold: vad_threshold_for_background_noise(recognition.background_noise),
-                vad_silence_ms: pause_tolerance_to_ms(recognition.pause_tolerance),
-                continuous_recognition: recognition.continuous_recognition,
-                audio_source: CaptureSource::SystemAudio,
-                finish_when_audio_ends: true,
-            },
+        let config = self.session_config(
+            Some(&plugin_session),
+            &recognition,
+            CaptureSource::SystemAudio,
+            vad_threshold_for_background_noise(recognition.background_noise),
+            ctx,
         );
+        let session = start_session(audio_rx, self.event_tx.clone(), config);
         match media_import::import_audio_file(
             path,
             audio_tx,
@@ -1326,14 +1353,7 @@ impl XRTranslateApp {
                 self.sessions = vec![session];
                 self.meeting_plugin.audio_import = Some(import);
                 self.audio_txs.clear();
-                self.session_owner = TranslationSessionOwner::Meeting {
-                    meeting_id: self
-                        .meeting_plugin
-                        .controller
-                        .active_meeting_id()
-                        .unwrap_or_default(),
-                    is_imported: true,
-                };
+                self.session_owner = TranslationSessionOwner::Plugin(plugin_session.owner);
                 self.is_translating = true;
                 if let Ok(mut state) = self.shared_session_state.lock() {
                     state.is_translating = true;
@@ -1343,7 +1363,7 @@ impl XRTranslateApp {
             }
             Err(error) => {
                 session.finish();
-                self.meeting_sessions_remaining.store(0, Ordering::Release);
+                self.meeting_plugin.event_sink.cancel_sessions();
                 self.meeting_plugin.controller.error = Some(error.to_string());
                 if let Some(meeting_id) = self.meeting_plugin.controller.active_meeting_id()
                     && let Err(store_error) = self
@@ -1360,7 +1380,7 @@ impl XRTranslateApp {
     }
 
     pub(crate) fn apply_service_configuration(&mut self, ctx: Option<eframe::egui::Context>) {
-        if self.session_owner.is_meeting()
+        if self.session_owner.is_plugin(PluginId::MEETING.as_str())
             || self.meeting_plugin.controller.active_meeting_id().is_some()
         {
             self.meeting_plugin.controller.error =
@@ -1368,7 +1388,9 @@ impl XRTranslateApp {
             self.navigation.page = Page::Plugin(PluginId::MEETING);
             return;
         }
-        if self.session_owner.is_video_player()
+        if self
+            .session_owner
+            .is_plugin(PluginId::VIDEO_PLAYER.as_str())
             || self.player_plugin.controller.active_task_id.is_some()
         {
             self.player_plugin.controller.error =
@@ -1391,12 +1413,10 @@ impl XRTranslateApp {
 
     fn start_session(&mut self, ctx: Option<eframe::egui::Context>) {
         let routes = self.capture_source.routes();
-        let publish_to_host_outputs = self.meeting_plugin.controller.active_meeting_id().is_none();
-        let speaker_recognition_for_session = if publish_to_host_outputs {
-            self.speaker_recognition_enabled
-        } else {
-            true
-        };
+        let plugin_session = self.active_plugin_session();
+        let publish_to_host_outputs = plugin_session
+            .as_ref()
+            .is_none_or(PluginSessionBinding::publish_to_host_outputs);
         let session_channels = routes
             .iter()
             .map(|_| unbounded::<Vec<f32>>())
@@ -1420,21 +1440,12 @@ impl XRTranslateApp {
         match self.start_selected_capture(routes, &audio_txs) {
             Ok(()) => {
                 if !publish_to_host_outputs {
-                    self.meeting_sessions_remaining
-                        .store(routes.len(), Ordering::Release);
-                    self.meeting_end_requested.store(false, Ordering::Release);
-                    self.session_owner = TranslationSessionOwner::Meeting {
-                        meeting_id: self
-                            .meeting_plugin
-                            .controller
-                            .active_meeting_id()
-                            .unwrap_or_default(),
-                        is_imported: false,
-                    };
-                } else if let Some(task_id) = self.player_plugin.controller.active_task_id.clone() {
-                    self.session_owner = TranslationSessionOwner::VideoPlayer { task_id };
+                    self.meeting_plugin.event_sink.begin_sessions(routes.len());
+                }
+                if let Some(binding) = &plugin_session {
+                    self.session_owner = TranslationSessionOwner::Plugin(binding.owner.clone());
                 } else {
-                    self.session_owner = TranslationSessionOwner::MainLive {
+                    self.session_owner = TranslationSessionOwner::Host {
                         capture_source: self.capture_source,
                     };
                 }
@@ -1443,40 +1454,15 @@ impl XRTranslateApp {
                     .zip(routes.iter())
                     .map(|((_, audio_rx), source)| {
                         let recognition = self.recognition_settings(*source).clone();
-                        let tts_handle = (publish_to_host_outputs
-                            && crate::feature_access::is_available(
-                                crate::feature_access::Feature::TtsPlayback,
-                            ))
-                        .then(|| self.audio_system.tts_handle())
-                        .flatten();
-                        let session = start_session(
-                            audio_rx.clone(),
-                            self.event_tx.clone(),
-                            SessionConfig {
-                                server_url: self.server_url.clone(),
-                                source_lang: self.source_lang.clone(),
-                                target_lang: self.target_lang.clone(),
-                                speaker_recognition_enabled: speaker_recognition_for_session,
-                                external_audio_gate: if publish_to_host_outputs {
-                                    ExternalAudioGate::new(
-                                        self.osc_plugin.mute_state(),
-                                        Arc::clone(&self.mute_self_pauses_translation),
-                                    )
-                                } else {
-                                    ExternalAudioGate::default()
-                                },
-                                publish_to_host_outputs,
-                                tts: tts_handle,
-                                egui_ctx: ctx.clone(),
-                                vad_threshold: vad_threshold_for_background_noise(
-                                    recognition.background_noise,
-                                ),
-                                vad_silence_ms: pause_tolerance_to_ms(recognition.pause_tolerance),
-                                continuous_recognition: recognition.continuous_recognition,
-                                audio_source: *source,
-                                finish_when_audio_ends: false,
-                            },
+                        let config = self.session_config(
+                            plugin_session.as_ref(),
+                            &recognition,
+                            *source,
+                            vad_threshold_for_background_noise(recognition.background_noise),
+                            ctx.clone(),
                         );
+                        let session =
+                            start_session(audio_rx.clone(), self.event_tx.clone(), config);
                         if crate::feature_access::is_available(
                             crate::feature_access::Feature::TtsPlayback,
                         ) {
@@ -2196,7 +2182,12 @@ impl XRTranslateApp {
             self.translations = state.translations.clone();
             let was_translating = self.is_translating;
             self.is_translating = state.is_translating;
-            if was_translating && !self.is_translating && self.session_owner.is_video_player() {
+            if was_translating
+                && !self.is_translating
+                && self
+                    .session_owner
+                    .is_plugin(PluginId::VIDEO_PLAYER.as_str())
+            {
                 self.player_plugin.controller.pause_task();
                 self.session_owner = TranslationSessionOwner::None;
                 for session in &self.sessions {
@@ -2241,37 +2232,6 @@ fn vad_threshold_for_background_noise(value: f32) -> f32 {
     value.clamp(0.2, 0.8)
 }
 
-#[allow(clippy::too_many_arguments)]
-fn persist_meeting_segment(
-    sink: &plugins::meeting::events::MeetingEventSink,
-    audio_source: CaptureSource,
-    turn_id: &str,
-    segment_index: u32,
-    source_text: &str,
-    translated_text: Option<&str>,
-    raw_speaker_id: &str,
-    source_start_ms: f64,
-    source_end_ms: f64,
-    is_final: bool,
-) {
-    let source = match audio_source {
-        CaptureSource::Microphone => MeetingSegmentSource::Microphone,
-        CaptureSource::SystemAudio => MeetingSegmentSource::SystemAudio,
-        CaptureSource::Both => return,
-    };
-    sink.persist(MeetingSegmentEvent {
-        source,
-        turn_id: turn_id.to_owned(),
-        segment_index,
-        source_text: source_text.to_owned(),
-        translated_text: translated_text.map(ToOwned::to_owned),
-        raw_speaker_id: raw_speaker_id.to_owned(),
-        source_start_ms,
-        source_end_ms,
-        is_final,
-    });
-}
-
 fn spawn_meeting_audio_router(
     session_tx: Sender<Vec<f32>>,
     recording: plugins::meeting::recording::RecordingSink,
@@ -2301,7 +2261,10 @@ fn spawn_meeting_audio_router(
 
 impl XRTranslateApp {
     fn sync_player_subtitles(&mut self) {
-        if !self.session_owner.is_video_player() {
+        if !self
+            .session_owner
+            .is_plugin(PluginId::VIDEO_PLAYER.as_str())
+        {
             return;
         }
         let active_task_id = self.player_plugin.controller.active_task_id.clone();
@@ -2344,6 +2307,12 @@ impl XRTranslateApp {
                     speaker,
                     entry.source.clone(),
                     Some(entry.translated.clone()),
+                    plugins::player::subtitles::SubtitleMetadata {
+                        timing: entry.timing,
+                        boundary: entry.boundary,
+                        revisable: entry.revisable,
+                        finalized: !entry.live,
+                    },
                 );
             }
         }

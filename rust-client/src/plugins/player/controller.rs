@@ -1,6 +1,6 @@
 use super::{
     backend::{MediaBackend, MediaSource, PlaybackStatus, window::NativeVideoHost},
-    subtitles::{SubtitleCue, SubtitleTimeline},
+    subtitles::{SubtitleCue, SubtitleMetadata, SubtitleTimeline},
     task::{AudioChannelItem, VideoSubtitleMode, VideoTask, VideoTaskStore},
 };
 use std::path::PathBuf;
@@ -507,19 +507,23 @@ impl VideoPlayerController {
         speaker: Option<String>,
         orig: String,
         trans: Option<String>,
+        metadata: SubtitleMetadata,
     ) {
         if !self.is_task_running() {
             return;
         }
 
-        let changed = self.subtitles.add_cue(SubtitleCue {
-            id,
-            start_ms,
-            end_ms,
-            speaker_name: speaker,
-            original_text: orig,
-            translated_text: trans,
-        });
+        let changed = self.subtitles.add_cue_with_metadata(
+            SubtitleCue {
+                id,
+                start_ms,
+                end_ms,
+                speaker_name: speaker,
+                original_text: orig,
+                translated_text: trans,
+            },
+            metadata,
+        );
 
         if changed {
             if let Some(task_id) = &self.active_task_id {
@@ -577,14 +581,17 @@ fn parse_srt_to_timeline(srt_content: &str) -> SubtitleTimeline {
                     (first_line, None)
                 };
 
-                timeline.add_cue(SubtitleCue {
-                    id: format!("srt_{}", idx),
-                    start_ms,
-                    end_ms,
-                    speaker_name,
-                    original_text,
-                    translated_text,
-                });
+                timeline.add_cue_with_metadata(
+                    SubtitleCue {
+                        id: format!("srt_{}", idx),
+                        start_ms,
+                        end_ms,
+                        speaker_name,
+                        original_text,
+                        translated_text,
+                    },
+                    SubtitleMetadata::authored(),
+                );
             }
         }
     }
@@ -633,6 +640,7 @@ mod tests {
             Some("Speaker".into()),
             "Hello".into(),
             Some("你好".into()),
+            SubtitleMetadata::default(),
         );
         assert_eq!(controller.subtitles.cues().len(), 1);
     }

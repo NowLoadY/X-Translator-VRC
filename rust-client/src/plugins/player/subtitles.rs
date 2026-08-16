@@ -1,4 +1,7 @@
+use std::collections::BTreeMap;
+
 use serde::{Deserialize, Serialize};
+use xrtranslate_protocol::{SegmentBoundary, SegmentTiming};
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct SubtitleCue {
@@ -10,9 +13,33 @@ pub struct SubtitleCue {
     pub translated_text: Option<String>,
 }
 
+/// Generic recognition metadata used to turn a transcript window into a
+/// display cue. It deliberately contains no player-specific or backend-model
+/// details, so other subtitle-producing plugins can apply their own policy.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct SubtitleMetadata {
+    pub timing: SegmentTiming,
+    pub boundary: SegmentBoundary,
+    pub revisable: bool,
+    pub finalized: bool,
+}
+
+impl SubtitleMetadata {
+    pub const fn authored() -> Self {
+        Self {
+            timing: SegmentTiming::Authored,
+            boundary: SegmentBoundary::InputBoundary,
+            revisable: false,
+            finalized: true,
+        }
+    }
+}
+
 #[derive(Clone, Debug, Default, Serialize, Deserialize)]
 pub struct SubtitleTimeline {
     cues: Vec<SubtitleCue>,
+    #[serde(default)]
+    metadata: BTreeMap<String, SubtitleMetadata>,
     pub enabled: bool,
 }
 
@@ -20,15 +47,22 @@ impl SubtitleTimeline {
     pub fn new() -> Self {
         Self {
             cues: Vec::new(),
+            metadata: BTreeMap::new(),
             enabled: true,
         }
     }
 
     pub fn clear(&mut self) {
         self.cues.clear();
+        self.metadata.clear();
     }
 
-    pub fn add_cue(&mut self, cue: SubtitleCue) -> bool {
+    #[cfg(test)]
+    fn add_cue(&mut self, cue: SubtitleCue) -> bool {
+        self.add_cue_with_metadata(cue, SubtitleMetadata::default())
+    }
+
+    pub fn add_cue_with_metadata(&mut self, cue: SubtitleCue, metadata: SubtitleMetadata) -> bool {
         if cue.original_text.trim().is_empty()
             && cue
                 .translated_text
@@ -40,7 +74,7 @@ impl SubtitleTimeline {
 
         // 1. Check exact ID match (turn_id or stream_id based)
         if let Some(index) = self.cues.iter().position(|c| c.id == cue.id) {
-            return self.replace_cue(index, cue);
+            return self.replace_cue(index, cue, metadata);
         }
 
         // 2. Check semantic & temporal duplication. Proximity alone is not a
@@ -62,19 +96,28 @@ impl SubtitleTimeline {
             };
             time_diff <= 3500 && same_content
         }) {
-            return self.replace_cue(index, cue);
+            return self.replace_cue(index, cue, metadata);
         }
 
         // 3. New distinct subtitle
+        self.metadata.insert(cue.id.clone(), metadata);
         self.cues.push(cue);
         self.cues.sort_by_key(|c| c.start_ms);
         true
     }
 
-    fn replace_cue(&mut self, index: usize, cue: SubtitleCue) -> bool {
-        if self.cues[index] == cue {
+    fn replace_cue(&mut self, index: usize, cue: SubtitleCue, metadata: SubtitleMetadata) -> bool {
+        let previous_id = self.cues[index].id.clone();
+        let cue_unchanged = self.cues[index] == cue;
+        let metadata_unchanged =
+            self.metadata.get(&previous_id).copied().unwrap_or_default() == metadata;
+        if cue_unchanged && metadata_unchanged {
             return false;
         }
+        if previous_id != cue.id {
+            self.metadata.remove(&previous_id);
+        }
+        self.metadata.insert(cue.id.clone(), metadata);
         self.cues[index] = cue;
         self.cues.sort_by_key(|cue| cue.start_ms);
         true
@@ -88,14 +131,28 @@ impl SubtitleTimeline {
         // (~250ms advance) to match natural human reading rhythm and visual perception.
         const SUBTITLE_LEAD_IN_MS: i64 = 250;
         let query_ms = current_ms + SUBTITLE_LEAD_IN_MS;
-        self.cues.iter().find(|cue| {
-            let effective_end = if cue.end_ms <= cue.start_ms {
-                cue.start_ms + 3000
-            } else {
-                cue.end_ms.max(cue.start_ms + 2000)
-            };
-            query_ms >= cue.start_ms && current_ms <= effective_end
+        self.cues.iter().enumerate().rev().find_map(|(index, cue)| {
+            let effective_end = self.effective_end_at(index);
+            (query_ms >= cue.start_ms && current_ms <= effective_end).then_some(cue)
         })
+    }
+
+    fn effective_end_at(&self, index: usize) -> i64 {
+        let cue = &self.cues[index];
+        let supplied_end = if cue.end_ms <= cue.start_ms {
+            cue.start_ms + 3000
+        } else {
+            cue.end_ms
+        };
+        let metadata = self.metadata_for(&cue.id);
+        let padded_end = if metadata.timing == SegmentTiming::Unknown {
+            supplied_end.max(cue.start_ms + 2000)
+        } else {
+            supplied_end
+        };
+        self.cues
+            .get(index + 1)
+            .map_or(padded_end, |next| padded_end.min(next.start_ms))
     }
 
     pub fn count(&self) -> usize {
@@ -106,11 +163,23 @@ impl SubtitleTimeline {
         &self.cues
     }
 
+    pub fn metadata_for(&self, cue_id: &str) -> SubtitleMetadata {
+        self.metadata.get(cue_id).copied().unwrap_or_default()
+    }
+
     pub fn export_srt(&self) -> String {
         let mut out = String::new();
         for (idx, cue) in self.cues().iter().enumerate() {
             let start = format_timestamp_srt(cue.start_ms);
-            let end = format_timestamp_srt(cue.end_ms.max(cue.start_ms + 2000));
+            let metadata = self.metadata_for(&cue.id);
+            let end_ms = if metadata.timing == SegmentTiming::Unknown {
+                cue.end_ms.max(cue.start_ms + 2000)
+            } else if cue.end_ms <= cue.start_ms {
+                cue.start_ms + 3000
+            } else {
+                cue.end_ms
+            };
+            let end = format_timestamp_srt(end_ms);
             out.push_str(&format!("{}\n{} --> {}\n", idx + 1, start, end));
             let orig = cue.original_text.trim();
             if !orig.is_empty() {
@@ -366,5 +435,77 @@ mod tests {
 
         assert_eq!(timeline.cues()[0].id, "second");
         assert_eq!(timeline.cues()[1].id, "first");
+    }
+
+    #[test]
+    fn observed_timing_is_not_stretched_during_export() {
+        let mut timeline = SubtitleTimeline::new();
+        timeline.add_cue_with_metadata(
+            SubtitleCue {
+                id: "turn_1_segment_1".into(),
+                start_ms: 1_000,
+                end_ms: 1_450,
+                speaker_name: None,
+                original_text: "Short phrase".into(),
+                translated_text: None,
+            },
+            SubtitleMetadata {
+                timing: SegmentTiming::EstimatedTextPartition,
+                boundary: SegmentBoundary::Silence,
+                revisable: false,
+                finalized: true,
+            },
+        );
+
+        let srt = timeline.export_srt();
+        assert!(srt.contains("00:00:01,000 --> 00:00:01,450"));
+    }
+
+    #[test]
+    fn a_new_cue_is_not_hidden_by_legacy_minimum_duration() {
+        let mut timeline = SubtitleTimeline::new();
+        for (id, start, end) in [("first", 1_000, 1_200), ("second", 1_500, 1_700)] {
+            timeline.add_cue(SubtitleCue {
+                id: id.into(),
+                start_ms: start,
+                end_ms: end,
+                speaker_name: None,
+                original_text: id.into(),
+                translated_text: None,
+            });
+        }
+
+        assert_eq!(
+            timeline.active_cue_at(1_500).map(|cue| cue.id.as_str()),
+            Some("second")
+        );
+    }
+
+    #[test]
+    fn finalization_metadata_updates_without_changing_caption_text() {
+        let mut timeline = SubtitleTimeline::new();
+        let cue = SubtitleCue {
+            id: "stream_1".into(),
+            start_ms: 1_000,
+            end_ms: 1_500,
+            speaker_name: None,
+            original_text: "Hello".into(),
+            translated_text: Some("你好".into()),
+        };
+        let live = SubtitleMetadata {
+            timing: SegmentTiming::MergedWindows,
+            boundary: SegmentBoundary::DurationLimit,
+            revisable: true,
+            finalized: false,
+        };
+        assert!(timeline.add_cue_with_metadata(cue.clone(), live));
+        assert!(timeline.add_cue_with_metadata(
+            cue,
+            SubtitleMetadata {
+                finalized: true,
+                ..live
+            },
+        ));
+        assert!(timeline.metadata_for("stream_1").finalized);
     }
 }

@@ -1,8 +1,9 @@
 //! Built-in plugin catalogue and persisted enablement preferences.
 //!
 //! Plugins are linked into the client, but their navigation, settings and
-//! runtime lifecycles are selected through stable IDs.  Keeping this metadata
-//! here prevents the shell UI from accumulating one branch per plugin.
+//! runtime lifecycles are selected through stable IDs. This catalogue removes
+//! repeated navigation/settings metadata; statically typed runtime composition
+//! remains explicit in the host adapter.
 
 pub mod meeting;
 pub mod osc;

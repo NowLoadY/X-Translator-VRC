@@ -12,7 +12,10 @@ use tokio_tungstenite::{
     connect_async,
     tungstenite::{self, Message},
 };
-use xrtranslate_protocol::{CorpusTermMatch, DrainReason, ServerEvent as ProtocolServerEvent};
+use xrtranslate_protocol::{
+    CorpusTermMatch, DrainReason, SegmentBoundary, SegmentTiming,
+    ServerEvent as ProtocolServerEvent,
+};
 
 use crate::client_settings::CaptureSource;
 
@@ -74,6 +77,8 @@ pub enum SessionEvent {
         speaker_id: String,
         source_start_ms: f64,
         source_end_ms: f64,
+        timing: SegmentTiming,
+        boundary: SegmentBoundary,
         segment_index: u32,
         segment_count: u32,
         revisable: bool,
@@ -93,6 +98,8 @@ pub enum SessionEvent {
         speaker_id: String,
         source_start_ms: f64,
         source_end_ms: f64,
+        timing: SegmentTiming,
+        boundary: SegmentBoundary,
         term_matches: Vec<CorpusTermMatch>,
         revisable: bool,
         overlap_ratio: f32,
@@ -697,6 +704,16 @@ fn pipeline_drain_reason(text: &str) -> Option<DrainReason> {
     }
 }
 
+fn event_metadata<T>(data: Option<&serde_json::Map<String, Value>>, key: &str) -> T
+where
+    T: serde::de::DeserializeOwned + Default,
+{
+    data.and_then(|data| data.get(key))
+        .cloned()
+        .and_then(|value| serde_json::from_value(value).ok())
+        .unwrap_or_default()
+}
+
 fn forward_server_event(
     event_tx: &Sender<SessionEvent>,
     text: &str,
@@ -799,6 +816,8 @@ fn forward_server_event(
                     .and_then(|d| d.get("source_end_ms"))
                     .and_then(Value::as_f64)
                     .unwrap_or_default(),
+                timing: event_metadata(data, "timing"),
+                boundary: event_metadata(data, "boundary"),
                 segment_index: data
                     .and_then(|d| d.get("segment_index"))
                     .and_then(Value::as_u64)
@@ -873,6 +892,8 @@ fn forward_server_event(
                     .and_then(|d| d.get("source_end_ms"))
                     .and_then(Value::as_f64)
                     .unwrap_or_default(),
+                timing: event_metadata(data, "timing"),
+                boundary: event_metadata(data, "boundary"),
                 term_matches: data
                     .and_then(|d| d.get("term_matches"))
                     .cloned()
@@ -1020,7 +1041,7 @@ mod tests {
         let stream_id = 42;
         forward_server_event(
             &sender,
-            r#"{"action":"source_segment_ready","data":{"source_text":"hello","speaker_id":"speaker-03","source_start_ms":125.0,"source_end_ms":875.0,"segment_index":2,"segment_count":2,"revisable":true,"overlap_ratio":0.34}}"#,
+            r#"{"action":"source_segment_ready","data":{"source_text":"hello","speaker_id":"speaker-03","source_start_ms":125.0,"source_end_ms":875.0,"timing":"estimated_text_partition","boundary":"speaker_change","segment_index":2,"segment_count":2,"revisable":true,"overlap_ratio":0.34}}"#,
             stream_id,
             false,
             true,
@@ -1035,6 +1056,8 @@ mod tests {
             speaker_id,
             source_start_ms,
             source_end_ms,
+            timing,
+            boundary,
             segment_index,
             ..
         } = event
@@ -1047,6 +1070,8 @@ mod tests {
         assert_eq!(speaker_id, "speaker-03");
         assert_eq!(source_start_ms, 125.0);
         assert_eq!(source_end_ms, 875.0);
+        assert_eq!(timing, SegmentTiming::EstimatedTextPartition);
+        assert_eq!(boundary, SegmentBoundary::SpeakerChange);
         assert_eq!(segment_index, 2);
     }
 

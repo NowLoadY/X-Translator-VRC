@@ -158,6 +158,8 @@ pub(crate) fn merge_stream_recognition(
     if !fragment.speaker_id.is_empty() {
         current.speaker_id = fragment.speaker_id;
     }
+    current.timing = xrtranslate_protocol::SegmentTiming::MergedWindows;
+    current.boundary = fragment.boundary;
     current.source_start_ms = current.source_start_ms.min(fragment.source_start_ms);
     current.source_end_ms = current.source_end_ms.max(fragment.source_end_ms);
     retain_recognition_tail(current);
@@ -284,6 +286,8 @@ pub(crate) fn merge_stream_translation(
     if !fragment.speaker_id.is_empty() {
         current.speaker_id = fragment.speaker_id;
     }
+    current.timing = xrtranslate_protocol::SegmentTiming::MergedWindows;
+    current.boundary = fragment.boundary;
     current.source_start_ms = current.source_start_ms.min(fragment.source_start_ms);
     current.source_end_ms = current.source_end_ms.max(fragment.source_end_ms);
     StreamMerge {
@@ -413,6 +417,8 @@ mod tests {
             speaker_id: String::new(),
             source_start_ms: 0.0,
             source_end_ms: 1.0,
+            timing: xrtranslate_protocol::SegmentTiming::UtteranceWindow,
+            boundary: xrtranslate_protocol::SegmentBoundary::Silence,
             term_matches: Vec::new(),
             revisable: false,
             overlap_ratio: 0.0,
@@ -438,6 +444,8 @@ mod tests {
             speaker_id: String::new(),
             source_start_ms: 0.0,
             source_end_ms: 1_000.0,
+            timing: xrtranslate_protocol::SegmentTiming::UtteranceWindow,
+            boundary: xrtranslate_protocol::SegmentBoundary::DurationLimit,
             activation_matches: Vec::new(),
             context_matches: Vec::new(),
             revisable: true,

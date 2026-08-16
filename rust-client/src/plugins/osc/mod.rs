@@ -9,6 +9,37 @@ use std::sync::{Arc, atomic::AtomicBool};
 use runtime::{OscHandle, OscManager, OscSettings};
 pub use ui::{OscPageContext, OscUiAction};
 
+use crate::session_coordinator::{CaptionUpdate, HostOutputEvent, HostOutputSubscriber};
+
+impl HostOutputSubscriber for OscHandle {
+    fn on_host_output(&self, event: HostOutputEvent<'_>) {
+        match event {
+            HostOutputEvent::Caption {
+                stream_id,
+                source,
+                translated,
+                speaker,
+                update: CaptionUpdate::RollOver,
+            } => self.roll_stream_for(stream_id, source, translated, speaker),
+            HostOutputEvent::Caption {
+                stream_id,
+                source,
+                translated,
+                speaker,
+                update,
+            } => self.add_message_for_stream(
+                stream_id,
+                source,
+                translated,
+                speaker,
+                matches!(update, CaptionUpdate::Replace),
+            ),
+            HostOutputEvent::StreamEnded(stream_id) => self.end_stream_for(stream_id),
+            HostOutputEvent::Clear => self.clear_chatbox(),
+        }
+    }
+}
+
 /// Owns all OSC state and runtime resources behind the desktop plugin boundary.
 ///
 /// `host_enabled` controls whether the plugin may run at all, while

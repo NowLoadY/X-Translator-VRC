@@ -1,5 +1,5 @@
 use crate::{client_settings::CaptureSource, streaming::RevisableText};
-use xrtranslate_protocol::CorpusTermMatch;
+use xrtranslate_protocol::{CorpusTermMatch, SegmentBoundary, SegmentTiming};
 
 #[derive(Clone, Debug, PartialEq)]
 pub(crate) struct RecognitionHistoryEntry {
@@ -10,6 +10,8 @@ pub(crate) struct RecognitionHistoryEntry {
     pub(crate) speaker_id: String,
     pub(crate) source_start_ms: f64,
     pub(crate) source_end_ms: f64,
+    pub(crate) timing: SegmentTiming,
+    pub(crate) boundary: SegmentBoundary,
     pub(crate) activation_matches: Vec<CorpusTermMatch>,
     pub(crate) context_matches: Vec<CorpusTermMatch>,
     pub(crate) revisable: bool,
@@ -43,6 +45,8 @@ pub(crate) struct TranslationHistoryEntry {
     pub(crate) speaker_id: String,
     pub(crate) source_start_ms: f64,
     pub(crate) source_end_ms: f64,
+    pub(crate) timing: SegmentTiming,
+    pub(crate) boundary: SegmentBoundary,
     pub(crate) term_matches: Vec<CorpusTermMatch>,
     pub(crate) revisable: bool,
     pub(crate) overlap_ratio: f32,

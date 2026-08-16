@@ -5,8 +5,8 @@ use xrtranslate_engine::{
     SessionEngine,
 };
 use xrtranslate_protocol::{
-    AsrResult, AsrResultKind, CorpusTermMatch, LatencyMetrics, ServerEvent, SourceSegmentReady,
-    TranslationReady, TtsFinished,
+    AsrResult, AsrResultKind, CorpusTermMatch, LatencyMetrics, SegmentBoundary, SegmentTiming,
+    ServerEvent, SourceSegmentReady, TranslationReady, TtsFinished,
 };
 
 pub(crate) enum WireOutput {
@@ -23,6 +23,8 @@ pub(crate) struct SegmentContext {
     pub(crate) speaker_id: String,
     pub(crate) source_start_ms: f64,
     pub(crate) source_end_ms: f64,
+    pub(crate) timing: SegmentTiming,
+    pub(crate) boundary: SegmentBoundary,
     pub(crate) revisable: bool,
     pub(crate) overlap_ratio: f32,
     pub(crate) activation_matches: Vec<CorpusTermMatch>,
@@ -211,6 +213,8 @@ impl SessionAdapter {
                 speaker_id: String::new(),
                 source_start_ms: 0.0,
                 source_end_ms: 0.0,
+                timing: SegmentTiming::Unknown,
+                boundary: SegmentBoundary::Unknown,
                 revisable: false,
                 overlap_ratio: 0.0,
                 activation_matches: Vec::new(),
@@ -266,6 +270,8 @@ impl SessionAdapter {
                 speaker_id: String::new(),
                 source_start_ms: 0.0,
                 source_end_ms: 0.0,
+                timing: SegmentTiming::Unknown,
+                boundary: SegmentBoundary::Unknown,
                 revisable: false,
                 overlap_ratio: 0.0,
                 activation_matches: Vec::new(),
@@ -290,6 +296,8 @@ impl SessionAdapter {
             speaker_id: context.speaker_id,
             source_start_ms: context.source_start_ms,
             source_end_ms: context.source_end_ms,
+            timing: context.timing,
+            boundary: context.boundary,
             revisable: context.revisable,
             overlap_ratio: context.overlap_ratio,
         })
@@ -338,6 +346,8 @@ impl SessionAdapter {
                                     speaker_id: String::new(),
                                     source_start_ms: 0.0,
                                     source_end_ms: 0.0,
+                                    timing: SegmentTiming::Unknown,
+                                    boundary: SegmentBoundary::Unknown,
                                     revisable: false,
                                     overlap_ratio: 0.0,
                                     activation_matches: Vec::new(),
@@ -356,6 +366,8 @@ impl SessionAdapter {
                             speaker_id: metadata.context.speaker_id,
                             source_start_ms: metadata.context.source_start_ms,
                             source_end_ms: metadata.context.source_end_ms,
+                            timing: metadata.context.timing,
+                            boundary: metadata.context.boundary,
                             revisable: metadata.context.revisable,
                             overlap_ratio: metadata.context.overlap_ratio,
                             clone_audio_path: String::new(),
@@ -385,7 +397,9 @@ fn route(source_lang: &str, target_lang: &str) -> Result<LanguageRoute, String> 
 #[cfg(test)]
 mod tests {
     use super::{SegmentContext, SessionAdapter, WireOutput};
-    use xrtranslate_protocol::{AsrResultKind, LatencyMetrics, ServerEvent};
+    use xrtranslate_protocol::{
+        AsrResultKind, LatencyMetrics, SegmentBoundary, SegmentTiming, ServerEvent,
+    };
 
     #[test]
     fn adapter_maps_engine_output_to_legacy_wire_events() {
@@ -491,6 +505,8 @@ mod tests {
                         speaker_id: "speaker-01".into(),
                         source_start_ms: 120.0,
                         source_end_ms: 640.0,
+                        timing: SegmentTiming::UtteranceWindow,
+                        boundary: SegmentBoundary::Silence,
                         revisable: false,
                         overlap_ratio: 0.0,
                         activation_matches: Vec::new(),
@@ -507,7 +523,9 @@ mod tests {
             if result.turn_id == "turn-before"
                 && result.speaker_id == "speaker-01"
                 && result.source_start_ms == 120.0
-                && result.source_end_ms == 640.0)
+                && result.source_end_ms == 640.0
+                && result.timing == SegmentTiming::UtteranceWindow
+                && result.boundary == SegmentBoundary::Silence)
         );
     }
 }

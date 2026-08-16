@@ -280,6 +280,36 @@ pub enum AsrResultKind {
     Blank,
 }
 
+/// Provenance of a source segment's time range.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum SegmentTiming {
+    /// Older producers did not describe timing provenance.
+    #[default]
+    Unknown,
+    /// The range is the observed VAD utterance window.
+    UtteranceWindow,
+    /// The range was proportionally estimated within an utterance from text.
+    EstimatedTextPartition,
+    /// The range spans multiple recognition windows merged by the client.
+    MergedWindows,
+    /// The range came from an authored subtitle source such as SRT.
+    Authored,
+}
+
+/// Why the recognition window ended at this boundary.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum SegmentBoundary {
+    #[default]
+    Unknown,
+    Silence,
+    AdaptiveSilence,
+    DurationLimit,
+    SpeakerChange,
+    InputBoundary,
+}
+
 /// A source-language segment placed on the translation queue.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct SourceSegmentReady {
@@ -294,6 +324,10 @@ pub struct SourceSegmentReady {
     pub speaker_id: String,
     pub source_start_ms: f64,
     pub source_end_ms: f64,
+    #[serde(default)]
+    pub timing: SegmentTiming,
+    #[serde(default)]
+    pub boundary: SegmentBoundary,
     /// True when this segment belongs to a revisable continuous window.
     pub revisable: bool,
     /// Fraction of this window which repeats audio from its predecessor.
@@ -317,6 +351,10 @@ pub struct TranslationReady {
     /// Exclusive end position inside the current audio epoch.
     #[serde(default)]
     pub source_end_ms: f64,
+    #[serde(default)]
+    pub timing: SegmentTiming,
+    #[serde(default)]
+    pub boundary: SegmentBoundary,
     /// True when this result replaces the revisable tail of a continuous stream.
     pub revisable: bool,
     /// Fraction of this window which repeats audio from its predecessor.
@@ -483,6 +521,8 @@ mod tests {
                 speaker_id: String::new(),
                 source_start_ms: 0.0,
                 source_end_ms: 0.0,
+                timing: SegmentTiming::Unknown,
+                boundary: SegmentBoundary::Unknown,
                 revisable: false,
                 overlap_ratio: 0.0,
                 clone_audio_path: String::new(),
@@ -494,6 +534,30 @@ mod tests {
                 },
             })
         );
+    }
+
+    #[test]
+    fn segment_timing_and_boundary_have_stable_wire_values() {
+        let event = ServerEvent::SourceSegmentReady(SourceSegmentReady {
+            source_text: "hello".into(),
+            activation_matches: Vec::new(),
+            context_matches: Vec::new(),
+            turn_id: "turn-1".into(),
+            segment_index: 1,
+            segment_count: 2,
+            speaker_id: "speaker-01".into(),
+            source_start_ms: 100.0,
+            source_end_ms: 400.0,
+            timing: SegmentTiming::EstimatedTextPartition,
+            boundary: SegmentBoundary::SpeakerChange,
+            revisable: false,
+            overlap_ratio: 0.0,
+        });
+
+        let json = serde_json::to_string(&event).unwrap();
+        assert!(json.contains(r#""timing":"estimated_text_partition""#));
+        assert!(json.contains(r#""boundary":"speaker_change""#));
+        assert_eq!(serde_json::from_str::<ServerEvent>(&json).unwrap(), event);
     }
 
     #[test]

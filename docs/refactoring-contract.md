@@ -40,6 +40,10 @@ shared domain/runtime/UI capability
 ```
 
 - Shared infrastructure must not import a concrete plugin.
+- Shared session request/event types must not contain variants, fields, or
+  lifecycle branches named after a concrete plugin. Plugins configure sessions
+  through `TranslationSessionPlugin` and consume results through the neutral
+  subscriber contracts.
 - A plugin owns its domain state, persistence, workers, UI, and assets below its
   named module. It requests host capabilities through small typed inputs and
   actions rather than receiving the root application object.
@@ -48,6 +52,9 @@ shared domain/runtime/UI capability
   another plugin's private module.
 - Host code coordinates exclusive resources and routes typed events; it must not
   duplicate a plugin's domain policy.
+- Generic event pumps broadcast to registered subscribers. Conversion from a
+  generic session event into plugin-domain data belongs in that plugin's event
+  adapter, not in the pump or networking layer.
 - UI rendering should consume a snapshot/controller and emit typed actions.
   Rendering code must not acquire unrelated runtime or persistence ownership.
 
@@ -102,4 +109,3 @@ A batch is complete when:
 - formatting, compilation, and relevant tests pass without new warnings;
 - observable behavior and visuals remain unchanged;
 - the diff contains no unrelated cleanup and preserves prior user changes.
-

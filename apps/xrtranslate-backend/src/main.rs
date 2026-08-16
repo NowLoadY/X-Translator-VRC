@@ -37,14 +37,14 @@ use xrtranslate_engine::RouteEpoch;
 use xrtranslate_inference::{AsyncHttpClient, HttpRequest, ReqwestClient};
 use xrtranslate_protocol::{
     ActionControl, ClientControl, DrainReason, ErrorEvent, EventControl, Feature, LatencyMetrics,
-    PcmFormat, PcmFrame, PipelineDrained, RecognitionStreamEnded, RouteChanged, ServerEvent,
-    SessionReady, VadActivity,
+    PcmFormat, PcmFrame, PipelineDrained, RecognitionStreamEnded, RouteChanged, SegmentBoundary,
+    SegmentTiming, ServerEvent, SessionReady, VadActivity,
 };
 use xrtranslate_supervisor::{
     LlamaServerEndpoint, LlamaServerLauncher, LlamaServerProcess, LlamaServerProcessHandle,
     LlamaServerRole, LlamaServerSpec, StdLlamaServerLauncher,
 };
-use xrtranslate_vad::{FRAME_SAMPLES, SAMPLE_RATE_HZ, Utterance};
+use xrtranslate_vad::{FRAME_SAMPLES, SAMPLE_RATE_HZ, Utterance, UtteranceEndReason};
 
 use crate::{
     language::AdaptiveLanguageRoute,
@@ -84,6 +84,7 @@ struct StreamWindowContext {
     end_ms: f64,
     revisable: bool,
     overlap_ratio: f32,
+    boundary: SegmentBoundary,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -1412,6 +1413,7 @@ async fn run_inference_worker(
             (job.source_start_ms + overlap_ms).min(job.source_end_ms)
         };
         let window_ms = (job.source_end_ms - job.source_start_ms).max(1.0);
+        let boundary = segment_boundary(&job.utterance.end_reason);
         let segment_contexts = segment_contexts(
             &segments,
             &translation_context.segments,
@@ -1422,6 +1424,7 @@ async fn run_inference_worker(
                 end_ms: job.source_end_ms,
                 revisable: job.revisable,
                 overlap_ratio: (overlap_ms / window_ms) as f32,
+                boundary,
             },
         );
         if events
@@ -1641,9 +1644,18 @@ fn segment_contexts(
     speaker_id: String,
     window: StreamWindowContext,
 ) -> Vec<SegmentContext> {
+    let timing = if segments.len() == 1 {
+        SegmentTiming::UtteranceWindow
+    } else {
+        SegmentTiming::EstimatedTextPartition
+    };
     let weights = segments
         .iter()
-        .map(|segment| segment.source_text.chars().count().max(1))
+        // Latin text duration tracks spoken words better than punctuation and
+        // byte/character length, while CJK text naturally uses one unit per
+        // ideograph or kana. This is still an estimate and is labelled as such
+        // in SegmentTiming rather than pretending to be word alignment.
+        .map(|segment| text_density_units(&segment.source_text).max(1))
         .collect::<Vec<_>>();
     let total_weight = weights.iter().sum::<usize>().max(1) as f64;
     let duration = (window.end_ms - window.start_ms).max(0.0);
@@ -1667,6 +1679,8 @@ fn segment_contexts(
                 speaker_id: speaker_id.clone(),
                 source_start_ms: start,
                 source_end_ms: end,
+                timing,
+                boundary: window.boundary,
                 revisable: window.revisable,
                 overlap_ratio: window.overlap_ratio,
                 activation_matches: corpus_context
@@ -1684,6 +1698,16 @@ fn segment_contexts(
             }
         })
         .collect()
+}
+
+fn segment_boundary(reason: &UtteranceEndReason) -> SegmentBoundary {
+    match reason {
+        UtteranceEndReason::Silence => SegmentBoundary::Silence,
+        UtteranceEndReason::AdaptiveSilence => SegmentBoundary::AdaptiveSilence,
+        UtteranceEndReason::MaxActiveFrames => SegmentBoundary::DurationLimit,
+        UtteranceEndReason::SpeakerChange => SegmentBoundary::SpeakerChange,
+        UtteranceEndReason::Flushed => SegmentBoundary::InputBoundary,
+    }
 }
 
 fn millis(duration: std::time::Duration) -> u64 {
@@ -1785,6 +1809,7 @@ mod tests {
     use xrtranslate_engine::{
         EngineConfig, Language, LanguageRoute, SessionEngine, TranslationSegmentPair,
     };
+    use xrtranslate_protocol::{SegmentBoundary, SegmentTiming};
     use xrtranslate_supervisor::LlamaServerSpec;
 
     #[test]
@@ -1915,6 +1940,7 @@ mod tests {
                 end_ms: 3_000.0,
                 revisable: false,
                 overlap_ratio: 0.0,
+                boundary: SegmentBoundary::Silence,
             },
         );
         assert_eq!(metadata.len(), 2);
@@ -1926,6 +1952,8 @@ mod tests {
         assert_eq!(metadata[0].source_start_ms, 1_000.0);
         assert_eq!(metadata[0].source_end_ms, metadata[1].source_start_ms);
         assert_eq!(metadata[1].source_end_ms, 3_000.0);
+        assert_eq!(metadata[0].timing, SegmentTiming::EstimatedTextPartition);
+        assert_eq!(metadata[0].boundary, SegmentBoundary::Silence);
         assert!(metadata[0].source_end_ms < 2_000.0);
     }
 }

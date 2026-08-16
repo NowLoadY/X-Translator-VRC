@@ -118,6 +118,9 @@ impl SpeakerEmbeddingModel {
 pub struct TrackerConfig {
     pub similarity_threshold: f32,
     pub same_speaker_hysteresis: f32,
+    /// Minimum cosine advantage required before switching away from the
+    /// immediately previous speaker while that speaker remains plausible.
+    pub speaker_switch_margin: f32,
     pub max_speakers: usize,
 }
 
@@ -137,6 +140,13 @@ impl TrackerConfig {
                 "same_speaker_hysteresis must be finite and within 0..=0.25",
             ));
         }
+        if !self.speaker_switch_margin.is_finite()
+            || !(0.0..=0.25).contains(&self.speaker_switch_margin)
+        {
+            return Err(SpeakerError::InvalidTrackerConfig(
+                "speaker_switch_margin must be finite and within 0..=0.25",
+            ));
+        }
         if self.max_speakers == 0 || self.max_speakers > 64 {
             return Err(SpeakerError::InvalidTrackerConfig(
                 "max_speakers must be within 1..=64",
@@ -151,6 +161,7 @@ impl Default for TrackerConfig {
         Self {
             similarity_threshold: 0.56,
             same_speaker_hysteresis: 0.16,
+            speaker_switch_margin: 0.04,
             max_speakers: 8,
         }
     }
@@ -200,14 +211,45 @@ impl OnlineSpeakerTracker {
 
     pub fn assign(&mut self, embedding: &[f32]) -> Result<SpeakerAssignment, SpeakerError> {
         let embedding = normalize_embedding(embedding.to_vec())?;
-        let best = self
+        let scores = self
             .centroids
             .iter()
             .enumerate()
             .map(|(index, centroid)| (index, cosine(&embedding, &centroid.embedding)))
+            .collect::<Vec<_>>();
+        let best = scores
+            .iter()
+            .copied()
             .max_by(|left, right| left.1.total_cmp(&right.1));
 
-        let accepted = best.filter(|(index, similarity)| {
+        // A nearest-centroid decision is unstable when two profiles score
+        // almost equally. Preserve temporal continuity while the previous
+        // speaker is still above its hysteresis threshold, and switch only
+        // when another profile has a meaningful cosine advantage.
+        let preferred = match (self.previous_speaker, best) {
+            (Some(previous_index), Some((best_index, best_similarity)))
+                if best_index != previous_index =>
+            {
+                let previous_similarity = scores
+                    .iter()
+                    .find_map(|(index, similarity)| {
+                        (*index == previous_index).then_some(*similarity)
+                    })
+                    .unwrap_or(f32::NEG_INFINITY);
+                let continuation_threshold =
+                    self.config.similarity_threshold - self.config.same_speaker_hysteresis;
+                if previous_similarity >= continuation_threshold
+                    && best_similarity - previous_similarity < self.config.speaker_switch_margin
+                {
+                    Some((previous_index, previous_similarity))
+                } else {
+                    Some((best_index, best_similarity))
+                }
+            }
+            _ => best,
+        };
+
+        let accepted = preferred.filter(|(index, similarity)| {
             let threshold = if self.previous_speaker == Some(*index) {
                 self.config.similarity_threshold - self.config.same_speaker_hysteresis
             } else {
@@ -317,8 +359,10 @@ impl AdaptiveSpeakerThrottle {
     pub const CIRCUIT_BREAKER_THRESHOLD_MS: u64 = 350;
 
     pub fn new(sample_rate_hz: u32) -> Self {
-        let min_step = (sample_rate_hz as f64 * (Self::DEFAULT_MIN_STEP_MS as f64 / 1000.0)) as usize;
-        let max_step = (sample_rate_hz as f64 * (Self::DEFAULT_MAX_STEP_MS as f64 / 1000.0)) as usize;
+        let min_step =
+            (sample_rate_hz as f64 * (Self::DEFAULT_MIN_STEP_MS as f64 / 1000.0)) as usize;
+        let max_step =
+            (sample_rate_hz as f64 * (Self::DEFAULT_MAX_STEP_MS as f64 / 1000.0)) as usize;
         Self {
             min_step_samples: min_step.max(1),
             max_step_samples: max_step.max(min_step),
@@ -436,9 +480,7 @@ impl Default for StreamingDiarizerConfig {
 #[derive(Clone, Debug, PartialEq)]
 pub enum StreamingSpeakerEvent {
     /// Speech continues with currently assigned speaker.
-    Continues {
-        speaker_id: String,
-    },
+    Continues { speaker_id: String },
     /// A speaker change was detected. Returns the samples for the previous speaker turn,
     /// the speaker IDs, and the cut offset.
     SpeakerCut {
@@ -516,18 +558,18 @@ impl StreamingSpeakerSegmenter {
         samples: &[i16],
     ) -> Result<Option<StreamingSpeakerEvent>, SpeakerError> {
         self.active_samples.extend_from_slice(samples);
-        self.samples_since_last_evaluation =
-            self.samples_since_last_evaluation.saturating_add(samples.len());
+        self.samples_since_last_evaluation = self
+            .samples_since_last_evaluation
+            .saturating_add(samples.len());
         self.total_turn_samples = self.total_turn_samples.saturating_add(samples.len());
 
         // Circuit breaker: skip online slice evaluation under extreme load, fallback to whole turn
         if self.throttle.is_circuit_broken() {
-            return Ok(self
-                .current_speaker_id
-                .as_ref()
-                .map(|id| StreamingSpeakerEvent::Continues {
+            return Ok(self.current_speaker_id.as_ref().map(|id| {
+                StreamingSpeakerEvent::Continues {
                     speaker_id: id.clone(),
-                }));
+                }
+            }));
         }
 
         let step_threshold = self.throttle.current_step_samples();
@@ -575,7 +617,10 @@ impl StreamingSpeakerSegmenter {
         if self.consecutive_pending_count >= self.config.consecutive_confirmations {
             let step_back = step_threshold * self.consecutive_pending_count;
             let cut_offset = self.active_samples.len().saturating_sub(step_back);
-            let min_cut = self.config.min_speech_samples.min(self.active_samples.len());
+            let min_cut = self
+                .config
+                .min_speech_samples
+                .min(self.active_samples.len());
             let safe_cut = cut_offset.max(min_cut / 2).min(self.active_samples.len());
 
             let finalized_samples = self.active_samples[..safe_cut].to_vec();
@@ -840,6 +885,7 @@ mod tests {
         let mut tracker = OnlineSpeakerTracker::new(TrackerConfig {
             similarity_threshold: 0.8,
             same_speaker_hysteresis: 0.04,
+            speaker_switch_margin: 0.03,
             max_speakers: 2,
         })
         .unwrap();
@@ -860,6 +906,34 @@ mod tests {
             "speaker-02"
         );
         assert_eq!(tracker.speaker_count(), 2);
+    }
+
+    #[test]
+    fn tracker_requires_a_meaningful_advantage_before_switching_speakers() {
+        let mut tracker = OnlineSpeakerTracker::new(TrackerConfig {
+            similarity_threshold: 0.5,
+            same_speaker_hysteresis: 0.1,
+            speaker_switch_margin: 0.04,
+            max_speakers: 3,
+        })
+        .unwrap();
+        tracker.assign(&[1.0, 0.0, 0.0]).unwrap();
+        tracker.assign(&[0.0, 1.0, 0.0]).unwrap();
+
+        // Re-establish speaker 1 as the previous speaker.
+        assert_eq!(
+            tracker.assign(&[0.8, 0.6, 0.0]).unwrap().speaker_id,
+            "speaker-01"
+        );
+
+        // Speaker 2 wins by only ~0.02, which is ambiguous and should not
+        // cause a label flicker between adjacent windows.
+        let ambiguous = tracker.assign(&[0.57, 0.82, 0.0]).unwrap();
+        assert_eq!(ambiguous.speaker_id, "speaker-01");
+
+        // A clear advantage still switches promptly.
+        let clear = tracker.assign(&[0.2, 0.98, 0.0]).unwrap();
+        assert_eq!(clear.speaker_id, "speaker-02");
     }
 
     #[test]

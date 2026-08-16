@@ -46,8 +46,8 @@ use xrtranslate_vad::{
 };
 
 use crate::language::{
-    AdaptiveLanguageRoute, AutoDecision, LanguageRoute, SupportedLanguage,
-    is_traditional_chinese, to_traditional_chinese,
+    AdaptiveLanguageRoute, AutoDecision, LanguageRoute, SupportedLanguage, is_traditional_chinese,
+    to_traditional_chinese,
 };
 
 const SILERO_VAD_MODEL: &str = "models/silero-vad/src/silero_vad/data/silero_vad.onnx";
@@ -485,6 +485,7 @@ impl NativePipeline {
             let tracker = TrackerConfig {
                 similarity_threshold: config.speaker.similarity_threshold as f32,
                 same_speaker_hysteresis: config.speaker.same_speaker_hysteresis as f32,
+                speaker_switch_margin: config.speaker.speaker_switch_margin as f32,
                 max_speakers: config.speaker.max_speakers,
             }
             .validate()
@@ -535,7 +536,9 @@ impl NativePipeline {
                 match GtcrnDenoiser::from_file(&model_path, config.denoise.intra_threads) {
                     Ok(denoiser) => Some(denoiser),
                     Err(error) => {
-                        warn!("failed to initialize GTCRN denoiser ({error}), continuing with bypass");
+                        warn!(
+                            "failed to initialize GTCRN denoiser ({error}), continuing with bypass"
+                        );
                         None
                     }
                 }
@@ -594,12 +597,8 @@ impl NativePipeline {
             self.pending_denoised_pcm.extend_from_slice(pcm);
         }
 
-        let complete_bytes = self
-            .pending_pcm
-            .len()
-            .min(self.pending_denoised_pcm.len())
-            / FRAME_BYTES
-            * FRAME_BYTES;
+        let complete_bytes =
+            self.pending_pcm.len().min(self.pending_denoised_pcm.len()) / FRAME_BYTES * FRAME_BYTES;
         let raw_completed = self.pending_pcm.drain(..complete_bytes).collect::<Vec<_>>();
         let denoised_completed = self
             .pending_denoised_pcm
@@ -616,7 +615,8 @@ impl NativePipeline {
                     .vad
                     .infer_pcm16le(denoised_frame)
                     .map_err(|error| error.to_string())?;
-                let raw_samples = decode_pcm16le_frame(raw_frame).map_err(|error| error.to_string())?;
+                let raw_samples =
+                    decode_pcm16le_frame(raw_frame).map_err(|error| error.to_string())?;
                 self.processed_samples =
                     self.processed_samples.saturating_add(FRAME_SAMPLES as u64);
                 let threshold = self.endpoint_config.speech_threshold;
@@ -659,13 +659,11 @@ impl NativePipeline {
                 .vad
                 .infer_pcm16le(denoised_frame)
                 .map_err(|error| error.to_string())?;
-            let active = vad_is_active(
-                probability,
-                self.endpoint_config.speech_threshold,
-            );
+            let active = vad_is_active(probability, self.endpoint_config.speech_threshold);
             self.observe_vad_activity(active);
             let raw_samples = decode_pcm16le_frame(raw_frame).map_err(|error| error.to_string())?;
-            let denoised_samples = decode_pcm16le_frame(denoised_frame).map_err(|error| error.to_string())?;
+            let denoised_samples =
+                decode_pcm16le_frame(denoised_frame).map_err(|error| error.to_string())?;
 
             let is_in_speech =
                 active || matches!(self.endpoint.state(), EndpointState::Speaking { .. });
@@ -721,7 +719,12 @@ impl NativePipeline {
                     .fixed_window
                     .as_ref()
                     .map(|window| window.current_topic_turn_sequence);
-                PipelineEvent::Utterance(self.with_timeline(utterance, 0, topic_turn_sequence, None))
+                PipelineEvent::Utterance(self.with_timeline(
+                    utterance,
+                    0,
+                    topic_turn_sequence,
+                    None,
+                ))
             });
             self.observe_vad_activity(false);
             return Ok(event);
@@ -1565,7 +1568,10 @@ mod tests {
             topic_turn_sequence: None,
             speaker_id: Some("speaker-01".to_string()),
         };
-        assert_eq!(timed.utterance.end_reason, UtteranceEndReason::SpeakerChange);
+        assert_eq!(
+            timed.utterance.end_reason,
+            UtteranceEndReason::SpeakerChange
+        );
         assert_eq!(timed.speaker_id.as_deref(), Some("speaker-01"));
         assert_eq!(timed.source_end_ms, 128.0);
     }

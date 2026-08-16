@@ -10,7 +10,12 @@ use super::{
     store::{MeetingStore, NewSegment, SegmentSource},
 };
 use crossbeam_channel::{Sender, unbounded};
-use std::sync::Arc;
+use std::sync::{
+    Arc,
+    atomic::{AtomicBool, AtomicUsize, Ordering},
+};
+
+use crate::{CaptureSource, network::SessionEvent, session_coordinator::SessionEventSubscriber};
 
 #[derive(Clone, Copy, Debug)]
 pub enum MeetingSegmentSource {
@@ -43,6 +48,8 @@ enum Command {
 pub struct MeetingEventSink {
     tx: Sender<Command>,
     active: SharedMeetingCapture,
+    active_sessions: Arc<AtomicUsize>,
+    finish_requested: Arc<AtomicBool>,
 }
 
 impl MeetingEventSink {
@@ -65,7 +72,12 @@ impl MeetingEventSink {
                 }
             })
             .expect("failed to start meeting event store");
-        Self { tx, active }
+        Self {
+            tx,
+            active,
+            active_sessions: Arc::new(AtomicUsize::new(0)),
+            finish_requested: Arc::new(AtomicBool::new(false)),
+        }
     }
 
     pub fn persist(&self, event: MeetingSegmentEvent) {
@@ -88,11 +100,129 @@ impl MeetingEventSink {
             .unwrap_or(false)
     }
 
+    /// Registers all recognition streams belonging to one meeting operation.
+    pub fn begin_sessions(&self, count: usize) {
+        self.active_sessions.store(count, Ordering::Release);
+        self.finish_requested.store(false, Ordering::Release);
+    }
+
+    /// Requests durable completion once every stream has drained.
+    pub fn request_finish(&self) {
+        self.finish_requested.store(true, Ordering::Release);
+    }
+
+    pub fn cancel_sessions(&self) {
+        self.active_sessions.store(0, Ordering::Release);
+        self.finish_requested.store(false, Ordering::Release);
+    }
+
     #[cfg(test)]
     fn flush(&self) {
         let (done_tx, done_rx) = crossbeam_channel::bounded(1);
         self.tx.send(Command::Flush(done_tx)).unwrap();
         done_rx.recv().unwrap();
+    }
+}
+
+impl SessionEventSubscriber for MeetingEventSink {
+    fn on_session_event(&self, event: &SessionEvent) {
+        match event {
+            SessionEvent::SourceSegment {
+                audio_source,
+                text,
+                turn_id,
+                speaker_id,
+                source_start_ms,
+                source_end_ms,
+                segment_index,
+                revisable,
+                ..
+            } if !text.is_empty() => self.persist_segment(
+                *audio_source,
+                turn_id,
+                *segment_index,
+                text,
+                None,
+                speaker_id,
+                *source_start_ms,
+                *source_end_ms,
+                !revisable,
+            ),
+            SessionEvent::Translation {
+                audio_source,
+                source,
+                translated,
+                turn_id,
+                speaker_id,
+                source_start_ms,
+                source_end_ms,
+                segment_index,
+                revisable,
+                ..
+            } => self.persist_segment(
+                *audio_source,
+                turn_id,
+                *segment_index,
+                source,
+                Some(translated),
+                speaker_id,
+                *source_start_ms,
+                *source_end_ms,
+                !revisable,
+            ),
+            SessionEvent::Disconnected(reason) if reason == "Finished" => {
+                let previous = self
+                    .active_sessions
+                    .fetch_update(Ordering::AcqRel, Ordering::Acquire, |value| {
+                        value.checked_sub(1)
+                    })
+                    .unwrap_or(0);
+                if previous == 1
+                    && (self.active_is_imported() || self.finish_requested.load(Ordering::Acquire))
+                {
+                    self.finish_active();
+                    self.finish_requested.store(false, Ordering::Release);
+                }
+            }
+            SessionEvent::Error(error) => {
+                self.fail_active(error.clone());
+                self.cancel_sessions();
+            }
+            _ => {}
+        }
+    }
+}
+
+#[allow(clippy::too_many_arguments)]
+impl MeetingEventSink {
+    fn persist_segment(
+        &self,
+        audio_source: CaptureSource,
+        turn_id: &str,
+        segment_index: u32,
+        source_text: &str,
+        translated_text: Option<&str>,
+        raw_speaker_id: &str,
+        source_start_ms: f64,
+        source_end_ms: f64,
+        is_final: bool,
+    ) {
+        let source = match audio_source {
+            CaptureSource::Microphone => MeetingSegmentSource::Microphone,
+            CaptureSource::SystemAudio => MeetingSegmentSource::SystemAudio,
+            CaptureSource::Both => return,
+        };
+        self.persist(MeetingSegmentEvent {
+            source,
+            turn_id: turn_id.to_owned(),
+            segment_index,
+            source_text: source_text.to_owned(),
+            translated_text: translated_text.map(ToOwned::to_owned),
+            raw_speaker_id: raw_speaker_id.to_owned(),
+            source_start_ms,
+            source_end_ms,
+            is_final,
+        });
     }
 }
 
@@ -263,6 +393,90 @@ mod tests {
                 .segments
                 .len(),
             1
+        );
+    }
+
+    #[test]
+    fn generic_session_events_are_adapted_inside_the_plugin() {
+        let store = Arc::new(MeetingStore::open_in_memory().unwrap());
+        let bundle = store
+            .create_meeting(NewMeeting::live(
+                "Subscriber",
+                Some("default".into()),
+                "en",
+                "zh",
+            ))
+            .unwrap();
+        store.start_meeting(&bundle.meeting.id).unwrap();
+        let active = Arc::new(Mutex::new(Some(ActiveMeetingCapture {
+            meeting_id: bundle.meeting.id.clone(),
+            topic_id: bundle.topics[0].id.clone(),
+            recognition_run_id: "run-generic".into(),
+            timeline_offset_ms: 0,
+            imported_audio: false,
+        })));
+        let sink = MeetingEventSink::start(Arc::clone(&store), active);
+
+        sink.on_session_event(&SessionEvent::Translation {
+            stream_id: 1,
+            audio_source: CaptureSource::Microphone,
+            continuous: false,
+            publish_to_host_outputs: false,
+            source: "hello".into(),
+            translated: "你好".into(),
+            turn_id: "turn-generic".into(),
+            segment_index: 1,
+            segment_count: 1,
+            speaker_id: "speaker-03".into(),
+            source_start_ms: 100.0,
+            source_end_ms: 500.0,
+            timing: xrtranslate_protocol::SegmentTiming::UtteranceWindow,
+            boundary: xrtranslate_protocol::SegmentBoundary::Silence,
+            term_matches: Vec::new(),
+            revisable: false,
+            overlap_ratio: 0.0,
+        });
+        sink.flush();
+
+        let stored = store.open_meeting(&bundle.meeting.id).unwrap();
+        assert_eq!(stored.segments.len(), 1);
+        assert_eq!(stored.segments[0].original_text, "hello");
+        assert_eq!(stored.segments[0].translated_text.as_deref(), Some("你好"));
+    }
+
+    #[test]
+    fn requested_finish_waits_for_every_generic_session() {
+        let store = Arc::new(MeetingStore::open_in_memory().unwrap());
+        let bundle = store
+            .create_meeting(NewMeeting::live(
+                "Lifecycle",
+                Some("default".into()),
+                "en",
+                "zh",
+            ))
+            .unwrap();
+        store.start_meeting(&bundle.meeting.id).unwrap();
+        let active = Arc::new(Mutex::new(Some(ActiveMeetingCapture {
+            meeting_id: bundle.meeting.id.clone(),
+            topic_id: bundle.topics[0].id.clone(),
+            recognition_run_id: "run-lifecycle".into(),
+            timeline_offset_ms: 0,
+            imported_audio: false,
+        })));
+        let sink = MeetingEventSink::start(Arc::clone(&store), Arc::clone(&active));
+        sink.begin_sessions(2);
+        sink.request_finish();
+
+        sink.on_session_event(&SessionEvent::Disconnected("Finished".into()));
+        sink.flush();
+        assert!(active.lock().unwrap().is_some());
+
+        sink.on_session_event(&SessionEvent::Disconnected("Finished".into()));
+        sink.flush();
+        assert!(active.lock().unwrap().is_none());
+        assert_eq!(
+            store.get_meeting(&bundle.meeting.id).unwrap().status,
+            MeetingStatus::Ended
         );
     }
 }

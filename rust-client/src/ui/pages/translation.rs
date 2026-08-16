@@ -260,41 +260,19 @@ pub fn render(app: &mut crate::XRTranslateApp, ui: &mut egui::Ui) {
             ui.horizontal(|ui| {
                 if app.is_translating {
                     match &app.session_owner {
-                        crate::session_coordinator::TranslationSessionOwner::Meeting { .. } => {
-                            if components::primary_button(
-                                ui,
-                                crate::i18n::tr(app.ui_language, "Open meeting controls"),
-                            )
-                            .clicked()
-                            {
-                                app.open_meeting_plugin();
-                            }
+                        crate::session_coordinator::TranslationSessionOwner::Plugin(owner) => {
+                            let plugin_id = crate::plugins::PluginId::parse(owner.plugin_id());
+                            let open_label = owner.open_label(app.ui_language);
+                            let active_message = owner.active_message(app.ui_language);
+                            let open_clicked = components::primary_button(ui, open_label).clicked();
                             ui.label(
-                                egui::RichText::new(crate::i18n::tr(
-                                    app.ui_language,
-                                    "A meeting owns the active audio session",
-                                ))
-                                .color(crate::ui::theme::text_weak())
-                                .size(11.5),
+                                egui::RichText::new(active_message)
+                                    .color(crate::ui::theme::text_weak())
+                                    .size(11.5),
                             );
-                        }
-                        crate::session_coordinator::TranslationSessionOwner::VideoPlayer { .. } => {
-                            if components::primary_button(
-                                ui,
-                                crate::i18n::tr(app.ui_language, "Open Media Player"),
-                            )
-                            .clicked()
-                            {
-                                app.open_video_player_plugin();
+                            if open_clicked && let Some(plugin_id) = plugin_id {
+                                app.open_plugin(plugin_id);
                             }
-                            ui.label(
-                                egui::RichText::new(crate::i18n::tr(
-                                    app.ui_language,
-                                    "Media Player owns the active translation session",
-                                ))
-                                .color(crate::ui::theme::text_weak())
-                                .size(11.5),
-                            );
                         }
                         _ => {
                             if danger_button(

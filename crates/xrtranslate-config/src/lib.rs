@@ -390,6 +390,9 @@ pub struct SpeakerConfig {
     /// Lower threshold applied only to the immediately previous speaker.
     #[serde(default = "default_same_speaker_hysteresis")]
     pub same_speaker_hysteresis: f64,
+    /// Required cosine advantage before changing a plausible previous speaker.
+    #[serde(default = "default_speaker_switch_margin")]
+    pub speaker_switch_margin: f64,
     /// Strict upper bound for per-session centroid memory.
     #[serde(default = "default_max_speakers")]
     pub max_speakers: usize,
@@ -408,6 +411,7 @@ impl Default for SpeakerConfig {
             model_path: default_speaker_model_path(),
             similarity_threshold: default_speaker_similarity_threshold(),
             same_speaker_hysteresis: default_same_speaker_hysteresis(),
+            speaker_switch_margin: default_speaker_switch_margin(),
             max_speakers: default_max_speakers(),
             min_utterance_ms: default_speaker_min_utterance_ms(),
             intra_threads: default_speaker_intra_threads(),
@@ -779,6 +783,9 @@ const fn default_speaker_similarity_threshold() -> f64 {
 const fn default_same_speaker_hysteresis() -> f64 {
     0.16
 }
+const fn default_speaker_switch_margin() -> f64 {
+    0.04
+}
 const fn default_max_speakers() -> usize {
     8
 }
@@ -828,6 +835,7 @@ mod tests {
         assert!(config.speaker.enabled);
         assert_eq!(config.speaker.max_speakers, 8);
         assert_eq!(config.speaker.min_utterance_ms, 750);
+        assert_eq!(config.speaker.speaker_switch_margin, 0.04);
         assert!(config.prompt_context.enabled);
         assert_eq!(config.prompt_context.max_entries, 6);
         assert_eq!(config.prompt_context.asr_max_chars, 800);
@@ -856,6 +864,16 @@ mod tests {
                 .and_then(Value::as_u64),
             Some(9001)
         );
+    }
+
+    #[test]
+    fn legacy_speaker_config_gets_the_safe_switch_margin() {
+        let speaker: SpeakerConfig = serde_json::from_str(
+            r#"{"enabled":true,"similarity_threshold":0.56,"same_speaker_hysteresis":0.16}"#,
+        )
+        .unwrap();
+
+        assert_eq!(speaker.speaker_switch_margin, 0.04);
     }
 
     #[test]
