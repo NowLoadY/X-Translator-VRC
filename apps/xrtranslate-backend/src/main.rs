@@ -48,6 +48,7 @@ use xrtranslate_supervisor::{
 use xrtranslate_vad::{FRAME_SAMPLES, SAMPLE_RATE_HZ, Utterance, UtteranceEndReason};
 
 use crate::{
+    conversation_context::LogicalTurnRecord,
     language::AdaptiveLanguageRoute,
     pipeline::{
         NativeInference, NativePipeline, PipelineEvent, RecognizedOutput, TimedUtterance,
@@ -58,6 +59,7 @@ use crate::{
     terminology::{rewrite_recognition_terms, rewrite_translation_terms},
 };
 
+mod conversation_context;
 mod language;
 mod pipeline;
 mod scheduler;
@@ -66,7 +68,7 @@ mod terminology;
 use scheduler::InferenceScheduler;
 use xr_corpus_client::CorpusClient;
 use xr_corpus_protocol::{
-    ContextBudgets, PrepareAsrRequest, PrepareTranslationRequest, RecordTranslationRequest,
+    ContextBudgets, PrepareAsrRequest, PrepareTranslationRequest,
     SegmentContext as CorpusSegmentContext,
 };
 
@@ -1383,6 +1385,57 @@ async fn run_inference_worker(
         {
             break;
         }
+        // Speaker identity is neutral recognition metadata and belongs to the
+        // logical dialogue turn. Resolve it while the preceding translation
+        // may still be running, then make it available to context selection.
+        let speaker_enabled = speaker_recognition_enabled.load(Ordering::Acquire);
+        let speaker_revision = speaker_state_revision.load(Ordering::Acquire);
+        if speaker_revision != speaker_revision_seen {
+            if let Some(diarizer) = &mut diarizer {
+                diarizer.reset();
+            }
+            speaker_revision_seen = speaker_revision;
+            speaker_load_failed = false;
+        }
+        let duration_ms = job.source_end_ms - job.source_start_ms;
+        let speaker_id = if let Some(assigned) = job.speaker_id.clone() {
+            assigned
+        } else if speaker_enabled && duration_ms >= f64::from(speaker_min_utterance_ms) {
+            if diarizer.is_none() && !speaker_load_failed {
+                match tokio::task::block_in_place(|| inference.speaker_diarizer()) {
+                    Ok(loaded) => diarizer = loaded,
+                    Err(error) => {
+                        speaker_load_failed = true;
+                        warn!(%error, "speaker model failed to initialize; preserving ASR");
+                    }
+                }
+            }
+            match &mut diarizer {
+                Some(diarizer) => {
+                    match tokio::task::block_in_place(|| diarizer.identify(&job.utterance.samples))
+                    {
+                        Ok(assignment) => {
+                            info!(
+                                speaker_id = assignment.speaker_id,
+                                similarity = assignment.similarity,
+                                is_new = assignment.is_new,
+                                "speaker voiceprint assigned"
+                            );
+                            assignment.speaker_id
+                        }
+                        Err(error) => {
+                            warn!(%error, "speaker embedding failed; preserving ASR with unknown speaker");
+                            "speaker-unknown".into()
+                        }
+                    }
+                }
+                None => "speaker-unknown".into(),
+            }
+        } else if speaker_enabled {
+            "speaker-unknown".into()
+        } else {
+            String::new()
+        };
         // ASR for this turn ran while the previous turn translated. Commit the
         // prior translation before selecting this turn's corpus context so
         // prompt history and emitted events retain strict stream order.
@@ -1399,6 +1452,7 @@ async fn run_inference_worker(
             .prepare_translation(&PrepareTranslationRequest {
                 asr_context_id: asr_context.context_id,
                 turn_id: Some(job.topic_turn_id.clone()),
+                speaker_id: speaker_id.clone(),
                 source_language: recognized.source_language.clone(),
                 target_language: recognized.target_language.clone(),
                 recognized_text: recognized.source_text.clone(),
@@ -1457,54 +1511,6 @@ async fn run_inference_worker(
             segments = recognized.segments.len(),
             "ASR completed an utterance"
         );
-        let speaker_enabled = speaker_recognition_enabled.load(Ordering::Acquire);
-        let speaker_revision = speaker_state_revision.load(Ordering::Acquire);
-        if speaker_revision != speaker_revision_seen {
-            if let Some(diarizer) = &mut diarizer {
-                diarizer.reset();
-            }
-            speaker_revision_seen = speaker_revision;
-            speaker_load_failed = false;
-        }
-        let duration_ms = job.source_end_ms - job.source_start_ms;
-        let speaker_id = if let Some(assigned) = job.speaker_id {
-            assigned
-        } else if speaker_enabled && duration_ms >= f64::from(speaker_min_utterance_ms) {
-            if diarizer.is_none() && !speaker_load_failed {
-                match tokio::task::block_in_place(|| inference.speaker_diarizer()) {
-                    Ok(loaded) => diarizer = loaded,
-                    Err(error) => {
-                        speaker_load_failed = true;
-                        warn!(%error, "speaker model failed to initialize; preserving ASR");
-                    }
-                }
-            }
-            match &mut diarizer {
-                Some(diarizer) => {
-                    match tokio::task::block_in_place(|| diarizer.identify(&job.utterance.samples))
-                    {
-                        Ok(assignment) => {
-                            info!(
-                                speaker_id = assignment.speaker_id,
-                                similarity = assignment.similarity,
-                                is_new = assignment.is_new,
-                                "speaker voiceprint assigned"
-                            );
-                            assignment.speaker_id
-                        }
-                        Err(error) => {
-                            warn!(%error, "speaker embedding failed; preserving ASR with unknown speaker");
-                            "speaker-unknown".into()
-                        }
-                    }
-                }
-                None => "speaker-unknown".into(),
-            }
-        } else if speaker_enabled {
-            "speaker-unknown".into()
-        } else {
-            String::new()
-        };
         let asr_elapsed = recognized.asr_elapsed;
         let source_language = recognized.source_language.clone();
         let target_language = recognized.target_language.clone();
@@ -1522,7 +1528,7 @@ async fn run_inference_worker(
             &segments,
             &translation_context.segments,
             job.turn_id.clone(),
-            speaker_id,
+            speaker_id.clone(),
             StreamWindowContext {
                 start_ms: non_overlapping_start_ms,
                 end_ms: job.source_end_ms,
@@ -1551,6 +1557,10 @@ async fn run_inference_worker(
         let corpus_session = corpus_session.clone();
         let inference = inference.clone();
         let scheduler = scheduler.clone();
+        let logical_turn_id = job.topic_turn_id.clone();
+        let history_speaker_id = speaker_id;
+        let history_source_language = source_language.clone();
+        let history_target_language = target_language.clone();
         pending_translation = Some(tokio::spawn(async move {
             let translations = futures_util::stream::iter(
                 segments
@@ -1581,10 +1591,13 @@ async fn run_inference_worker(
             .buffered(TRANSLATION_CONCURRENCY_PER_SESSION);
             tokio::pin!(translations);
             let mut batch = Vec::new();
+            let mut completed_pairs = Vec::new();
+            let mut cancelled = false;
             while let Some((segment_context, source_for_terms, prompt_terms, mut output)) =
                 translations.next().await
             {
                 if *translation_generation.borrow() != event_generation {
+                    cancelled = true;
                     break;
                 }
                 if let Ok(translated) = &mut output {
@@ -1596,18 +1609,10 @@ async fn run_inference_worker(
                     );
                     translated.translated_text = rewrite.translated_text;
                     translated.term_matches = rewrite.term_matches;
-                    if let Err(message) = corpus_session
-                        .record_translation(&RecordTranslationRequest {
-                            context_id,
-                            source_language: translated.source_language.clone(),
-                            target_language: translated.target_language.clone(),
-                            source_text: translated.source_text.clone(),
-                            translated_text: translated.translated_text.clone(),
-                        })
-                        .await
-                    {
-                        warn!(%message, "could not record XR Corpus translation context");
-                    }
+                    completed_pairs.push((
+                        translated.source_text.clone(),
+                        translated.translated_text.clone(),
+                    ));
                 }
                 batch.push(InferenceEvent::Translation {
                     generation: event_generation,
@@ -1617,6 +1622,21 @@ async fn run_inference_worker(
                     context: segment_context,
                     output,
                 });
+            }
+            if !cancelled
+                && let Some(request) = (LogicalTurnRecord {
+                    context_id,
+                    turn_id: logical_turn_id,
+                    speaker_id: history_speaker_id,
+                    source_language: &history_source_language,
+                    target_language: &history_target_language,
+                    completed_pairs: &completed_pairs,
+                })
+                .into_request()
+            {
+                if let Err(message) = corpus_session.record_translation(&request).await {
+                    warn!(%message, "could not record XR Corpus translation context");
+                }
             }
             batch
         }));

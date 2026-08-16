@@ -163,7 +163,7 @@ impl Default for TrackerConfig {
     fn default() -> Self {
         Self {
             similarity_threshold: 0.56,
-            same_speaker_hysteresis: 0.16,
+            same_speaker_hysteresis: 0.14,
             speaker_switch_margin: 0.04,
             max_speakers: 8,
         }
@@ -946,6 +946,26 @@ mod tests {
         // A clear advantage still switches promptly.
         let clear = tracker.assign(&[0.2, 0.98, 0.0]).unwrap();
         assert_eq!(clear.speaker_id, "speaker-02");
+    }
+
+    #[test]
+    fn narrower_continuation_band_detects_a_coherent_new_voice_earlier() {
+        let mut tracker = OnlineSpeakerTracker::new(TrackerConfig {
+            similarity_threshold: 0.5,
+            same_speaker_hysteresis: 0.12,
+            speaker_switch_margin: 0.04,
+            max_speakers: 3,
+        })
+        .unwrap();
+        tracker.assign(&[1.0, 0.0]).unwrap();
+
+        // A 0.37 cosine score is below the new 0.38 continuation threshold.
+        // Streaming mode still confirms this candidate across multiple
+        // windows before emitting a cut; the online tracker merely stops
+        // folding clearly separated evidence into the previous centroid.
+        let changed = tracker.assign(&[0.37, 0.929]).unwrap();
+        assert_eq!(changed.speaker_id, "speaker-02");
+        assert!(changed.is_new);
     }
 
     #[test]

@@ -71,6 +71,16 @@ Speaker identity is part of the recognition result, not a plugin capability
 toggle. Session plugins cannot enable or disable diarization. Presentation
 plugins such as OSC may independently decide whether to render the supplied ID.
 
+Translation conversation context is also shared infrastructure, never plugin
+state. XR Corpus owns one bounded history per backend session. History is keyed
+by stable logical speech-turn identity rather than subtitle rows: a Speak
+utterance with several translation segments is committed once, and repeated
+continuous-window revisions update the same turn instead of appending overlap.
+Prompts may use neutral speaker identity, prior completed turns, and the full
+current source utterance, but plugins cannot inject, retain, or reorder model
+history. This keeps Meeting, Player, OSC, and future consumers on identical
+recognition and translation semantics.
+
 ### Scheduling is a shared infrastructure policy
 
 Plugins never choose model thread counts, queue sizes, or concrete scheduler

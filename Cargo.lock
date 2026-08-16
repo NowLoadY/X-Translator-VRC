@@ -6956,6 +6956,7 @@ name = "xr-corpus-protocol"
 version = "0.1.0"
 dependencies = [
  "serde",
+ "serde_json",
  "xr-corpus-core",
 ]
 

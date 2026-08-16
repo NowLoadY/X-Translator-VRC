@@ -781,7 +781,7 @@ const fn default_speaker_similarity_threshold() -> f64 {
     0.56
 }
 const fn default_same_speaker_hysteresis() -> f64 {
-    0.16
+    0.14
 }
 const fn default_speaker_switch_margin() -> f64 {
     0.04
@@ -835,6 +835,7 @@ mod tests {
         assert!(config.speaker.enabled);
         assert_eq!(config.speaker.max_speakers, 8);
         assert_eq!(config.speaker.min_utterance_ms, 750);
+        assert_eq!(config.speaker.same_speaker_hysteresis, 0.12);
         assert_eq!(config.speaker.speaker_switch_margin, 0.04);
         assert!(config.prompt_context.enabled);
         assert_eq!(config.prompt_context.max_entries, 6);
