@@ -50,11 +50,13 @@ pub(super) struct StableIdentityTracker {
 }
 
 impl StableIdentityTracker {
-    pub(super) fn begin_turn(&mut self, continue_previous: bool) {
-        if continue_previous {
+    pub(super) fn begin_turn(&mut self, inherit_previous: bool, retain_candidate: bool) {
+        if inherit_previous {
             self.current.clone_from(&self.last_stable);
         } else {
             self.current = None;
+        }
+        if !retain_candidate {
             self.pending = None;
         }
     }
@@ -101,7 +103,10 @@ impl StableIdentityTracker {
         }
 
         let candidate = self.pending.as_ref().expect("candidate was just created");
-        let minimum_evidence_span = window_samples.saturating_mul(3) / 4;
+        // Two overlapping windows still contain independently arrived speech.
+        // Requiring three quarters of a window made normal conversational
+        // turns wait for a third inference even after two coherent results.
+        let minimum_evidence_span = window_samples.saturating_mul(3) / 8;
         if candidate.observations < required_observations.max(2)
             || observed_at.saturating_sub(candidate.first_observed_at) < minimum_evidence_span
         {
@@ -169,7 +174,7 @@ mod tests {
     fn provisional_noise_never_allocates_a_permanent_speaker() {
         let mut tracker = sticky_tracker();
         let mut identity = StableIdentityTracker::default();
-        identity.begin_turn(false);
+        identity.begin_turn(false, false);
         assert_eq!(
             identity
                 .observe(&mut tracker, &[1.0, 0.0, 0.0], 800, 800, 3)
@@ -204,7 +209,7 @@ mod tests {
     fn coherent_separated_evidence_registers_one_real_switch() {
         let mut tracker = sticky_tracker();
         let mut identity = StableIdentityTracker::default();
-        identity.begin_turn(false);
+        identity.begin_turn(false, false);
         identity
             .observe(&mut tracker, &[1.0, 0.0], 800, 800, 3)
             .unwrap();
@@ -234,18 +239,44 @@ mod tests {
     }
 
     #[test]
+    fn two_coherent_windows_can_cut_an_active_speaker_turn() {
+        let mut tracker = sticky_tracker();
+        let mut identity = StableIdentityTracker::default();
+        identity.begin_turn(false, false);
+        identity
+            .observe(&mut tracker, &[1.0, 0.0], 800, 800, 2)
+            .unwrap();
+
+        assert_eq!(
+            identity
+                .observe(&mut tracker, &[0.0, 1.0], 1_100, 800, 2)
+                .unwrap(),
+            StableIdentityDecision::Pending
+        );
+        assert_eq!(
+            identity
+                .observe(&mut tracker, &[0.02, 1.0], 1_400, 800, 2)
+                .unwrap(),
+            StableIdentityDecision::Switch {
+                previous: "speaker-01".into(),
+                new: "speaker-02".into(),
+            }
+        );
+    }
+
+    #[test]
     fn short_adjacent_turn_inherits_only_when_continuity_is_allowed() {
         let mut tracker = sticky_tracker();
         let mut identity = StableIdentityTracker::default();
-        identity.begin_turn(false);
+        identity.begin_turn(false, false);
         identity
             .observe(&mut tracker, &[1.0, 0.0], 800, 800, 3)
             .unwrap();
         assert_eq!(identity.finish_turn().as_deref(), Some("speaker-01"));
 
-        identity.begin_turn(true);
+        identity.begin_turn(true, true);
         assert_eq!(identity.finish_turn().as_deref(), Some("speaker-01"));
-        identity.begin_turn(false);
+        identity.begin_turn(false, false);
         assert!(identity.finish_turn().is_none());
     }
 
@@ -253,30 +284,27 @@ mod tests {
     fn a_candidate_can_be_confirmed_across_adjacent_short_turns() {
         let mut tracker = sticky_tracker();
         let mut identity = StableIdentityTracker::default();
-        identity.begin_turn(false);
+        identity.begin_turn(false, false);
         identity
             .observe(&mut tracker, &[1.0, 0.0], 800, 800, 2)
             .unwrap();
         identity.finish_turn();
 
-        identity.begin_turn(true);
+        identity.begin_turn(false, true);
         assert_eq!(
             identity
                 .observe(&mut tracker, &[0.0, 1.0], 1_100, 800, 2)
                 .unwrap(),
             StableIdentityDecision::Pending
         );
-        identity.finish_turn();
+        assert!(identity.finish_turn().is_none());
 
-        identity.begin_turn(true);
+        identity.begin_turn(false, true);
         assert_eq!(
             identity
                 .observe(&mut tracker, &[0.02, 1.0], 1_800, 800, 2)
                 .unwrap(),
-            StableIdentityDecision::Switch {
-                previous: "speaker-01".into(),
-                new: "speaker-02".into(),
-            }
+            StableIdentityDecision::Continues("speaker-02".into())
         );
         assert_eq!(tracker.speaker_count(), 2);
     }
@@ -285,7 +313,7 @@ mod tests {
     fn a_long_pause_discards_cross_turn_candidate_evidence() {
         let mut tracker = sticky_tracker();
         let mut identity = StableIdentityTracker::default();
-        identity.begin_turn(false);
+        identity.begin_turn(false, false);
         identity
             .observe(&mut tracker, &[1.0, 0.0], 800, 800, 2)
             .unwrap();
@@ -294,7 +322,7 @@ mod tests {
             .unwrap();
         identity.finish_turn();
 
-        identity.begin_turn(false);
+        identity.begin_turn(false, false);
         assert_eq!(
             identity
                 .observe(&mut tracker, &[0.02, 1.0], 1_800, 800, 2)

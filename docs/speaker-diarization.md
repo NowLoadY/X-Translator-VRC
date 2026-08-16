@@ -62,6 +62,8 @@ models/3D-Speaker-ERes2NetV2/speaker_embedding.onnx
 - `min_utterance_ms` 以下的片段标记为 `speaker-unknown`，避免用爆破音或极短噪声创建身份。
 - ONNX 推理位于 Tokio blocking region，不会阻塞 WebSocket/VAD intake；Hy-MT2 使用每会话最多两路、保持输出顺序的并发请求，与托管服务的四个推理 slot 匹配。
 
+活动语音中确认换人会产生 `SpeakerChange` 边界，立即结束上一句并为新说话人开启下一句。自然停顿已经由 VAD 切句时，新句会重新判断身份，不会仅因停顿较短就预先继承上一人的编号；尚未确认的新声纹证据可以跨短停顿保留，以兼顾短句响应和噪声抑制。
+
 ## 时间线语义
 
 协议版本为 2。`source_segment_ready` 与 `translation_ready` 都带有：

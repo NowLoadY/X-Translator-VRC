@@ -594,10 +594,17 @@ impl StreamingSpeakerSegmenter {
         &mut self,
         samples: &[i16],
     ) -> Result<Option<StreamingSpeakerEvent>, SpeakerError> {
-        const CONTINUITY_GAP_SAMPLES: usize = SAMPLE_RATE_HZ as usize * 3 / 2;
+        // A zero/very short gap is produced by technical hard splits and can
+        // safely inherit the active identity. A real VAD pause starts a fresh
+        // identity decision, while coherent provisional evidence may survive
+        // a normal conversational gap.
+        const IDENTITY_CONTINUITY_GAP_SAMPLES: usize = SAMPLE_RATE_HZ as usize / 16;
+        const CANDIDATE_CONTINUITY_GAP_SAMPLES: usize = SAMPLE_RATE_HZ as usize * 3 / 2;
         if self.turn_speech_samples == 0 {
-            self.identity
-                .begin_turn(self.silence_samples <= CONTINUITY_GAP_SAMPLES);
+            self.identity.begin_turn(
+                self.silence_samples <= IDENTITY_CONTINUITY_GAP_SAMPLES,
+                self.silence_samples <= CANDIDATE_CONTINUITY_GAP_SAMPLES,
+            );
         }
         self.active_samples.extend_from_slice(samples);
         self.samples_since_last_evaluation = self
