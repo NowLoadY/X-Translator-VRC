@@ -40,7 +40,7 @@ pub struct VideoPlayerController {
     pub last_hover_instant: Option<Instant>,
     pub last_save_instant: Instant,
     pub last_manual_scroll: Option<Instant>,
-    pub last_auto_scrolled_idx: Option<usize>,
+    pub last_auto_scrolled_cue_id: Option<String>,
     pub timeline_viewport_height: Option<f32>,
     pub mpv_installer: super::installer::MpvInstaller,
 
@@ -93,7 +93,7 @@ impl Default for VideoPlayerController {
             last_hover_instant: Some(Instant::now()),
             last_save_instant: Instant::now(),
             last_manual_scroll: None,
-            last_auto_scrolled_idx: None,
+            last_auto_scrolled_cue_id: None,
             timeline_viewport_height: None,
             mpv_installer: super::installer::MpvInstaller::default(),
             is_extracting: false,
@@ -116,7 +116,7 @@ impl VideoPlayerController {
         self.route = VideoPlayerRoute::Library;
         self.active_task_id = None;
         self.current_source = None;
-        self.last_auto_scrolled_idx = None;
+        self.last_auto_scrolled_cue_id = None;
         if let Some(host) = &self.native_host {
             host.hide();
         }
@@ -130,7 +130,7 @@ impl VideoPlayerController {
         self.route = VideoPlayerRoute::Create;
         self.active_task_id = None;
         self.current_source = None;
-        self.last_auto_scrolled_idx = None;
+        self.last_auto_scrolled_cue_id = None;
         self.draft_title.clear();
         self.draft_source.clear();
         self.draft_source_lang = "auto".into();

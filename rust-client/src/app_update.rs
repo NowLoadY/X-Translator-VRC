@@ -23,6 +23,8 @@ use tokio::io::AsyncWriteExt;
 
 const LATEST_RELEASE_URL: &str =
     "https://api.github.com/repos/NowLoadY/XRTranslate/releases/latest";
+const LATEST_RELEASE_PAGE: &str = "https://github.com/NowLoadY/XRTranslate/releases/latest";
+const RELEASE_DOWNLOAD_BASE: &str = "https://github.com/NowLoadY/XRTranslate/releases/download/";
 const USER_AGENT: &str = concat!("XRTranslate updater/", env!("CARGO_PKG_VERSION"));
 const MAX_DOWNLOAD_ATTEMPTS: u32 = 4;
 const GITHUB_API_VERSION: &str = "2022-11-28";
@@ -271,7 +273,53 @@ async fn check_latest_release(proxy_url: Option<&str>) -> Result<Option<ReleaseA
         return Err("Updates are available for Windows and Linux builds only.".into());
     }
     let client = http_client(proxy_url)?;
-    let release = client
+    let (latest_tag, latest_version) = match discover_latest_version(&client).await {
+        Ok(release) => release,
+        Err(page_error) => {
+            let release = fetch_latest_release(&client).await.map_err(|api_error| {
+                format!(
+                    "Cannot check for updates: GitHub release page failed ({page_error}); \
+                     GitHub API failed ({api_error})."
+                )
+            })?;
+            return release_asset_if_newer(release);
+        }
+    };
+    if !version_is_newer(&latest_version, crate::version::APP_VERSION) {
+        return Ok(None);
+    }
+
+    match fetch_latest_release(&client).await {
+        Ok(release) => release_asset_if_newer(release),
+        Err(api_error) => fallback_release_asset(&client, &latest_tag, &latest_version)
+            .await
+            .map(Some)
+            .map_err(|fallback_error| {
+                format!(
+                    "GitHub API is unavailable ({api_error}); direct release lookup also failed \
+                     ({fallback_error})."
+                )
+            }),
+    }
+}
+
+async fn discover_latest_version(client: &reqwest::Client) -> Result<(String, String), String> {
+    let response = client
+        .get(LATEST_RELEASE_PAGE)
+        .send()
+        .await
+        .map_err(|error| error.to_string())?;
+    if !response.status().is_success() {
+        return Err(format!("HTTP {}", response.status()));
+    }
+    let tag = release_tag_from_url(response.url())
+        .ok_or_else(|| format!("unexpected redirect target {}", response.url()))?;
+    let version = normalize_version(&tag)?;
+    Ok((tag, version))
+}
+
+async fn fetch_latest_release(client: &reqwest::Client) -> Result<GitHubRelease, String> {
+    let response = client
         .get(LATEST_RELEASE_URL)
         .header(ACCEPT, "application/vnd.github+json")
         .header(
@@ -280,12 +328,16 @@ async fn check_latest_release(proxy_url: Option<&str>) -> Result<Option<ReleaseA
         )
         .send()
         .await
-        .map_err(|error| format!("Cannot check for updates: {error}"))?
+        .map_err(|error| error.to_string())?;
+    response
         .error_for_status()
-        .map_err(|error| format!("Cannot check for updates: {error}"))?
+        .map_err(|error| error.to_string())?
         .json::<GitHubRelease>()
         .await
-        .map_err(|error| format!("Cannot read update information: {error}"))?;
+        .map_err(|error| error.to_string())
+}
+
+fn release_asset_if_newer(release: GitHubRelease) -> Result<Option<ReleaseAsset>, String> {
     let latest_version = normalize_version(&release.tag_name)?;
     if !version_is_newer(&latest_version, crate::version::APP_VERSION) {
         return Ok(None);
@@ -299,6 +351,57 @@ async fn check_latest_release(proxy_url: Option<&str>) -> Result<Option<ReleaseA
         size: asset.size,
         sha256: asset.digest.as_deref().and_then(parse_sha256_digest),
     }))
+}
+
+async fn fallback_release_asset(
+    client: &reqwest::Client,
+    tag: &str,
+    version: &str,
+) -> Result<ReleaseAsset, String> {
+    let name = standard_release_asset_name(version);
+    let mut download_url = reqwest::Url::parse(RELEASE_DOWNLOAD_BASE)
+        .map_err(|error| format!("invalid release URL: {error}"))?;
+    download_url
+        .path_segments_mut()
+        .map_err(|_| "invalid release URL".to_string())?
+        .push(tag)
+        .push(&name);
+    let response = client
+        .head(download_url.clone())
+        .header(ACCEPT_ENCODING, "identity")
+        .send()
+        .await
+        .map_err(|error| error.to_string())?
+        .error_for_status()
+        .map_err(|error| error.to_string())?;
+    let size = response
+        .content_length()
+        .filter(|size| *size > 0)
+        .ok_or("release server did not report the package size")?;
+    Ok(ReleaseAsset {
+        version: version.to_owned(),
+        name,
+        download_url: download_url.into(),
+        size,
+        sha256: None,
+    })
+}
+
+fn release_tag_from_url(url: &reqwest::Url) -> Option<String> {
+    let segments = url.path_segments()?.collect::<Vec<_>>();
+    let tag = segments
+        .windows(2)
+        .find_map(|pair| (pair[0] == "tag").then_some(pair[1]))?;
+    (!tag.is_empty()).then(|| tag.to_owned())
+}
+
+fn standard_release_asset_name(version: &str) -> String {
+    let platform = if cfg!(target_os = "windows") {
+        "win-x64"
+    } else {
+        "linux-x64"
+    };
+    format!("XRTranslate-v{version}-{platform}.zip")
 }
 
 async fn download_and_stage(
@@ -817,5 +920,28 @@ mod tests {
             Some(digest.as_str())
         );
         assert_eq!(parse_sha256_digest("sha256:not-a-digest"), None);
+    }
+
+    #[test]
+    fn extracts_release_tag_from_latest_redirect() {
+        let url = reqwest::Url::parse(
+            "https://github.com/NowLoadY/XRTranslate/releases/tag/v0.2.5",
+        )
+        .unwrap();
+        assert_eq!(release_tag_from_url(&url).as_deref(), Some("v0.2.5"));
+
+        let unexpected =
+            reqwest::Url::parse("https://github.com/NowLoadY/XRTranslate/releases").unwrap();
+        assert_eq!(release_tag_from_url(&unexpected), None);
+    }
+
+    #[test]
+    fn fallback_asset_name_matches_release_packaging() {
+        let name = standard_release_asset_name("0.2.5");
+        if cfg!(target_os = "windows") {
+            assert_eq!(name, "XRTranslate-v0.2.5-win-x64.zip");
+        } else {
+            assert_eq!(name, "XRTranslate-v0.2.5-linux-x64.zip");
+        }
     }
 }

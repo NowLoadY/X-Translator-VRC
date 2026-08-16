@@ -4,6 +4,25 @@ use crate::plugins::player::{
 };
 use eframe::egui::{self, Color32, CornerRadius, Frame, Margin, Stroke};
 
+fn horizontal_slider(
+    ui: &mut egui::Ui,
+    value: &mut f32,
+    range: std::ops::RangeInclusive<f32>,
+    width: f32,
+    height: f32,
+) -> egui::Response {
+    ui.scope(|ui| {
+        // egui's horizontal Slider sizes itself from `spacing.slider_width`;
+        // `add_sized` alone does not override that width.
+        ui.spacing_mut().slider_width = width;
+        ui.add_sized(
+            [width, height],
+            egui::Slider::new(value, range).show_value(false),
+        )
+    })
+    .inner
+}
+
 pub(super) fn render_audio_card(
     controller: &mut VideoPlayerController,
     language: crate::i18n::UiLanguage,
@@ -76,10 +95,9 @@ pub(super) fn render_audio_card(
                 // ── Seek slider ──
                 let mut current_sec = (controller.get_time_ms() / 1000) as f32;
                 let max_sec = (controller.get_duration_ms().max(1) / 1000) as f32;
-                let right_w = 160.0;
-                let slider_w = (ui.available_width() - right_w).max(40.0);
-                let slider = egui::Slider::new(&mut current_sec, 0.0..=max_sec).show_value(false);
-                if ui.add_sized([slider_w, 16.0], slider).changed() {
+                let slider_w = (ui.available_width() - 112.0).max(40.0);
+                if horizontal_slider(ui, &mut current_sec, 0.0..=max_sec, slider_w, 16.0).changed()
+                {
                     if let Some(backend) = &mut controller.backend {
                         backend.seek((current_sec * 1000.0) as i64);
                     }
@@ -87,8 +105,7 @@ pub(super) fn render_audio_card(
 
                 // ── Volume ──
                 let mut vol = controller.volume;
-                let vol_slider = egui::Slider::new(&mut vol, 0.0..=1.0).show_value(false);
-                if ui.add_sized([40.0, 16.0], vol_slider).changed() {
+                if horizontal_slider(ui, &mut vol, 0.0..=1.0, 64.0, 16.0).changed() {
                     controller.set_volume(vol);
                 }
 
@@ -327,10 +344,10 @@ pub(super) fn render_viewport_card(
                     // ── Seek slider ──
                     let mut current_sec = (controller.get_time_ms() / 1000) as f32;
                     let max_sec = (controller.get_duration_ms().max(1) / 1000) as f32;
-                    let right_w = 180.0; // space for buttons to the right
-                    let slider_w = (ui.available_width() - right_w).max(30.0);
-                    let slider = egui::Slider::new(&mut current_sec, 0.0..=max_sec).show_value(false);
-                    if ui.add_sized([slider_w, 14.0], slider).changed() {
+                    let slider_w = (ui.available_width() - 192.0).max(40.0);
+                    if horizontal_slider(ui, &mut current_sec, 0.0..=max_sec, slider_w, 14.0)
+                        .changed()
+                    {
                         if let Some(backend) = &mut controller.backend {
                             backend.seek((current_sec * 1000.0) as i64);
                         }
@@ -338,8 +355,7 @@ pub(super) fn render_viewport_card(
 
                     // ── Volume ──
                     let mut vol = controller.volume;
-                    let vol_slider = egui::Slider::new(&mut vol, 0.0..=1.0).show_value(false);
-                    if ui.add_sized([36.0, 14.0], vol_slider).changed() {
+                    if horizontal_slider(ui, &mut vol, 0.0..=1.0, 72.0, 14.0).changed() {
                         controller.set_volume(vol);
                     }
 

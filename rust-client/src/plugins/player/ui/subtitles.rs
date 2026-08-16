@@ -1,7 +1,39 @@
 use super::format_time_ms;
-use crate::plugins::player::{controller::VideoPlayerController, i18n::tr};
+use crate::plugins::player::{controller::VideoPlayerController, i18n::tr, subtitles::SubtitleCue};
 use crate::ui::components;
 use eframe::egui::{self, Color32, CornerRadius, Frame, Margin, Stroke};
+
+const CUE_ROW_HEIGHT: f32 = 88.0;
+const CUE_ROW_GAP: f32 = 8.0;
+
+fn timeline_padding(viewport_height: f32) -> f32 {
+    ((viewport_height - CUE_ROW_HEIGHT) * 0.5).max(0.0)
+}
+
+fn timeline_content_height(cue_count: usize, viewport_height: f32) -> f32 {
+    if cue_count == 0 {
+        return viewport_height;
+    }
+    let rows = cue_count as f32 * CUE_ROW_HEIGHT;
+    let gaps = cue_count.saturating_sub(1) as f32 * CUE_ROW_GAP;
+    rows + gaps + timeline_padding(viewport_height) * 2.0
+}
+
+fn centered_cue_offset(index: usize) -> f32 {
+    index as f32 * (CUE_ROW_HEIGHT + CUE_ROW_GAP)
+}
+
+fn visible_cue_range(
+    viewport: egui::Rect,
+    cue_count: usize,
+    viewport_height: f32,
+) -> std::ops::Range<usize> {
+    let padding = timeline_padding(viewport_height);
+    let extent = CUE_ROW_HEIGHT + CUE_ROW_GAP;
+    let first = (((viewport.min.y - padding) / extent).floor() as isize - 1).max(0) as usize;
+    let end = (((viewport.max.y - padding) / extent).ceil() as isize + 1).max(0) as usize;
+    first.min(cue_count)..end.min(cue_count)
+}
 
 pub(super) fn render_subtitles_card(
     controller: &mut VideoPlayerController,
@@ -74,7 +106,7 @@ pub(super) fn render_subtitles_card(
                             .clicked()
                         {
                             controller.last_manual_scroll = None;
-                            controller.last_auto_scrolled_idx = None;
+                            controller.last_auto_scrolled_cue_id = None;
                         }
                     });
                 }
@@ -103,7 +135,6 @@ pub(super) fn render_subtitles_card(
                     });
             } else {
                 let mut seek_to_ms = None;
-                let row_height = 88.0;
                 let total_rows = cues.len();
 
                 let mut scroll_area = egui::ScrollArea::vertical()
@@ -117,116 +148,45 @@ pub(super) fn render_subtitles_card(
                     .unwrap_or(450.0)
                     .clamp(360.0, 500.0);
 
-                // Programmatic auto-scroll: ONLY when transitioning to a NEW cue
+                let active_cue_id = active_idx.map(|idx| cues[idx].id.as_str());
                 if auto_scroll_active
-                    && active_idx.is_some()
-                    && active_idx != controller.last_auto_scrolled_idx
+                    && active_cue_id != controller.last_auto_scrolled_cue_id.as_deref()
+                    && let Some(idx) = active_idx
                 {
-                    if let Some(idx) = active_idx {
-                        let center_offset = (viewport_height - row_height) * 0.5;
-                        let target_offset = ((idx as f32 * row_height) - center_offset).max(0.0);
-                        scroll_area = scroll_area.vertical_scroll_offset(target_offset);
-                        controller.last_auto_scrolled_idx = Some(idx);
-                    }
+                    scroll_area = scroll_area.vertical_scroll_offset(centered_cue_offset(idx));
+                    controller.last_auto_scrolled_cue_id = Some(cues[idx].id.clone());
                 }
 
-                let scroll_output =
-                    scroll_area.show_rows(ui, row_height, total_rows, |ui, row_range| {
-                        for idx in row_range {
-                            let cue = &cues[idx];
-                            let is_current = Some(idx) == active_idx;
+                let scroll_output = scroll_area.show_viewport(ui, |ui, viewport| {
+                    let padding = timeline_padding(viewport_height);
+                    let row_extent = CUE_ROW_HEIGHT + CUE_ROW_GAP;
+                    let content_top = ui.max_rect().top();
+                    let content_left = ui.max_rect().left();
+                    let content_width = ui.available_width();
+                    ui.set_height(timeline_content_height(total_rows, viewport_height));
 
-                            let bg_color = if is_current {
-                                Color32::from_rgb(239, 246, 255)
-                            } else {
-                                Color32::from_rgb(248, 250, 252)
-                            };
-
-                            let stroke = if is_current {
-                                Stroke::new(1.5, Color32::from_rgb(96, 165, 250))
-                            } else {
-                                Stroke::new(1.0, Color32::from_rgb(241, 245, 249))
-                            };
-
-                            let resp = Frame::new()
-                                .fill(bg_color)
-                                .stroke(stroke)
-                                .corner_radius(CornerRadius::same(if is_current { 10 } else { 8 }))
-                                .inner_margin(Margin::symmetric(14, 8))
-                                .show(ui, |ui| {
-                                    ui.set_width(ui.available_width());
-                                    ui.set_height(row_height - 8.0);
-                                    ui.vertical(|ui| {
-                                        ui.horizontal(|ui| {
-                                            ui.label(
-                                                egui::RichText::new(format!(
-                                                    "[{} - {}]",
-                                                    format_time_ms(cue.start_ms),
-                                                    format_time_ms(
-                                                        cue.end_ms.max(cue.start_ms + 2000)
-                                                    )
-                                                ))
-                                                .size(11.5)
-                                                .monospace()
-                                                .color(if is_current {
-                                                    Color32::from_rgb(37, 99, 235)
-                                                } else {
-                                                    Color32::from_rgb(59, 130, 246)
-                                                })
-                                                .strong(),
-                                            );
-
-                                            if let Some(speaker) = &cue.speaker_name {
-                                                ui.add_space(6.0);
-                                                components::speaker_badge(ui, speaker);
-                                            }
-                                        });
-
-                                        ui.add_space(2.0);
-
-                                        ui.add(
-                                            egui::Label::new(
-                                                egui::RichText::new(&cue.original_text)
-                                                    .size(12.5)
-                                                    .color(if is_current {
-                                                        crate::ui::theme::text_strong()
-                                                    } else {
-                                                        crate::ui::theme::text_weak()
-                                                    }),
-                                            )
-                                            .truncate(),
-                                        );
-
-                                        if let Some(trans) = &cue.translated_text {
-                                            ui.add_space(1.0);
-                                            ui.add(
-                                                egui::Label::new(
-                                                    egui::RichText::new(trans)
-                                                        .size(14.0)
-                                                        .strong()
-                                                        .color(if is_current {
-                                                            Color32::from_rgb(30, 58, 138)
-                                                        } else {
-                                                            Color32::from_rgb(30, 64, 175)
-                                                        }),
-                                                )
-                                                .truncate(),
-                                            );
-                                        }
-                                    });
-                                })
-                                .response
-                                .interact(egui::Sense::click());
-
-                            if resp.clicked() {
-                                seek_to_ms = Some(cue.start_ms);
-                                controller.last_manual_scroll = None;
-                                controller.last_auto_scrolled_idx = None;
-                            }
-
-                            ui.add_space(8.0);
+                    for idx in visible_cue_range(viewport, total_rows, viewport_height) {
+                        let cue = &cues[idx];
+                        let row_top = content_top + padding + idx as f32 * row_extent;
+                        let row_rect = egui::Rect::from_min_size(
+                            egui::pos2(content_left, row_top),
+                            egui::vec2(content_width, CUE_ROW_HEIGHT),
+                        );
+                        let response = ui
+                            .scope_builder(
+                                egui::UiBuilder::new()
+                                    .id_salt(("player-subtitle-cue", &cue.id))
+                                    .max_rect(row_rect),
+                                |ui| render_cue_row(ui, cue, Some(idx) == active_idx),
+                            )
+                            .inner;
+                        if response.clicked() {
+                            seek_to_ms = Some(cue.start_ms);
+                            controller.last_manual_scroll = None;
+                            controller.last_auto_scrolled_cue_id = None;
                         }
-                    });
+                    }
+                });
 
                 controller.timeline_viewport_height = Some(scroll_output.inner_rect.height());
 
@@ -245,7 +205,9 @@ pub(super) fn render_subtitles_card(
 
                 if wheel_scrolled || is_dragged {
                     controller.last_manual_scroll = Some(now);
-                    controller.last_auto_scrolled_idx = active_idx;
+                    // Recenter the same active cue after the manual-scroll
+                    // grace period expires.
+                    controller.last_auto_scrolled_cue_id = None;
                 }
 
                 if let Some(ms) = seek_to_ms {
@@ -256,4 +218,123 @@ pub(super) fn render_subtitles_card(
             }
         });
     });
+}
+
+fn render_cue_row(ui: &mut egui::Ui, cue: &SubtitleCue, is_current: bool) -> egui::Response {
+    let bg_color = if is_current {
+        Color32::from_rgb(239, 246, 255)
+    } else {
+        Color32::from_rgb(248, 250, 252)
+    };
+    let stroke = if is_current {
+        Stroke::new(1.5, Color32::from_rgb(96, 165, 250))
+    } else {
+        Stroke::new(1.0, Color32::from_rgb(241, 245, 249))
+    };
+
+    Frame::new()
+        .fill(bg_color)
+        .stroke(stroke)
+        .corner_radius(CornerRadius::same(if is_current { 10 } else { 8 }))
+        .inner_margin(Margin::symmetric(14, 8))
+        .show(ui, |ui| {
+            ui.set_width(ui.available_width());
+            ui.set_height(CUE_ROW_HEIGHT - 16.0);
+            ui.vertical(|ui| {
+                ui.horizontal(|ui| {
+                    ui.label(
+                        egui::RichText::new(format!(
+                            "[{} - {}]",
+                            format_time_ms(cue.start_ms),
+                            format_time_ms(cue.end_ms.max(cue.start_ms + 2000))
+                        ))
+                        .size(11.5)
+                        .monospace()
+                        .color(if is_current {
+                            Color32::from_rgb(37, 99, 235)
+                        } else {
+                            Color32::from_rgb(59, 130, 246)
+                        })
+                        .strong(),
+                    );
+
+                    if let Some(speaker) = &cue.speaker_name {
+                        ui.add_space(6.0);
+                        components::speaker_badge(ui, speaker);
+                    }
+                });
+
+                ui.add_space(2.0);
+                ui.add(
+                    egui::Label::new(egui::RichText::new(&cue.original_text).size(12.5).color(
+                        if is_current {
+                            crate::ui::theme::text_strong()
+                        } else {
+                            crate::ui::theme::text_weak()
+                        },
+                    ))
+                    .truncate(),
+                );
+
+                if let Some(translated) = &cue.translated_text {
+                    ui.add_space(1.0);
+                    ui.add(
+                        egui::Label::new(
+                            egui::RichText::new(translated).size(14.0).strong().color(
+                                if is_current {
+                                    Color32::from_rgb(30, 58, 138)
+                                } else {
+                                    Color32::from_rgb(30, 64, 175)
+                                },
+                            ),
+                        )
+                        .truncate(),
+                    );
+                }
+            });
+        })
+        .response
+        .interact(egui::Sense::click())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn first_and_last_cues_can_both_be_centered() {
+        let viewport = 450.0;
+        let count = 125;
+        let content_height = timeline_content_height(count, viewport);
+        let max_offset = content_height - viewport;
+
+        assert_eq!(centered_cue_offset(0), 0.0);
+        assert!((centered_cue_offset(count - 1) - max_offset).abs() < f32::EPSILON);
+    }
+
+    #[test]
+    fn appending_cues_does_not_move_the_current_cue_center() {
+        let active = 42;
+        let viewport = 450.0;
+        let target = centered_cue_offset(active);
+
+        for count in [43, 100] {
+            let max_offset = timeline_content_height(count, viewport) - viewport;
+            assert!(target <= max_offset);
+            let cue_center = timeline_padding(viewport)
+                + active as f32 * (CUE_ROW_HEIGHT + CUE_ROW_GAP)
+                + CUE_ROW_HEIGHT * 0.5;
+            assert!((cue_center - target - viewport * 0.5).abs() < f32::EPSILON);
+        }
+    }
+
+    #[test]
+    fn visible_range_is_bounded_for_dynamic_content() {
+        let viewport =
+            egui::Rect::from_min_max(egui::pos2(0.0, 1_000.0), egui::pos2(900.0, 1_450.0));
+        let range = visible_cue_range(viewport, 20, 450.0);
+
+        assert!(range.start < range.end);
+        assert!(range.end <= 20);
+    }
 }
