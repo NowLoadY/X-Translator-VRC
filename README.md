@@ -9,92 +9,100 @@
 </p>
 
 <p align="center">
-  <strong>为 VRChat 提供实时字幕与双向语音翻译</strong>
+  <strong>Real-Time Subtitles & Voice Translation for Desktop, Media, and VRChat</strong>
 </p>
 
 <p align="center">
-  <b>中文</b> • <a href="README_EN.md">English</a>
+  <b>English</b> •
+  <a href="docs/readme/README_CN.md">简体中文</a> •
+  <a href="docs/readme/README_JA.md">日本語</a> •
+  <a href="docs/readme/README_KO.md">한국어</a> •
+  <a href="docs/readme/README_DE.md">Deutsch</a> •
+  <a href="docs/readme/README_FR.md">Français</a> •
+  <a href="docs/readme/README_ES.md">Español</a> •
+  <a href="docs/readme/README_RU.md">Русский</a> •
+  <a href="docs/readme/README_SV.md">Svenska</a>
 </p>
 
 <p align="center">
-  <a href="#界面预览">界面预览</a> •
-  <a href="#使用指南">使用指南</a> •
-  <a href="#常用位置">常用位置</a> •
+  <a href="#interface-preview">Interface Preview</a> •
+  <a href="#user-guide">User Guide</a> •
+  <a href="#common-locations">Common Locations</a> •
   <a href="#citation">Citation</a> •
-  <a href="#acknowledgements">致谢</a>
+  <a href="#acknowledgements">Acknowledgements</a> •
+  <a href="#license">License</a>
 </p>
 
 <p align="center">
-  选择语言和麦克风，一键开启实时翻译。
+  Select your languages and microphone, then start real-time translation with one click.
 </p>
 
 ---
 
-## 界面预览
+## Interface Preview
 
-首次打开时，欢迎页会带你完成必要准备。之后也可以随时从侧边栏重新打开。
-
-<p align="center">
-  <img src="assets/preview-Welcome-1.png" alt="XRTranslate 欢迎页" width="760" />
-</p>
-
-支持生成视频字幕并直接高性能播放。
+The welcome page walks through the initial setup and remains available from the sidebar.
 
 <p align="center">
-  <img src="assets/preview-GenerateVideoSubtitle.png" width="760" />
+  <img src="assets/preview-Welcome-1.png" alt="XRTranslate welcome page" width="760" />
+</p>
+
+Supports generating video subtitles and playing them directly at high performance.
+
+<p align="center">
+  <img src="assets/preview-GenerateVideoSubtitle.png" alt="XRTranslate video subtitle generation" width="760" />
 </p>
 
 <p align="center">
-  <img src="assets/preview-Translation.png" alt="XRTranslate 翻译界面" width="900" />
+  <img src="assets/preview-Translation.png" alt="XRTranslate translation screen" width="900" />
 </p>
 
-OSC 字幕可以逐条显示，也可以合并排列。
+OSC subtitles can keep messages separate or arrange them together.
 
 <table>
   <tr>
-    <td width="50%" align="center"><img src="assets/preview-OSC-Bilingual-Separate.png" alt="OSC 字幕逐条显示" /></td>
-    <td width="50%" align="center"><img src="assets/preview-OSC-Bilingual-Merge.png" alt="OSC 字幕合并显示" /></td>
+    <td width="50%" align="center"><img src="assets/preview-OSC-Bilingual-Separate.png" alt="OSC subtitles shown separately" /></td>
+    <td width="50%" align="center"><img src="assets/preview-OSC-Bilingual-Merge.png" alt="OSC subtitles merged" /></td>
   </tr>
   <tr>
-    <td align="center"><sub>逐条显示</sub></td>
-    <td align="center"><sub>合并显示</sub></td>
+    <td align="center"><sub>Separate</sub></td>
+    <td align="center"><sub>Merge</sub></td>
   </tr>
 </table>
 
-支持通过 OSC 快速打字输入与实时翻译发送。
+Supports fast typing and real-time translation through OSC.
 
 <p align="center">
-  <img src="assets/preview-OSC-type.png" alt="OSC 打字输入与实时翻译" width="760" />
+  <img src="assets/preview-OSC-type.png" alt="OSC Typing and Real-Time Translation" width="760" />
 </p>
 
+---
+
+## User Guide
+
+Download the latest Windows version from [GitHub Releases](https://github.com/NowLoadY/XRTranslate/releases), extract it, and open XRTranslate. The first-run guide prepares the runtime and models automatically; once it finishes, you can start translating.
 
 ---
 
-## 使用指南
+## Common Locations
 
-前往 [GitHub Releases](https://github.com/NowLoadY/XRTranslate/releases) 下载最新的 Windows 版本，解压后打开 XRTranslate。首次启动引导会自动准备运行环境和模型；完成引导后即可开始翻译。
-
----
-
-## 常用位置
-
-| 项目 | 默认路径 | 说明 |
+| Item | Default Path | Description |
 | :--- | :--- | :--- |
-| **模型文件** | `models/` | 放置语音识别模型与翻译模型等模型包 |
-| **专业语料库** | [XR Corpus](https://github.com/NowLoadY/XR-Corpus) | 独立维护的 Markdown 术语与上下文服务 |
-| **运行日志** | `runtime/logs/` | 查看后台服务与客户端日志 |
-| **本地服务设置** | `config.json` | 端口、模型及渲染参数配置 |
+| **Model Assets** | `models/` | Stores speech recognition and translation model packages |
+| **Terminology Corpora** | [XR Corpus](https://github.com/NowLoadY/XR-Corpus) | Independently maintained Markdown terminology and context service |
+| **Execution Logs** | `runtime/logs/` | Service & client execution logs |
+| **Local Config** | `config.json` | Port numbers, model configurations, and rendering parameters |
 
-### 默认模型的资源占用
+### Default Model Resource Use
 
-以下为默认设置、两个模型均使用显卡运行时的参考值；不同显卡、llama.cpp 版本和设置会有少量差异。
+The figures below are for the default settings with both models running on the GPU. They can vary slightly with your GPU, llama.cpp version, and settings.
 
-| 模型 | 用途 | 文件大小 | 预计显存占用 |
+| Model | Purpose | File Size | Estimated VRAM Use |
 | :--- | :--- | :--- | :--- |
-| **语音识别模型** | 语音识别 | 约 1.8 GB | 约 2.7 GB |
-| **翻译模型** | 翻译 | 约 1.1 GB | 约 1.4 GB |
+| **Speech recognition model** | Speech recognition | About 1.8 GB | About 2.7 GB |
+| **Translation model** | Translation | About 1.1 GB | About 1.4 GB |
 
-两个模型同时运行时，预计占用约 **4.1 GB** 显存。建议使用 8 GB 或以上显存的显卡，以留出系统和其他程序所需空间。
+Running both models together uses about **4.1 GB** of VRAM. An 8 GB or larger GPU is recommended to leave room for Windows and other applications.
 
 ---
 
@@ -116,16 +124,17 @@ OSC 字幕可以逐条显示，也可以合并排列。
 
 ## Acknowledgements
 
-特别感谢原始项目 [X-Translator](https://github.com/zhaoyx239/X-Translator) 及其作者团队的卓越贡献。
+Special thanks to the original [X-Translator](https://github.com/zhaoyx239/X-Translator) project and its authors for their contributions.
 
-同时感谢 [XTalk](https://github.com/xcc-zach/xtalk)、[X-ASR](https://github.com/Gilgamesh-J/X-ASR)、[Paraformer](https://github.com/modelscope/FunASR)、[SenseVoice](https://github.com/FunAudioLLM/SenseVoice)、[NiuTrans LMT](https://github.com/NiuTrans/LMT)、[Hunyuan-MT](https://github.com/Tencent-Hunyuan/Hunyuan-MT)、[X-Voice](https://github.com/sunnyxrxrx/X-Voice)、[IndexTTS](https://github.com/index-tts/index-tts) 与 [OpenSTBench](https://github.com/sjtuayj/OpenSTBench)。
+This project also uses or draws inspiration from [XTalk](https://github.com/xcc-zach/xtalk), [X-ASR](https://github.com/Gilgamesh-J/X-ASR), [Paraformer](https://github.com/modelscope/FunASR), [SenseVoice](https://github.com/FunAudioLLM/SenseVoice), [NiuTrans LMT](https://github.com/NiuTrans/LMT), [Hunyuan-MT](https://github.com/Tencent-Hunyuan/Hunyuan-MT), [X-Voice](https://github.com/sunnyxrxrx/X-Voice), [IndexTTS](https://github.com/index-tts/index-tts), and [OpenSTBench](https://github.com/sjtuayj/OpenSTBench).
 
-特别感谢 [Yakutan](https://github.com/febilly/Yakutan) 及其作者 [febilly](https://github.com/febilly) 带来的启发与贡献。
+Special thanks to [Yakutan](https://github.com/febilly/Yakutan) and its author [febilly](https://github.com/febilly) for their inspiration and contributions.
 
 ## License
 
-本项目包含采用不同开源许可证发布的代码：
+This repository contains code released under different open-source licenses:
 
-- 原项目 X-Translator 相关代码沿用 [MIT License](LICENSE-MIT)。
-- Rust 原生客户端及新增代码采用 [GNU Affero General Public License v3.0 (AGPL-3.0)](LICENSE)。
-具体许可范围以仓库中的许可证文件及对应源码为准。
+- Code originating from the original X-Translator project remains under the [MIT License](LICENSE-MIT).
+- The native Rust client and newly added code are released under the [GNU Affero General Public License v3.0 (AGPL-3.0)](LICENSE).
+
+Please refer to the corresponding license files and source files for the applicable licensing terms.
