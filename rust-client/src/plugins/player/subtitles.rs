@@ -39,31 +39,44 @@ impl SubtitleTimeline {
         }
 
         // 1. Check exact ID match (turn_id or stream_id based)
-        if let Some(existing) = self.cues.iter_mut().find(|c| c.id == cue.id) {
-            if *existing == cue {
-                return false;
-            }
-            *existing = cue;
-            return true;
+        if let Some(index) = self.cues.iter().position(|c| c.id == cue.id) {
+            return self.replace_cue(index, cue);
         }
 
-        // 2. Check semantic & temporal duplication:
-        // If identical text within 3500ms OR overlapping time window within 1000ms
+        // 2. Check semantic & temporal duplication. Proximity alone is not a
+        // duplicate: fast dialogue legitimately produces distinct nearby cues.
         let cue_orig = cue.original_text.trim();
-        if let Some(existing) = self.cues.iter_mut().find(|c| {
-            let time_diff = (c.start_ms - cue.start_ms).abs();
-            (time_diff <= 3500 && c.original_text.trim() == cue_orig) || time_diff <= 1000
-        }) {
-            if *existing == cue {
+        let cue_translation = cue.translated_text.as_deref().map(str::trim);
+        if let Some(index) = self.cues.iter().position(|c| {
+            if has_stable_identity(&cue.id) && has_stable_identity(&c.id) {
                 return false;
             }
-            *existing = cue;
-            return true;
+            let time_diff = (c.start_ms - cue.start_ms).abs();
+            let same_content = if cue_orig.is_empty() {
+                cue_translation.is_some_and(|translation| {
+                    !translation.is_empty()
+                        && c.translated_text.as_deref().map(str::trim) == Some(translation)
+                })
+            } else {
+                c.original_text.trim() == cue_orig
+            };
+            time_diff <= 3500 && same_content
+        }) {
+            return self.replace_cue(index, cue);
         }
 
         // 3. New distinct subtitle
         self.cues.push(cue);
         self.cues.sort_by_key(|c| c.start_ms);
+        true
+    }
+
+    fn replace_cue(&mut self, index: usize, cue: SubtitleCue) -> bool {
+        if self.cues[index] == cue {
+            return false;
+        }
+        self.cues[index] = cue;
+        self.cues.sort_by_key(|cue| cue.start_ms);
         true
     }
 
@@ -143,6 +156,10 @@ impl SubtitleTimeline {
         }
         out
     }
+}
+
+fn has_stable_identity(id: &str) -> bool {
+    id.starts_with("turn_") || id.starts_with("stream_") || id.starts_with("srt_")
 }
 
 fn format_timestamp_lrc(ms: i64) -> String {
@@ -300,5 +317,54 @@ mod tests {
             translated_text: Some("你刚才和路易斯讨论了周日的事。".into()),
         });
         assert_eq!(timeline.count(), 1);
+    }
+
+    #[test]
+    fn nearby_distinct_cues_are_not_merged() {
+        let mut timeline = SubtitleTimeline::new();
+        timeline.add_cue(SubtitleCue {
+            id: "turn_1_segment_1".into(),
+            start_ms: 1_000,
+            end_ms: 2_000,
+            speaker_name: None,
+            original_text: "First".into(),
+            translated_text: Some("第一句".into()),
+        });
+        timeline.add_cue(SubtitleCue {
+            id: "turn_1_segment_2".into(),
+            start_ms: 1_500,
+            end_ms: 2_500,
+            speaker_name: None,
+            original_text: "First".into(),
+            translated_text: Some("第二句".into()),
+        });
+
+        assert_eq!(timeline.count(), 2);
+    }
+
+    #[test]
+    fn revised_start_time_keeps_timeline_sorted() {
+        let mut timeline = SubtitleTimeline::new();
+        for (id, start) in [("first", 1_000), ("second", 2_000)] {
+            timeline.add_cue(SubtitleCue {
+                id: id.into(),
+                start_ms: start,
+                end_ms: start + 1_000,
+                speaker_name: None,
+                original_text: id.into(),
+                translated_text: None,
+            });
+        }
+        timeline.add_cue(SubtitleCue {
+            id: "second".into(),
+            start_ms: 500,
+            end_ms: 1_500,
+            speaker_name: None,
+            original_text: "second revised".into(),
+            translated_text: None,
+        });
+
+        assert_eq!(timeline.cues()[0].id, "second");
+        assert_eq!(timeline.cues()[1].id, "first");
     }
 }

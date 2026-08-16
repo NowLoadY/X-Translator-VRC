@@ -219,6 +219,22 @@ pub struct MpvBackend {
     active_channels: Vec<super::super::task::AudioChannelItem>,
 }
 
+fn reconcile_playback_status(
+    current: PlaybackStatus,
+    end_file_event: bool,
+    eof_reached: bool,
+    paused: Option<bool>,
+) -> PlaybackStatus {
+    if end_file_event || eof_reached {
+        return PlaybackStatus::Stopped;
+    }
+    match (current, paused) {
+        (PlaybackStatus::Playing, Some(true)) => PlaybackStatus::Paused,
+        (PlaybackStatus::Paused, Some(false)) => PlaybackStatus::Playing,
+        _ => current,
+    }
+}
+
 #[cfg(windows)]
 fn is_mpv_dll_available() -> bool {
     use windows::Win32::System::LibraryLoader::LoadLibraryW;
@@ -296,9 +312,13 @@ impl MediaBackend for MpvBackend {
     }
 
     fn seek(&mut self, ms: i64) {
+        let was_stopped = self.status == PlaybackStatus::Stopped;
+        if was_stopped {
+            let _ = self.mpv.set_property_bool("pause", true);
+        }
         let secs = (ms.max(0) as f64) / 1000.0;
         let _ = self.mpv.command(&["seek", &secs.to_string(), "absolute"]);
-        if self.status == PlaybackStatus::Stopped {
+        if was_stopped {
             self.status = PlaybackStatus::Paused;
         }
     }
@@ -375,10 +395,12 @@ impl MediaBackend for MpvBackend {
     }
 
     fn tick(&mut self) {
+        let mut end_file_event = false;
         while let Some(event_id) = self.mpv.poll_event() {
             if event_id == libmpv_sys::mpv_event_id_MPV_EVENT_END_FILE {
-                self.status = PlaybackStatus::Stopped;
+                end_file_event = true;
             } else if event_id == libmpv_sys::mpv_event_id_MPV_EVENT_PLAYBACK_RESTART {
+                end_file_event = false;
                 if let Some(duration) = self.mpv.get_property_f64("duration") {
                     if duration > 0.0 {
                         self.duration_ms = (duration * 1000.0) as i64;
@@ -391,21 +413,9 @@ impl MediaBackend for MpvBackend {
             }
         }
 
-        if let Some(eof) = self.mpv.get_property_bool("eof-reached") {
-            if eof && self.status == PlaybackStatus::Playing {
-                self.status = PlaybackStatus::Stopped;
-            }
-        }
-
-        if let Some(paused) = self.mpv.get_property_bool("pause") {
-            if paused && self.status == PlaybackStatus::Playing {
-                self.status = PlaybackStatus::Paused;
-            } else if !paused
-                && (self.status == PlaybackStatus::Paused || self.status == PlaybackStatus::Stopped)
-            {
-                self.status = PlaybackStatus::Playing;
-            }
-        }
+        let eof_reached = self.mpv.get_property_bool("eof-reached").unwrap_or(false);
+        let paused = self.mpv.get_property_bool("pause");
+        self.status = reconcile_playback_status(self.status, end_file_event, eof_reached, paused);
     }
 
     fn attach_native_host(&mut self, host_handle: *mut std::ffi::c_void) {
@@ -527,6 +537,30 @@ mod tests {
             let b = backend.unwrap();
             assert_eq!(b.get_status(), PlaybackStatus::Stopped);
         }
+    }
+
+    #[test]
+    fn eof_state_cannot_be_overridden_by_pause_property() {
+        assert_eq!(
+            reconcile_playback_status(PlaybackStatus::Playing, true, false, Some(false)),
+            PlaybackStatus::Stopped
+        );
+        assert_eq!(
+            reconcile_playback_status(PlaybackStatus::Playing, false, true, Some(false)),
+            PlaybackStatus::Stopped
+        );
+    }
+
+    #[test]
+    fn stopped_state_requires_an_explicit_play_request() {
+        assert_eq!(
+            reconcile_playback_status(PlaybackStatus::Stopped, false, false, Some(false)),
+            PlaybackStatus::Stopped
+        );
+        assert_eq!(
+            reconcile_playback_status(PlaybackStatus::Paused, false, false, Some(false)),
+            PlaybackStatus::Playing
+        );
     }
 
     #[test]

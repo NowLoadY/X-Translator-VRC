@@ -293,6 +293,37 @@ pub(crate) fn merge_stream_translation(
     }
 }
 
+/// Inserts a completed, non-streaming translation without conflating separate
+/// segments from the same backend turn. Stable backend identity wins over the
+/// legacy text/time fallback used by older event payloads without a turn ID.
+pub(crate) fn upsert_completed_translation(
+    history: &mut Vec<TranslationHistoryEntry>,
+    fragment: TranslationHistoryEntry,
+) {
+    if !fragment.turn_id.is_empty() {
+        if let Some(existing) = history.iter_mut().rfind(|entry| {
+            entry.audio_source == fragment.audio_source
+                && entry.turn_id == fragment.turn_id
+                && entry.segment_index == fragment.segment_index
+        }) {
+            *existing = fragment;
+        } else {
+            history.push(fragment);
+        }
+        return;
+    }
+
+    if let Some(last) = history.last_mut()
+        && last.turn_id.is_empty()
+        && last.source == fragment.source
+        && (last.source_start_ms - fragment.source_start_ms).abs() <= 2500.0
+    {
+        *last = fragment;
+    } else {
+        history.push(fragment);
+    }
+}
+
 fn initialize_revision(entry: &mut TranslationHistoryEntry) {
     if entry.revisable {
         entry.source_revision = Some(crate::streaming::RevisableText::new(&entry.source));
@@ -373,6 +404,7 @@ mod tests {
     fn fragment(stream_id: u64, source: &str, translated: &str) -> TranslationHistoryEntry {
         TranslationHistoryEntry {
             turn_id: String::new(),
+            segment_index: 0,
             stream_id: Some(stream_id),
             audio_source: CaptureSource::Microphone,
             live: true,
@@ -426,6 +458,52 @@ mod tests {
         assert_eq!(microphone.entry.source, "Hello world");
         assert_eq!(microphone.entry.translated, "你好世界");
         assert_eq!(history[1].source, "Music");
+    }
+
+    #[test]
+    fn completed_translation_keeps_every_segment_in_one_turn() {
+        let mut history = Vec::new();
+        let mut first = fragment(7, "First sentence.", "第一句。");
+        first.stream_id = None;
+        first.live = false;
+        first.turn_id = "turn-7".into();
+        first.segment_index = 1;
+        let mut second = fragment(7, "Second sentence.", "第二句。");
+        second.stream_id = None;
+        second.live = false;
+        second.turn_id = "turn-7".into();
+        second.segment_index = 2;
+
+        upsert_completed_translation(&mut history, first);
+        upsert_completed_translation(&mut history, second);
+
+        assert_eq!(history.len(), 2);
+        assert_eq!(history[0].source, "First sentence.");
+        assert_eq!(history[1].source, "Second sentence.");
+    }
+
+    #[test]
+    fn completed_translation_revises_only_its_matching_segment() {
+        let mut history = Vec::new();
+        let mut first = fragment(7, "First", "第一");
+        first.stream_id = None;
+        first.live = false;
+        first.turn_id = "turn-7".into();
+        first.segment_index = 1;
+        let mut second = fragment(7, "Second", "第二");
+        second.stream_id = None;
+        second.live = false;
+        second.turn_id = "turn-7".into();
+        second.segment_index = 2;
+        upsert_completed_translation(&mut history, first.clone());
+        upsert_completed_translation(&mut history, second);
+
+        first.source = "First revised".into();
+        upsert_completed_translation(&mut history, first);
+
+        assert_eq!(history.len(), 2);
+        assert_eq!(history[0].source, "First revised");
+        assert_eq!(history[1].source, "Second");
     }
 
     #[test]

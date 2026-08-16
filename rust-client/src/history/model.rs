@@ -34,6 +34,7 @@ pub(crate) struct PendingFinalAsr {
 #[derive(Clone, Debug, PartialEq)]
 pub(crate) struct TranslationHistoryEntry {
     pub(crate) turn_id: String,
+    pub(crate) segment_index: u32,
     pub(crate) stream_id: Option<u64>,
     pub(crate) audio_source: CaptureSource,
     pub(crate) live: bool,

@@ -38,6 +38,7 @@ use client_settings::{CaptureSource, ClientSettings, RecognitionSettings};
 use history::{
     PendingFinalAsr, PendingRecognitionWindow, RecognitionHistoryEntry, TranslationHistoryEntry,
     collect_recognition_window, merge_stream_recognition, merge_stream_translation,
+    upsert_completed_translation,
 };
 use i18n::UiLanguage;
 use network::{ExternalAudioGate, SessionConfig, SessionEvent, SessionHandle, start_session};
@@ -518,6 +519,7 @@ impl Default for XRTranslateApp {
                             }
                             let fragment = TranslationHistoryEntry {
                                 turn_id: turn_id.clone(),
+                                segment_index,
                                 stream_id: continuous.then_some(stream_id),
                                 audio_source,
                                 live: continuous,
@@ -562,22 +564,7 @@ impl Default for XRTranslateApp {
                                     &fragment.speaker_id,
                                     false,
                                 );
-                                if let Some(last) = state.translations.last_mut() {
-                                    if !fragment.turn_id.is_empty()
-                                        && last.turn_id == fragment.turn_id
-                                    {
-                                        *last = fragment;
-                                    } else if last.source == fragment.source
-                                        && (last.source_start_ms - fragment.source_start_ms).abs()
-                                            <= 2500.0
-                                    {
-                                        *last = fragment;
-                                    } else {
-                                        state.translations.push(fragment);
-                                    }
-                                } else {
-                                    state.translations.push(fragment);
-                                }
+                                upsert_completed_translation(&mut state.translations, fragment);
                             }
                             if state.translations.len() > 100 {
                                 state.translations.remove(0);
@@ -2344,7 +2331,7 @@ impl XRTranslateApp {
                     Some(entry.speaker_id.clone())
                 };
                 let cue_id = if !entry.turn_id.is_empty() {
-                    format!("turn_{}", entry.turn_id)
+                    format!("turn_{}_segment_{}", entry.turn_id, entry.segment_index)
                 } else if let Some(sid) = entry.stream_id {
                     format!("stream_{}_{}", sid, entry.source_start_ms.round() as i64)
                 } else {
