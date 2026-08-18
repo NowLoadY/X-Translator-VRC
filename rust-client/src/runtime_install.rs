@@ -533,7 +533,7 @@ fn configured_release_assets(project_root: &Path) -> Result<Vec<ReleaseAsset>, S
 
 fn load_runtime_config(project_root: &Path) -> Result<LlamaCppRuntimeConfig, String> {
     let path = project_root.join("config.json");
-    AppConfig::from_path(&path)
+    AppConfig::from_path_with_user_config(&path, project_root)
         .map(|config| config.model_manager.llama_cpp)
         .map_err(|error| {
             format!(

@@ -2,6 +2,16 @@
   "asr": {
     "provider": "qwen3-gguf",
     "providers": {
+      "openai": {
+        "api_key": "",
+        "context_window_tokens": 8192,
+        "max_tokens": 256,
+        "model": "gpt-4o-audio-preview",
+        "parallel_slots": 2,
+        "supports_prompt_context": true,
+        "transport": "openai",
+        "url": "https://api.openai.com/v1/chat/completions"
+      },
       "qwen3-gguf": {
         "context_window_tokens": 4800,
         "max_tokens": 128,
@@ -10,6 +20,7 @@
         "prompt_field": "prompt",
         "supports_language": true,
         "supports_prompt": true,
+        "transport": "local",
         "url": "http://127.0.0.1:8001/v1/chat/completions"
       }
     },
@@ -136,7 +147,7 @@
       "release": "b10333",
       "release_page": "https://github.com/ggml-org/llama.cpp/releases/tag/b10333"
     },
-    "llama_server_path": "D:\\app_install_path\\AI\\llama.cpp\\llama-server.exe"
+    "llama_server_path": "runtime/llama.cpp/llama-server.exe"
   },
   "osc": {
     "enabled": true,
@@ -187,6 +198,16 @@
         "parallel_slots": 2,
         "supports_prompt_context": true,
         "url": "http://127.0.0.1:8002/v1/chat/completions"
+      },
+      "openai": {
+        "api_key": "",
+        "context_window_tokens": 8192,
+        "max_tokens": 512,
+        "model": "gpt-4o-mini",
+        "parallel_slots": 2,
+        "supports_prompt_context": true,
+        "transport": "openai",
+        "url": "https://api.openai.com/v1/chat/completions"
       }
     },
     "source_lang": "auto",

@@ -449,13 +449,17 @@ impl NativePipeline {
             opening_window_frames: 4,
         };
         let endpoint = EndpointDetector::new(endpoint_config).map_err(|error| error.to_string())?;
-        let http =
-            ReqwestClient::with_default_direct_timeout().map_err(|error| error.to_string())?;
+        let asr_http = model_plan
+            .asr_http_client()
+            .map_err(|error| error.to_string())?;
         let asr = model_plan
-            .asr_adapter(http.clone())
+            .asr_adapter(asr_http)
+            .map_err(|error| error.to_string())?;
+        let translation_http = model_plan
+            .translation_http_client()
             .map_err(|error| error.to_string())?;
         let translation = model_plan
-            .translation_adapter(http)
+            .translation_adapter(translation_http)
             .map_err(|error| error.to_string())?;
         let speaker = if config.speaker.enabled {
             let model_path = if config.speaker.model_path.is_absolute() {

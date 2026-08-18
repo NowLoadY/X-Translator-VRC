@@ -53,6 +53,7 @@ use crate::{
         NativeInference, NativePipeline, PipelineEvent, RecognizedOutput, TimedUtterance,
         TranslationOutput, validate_input_chunk_size, validate_input_sample_rate,
     },
+    prompt_context::default_prompt_for_segment,
     session::{SegmentContext, SessionAdapter, WireOutput},
     terminology::{rewrite_recognition_terms, rewrite_translation_terms},
 };
@@ -61,6 +62,7 @@ mod conversation_context;
 mod language;
 mod model_runtime;
 mod pipeline;
+mod prompt_context;
 mod scheduler;
 mod session;
 mod terminology;
@@ -279,7 +281,6 @@ async fn run_backend() -> Result<(), Box<dyn std::error::Error>> {
         .init();
 
     let args = Arguments::parse();
-    let config = AppConfig::from_path(&args.config)?;
     let configured_root = args
         .config
         .parent()
@@ -287,6 +288,7 @@ async fn run_backend() -> Result<(), Box<dyn std::error::Error>> {
         .map(PathBuf::from)
         .unwrap_or_else(|| PathBuf::from("."));
     let project_root = std::path::absolute(&configured_root).unwrap_or(configured_root);
+    let config = AppConfig::from_path_with_user_config(&args.config, &project_root)?;
     let model_plan = Arc::new(NativeProviderPlan::resolve(&config, &project_root)?);
     validate_native_route(&config, &project_root, &model_plan)?;
     let corpus_client = CorpusClient::new(&args.corpus_url)?;
@@ -766,7 +768,9 @@ fn validate_native_route(
     model_plan: &NativeProviderPlan,
 ) -> Result<(), String> {
     validate_input_sample_rate(config.audio.sample_rate)?;
-    model_plan.check_assets()?;
+    if model_plan.uses_local_runtime() {
+        model_plan.check_assets()?;
+    }
     let vad_path = project_root.join("models/silero-vad/src/silero_vad/data/silero_vad.onnx");
     if !vad_path.is_file() {
         return Err(format!(
@@ -786,29 +790,46 @@ fn start_llama_servers(model_plan: &NativeProviderPlan) -> Result<Vec<LlamaServe
     }
 
     model_plan.check_assets()?;
-    let asr_port = local_endpoint_port(model_plan.asr_url())?;
-    let translation_port = local_endpoint_port(model_plan.translation_url())?;
-    if asr_port == translation_port {
+    let asr_port = model_plan
+        .asr_uses_local_runtime()
+        .then(|| local_endpoint_port(model_plan.asr_url()))
+        .transpose()?;
+    let translation_port = model_plan
+        .translation_uses_local_runtime()
+        .then(|| local_endpoint_port(model_plan.translation_url()))
+        .transpose()?;
+    if let (Some(asr_port), Some(translation_port)) = (asr_port, translation_port)
+        && asr_port == translation_port
+    {
         return Err(format!(
             "ASR and translation llama-server endpoints both use port {asr_port}"
         ));
     }
 
-    let [asr_spec, translation_spec] =
-        model_plan.managed_server_specs(asr_port, translation_port)?;
+    let (asr_spec, translation_spec) =
+        model_plan.managed_server_specs(asr_port.unwrap_or(0), translation_port.unwrap_or(0))?;
 
     let launcher = StdLlamaServerLauncher;
-    let asr = launcher
-        .launch(&asr_spec)
-        .map_err(|error| format!("cannot start Qwen3-ASR llama-server: {error}"))?;
-    let translation = launcher
-        .launch(&translation_spec)
-        .map_err(|error| format!("cannot start Hy-MT2 llama-server: {error}"))?;
+    let mut processes = Vec::new();
+    if let Some(spec) = asr_spec {
+        processes.push(
+            launcher
+                .launch(&spec)
+                .map_err(|error| format!("cannot start Qwen3-ASR llama-server: {error}"))?,
+        );
+    }
+    if let Some(spec) = translation_spec {
+        processes.push(
+            launcher
+                .launch(&spec)
+                .map_err(|error| format!("cannot start Hy-MT2 llama-server: {error}"))?,
+        );
+    }
     info!(
         asr_port,
         translation_port, "started managed llama.cpp model servers"
     );
-    Ok(vec![asr, translation])
+    Ok(processes)
 }
 
 async fn wait_for_model_servers(
@@ -816,10 +837,22 @@ async fn wait_for_model_servers(
     timeout_seconds: u64,
     processes: &mut [LlamaServerProcess],
 ) -> Result<(), String> {
-    let asr_health = health_url(model_plan.asr_url())?;
-    let translation_health = health_url(model_plan.translation_url())?;
-    let asr_models = models_url(model_plan.asr_url())?;
-    let translation_models = models_url(model_plan.translation_url())?;
+    let asr_health = model_plan
+        .asr_uses_local_runtime()
+        .then(|| health_url(model_plan.asr_url()))
+        .transpose()?;
+    let translation_health = model_plan
+        .translation_uses_local_runtime()
+        .then(|| health_url(model_plan.translation_url()))
+        .transpose()?;
+    let asr_models = model_plan
+        .asr_uses_local_runtime()
+        .then(|| models_url(model_plan.asr_url()))
+        .transpose()?;
+    let translation_models = model_plan
+        .translation_uses_local_runtime()
+        .then(|| models_url(model_plan.translation_url()))
+        .transpose()?;
     let client =
         ReqwestClient::new_direct(Duration::from_secs(2)).map_err(|error| error.to_string())?;
     let deadline = Instant::now() + Duration::from_secs(timeout_seconds);
@@ -836,20 +869,24 @@ async fn wait_for_model_servers(
                 ));
             }
         }
-        let asr = check_model_ready(
-            &client,
-            &asr_health,
-            &asr_models,
-            model_plan.asr_model_alias(),
-        )
-        .await;
-        let translation = check_model_ready(
-            &client,
-            &translation_health,
-            &translation_models,
-            model_plan.translation_model_alias(),
-        )
-        .await;
+        let asr = match (&asr_health, &asr_models) {
+            (Some(health), Some(models)) => {
+                check_model_ready(&client, health, models, model_plan.asr_model_alias()).await
+            }
+            _ => Ok(()),
+        };
+        let translation = match (&translation_health, &translation_models) {
+            (Some(health), Some(models)) => {
+                check_model_ready(
+                    &client,
+                    health,
+                    models,
+                    model_plan.translation_model_alias(),
+                )
+                .await
+            }
+            _ => Ok(()),
+        };
         if asr.is_ok() && translation.is_ok() {
             return Ok(());
         }
@@ -1550,6 +1587,8 @@ async fn run_inference_worker(
                 let target_language = target_language.clone();
                 let source_for_terms = segment.translation_text.clone();
                 let prompt_terms = corpus_context.prompt_terms.clone();
+                let prompt_context =
+                    default_prompt_for_segment(&source_language, &target_language, &corpus_context);
                 async move {
                     let _permit = scheduler.acquire_translation(workload).await;
                     let output = inference
@@ -1557,7 +1596,7 @@ async fn run_inference_worker(
                             &segment,
                             &source_language,
                             &target_language,
-                            corpus_context.prompt,
+                            prompt_context,
                         )
                         .await;
                     (segment_context, source_for_terms, prompt_terms, output)

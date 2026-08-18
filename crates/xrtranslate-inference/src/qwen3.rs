@@ -64,6 +64,26 @@ impl<C> Qwen3AsrAdapter<C> {
         })
     }
 
+    /// Creates an audio-chat ASR adapter for a remote OpenAI-compatible
+    /// endpoint. The payload remains the same multimodal chat contract; only
+    /// transport authentication differs from the local llama-server route.
+    pub fn with_bearer_token(
+        http: C,
+        endpoint: impl Into<String>,
+        model: impl Into<String>,
+        token: impl Into<String>,
+    ) -> Result<Self, InferenceError> {
+        let model = model.into().trim().to_owned();
+        if model.is_empty() {
+            return Err(InferenceError::InvalidConfiguration {
+                field: "model",
+                message: "must not be empty".into(),
+            });
+        }
+        let chat = OpenAiCompatibleClient::with_bearer_token(http, endpoint, token)?;
+        Ok(Self { chat, model })
+    }
+
     pub fn endpoint(&self) -> &str {
         self.chat.endpoint()
     }

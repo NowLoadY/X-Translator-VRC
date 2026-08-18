@@ -60,10 +60,8 @@ impl ServiceConfigEditor {
     }
 
     pub fn reload(&mut self) -> Result<(), String> {
-        let contents = std::fs::read_to_string(&self.path)
+        self.document = xrtranslate_config::load_user_config_document(&self.path, &project_root())
             .map_err(|error| format!("Cannot read {}: {error}", self.path.display()))?;
-        self.document = serde_json::from_str(&contents)
-            .map_err(|error| format!("Invalid config.json: {error}"))?;
         self.categories = [
             ("asr", "ASR / Speech Recognition"),
             ("translation", "Translation"),
@@ -193,6 +191,16 @@ impl ServiceConfigEditor {
                         &mut self.categories[cat_idx].show_all,
                         crate::i18n::tr(language, "All providers"),
                     );
+                    if ui
+                        .button(crate::i18n::tr(language, "Add online API"))
+                        .clicked()
+                    {
+                        if let Err(error) = self.add_remote_provider(category_key) {
+                            self.message = Some(error);
+                        } else {
+                            self.dirty = true;
+                        }
+                    }
                 });
 
                 ui.add_space(12.0);
@@ -217,6 +225,8 @@ impl ServiceConfigEditor {
                         let is_active = provider_name == active_name;
                         let model_asset =
                             provider_model_asset(&self.categories[cat_idx].providers[provider_idx]);
+                        let remote =
+                            provider_is_remote(&self.categories[cat_idx].providers[provider_idx]);
 
                         ui.push_id(&provider_name, |ui| {
                             egui::Frame::new()
@@ -264,6 +274,7 @@ impl ServiceConfigEditor {
                                                 category_key,
                                                 provider_name: &provider_name,
                                                 model_asset: model_asset.as_deref(),
+                                                remote,
                                             },
                                         ) {
                                             self.message = Some(message);
@@ -347,6 +358,7 @@ impl ServiceConfigEditor {
                         let provider_name = self.categories[cat_idx].providers[idx].name.clone();
                         let model_asset =
                             provider_model_asset(&self.categories[cat_idx].providers[idx]);
+                        let remote = provider_is_remote(&self.categories[cat_idx].providers[idx]);
 
                         ui.horizontal_wrapped(|ui| {
                             ui.label(
@@ -366,6 +378,7 @@ impl ServiceConfigEditor {
                                     category_key,
                                     provider_name: &provider_name,
                                     model_asset: model_asset.as_deref(),
+                                    remote,
                                 },
                             ) {
                                 self.message = Some(message);
@@ -499,8 +512,6 @@ impl ServiceConfigEditor {
                 }
             }
         }
-        let formatted = serde_json::to_string_pretty(&self.document)
-            .map_err(|error| format!("Cannot serialize config.json: {error}"))?;
         let parsed = xrtranslate_config::AppConfig::from_value(self.document.clone())
             .map_err(|error| format!("Invalid configuration: {error}"))?;
         let route = parsed
@@ -511,9 +522,64 @@ impl ServiceConfigEditor {
             &route.translation,
             xrtranslate_assets::ModelCapability::Translation,
         )?;
-        std::fs::write(&self.path, format!("{formatted}\n"))
-            .map_err(|error| format!("Cannot save {}: {error}", self.path.display()))?;
+        xrtranslate_config::save_user_config_document(&self.path, &project_root(), &self.document)?;
         self.dirty = false;
+        Ok(())
+    }
+
+    fn add_remote_provider(&mut self, category_key: &str) -> Result<(), String> {
+        let category_index = self
+            .categories
+            .iter()
+            .position(|category| category.key == category_key)
+            .ok_or_else(|| format!("Unknown provider category {category_key}"))?;
+        let providers = self
+            .document
+            .get_mut(category_key)
+            .and_then(Value::as_object_mut)
+            .and_then(|section| section.get_mut("providers"))
+            .and_then(Value::as_object_mut)
+            .ok_or_else(|| format!("Missing {category_key}.providers section"))?;
+        let base = "openai-custom";
+        let mut name = base.to_owned();
+        let mut index = 2;
+        while providers.contains_key(&name) {
+            name = format!("{base}-{index}");
+            index += 1;
+        }
+        providers.insert(
+            name.clone(),
+            serde_json::json!({
+                "transport": "openai",
+                "url": "https://api.openai.com/v1/chat/completions",
+                "api_key": "",
+                "model": if category_key == "asr" { "gpt-4o-audio-preview" } else { "gpt-4o-mini" },
+                "context_window_tokens": 8192,
+                "max_tokens": if category_key == "asr" { 256 } else { 512 },
+                "parallel_slots": 2,
+                "supports_prompt_context": true
+            }),
+        );
+        let category = &mut self.categories[category_index];
+        category.providers.push(ProviderCard {
+            name: name.clone(),
+            fields: providers
+                .get(&name)
+                .and_then(Value::as_object)
+                .map(|config| {
+                    config
+                        .iter()
+                        .map(|(name, value)| ConfigField {
+                            name: name.clone(),
+                            value: display_value(value),
+                            kind: field_kind(value),
+                        })
+                        .collect()
+                })
+                .unwrap_or_default(),
+        });
+        category.providers.sort_by(|a, b| a.name.cmp(&b.name));
+        category.selected_provider = name;
         Ok(())
     }
 }
@@ -522,6 +588,9 @@ fn validate_native_provider_asset(
     provider: &xrtranslate_config::NativeProviderConfig,
     capability: xrtranslate_assets::ModelCapability,
 ) -> Result<(), String> {
+    if !provider.uses_local_runtime() {
+        return Ok(());
+    }
     let manifest = if let Some(key) = provider.model_asset.as_deref() {
         let id = xrtranslate_assets::ModelAssetId::from_config_key(key).ok_or_else(|| {
             format!(
@@ -561,6 +630,14 @@ fn provider_model_asset(provider: &ProviderCard) -> Option<String> {
         .filter(|value| !value.is_empty())
 }
 
+fn provider_is_remote(provider: &ProviderCard) -> bool {
+    provider
+        .fields
+        .iter()
+        .find(|field| field.name == "transport")
+        .is_some_and(|field| field.value.trim().eq_ignore_ascii_case("openai"))
+}
+
 /// Renders the same model lifecycle control inside every provider card that
 /// declares a `model_asset`. The provider configuration, rather than a model
 /// name in the UI, decides which package is offered.
@@ -570,6 +647,7 @@ struct ProviderModelAction<'a> {
     category_key: &'a str,
     provider_name: &'a str,
     model_asset: Option<&'a str>,
+    remote: bool,
 }
 
 fn render_provider_model_action(
@@ -582,6 +660,9 @@ fn render_provider_model_action(
     use eframe::egui;
 
     let Some(model_asset) = request.model_asset else {
+        if request.remote {
+            return None;
+        }
         return crate::ui::components::animated_button(
             ui,
             crate::i18n::tr(request.language, "Check model files"),
@@ -799,12 +880,13 @@ fn render_field_input(
                     });
                 changed
             } else {
-                ui.add(
-                    egui::TextEdit::singleline(&mut field.value)
-                        .desired_width(width.min(360.0))
-                        .hint_text(value_hint(field.kind)),
-                )
-                .changed()
+                let mut edit = egui::TextEdit::singleline(&mut field.value)
+                    .desired_width(width.min(360.0))
+                    .hint_text(value_hint(field.kind));
+                if field.name == "api_key" {
+                    edit = edit.password(true);
+                }
+                ui.add(edit).changed()
             }
         }
     }
@@ -859,6 +941,14 @@ fn project_config_path() -> PathBuf {
     PathBuf::from("config.json")
 }
 
+fn project_root() -> PathBuf {
+    project_config_path()
+        .parent()
+        .filter(|path| !path.as_os_str().is_empty())
+        .map(PathBuf::from)
+        .unwrap_or_else(|| PathBuf::from("."))
+}
+
 fn field_kind(value: &Value) -> JsonFieldKind {
     match value {
         Value::String(_) => JsonFieldKind::String,
@@ -910,7 +1000,10 @@ mod tests {
     fn provider(name: &str, model_asset: Option<&str>) -> NativeProviderConfig {
         NativeProviderConfig {
             provider: name.into(),
+            transport: "local".into(),
             url: "http://127.0.0.1:8000/v1/chat/completions".into(),
+            model: String::new(),
+            api_key: None,
             model_asset: model_asset.map(str::to_owned),
             runtime: LocalModelRuntimeConfig {
                 context_window_tokens: 2_048,

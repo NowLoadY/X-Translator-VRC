@@ -443,10 +443,8 @@ pub fn set_model_level(
     level: ModelLevel,
 ) -> Result<(), String> {
     let path = project_root.join("config.json");
-    let contents = std::fs::read_to_string(&path)
+    let mut document = xrtranslate_config::load_user_config_document(&path, project_root)
         .map_err(|error| format!("Cannot read {}: {error}", path.display()))?;
-    let mut document: serde_json::Value =
-        serde_json::from_str(&contents).map_err(|error| format!("Invalid config.json: {error}"))?;
     let section_name = match capability {
         ModelCapability::Asr => "asr",
         ModelCapability::Translation => "translation",
@@ -477,12 +475,9 @@ pub fn set_model_level(
         "model_asset".into(),
         serde_json::Value::String(manifest.id.as_str().into()),
     );
-    let formatted = serde_json::to_string_pretty(&document)
-        .map_err(|error| format!("Cannot serialize config.json: {error}"))?;
-    xrtranslate_config::AppConfig::from_value(document)
+    xrtranslate_config::AppConfig::from_value(document.clone())
         .map_err(|error| format!("Invalid configuration: {error}"))?;
-    std::fs::write(&path, format!("{formatted}\n"))
-        .map_err(|error| format!("Cannot save {}: {error}", path.display()))
+    xrtranslate_config::save_user_config_document(&path, project_root, &document)
 }
 
 fn configured_assets(
@@ -517,7 +512,7 @@ fn configured_assets(
 
 fn load_config(project_root: &std::path::Path) -> Result<AppConfig, String> {
     let config_path = project_root.join("config.json");
-    AppConfig::from_path(&config_path)
+    AppConfig::from_path_with_user_config(&config_path, project_root)
         .map_err(|error| format!("Cannot read {}: {error}", config_path.display()))
 }
 

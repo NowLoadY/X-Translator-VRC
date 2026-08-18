@@ -75,6 +75,130 @@ impl RuntimeLayout {
             .map(Path::to_path_buf)
             .unwrap_or_else(|_| path.to_path_buf())
     }
+
+    /// Returns the writable user override document for model/provider
+    /// settings. Debug builds keep it inside the ignored project runtime;
+    /// packaged builds use the platform user configuration directory so an
+    /// application update never replaces personal settings.
+    #[must_use]
+    pub fn user_config_path(project_root: impl AsRef<Path>) -> PathBuf {
+        if cfg!(debug_assertions) {
+            return project_root
+                .as_ref()
+                .join("runtime")
+                .join("user-config.json");
+        }
+
+        let directory = if cfg!(windows) {
+            std::env::var_os("LOCALAPPDATA")
+                .or_else(|| std::env::var_os("APPDATA"))
+                .map(PathBuf::from)
+        } else {
+            std::env::var_os("XDG_CONFIG_HOME")
+                .map(PathBuf::from)
+                .or_else(|| {
+                    std::env::var_os("HOME").map(|home| PathBuf::from(home).join(".config"))
+                })
+        };
+        directory
+            .unwrap_or_else(|| project_root.as_ref().join("runtime"))
+            .join("XRTranslate")
+            .join("user-config.json")
+    }
+}
+
+/// Loads the immutable project defaults and applies the writable user
+/// override document with recursive object merging.
+pub fn load_user_config_document(
+    base_path: impl AsRef<Path>,
+    project_root: impl AsRef<Path>,
+) -> Result<Value, ConfigError> {
+    let base_path = base_path.as_ref();
+    let contents = fs::read_to_string(base_path).map_err(|source| ConfigError::Read {
+        path: base_path.to_path_buf(),
+        source,
+    })?;
+    let mut document: Value = serde_json::from_str(&contents).map_err(ConfigError::InvalidJson)?;
+    let override_path = RuntimeLayout::user_config_path(project_root);
+    if override_path.is_file() {
+        let contents = fs::read_to_string(&override_path).map_err(|source| ConfigError::Read {
+            path: override_path.clone(),
+            source,
+        })?;
+        let overlay: Value = serde_json::from_str(&contents).map_err(ConfigError::InvalidJson)?;
+        merge_config_values(&mut document, overlay);
+    }
+    Ok(document)
+}
+
+/// Computes the minimal recursive override needed to represent `effective`
+/// on top of `base`. Unchanged defaults therefore remain owned by config.json.
+#[must_use]
+pub fn user_config_override(base: &Value, effective: &Value) -> Option<Value> {
+    if base == effective {
+        return None;
+    }
+    match (base, effective) {
+        (Value::Object(base), Value::Object(effective)) => {
+            let mut changes = Map::new();
+            for (key, value) in effective {
+                let change = base
+                    .get(key)
+                    .and_then(|base_value| user_config_override(base_value, value))
+                    .or_else(|| (!base.contains_key(key)).then(|| value.clone()));
+                if let Some(change) = change {
+                    changes.insert(key.clone(), change);
+                }
+            }
+            Some(Value::Object(changes))
+        }
+        _ => Some(effective.clone()),
+    }
+}
+
+/// Persists only user changes and leaves the shipped default document intact.
+pub fn save_user_config_document(
+    base_path: impl AsRef<Path>,
+    project_root: impl AsRef<Path>,
+    effective: &Value,
+) -> Result<(), String> {
+    let base_path = base_path.as_ref();
+    let base_contents = fs::read_to_string(base_path)
+        .map_err(|error| format!("Cannot read {}: {error}", base_path.display()))?;
+    let base: Value = serde_json::from_str(&base_contents)
+        .map_err(|error| format!("Invalid config.json: {error}"))?;
+    let path = RuntimeLayout::user_config_path(project_root);
+    match user_config_override(&base, effective) {
+        Some(override_document) if !override_document.as_object().is_some_and(Map::is_empty) => {
+            if let Some(parent) = path.parent() {
+                fs::create_dir_all(parent)
+                    .map_err(|error| format!("Cannot create {}: {error}", parent.display()))?;
+            }
+            let formatted = serde_json::to_string_pretty(&override_document)
+                .map_err(|error| format!("Cannot serialize user configuration: {error}"))?;
+            fs::write(&path, format!("{formatted}\n"))
+                .map_err(|error| format!("Cannot save {}: {error}", path.display()))?;
+        }
+        _ => {
+            let _ = fs::remove_file(&path);
+        }
+    }
+    Ok(())
+}
+
+fn merge_config_values(base: &mut Value, overlay: Value) {
+    match (base, overlay) {
+        (Value::Object(base), Value::Object(overlay)) => {
+            for (key, value) in overlay {
+                if let Some(existing) = base.get_mut(&key) {
+                    merge_config_values(existing, value);
+                } else {
+                    base.insert(key, value);
+                }
+            }
+        }
+        (base, overlay) => *base = overlay,
+    }
 }
 
 /// The parsed native-backend configuration and the complete original JSON.
@@ -107,6 +231,18 @@ impl AppConfig {
             source,
         })?;
         let mut config = Self::from_json_str(&contents)?;
+        config.source_path = Some(path);
+        Ok(config)
+    }
+
+    /// Reads the project defaults and applies the user override document.
+    pub fn from_path_with_user_config(
+        path: impl AsRef<Path>,
+        project_root: impl AsRef<Path>,
+    ) -> Result<Self, ConfigError> {
+        let path = path.as_ref().to_path_buf();
+        let raw = load_user_config_document(&path, project_root)?;
+        let mut config = Self::from_value(raw)?;
         config.source_path = Some(path);
         Ok(config)
     }
@@ -798,11 +934,30 @@ pub struct NativeModelRouteConfig {
     pub translation: NativeProviderConfig,
 }
 
+impl NativeModelRouteConfig {
+    /// Returns whether at least one selected capability still needs a local
+    /// llama.cpp process. Remote API routes can run without the native model
+    /// executable or package files.
+    #[must_use]
+    pub fn uses_local_runtime(&self) -> bool {
+        self.asr.transport != "openai" || self.translation.transport != "openai"
+    }
+}
+
 /// Common settings shared by every native model provider.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct NativeProviderConfig {
     pub provider: String,
+    /// `local` selects a managed llama.cpp route; `openai` selects a remote
+    /// OpenAI Chat Completions-compatible endpoint.
+    pub transport: String,
     pub url: String,
+    /// Remote model identifier. Local routes may leave this empty and use the
+    /// provider's stable server alias instead.
+    pub model: String,
+    /// Bearer credential for remote routes. It is intentionally optional in
+    /// the typed contract so settings can be edited before a key is entered.
+    pub api_key: Option<String>,
     /// Stable local package key. Older configurations may omit this and let
     /// the backend provider profile choose its compatibility default.
     pub model_asset: Option<String>,
@@ -969,6 +1124,33 @@ fn active_native_provider(
     let path = format!("{section}.providers.{provider}");
     let url = required_provider_url(providers, provider, &format!("{path}.url"), issues);
     let object = providers.get(provider).and_then(Value::as_object);
+    let transport = object
+        .and_then(|provider| provider.get("transport"))
+        .and_then(Value::as_str)
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .unwrap_or("local")
+        .to_owned();
+    if !matches!(transport.as_str(), "local" | "openai") {
+        issues.push(format!("{path}.transport must be \"local\" or \"openai\""));
+    }
+    let model = object
+        .and_then(|provider| provider.get("model"))
+        .and_then(Value::as_str)
+        .map(str::trim)
+        .unwrap_or_default()
+        .to_owned();
+    if transport == "openai" && model.is_empty() {
+        issues.push(format!(
+            "{path}.model must be a non-empty string for remote providers"
+        ));
+    }
+    let api_key = object
+        .and_then(|provider| provider.get("api_key"))
+        .and_then(Value::as_str)
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .map(str::to_owned);
     let model_asset = object
         .and_then(|provider| provider.get("model_asset"))
         .and_then(Value::as_str)
@@ -980,15 +1162,32 @@ fn active_native_provider(
         .and_then(|provider| provider.get("supports_prompt_context"))
         .and_then(Value::as_bool)
         .unwrap_or(false);
-    match url {
-        Some(url) => Some(NativeProviderConfig {
-            provider: provider.to_owned(),
-            url,
-            model_asset,
-            runtime,
-            supports_prompt_context,
-        }),
-        None => None,
+    if !issues
+        .iter()
+        .any(|issue| issue.starts_with(&format!("{path}.")))
+    {
+        match url {
+            Some(url) => Some(NativeProviderConfig {
+                provider: provider.to_owned(),
+                transport,
+                url,
+                model,
+                api_key,
+                model_asset,
+                runtime,
+                supports_prompt_context,
+            }),
+            None => None,
+        }
+    } else {
+        None
+    }
+}
+
+impl NativeProviderConfig {
+    #[must_use]
+    pub fn uses_local_runtime(&self) -> bool {
+        self.transport != "openai"
     }
 }
 const fn default_speaker_switch_margin() -> f64 {
@@ -1080,7 +1279,7 @@ mod tests {
         assert_eq!(config.translation.provider, "hunyuan");
         assert_eq!(config.tts.provider, "none");
         assert_eq!(config.model_manager.llama_cpp.release, "b10333");
-        assert_eq!(config.model_manager.llama_cpp.downloads.len(), 5);
+        assert_eq!(config.model_manager.llama_cpp.downloads.len(), 6);
         assert_eq!(
             config.model_manager.llama_cpp.downloads[0].name,
             "llama-b10333-bin-win-cpu-x64.zip"
@@ -1186,6 +1385,54 @@ mod tests {
 
         assert_eq!(route.asr.model_asset, None);
         assert_eq!(route.translation.model_asset, None);
+    }
+
+    #[test]
+    fn native_model_route_accepts_remote_models_without_local_assets() {
+        let mut document: Value =
+            serde_json::from_str(include_str!("../../../config.json")).unwrap();
+        document["asr"]["provider"] = Value::from("openai");
+        document["translation"]["provider"] = Value::from("openai");
+        let config = AppConfig::from_value(document).unwrap();
+        let route = config.native_model_route().unwrap();
+
+        assert!(!route.uses_local_runtime());
+        assert_eq!(route.asr.model, "gpt-4o-audio-preview");
+        assert_eq!(route.translation.model, "gpt-4o-mini");
+        assert!(route.asr.api_key.is_none());
+    }
+
+    #[test]
+    fn user_config_overlay_preserves_defaults_and_round_trips_changes() {
+        let root =
+            std::env::temp_dir().join(format!("xrtranslate-config-overlay-{}", std::process::id()));
+        let _ = fs::remove_dir_all(&root);
+        fs::create_dir_all(&root).unwrap();
+        let base_path = root.join("config.json");
+        let base = serde_json::json!({
+            "translation": {"provider": "hunyuan", "providers": {"hunyuan": {"max_tokens": 256}}},
+            "model_manager": {"llama_server_path": "runtime/llama.cpp/llama-server"}
+        });
+        fs::write(&base_path, serde_json::to_vec_pretty(&base).unwrap()).unwrap();
+
+        let mut effective = load_user_config_document(&base_path, &root).unwrap();
+        effective["translation"]["providers"]["hunyuan"]["max_tokens"] = Value::from(512);
+        save_user_config_document(&base_path, &root, &effective).unwrap();
+
+        let persisted = load_user_config_document(&base_path, &root).unwrap();
+        assert_eq!(
+            persisted["translation"]["providers"]["hunyuan"]["max_tokens"],
+            512
+        );
+        assert_eq!(
+            persisted["model_manager"]["llama_server_path"],
+            "runtime/llama.cpp/llama-server"
+        );
+        assert_eq!(
+            serde_json::from_slice::<Value>(&fs::read(&base_path).unwrap()).unwrap(),
+            base
+        );
+        fs::remove_dir_all(root).unwrap();
     }
 
     #[test]

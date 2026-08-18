@@ -76,10 +76,37 @@ state. XR Corpus owns one bounded history per backend session. History is keyed
 by stable logical speech-turn identity rather than subtitle rows: a Speak
 utterance with several translation segments is committed once, and repeated
 continuous-window revisions update the same turn instead of appending overlap.
-Prompts may use neutral speaker identity, prior completed turns, and the full
-current source utterance, but plugins cannot inject, retain, or reorder model
-history. This keeps Meeting, Player, OSC, and future consumers on identical
-recognition and translation semantics.
+Prompts may use neutral speaker identity, prior completed turns, and source
+context surrounding the exact current segment, but plugins cannot inject,
+retain, or reorder model history. This keeps Meeting, Player, OSC, and future
+consumers on identical recognition and translation semantics.
+
+### User-composable translation prompts
+
+User-defined prompt composition is a shared translation capability, not
+plugin state and not XR Corpus presentation policy. Keep the boundary in three
+layers:
+
+- XR Corpus selects and bounds neutral context facts. Its protocol may expose
+  relevant terminology, recent bilingual turns, the previous overlapping
+  revision, and source text surrounding the exact current segment. It must not
+  store user templates, UI block ordering, arbitrary instructions, or
+  provider-specific message roles.
+- Shared host/inference configuration owns the user's composition: enabled
+  block IDs, ordering, per-block limits such as the most recent N turns, and
+  editable text blocks. Meeting, Player, OSC, and future plugins all consume
+  the same resolved composition rather than maintaining separate prompt state.
+- `xrtranslate-inference::translation::profile` applies the resolved reference
+  context to each provider's required system/user message shape and retains the
+  non-editable current-input/output boundary. A custom block must never be able
+  to relabel historical or surrounding text as the current input.
+
+The host default composes directly from the structured `context_data` and
+`prompt_terms` fields. The translation protocol does not carry a pre-rendered
+prompt, so new composition code cannot accidentally reintroduce provider or UI
+policy into XR Corpus.
+Do not introduce a template trait or editor abstraction until the shared
+composer and its first UI consumer are implemented together.
 
 ### Scheduling is a shared infrastructure policy
 
@@ -119,6 +146,13 @@ prompt rules, launch arguments, or UI labels through plugin and host code.
 - `xrtranslate-inference::translation::profile` owns provider-specific prompts,
   sampling parameters, and output cleanup. Transport and authentication remain
   in the adapter.
+- A provider may select `transport: "local"` or `transport: "openai"`. The
+  former resolves immutable GGUF assets and managed llama.cpp servers; the
+  latter resolves a model identifier and sends OpenAI Chat Completions-shaped
+  requests with optional Bearer authentication. ASR uses the same neutral
+  audio-chat contract, so ASR and translation can independently be local,
+  remote, or mixed without changing the session pipeline. Remote providers do
+  not require a local model asset or llama-server executable.
 - Desktop model selection is keyed by provider plus capability (and level when
   writing a choice). Provider setting fields use declarative descriptors;
   unknown configuration fields retain the generic editor fallback.

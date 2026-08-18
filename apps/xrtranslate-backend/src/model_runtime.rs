@@ -23,12 +23,14 @@ use xrtranslate_supervisor::{LlamaServerEndpoint, LlamaServerSpec};
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 enum AsrProfile {
-    Qwen3,
+    Qwen3Local,
+    OpenAiAudio,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 enum TranslationProfile {
-    Hunyuan,
+    HunyuanLocal,
+    OpenAiCompatible,
 }
 
 #[derive(Clone, Debug)]
@@ -85,27 +87,45 @@ impl NativeProviderPlan {
             .map_err(|error| error.to_string())?;
         route.llama_server_path = RuntimeLayout::for_project_root(project_root)
             .resolve_configured_path(&route.llama_server_path);
-        let asr_profile = AsrProfile::registered(&route.asr.provider)
+        let asr_profile = AsrProfile::registered(&route.asr.provider, &route.asr.transport)
             .ok_or_else(|| format!("unsupported ASR provider {:?}", route.asr.provider))?;
-        let translation_profile = TranslationProfile::registered(&route.translation.provider)
-            .ok_or_else(|| {
-                format!(
-                    "unsupported translation provider {:?}",
-                    route.translation.provider
+        let translation_profile = TranslationProfile::registered(
+            &route.translation.provider,
+            &route.translation.transport,
+        )
+        .ok_or_else(|| {
+            format!(
+                "unsupported translation provider {:?}",
+                route.translation.provider
+            )
+        })?;
+        let asr_asset_id = route
+            .asr
+            .uses_local_runtime()
+            .then(|| {
+                route_asset_id(
+                    &route.asr,
+                    asr_profile.default_asset(),
+                    ModelCapability::Asr,
                 )
-            })?;
-        let asr_asset_id = route_asset_id(
-            &route.asr,
-            asr_profile.default_asset(),
-            ModelCapability::Asr,
-        )?;
-        let translation_asset_id = route_asset_id(
-            &route.translation,
-            translation_profile.default_asset(),
-            ModelCapability::Translation,
-        )?;
-        let assets =
-            resolve_model_assets(config, project_root, [asr_asset_id, translation_asset_id]);
+            })
+            .transpose()?;
+        let translation_asset_id = route
+            .translation
+            .uses_local_runtime()
+            .then(|| {
+                route_asset_id(
+                    &route.translation,
+                    translation_profile.default_asset(),
+                    ModelCapability::Translation,
+                )
+            })
+            .transpose()?;
+        let assets = resolve_model_assets(
+            config,
+            project_root,
+            asr_asset_id.into_iter().chain(translation_asset_id),
+        );
         let translation_supports_prompt_context = route.translation.supports_prompt_context;
 
         Ok(Self {
@@ -118,10 +138,41 @@ impl NativeProviderPlan {
     }
 
     pub(crate) fn check_assets(&self) -> Result<(), String> {
+        if !self.uses_local_runtime() {
+            return Ok(());
+        }
         self.assets
             .check()
             .into_result()
             .map_err(|error| error.to_string())
+    }
+
+    pub(crate) fn uses_local_runtime(&self) -> bool {
+        self.route.uses_local_runtime()
+    }
+
+    pub(crate) fn asr_uses_local_runtime(&self) -> bool {
+        self.route.asr.uses_local_runtime()
+    }
+
+    pub(crate) fn translation_uses_local_runtime(&self) -> bool {
+        self.route.translation.uses_local_runtime()
+    }
+
+    pub(crate) fn asr_http_client(&self) -> Result<ReqwestClient, String> {
+        if self.asr_uses_local_runtime() {
+            ReqwestClient::with_default_direct_timeout().map_err(|error| error.to_string())
+        } else {
+            ReqwestClient::with_default_timeout().map_err(|error| error.to_string())
+        }
+    }
+
+    pub(crate) fn translation_http_client(&self) -> Result<ReqwestClient, String> {
+        if self.translation_uses_local_runtime() {
+            ReqwestClient::with_default_direct_timeout().map_err(|error| error.to_string())
+        } else {
+            ReqwestClient::with_default_timeout().map_err(|error| error.to_string())
+        }
     }
 
     pub(crate) fn llama_server_path(&self) -> &Path {
@@ -144,15 +195,17 @@ impl NativeProviderPlan {
         &self.route.translation.url
     }
 
-    pub(crate) fn asr_model_alias(&self) -> &'static str {
+    pub(crate) fn asr_model_alias(&self) -> &str {
         match self.asr_profile {
-            AsrProfile::Qwen3 => "qwen3-asr",
+            AsrProfile::Qwen3Local => "qwen3-asr",
+            AsrProfile::OpenAiAudio => &self.route.asr.model,
         }
     }
 
-    pub(crate) fn translation_model_alias(&self) -> &'static str {
+    pub(crate) fn translation_model_alias(&self) -> &str {
         match self.translation_profile {
-            TranslationProfile::Hunyuan => "hy-mt2",
+            TranslationProfile::HunyuanLocal => "hy-mt2",
+            TranslationProfile::OpenAiCompatible => &self.route.translation.model,
         }
     }
 
@@ -165,8 +218,23 @@ impl NativeProviderPlan {
         http: ReqwestClient,
     ) -> Result<NativeAsrAdapter, InferenceError> {
         match self.asr_profile {
-            AsrProfile::Qwen3 => Qwen3AsrAdapter::new(http, self.asr_url(), self.asr_model_alias())
-                .map(NativeAsrAdapter::Qwen3),
+            AsrProfile::Qwen3Local => {
+                Qwen3AsrAdapter::new(http, self.asr_url(), self.asr_model_alias())
+                    .map(NativeAsrAdapter::Qwen3)
+            }
+            AsrProfile::OpenAiAudio => {
+                let adapter = if let Some(token) = self.route.asr.api_key.as_deref() {
+                    Qwen3AsrAdapter::with_bearer_token(
+                        http,
+                        self.asr_url(),
+                        self.asr_model_alias(),
+                        token,
+                    )
+                } else {
+                    Qwen3AsrAdapter::new(http, self.asr_url(), self.asr_model_alias())
+                }?;
+                Ok(NativeAsrAdapter::Qwen3(adapter))
+            }
         }
     }
 
@@ -175,12 +243,30 @@ impl NativeProviderPlan {
         http: ReqwestClient,
     ) -> Result<TranslationAdapter<ReqwestClient>, InferenceError> {
         match self.translation_profile {
-            TranslationProfile::Hunyuan => TranslationAdapter::new(
+            TranslationProfile::HunyuanLocal => TranslationAdapter::new(
                 http,
                 self.translation_url(),
                 self.translation_model_alias(),
                 TranslationProvider::Hunyuan,
             ),
+            TranslationProfile::OpenAiCompatible => {
+                if let Some(token) = self.route.translation.api_key.as_deref() {
+                    TranslationAdapter::with_bearer_token(
+                        http,
+                        self.translation_url(),
+                        self.translation_model_alias(),
+                        TranslationProvider::OpenAiCompatible,
+                        token,
+                    )
+                } else {
+                    TranslationAdapter::new(
+                        http,
+                        self.translation_url(),
+                        self.translation_model_alias(),
+                        TranslationProvider::OpenAiCompatible,
+                    )
+                }
+            }
         }
     }
 
@@ -188,31 +274,34 @@ impl NativeProviderPlan {
         &self,
         asr_port: u16,
         translation_port: u16,
-    ) -> Result<[LlamaServerSpec; 2], String> {
+    ) -> Result<(Option<LlamaServerSpec>, Option<LlamaServerSpec>), String> {
         let bind = |port| LlamaServerEndpoint::new(IpAddr::V4(Ipv4Addr::LOCALHOST), port);
-        let asr_asset = self.assets.active_asset(ModelCapability::Asr);
-        let translation_asset = self.assets.active_asset(ModelCapability::Translation);
-
-        let mut asr = match self.asr_profile {
-            AsrProfile::Qwen3 => LlamaServerSpec::qwen3_asr_gguf(
+        let asr = if self.asr_uses_local_runtime() {
+            let asset = self.assets.active_asset(ModelCapability::Asr);
+            let mut spec = LlamaServerSpec::qwen3_asr_gguf(
                 self.llama_server_path(),
-                model_file(asr_asset, ModelFileRole::Weights)?,
-                model_file(asr_asset, ModelFileRole::MultimodalProjection)?,
-            ),
-        }
-        .with_endpoint(bind(asr_port));
-        apply_model_runtime(&mut asr, self.asr_runtime())?;
-
-        let mut translation = match self.translation_profile {
-            TranslationProfile::Hunyuan => LlamaServerSpec::hunyuan_mt_gguf(
+                model_file(asset, ModelFileRole::Weights)?,
+                model_file(asset, ModelFileRole::MultimodalProjection)?,
+            )
+            .with_endpoint(bind(asr_port));
+            apply_model_runtime(&mut spec, self.asr_runtime())?;
+            Some(spec)
+        } else {
+            None
+        };
+        let translation = if self.translation_uses_local_runtime() {
+            let asset = self.assets.active_asset(ModelCapability::Translation);
+            let mut spec = LlamaServerSpec::hunyuan_mt_gguf(
                 self.llama_server_path(),
-                model_file(translation_asset, ModelFileRole::Weights)?,
-            ),
-        }
-        .with_endpoint(bind(translation_port));
-        apply_model_runtime(&mut translation, self.translation_runtime())?;
-
-        Ok([asr, translation])
+                model_file(asset, ModelFileRole::Weights)?,
+            )
+            .with_endpoint(bind(translation_port));
+            apply_model_runtime(&mut spec, self.translation_runtime())?;
+            Some(spec)
+        } else {
+            None
+        };
+        Ok((asr, translation))
     }
 }
 
@@ -229,31 +318,39 @@ fn model_file(
 }
 
 impl AsrProfile {
-    fn registered(provider: &str) -> Option<Self> {
+    fn registered(provider: &str, transport: &str) -> Option<Self> {
+        if transport == "openai" {
+            return Some(Self::OpenAiAudio);
+        }
         match provider {
-            "qwen3-gguf" => Some(Self::Qwen3),
+            "qwen3-gguf" => Some(Self::Qwen3Local),
             _ => None,
         }
     }
 
     const fn default_asset(self) -> ModelAssetId {
         match self {
-            Self::Qwen3 => ModelAssetId::Qwen3AsrGguf,
+            Self::Qwen3Local => ModelAssetId::Qwen3AsrGguf,
+            Self::OpenAiAudio => ModelAssetId::Qwen3AsrGguf,
         }
     }
 }
 
 impl TranslationProfile {
-    fn registered(provider: &str) -> Option<Self> {
+    fn registered(provider: &str, transport: &str) -> Option<Self> {
+        if transport == "openai" {
+            return Some(Self::OpenAiCompatible);
+        }
         match provider {
-            "hunyuan" => Some(Self::Hunyuan),
+            "hunyuan" => Some(Self::HunyuanLocal),
             _ => None,
         }
     }
 
     const fn default_asset(self) -> ModelAssetId {
         match self {
-            Self::Hunyuan => ModelAssetId::HunyuanMtGguf,
+            Self::HunyuanLocal => ModelAssetId::HunyuanMtGguf,
+            Self::OpenAiCompatible => ModelAssetId::HunyuanMtGguf,
         }
     }
 }
@@ -340,9 +437,13 @@ mod tests {
 
         assert_eq!(
             plan.llama_server_path(),
-            Path::new("release-root/runtime/llama.cpp/llama-server")
+            Path::new("release-root")
+                .join("runtime/llama.cpp")
+                .join(format!("llama-server{}", std::env::consts::EXE_SUFFIX))
         );
-        let [asr, translation] = plan.managed_server_specs(8101, 8102).unwrap();
+        let (asr, translation) = plan.managed_server_specs(8101, 8102).unwrap();
+        let asr = asr.unwrap();
+        let translation = translation.unwrap();
 
         assert_eq!(asr.model_alias, "qwen3-asr");
         assert_eq!(translation.model_alias, "hy-mt2");
@@ -434,12 +535,35 @@ mod tests {
     }
 
     #[test]
+    fn remote_routes_skip_native_assets_and_use_configured_models() {
+        let mut document: serde_json::Value =
+            serde_json::from_str(include_str!("../../../config.json")).unwrap();
+        document["asr"]["provider"] = serde_json::Value::from("openai-custom");
+        document["translation"]["provider"] = serde_json::Value::from("openai-custom");
+        let asr_remote = document["asr"]["providers"]["openai"].clone();
+        let translation_remote = document["translation"]["providers"]["openai"].clone();
+        document["asr"]["providers"]["openai-custom"] = asr_remote;
+        document["translation"]["providers"]["openai-custom"] = translation_remote;
+        let config = AppConfig::from_value(document).unwrap();
+        let plan = NativeProviderPlan::resolve(&config, Path::new("release-root")).unwrap();
+
+        assert!(!plan.uses_local_runtime());
+        assert!(plan.check_assets().is_ok());
+        assert_eq!(plan.asr_model_alias(), "gpt-4o-audio-preview");
+        assert_eq!(plan.translation_model_alias(), "gpt-4o-mini");
+        assert!(plan.managed_server_specs(8101, 8102).unwrap().0.is_none());
+        assert!(plan.managed_server_specs(8101, 8102).unwrap().1.is_none());
+    }
+
+    #[test]
     fn every_catalog_provider_has_a_backend_runtime_profile() {
         for manifest in xrtranslate_assets::DEFAULT_GGUF_MANIFEST {
             let registered = match manifest.capability {
-                ModelCapability::Asr => AsrProfile::registered(manifest.provider).is_some(),
+                ModelCapability::Asr => {
+                    AsrProfile::registered(manifest.provider, "local").is_some()
+                }
                 ModelCapability::Translation => {
-                    TranslationProfile::registered(manifest.provider).is_some()
+                    TranslationProfile::registered(manifest.provider, "local").is_some()
                 }
             };
             assert!(

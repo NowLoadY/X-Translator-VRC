@@ -40,6 +40,24 @@ const DEVICE_OPTIONS: &[&str] = &["cuda", "cpu", "mps", "auto"];
 
 const PROVIDER_FIELDS: &[ProviderFieldDescriptor] = &[
     ProviderFieldDescriptor {
+        name: "transport",
+        label: "Transport",
+        help: Some(
+            "local uses the managed llama.cpp model; openai uses an OpenAI-compatible HTTP API.",
+        ),
+        editor: ProviderFieldEditor::Options(&["local", "openai"]),
+        visibility: ProviderFieldVisibility::Default,
+    },
+    ProviderFieldDescriptor {
+        name: "api_key",
+        label: "API key",
+        help: Some(
+            "Bearer credential for the selected remote API. Leave empty only when the endpoint does not require authentication.",
+        ),
+        editor: ProviderFieldEditor::Default,
+        visibility: ProviderFieldVisibility::Default,
+    },
+    ProviderFieldDescriptor {
         name: "context_window_tokens",
         label: "Context tokens per request",
         help: Some("Input and output context available to each parallel model request."),

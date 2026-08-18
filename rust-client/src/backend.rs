@@ -61,7 +61,7 @@ pub struct BackendManager {
 impl BackendManager {
     pub fn load() -> Self {
         let project_root = project_root();
-        let config = AppConfig::from_path(project_root.join("config.json")).ok();
+        let config = load_project_config(&project_root).ok();
         let configured_path = config
             .as_ref()
             .map(|config| config.model_manager.llama_server_path.clone())
@@ -176,10 +176,9 @@ impl BackendManager {
 
     fn write_llama_server_path(project_root: &std::path::Path, value: &str) -> Result<(), String> {
         let config_path = project_root.join("config.json");
-        let contents = std::fs::read_to_string(&config_path)
-            .map_err(|error| format!("Cannot read {}: {error}", config_path.display()))?;
-        let mut document: Value = serde_json::from_str(&contents)
-            .map_err(|error| format!("Invalid config.json: {error}"))?;
+        let mut document =
+            xrtranslate_config::load_user_config_document(&config_path, project_root)
+                .map_err(|error| format!("Cannot read {}: {error}", config_path.display()))?;
         let root = document
             .as_object_mut()
             .ok_or("config.json root must be an object")?;
@@ -192,10 +191,7 @@ impl BackendManager {
             "llama_server_path".into(),
             Value::String(value.trim().into()),
         );
-        let formatted = serde_json::to_string_pretty(&document)
-            .map_err(|error| format!("Cannot serialize config.json: {error}"))?;
-        std::fs::write(&config_path, format!("{formatted}\n"))
-            .map_err(|error| format!("Cannot save {}: {error}", config_path.display()))
+        xrtranslate_config::save_user_config_document(&config_path, project_root, &document)
     }
 
     pub fn prepare(&mut self, server_url: &str) -> Result<BackendStart, String> {
@@ -324,7 +320,7 @@ impl BackendManager {
     /// manifest without invoking an external downloader.
     pub fn check_model_files(&self, category: &str, provider: &str) -> Result<String, String> {
         let config_path = self.project_root.join("config.json");
-        let config = AppConfig::from_path(&config_path)
+        let config = AppConfig::from_path_with_user_config(&config_path, &self.project_root)
             .map_err(|error| format!("Cannot read {}: {error}", config_path.display()))?;
         let capability = match category {
             "asr" => ModelCapability::Asr,
@@ -381,14 +377,25 @@ impl BackendManager {
         // Revalidate and persist immediately before the backend reads
         // config.json. This also retries a recovery write that may have failed
         // transiently during application startup.
-        self.save_llama_server_path()?;
+        let config = load_project_config(&self.project_root)
+            .map_err(|error| format!("Cannot read native route: {error}"))?;
+        let use_local_runtime = config
+            .native_model_route()
+            .map_err(|error| error.to_string())?
+            .uses_local_runtime();
+        if use_local_runtime {
+            self.save_llama_server_path()?;
+        }
         let (mut command, capture_output) = self.native_backend_command_with_log()?;
-        let mut child = command
+        command
             .arg("--config")
             .arg(self.project_root.join("config.json"))
             .arg("--corpus-url")
-            .arg(CORPUS_SERVER_URL)
-            .arg("--manage-llama-servers")
+            .arg(CORPUS_SERVER_URL);
+        if use_local_runtime {
+            command.arg("--manage-llama-servers");
+        }
+        let mut child = command
             .spawn()
             .map_err(|error| format!("Cannot start backend: {error}"))?;
         let log_capture = capture_output.then(|| {
@@ -789,6 +796,12 @@ fn project_root() -> PathBuf {
     PathBuf::from(".")
 }
 
+fn load_project_config(project_root: &std::path::Path) -> Result<AppConfig, String> {
+    let path = project_root.join("config.json");
+    AppConfig::from_path_with_user_config(&path, project_root)
+        .map_err(|error| format!("Cannot read {}: {error}", path.display()))
+}
+
 fn absolute_from_project_root(project_root: &std::path::Path, path: PathBuf) -> PathBuf {
     let candidate = RuntimeLayout::for_project_root(project_root).resolve_configured_path(path);
     std::path::absolute(&candidate).unwrap_or(candidate)
@@ -1043,9 +1056,8 @@ mod tests {
         std::fs::write(root.join("config.json"), b"{\"model_manager\":{}}").unwrap();
 
         let persisted = BackendManager::persist_llama_server_path(&root, &server).unwrap();
-        let config: Value =
-            serde_json::from_str(&std::fs::read_to_string(root.join("config.json")).unwrap())
-                .unwrap();
+        let config =
+            xrtranslate_config::load_user_config_document(root.join("config.json"), &root).unwrap();
 
         assert!(persisted.is_absolute());
         assert_eq!(
@@ -1055,6 +1067,10 @@ mod tests {
                 std::env::consts::EXE_SUFFIX
             )
         );
+        let base: Value =
+            serde_json::from_str(&std::fs::read_to_string(root.join("config.json")).unwrap())
+                .unwrap();
+        assert!(base["model_manager"]["llama_server_path"].is_null());
         std::fs::remove_dir_all(root).unwrap();
     }
 
