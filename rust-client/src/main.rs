@@ -226,6 +226,8 @@ impl Default for XRTranslateApp {
         let loopback_devices = audio_system.available_loopback_devices();
         let (event_tx, event_rx) = unbounded();
         let backend_manager = backend::BackendManager::load();
+        let managed_runtime_missing = !backend_manager.llama_server_path_is_valid()
+            && backend_manager.uses_managed_llama_server_path();
         let mut settings = ClientSettings::load(&backend_manager.project_root());
         settings.sanitize_devices(&devices, &loopback_devices);
 
@@ -705,8 +707,14 @@ impl Default for XRTranslateApp {
             backend_start_deadline: None,
             settings_section: ui::pages::settings::SettingsSection::default(),
             modal_dialog: ui::modal::ModalDialog::default(),
-            first_run: settings.first_run,
-            onboarding_page: 0,
+            first_run: settings.first_run || managed_runtime_missing,
+            onboarding_page: if settings.first_run {
+                0
+            } else if managed_runtime_missing {
+                1
+            } else {
+                0
+            },
             ui_language: settings.ui_language,
             navigation: NavigationState {
                 collapsed: settings.sidebar_collapsed,
@@ -2434,20 +2442,15 @@ impl eframe::App for XRTranslateApp {
 fn configure_dll_search_paths() {
     use windows::Win32::System::LibraryLoader::SetDllDirectoryW;
     use windows::core::HSTRING;
-    if let Ok(exe_path) = std::env::current_exe()
-        && let Some(exe_dir) = exe_path.parent()
-    {
-        let res_bin = exe_dir.join("resources").join("bin");
-        if res_bin.is_dir() {
-            let _ = unsafe { SetDllDirectoryW(&HSTRING::from(res_bin.as_os_str())) };
+    for bin_dir in crate::plugins::player::runtime_bin_directories() {
+        if bin_dir.is_dir() {
+            if let Ok(abs) = bin_dir.canonicalize() {
+                let _ = unsafe { SetDllDirectoryW(&HSTRING::from(abs.as_os_str())) };
+            } else {
+                let _ = unsafe { SetDllDirectoryW(&HSTRING::from(bin_dir.as_os_str())) };
+            }
             return;
         }
-    }
-    let local_res_bin = std::path::Path::new("rust-client/resources/bin");
-    if local_res_bin.is_dir()
-        && let Ok(abs) = local_res_bin.canonicalize()
-    {
-        let _ = unsafe { SetDllDirectoryW(&HSTRING::from(abs.as_os_str())) };
     }
 }
 

@@ -72,7 +72,7 @@ if (Test-Path -LiteralPath $resourceBinDir) {
     }
 }
 
-$runArguments = @('run', '--manifest-path', $manifestPath)
+$runArguments = @('run', '--manifest-path', $manifestPath, '--features', 'mpv')
 if ($Release) {
     $runArguments += '--release'
 }

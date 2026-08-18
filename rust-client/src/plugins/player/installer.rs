@@ -4,11 +4,7 @@
 //! `mpv-2.dll` and `libmpv-2.dll` into `resources/bin/`.
 
 use crossbeam_channel::{Receiver, TryRecvError, unbounded};
-use std::{
-    fs, io,
-    path::{Path, PathBuf},
-    thread,
-};
+use std::{fs, io, path::Path, thread};
 use xrtranslate_download::{DownloadClient, DownloadProgress, DownloadSpec};
 
 pub const MPV_DOWNLOAD_URL: &str =
@@ -137,18 +133,6 @@ impl MpvInstaller {
     }
 }
 
-fn target_bin_directories() -> Vec<PathBuf> {
-    let mut dirs = Vec::new();
-    if let Ok(exe_path) = std::env::current_exe() {
-        if let Some(parent) = exe_path.parent() {
-            dirs.push(parent.join("resources").join("bin"));
-        }
-    }
-    dirs.push(PathBuf::from("resources").join("bin"));
-    dirs.push(PathBuf::from("rust-client").join("resources").join("bin"));
-    dirs
-}
-
 async fn download_and_install_mpv(
     sender: crossbeam_channel::Sender<Event>,
     proxy_url: Option<&str>,
@@ -186,7 +170,7 @@ async fn download_and_install_mpv(
     let _ = sender.send(Event::Extracting);
 
     // Extract to target bin directories
-    for bin_dir in target_bin_directories() {
+    for bin_dir in super::runtime_bin_directories() {
         let _ = fs::create_dir_all(&bin_dir);
         if bin_dir.is_dir() {
             extract_mpv_zip(&complete_path, &bin_dir)?;
@@ -200,9 +184,10 @@ async fn download_and_install_mpv(
     {
         use windows::Win32::System::LibraryLoader::SetDllDirectoryW;
         use windows::core::HSTRING;
-        for bin_dir in target_bin_directories() {
+        for bin_dir in super::runtime_bin_directories() {
             if bin_dir.is_dir() {
                 let _ = unsafe { SetDllDirectoryW(&HSTRING::from(bin_dir.as_os_str())) };
+                break;
             }
         }
     }

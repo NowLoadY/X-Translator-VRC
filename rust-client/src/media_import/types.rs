@@ -45,6 +45,7 @@ pub struct AudioFileInfo {
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum AudioImportStage {
+    #[allow(dead_code)]
     Extracting,
     Recognizing,
 }

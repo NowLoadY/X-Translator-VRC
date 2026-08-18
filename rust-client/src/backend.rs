@@ -97,8 +97,13 @@ impl BackendManager {
         };
         if manager.llama_server_path != configured_path
             && !manager.llama_server_path.trim().is_empty()
-            && let Err(error) =
-                Self::write_llama_server_path(&manager.project_root, &manager.llama_server_path)
+            && let Err(error) = Self::write_llama_server_path(
+                &manager.project_root,
+                &config_path_value(
+                    &RuntimeLayout::for_project_root(&manager.project_root)
+                        .config_path_for(std::path::Path::new(&manager.llama_server_path)),
+                ),
+            )
         {
             log::warn!("Cannot persist recovered llama-server path: {error}");
         }
@@ -111,7 +116,16 @@ impl BackendManager {
 
     pub fn llama_server_path_is_valid(&self) -> bool {
         let value = self.llama_server_path.trim();
-        !value.is_empty() && absolute_from_project_root(&self.project_root, value.into()).is_file()
+        !value.is_empty() && configured_llama_server_path(&self.project_root, value).is_file()
+    }
+
+    pub fn uses_managed_llama_server_path(&self) -> bool {
+        let value = self.llama_server_path.trim();
+        !value.is_empty()
+            && is_managed_llama_server_path(
+                &self.project_root,
+                &configured_llama_server_path(&self.project_root, value),
+            )
     }
 
     /// Stores the local llama.cpp executable where the Rust backend already
@@ -121,7 +135,7 @@ impl BackendManager {
         if requested.is_empty() {
             return Err("llama-server path is empty".into());
         }
-        let path = absolute_from_project_root(&self.project_root, PathBuf::from(requested));
+        let path = configured_llama_server_path(&self.project_root, requested);
         let persisted = Self::persist_llama_server_path(&self.project_root, &path)?;
         self.llama_server_path = persisted.display().to_string();
         Ok(())
@@ -142,15 +156,20 @@ impl BackendManager {
     ) -> Result<PathBuf, String> {
         let path = absolute_from_project_root(project_root, path.into());
         if !path.is_file() {
+            if is_managed_llama_server_path(project_root, &path) {
+                return Err(format!(
+                    "llama.cpp runtime is not installed. Open the Welcome Page and download the recommended runtime first. Expected executable: {}",
+                    path.display()
+                ));
+            }
             return Err(format!(
                 "llama-server executable does not exist: {}",
                 path.display()
             ));
         }
-        let value = RuntimeLayout::for_project_root(project_root)
-            .config_path_for(&path)
-            .display()
-            .to_string();
+        let value = config_path_value(
+            &RuntimeLayout::for_project_root(project_root).config_path_for(&path),
+        );
         Self::write_llama_server_path(project_root, &value)?;
         Ok(path)
     }
@@ -775,11 +794,27 @@ fn absolute_from_project_root(project_root: &std::path::Path, path: PathBuf) -> 
     std::path::absolute(&candidate).unwrap_or(candidate)
 }
 
+fn config_path_value(path: &std::path::Path) -> String {
+    let value = path.display().to_string();
+    if path.is_relative() {
+        value.replace('\\', "/")
+    } else {
+        value
+    }
+}
+
 fn preferred_llama_server_path(project_root: &std::path::Path, configured: &str) -> String {
     let configured = configured.trim();
     if !configured.is_empty() {
-        let candidate = absolute_from_project_root(project_root, configured.into());
+        let candidate = configured_llama_server_path(project_root, configured);
         if candidate.is_file() {
+            return candidate.display().to_string();
+        }
+
+        // Keep the normalized managed path visible to the installer and the
+        // error UI when the runtime has not been downloaded yet. External
+        // stale paths retain their original value for manual repair.
+        if is_managed_llama_server_path(project_root, &candidate) {
             return candidate.display().to_string();
         }
     }
@@ -792,6 +827,34 @@ fn preferred_llama_server_path(project_root: &std::path::Path, configured: &str)
     } else {
         configured.to_owned()
     }
+}
+
+fn configured_llama_server_path(project_root: &std::path::Path, configured: &str) -> PathBuf {
+    let layout = RuntimeLayout::for_project_root(project_root);
+    let configured_path = PathBuf::from(configured);
+    let mut candidate = layout.resolve_configured_path(&configured_path);
+
+    // The shared config keeps the managed executable extensionless so the
+    // same default works on Unix. Windows archives contain llama-server.exe.
+    if cfg!(windows)
+        && configured_path.is_relative()
+        && candidate == layout.managed_llama_server("llama-server")
+    {
+        candidate.set_extension("exe");
+    }
+
+    std::path::absolute(&candidate).unwrap_or(candidate)
+}
+
+fn is_managed_llama_server_path(project_root: &std::path::Path, path: &std::path::Path) -> bool {
+    let layout = RuntimeLayout::for_project_root(project_root);
+    let is_supported_name = path.file_stem().is_some_and(|name| name == "llama-server")
+        && match path.extension().and_then(|extension| extension.to_str()) {
+            None => true,
+            Some("exe") => cfg!(windows),
+            Some(_) => false,
+        };
+    path.parent() == Some(layout.llama_cpp_directory().as_path()) && is_supported_name
 }
 
 fn is_local_server(server_url: &str) -> bool {
@@ -941,6 +1004,16 @@ mod tests {
             std::env::consts::EXE_SUFFIX
         );
         let selected = preferred_llama_server_path(&root, &configured);
+        assert_eq!(PathBuf::from(selected), server);
+        std::fs::remove_dir_all(root).unwrap();
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn extensionless_managed_runtime_is_resolved_to_windows_executable() {
+        let root = temp_root("extensionless-windows");
+        let server = create_server(&root);
+        let selected = preferred_llama_server_path(&root, "runtime/llama.cpp/llama-server");
         assert_eq!(PathBuf::from(selected), server);
         std::fs::remove_dir_all(root).unwrap();
     }

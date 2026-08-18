@@ -264,13 +264,6 @@ impl VideoPlayerController {
             })
     }
 
-    pub fn is_task_running(&self) -> bool {
-        self.active_task_id
-            .as_deref()
-            .and_then(|id| self.store.get(id))
-            .map_or(false, |task| task.is_task_running)
-    }
-
     pub fn start_task(&mut self) {
         if let Some(task_id) = &self.active_task_id {
             if let Some(task) = self.store.get_mut(task_id) {
@@ -498,45 +491,6 @@ impl VideoPlayerController {
             .map(|b| b.get_diagnostics())
             .unwrap_or_default()
     }
-
-    pub fn ingest_live_caption(
-        &mut self,
-        id: String,
-        start_ms: i64,
-        end_ms: i64,
-        speaker: Option<String>,
-        orig: String,
-        trans: Option<String>,
-        metadata: SubtitleMetadata,
-    ) {
-        if !self.is_task_running() {
-            return;
-        }
-
-        let changed = self.subtitles.add_cue_with_metadata(
-            SubtitleCue {
-                id,
-                start_ms,
-                end_ms,
-                speaker_name: speaker,
-                original_text: orig,
-                translated_text: trans,
-            },
-            metadata,
-        );
-
-        if changed {
-            if let Some(task_id) = &self.active_task_id {
-                if let Some(task) = self.store.get_mut(task_id) {
-                    task.subtitles = self.subtitles.clone();
-                }
-                if self.last_save_instant.elapsed() >= std::time::Duration::from_secs(3) {
-                    let _ = self.store.save_to_dir(&self.storage_dir);
-                    self.last_save_instant = std::time::Instant::now();
-                }
-            }
-        }
-    }
 }
 
 fn parse_srt_to_timeline(srt_content: &str) -> SubtitleTimeline {
@@ -616,11 +570,11 @@ mod tests {
     use super::*;
 
     #[test]
-    fn controller_interplugin_export_and_ingest() {
+    fn controller_keeps_translation_cues_in_its_timeline() {
         let mut controller = VideoPlayerController::default();
         assert_eq!(controller.volume, 1.0);
 
-        let mut task = VideoTask::new(
+        let task = VideoTask::new(
             "Test Video".into(),
             MediaSource::NetworkStream("http://test.com".into()),
             "en".into(),
@@ -628,18 +582,19 @@ mod tests {
             VideoSubtitleMode::RealtimeTranslation,
             crate::client_settings::RecognitionSettings::default(),
         );
-        task.is_task_running = true;
         let task_id = task.id.clone();
         controller.store.add_or_update(task);
         controller.active_task_id = Some(task_id);
 
-        controller.ingest_live_caption(
-            "test_1".into(),
-            500,
-            2500,
-            Some("Speaker".into()),
-            "Hello".into(),
-            Some("你好".into()),
+        controller.subtitles.add_cue_with_metadata(
+            SubtitleCue {
+                id: "test_1".into(),
+                start_ms: 500,
+                end_ms: 2500,
+                speaker_name: Some("Speaker".into()),
+                original_text: "Hello".into(),
+                translated_text: Some("你好".into()),
+            },
             SubtitleMetadata::default(),
         );
         assert_eq!(controller.subtitles.cues().len(), 1);

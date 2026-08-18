@@ -12,8 +12,6 @@ mod types;
 
 pub use api::{AudioImportHandle, import_audio_file};
 #[allow(unused_imports)]
-pub(crate) use mpv_extract::build_recognition_pan_filter;
-#[allow(unused_imports)]
 pub use types::{
     AudioFileInfo, AudioImportError, AudioImportEvent, AudioImportOptions, AudioImportOutcome,
     AudioImportPacing, AudioImportProgress, AudioImportStage, IMPORT_SAMPLE_RATE,

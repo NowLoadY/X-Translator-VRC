@@ -6,12 +6,7 @@
 
 #![forbid(unsafe_code)]
 
-use std::{
-    error::Error,
-    f32::consts::PI,
-    fmt,
-    path::Path,
-};
+use std::{error::Error, f32::consts::PI, fmt, path::Path};
 
 use ndarray::{Array4, Array5};
 use ort::{session::Session, value::Value};
@@ -35,9 +30,15 @@ pub enum DenoiseError {
 impl fmt::Display for DenoiseError {
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
-            Self::Ort(error) => write!(formatter, "ONNX Runtime denoiser inference failed: {error}"),
-            Self::InvalidModelOutput(msg) => write!(formatter, "GTCRN model output is invalid: {msg}"),
-            Self::NonFiniteSample => formatter.write_str("audio stream contains non-finite samples"),
+            Self::Ort(error) => {
+                write!(formatter, "ONNX Runtime denoiser inference failed: {error}")
+            }
+            Self::InvalidModelOutput(msg) => {
+                write!(formatter, "GTCRN model output is invalid: {msg}")
+            }
+            Self::NonFiniteSample => {
+                formatter.write_str("audio stream contains non-finite samples")
+            }
         }
     }
 }
@@ -195,7 +196,8 @@ impl CausalStftStream {
 
     /// Appends audio samples into the input buffer.
     pub fn push_samples(&mut self, samples: &[i16]) {
-        self.in_buffer.extend(samples.iter().map(|&s| s as f32 / 32768.0));
+        self.in_buffer
+            .extend(samples.iter().map(|&s| s as f32 / 32768.0));
     }
 
     /// Checks if a complete 512-sample frame is ready for analysis.
@@ -220,7 +222,10 @@ impl CausalStftStream {
     }
 
     /// Consumes the enhanced complex bins, performs iSTFT, overlap-add, and yields 256 output samples.
-    pub fn synthesize_and_advance(&mut self, enhanced_bins: &[Complex; FFT_BINS]) -> [i16; HOP_SIZE] {
+    pub fn synthesize_and_advance(
+        &mut self,
+        enhanced_bins: &[Complex; FFT_BINS],
+    ) -> [i16; HOP_SIZE] {
         let mut full_fft = [Complex::default(); FFT_SIZE];
         full_fft[0] = Complex {
             re: enhanced_bins[0].re,
@@ -341,14 +346,18 @@ impl GtcrnDenoiser {
                 .get("enh")
                 .or_else(|| outputs.get("output"))
                 .or_else(|| outputs.get("enhanced"))
-                .ok_or(DenoiseError::InvalidModelOutput("missing 'enh' output tensor"))?;
+                .ok_or(DenoiseError::InvalidModelOutput(
+                    "missing 'enh' output tensor",
+                ))?;
 
-            let (_, enh_values) = enh_out
-                .try_extract_tensor::<f32>()
-                .map_err(|_| DenoiseError::InvalidModelOutput("invalid float output in enh tensor"))?;
+            let (_, enh_values) = enh_out.try_extract_tensor::<f32>().map_err(|_| {
+                DenoiseError::InvalidModelOutput("invalid float output in enh tensor")
+            })?;
 
             if enh_values.len() < FFT_BINS * 2 {
-                return Err(DenoiseError::InvalidModelOutput("enh tensor length too short"));
+                return Err(DenoiseError::InvalidModelOutput(
+                    "enh tensor length too short",
+                ));
             }
 
             let mut enhanced_bins = [Complex::default(); FFT_BINS];
@@ -360,7 +369,10 @@ impl GtcrnDenoiser {
             }
 
             // Update caches if returned
-            if let Some(conv_out) = outputs.get("conv_cache_out").or_else(|| outputs.get("conv_cache")) {
+            if let Some(conv_out) = outputs
+                .get("conv_cache_out")
+                .or_else(|| outputs.get("conv_cache"))
+            {
                 if let Ok((shape, data)) = conv_out.try_extract_tensor::<f32>() {
                     if shape.as_ref() == CONV_CACHE_SHAPE.map(|d| d as i64).as_slice() {
                         self.conv_cache = Array5::from_shape_vec(CONV_CACHE_SHAPE, data.to_vec())
@@ -368,7 +380,10 @@ impl GtcrnDenoiser {
                     }
                 }
             }
-            if let Some(tra_out) = outputs.get("tra_cache_out").or_else(|| outputs.get("tra_cache")) {
+            if let Some(tra_out) = outputs
+                .get("tra_cache_out")
+                .or_else(|| outputs.get("tra_cache"))
+            {
                 if let Ok((shape, data)) = tra_out.try_extract_tensor::<f32>() {
                     if shape.as_ref() == TRA_CACHE_SHAPE.map(|d| d as i64).as_slice() {
                         self.tra_cache = Array5::from_shape_vec(TRA_CACHE_SHAPE, data.to_vec())
@@ -376,7 +391,10 @@ impl GtcrnDenoiser {
                     }
                 }
             }
-            if let Some(inter_out) = outputs.get("inter_cache_out").or_else(|| outputs.get("inter_cache")) {
+            if let Some(inter_out) = outputs
+                .get("inter_cache_out")
+                .or_else(|| outputs.get("inter_cache"))
+            {
                 if let Ok((shape, data)) = inter_out.try_extract_tensor::<f32>() {
                     if shape.as_ref() == INTER_CACHE_SHAPE.map(|d| d as i64).as_slice() {
                         self.inter_cache = Array4::from_shape_vec(INTER_CACHE_SHAPE, data.to_vec())
@@ -422,7 +440,8 @@ mod tests {
         let mut original = Vec::with_capacity(total_samples);
         for i in 0..total_samples {
             let t = i as f32 / 16000.0;
-            let sample_f32 = 0.5 * (2.0 * PI * 440.0 * t).sin() + 0.3 * (2.0 * PI * 1000.0 * t).sin();
+            let sample_f32 =
+                0.5 * (2.0 * PI * 440.0 * t).sin() + 0.3 * (2.0 * PI * 1000.0 * t).sin();
             original.push((sample_f32 * 32767.0) as i16);
         }
 
@@ -498,11 +517,15 @@ mod tests {
     fn gtcrn_model_inference_denoises_noisy_signal() {
         let model_path = Path::new("../../models/gtcrn/gtcrn_simple.onnx");
         if !model_path.is_file() {
-            eprintln!("Skipping model inference test: model file not present at {}", model_path.display());
+            eprintln!(
+                "Skipping model inference test: model file not present at {}",
+                model_path.display()
+            );
             return;
         }
 
-        let mut denoiser = GtcrnDenoiser::from_file(model_path, 1).expect("failed to load GTCRN model");
+        let mut denoiser =
+            GtcrnDenoiser::from_file(model_path, 1).expect("failed to load GTCRN model");
 
         // Generate synthetic noisy speech (sine wave + random noise)
         let sample_rate = 16000.0;
@@ -525,7 +548,9 @@ mod tests {
         for s in &noisy {
             bytes.extend_from_slice(&s.to_le_bytes());
         }
-        let denoised_bytes = denoiser.process_pcm16le(&bytes).expect("denoising pcm bytes failed");
+        let denoised_bytes = denoiser
+            .process_pcm16le(&bytes)
+            .expect("denoising pcm bytes failed");
         assert_eq!(denoised_bytes.len() % (HOP_SIZE * 2), 0);
     }
 }

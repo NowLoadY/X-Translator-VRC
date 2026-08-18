@@ -111,9 +111,8 @@ impl fmt::Display for VadError {
             Self::InvalidMinSpeechFrames => {
                 formatter.write_str("min_speech_frames_to_start must be at least one")
             }
-            Self::InvalidOpeningWindowFrames => {
-                formatter.write_str("opening_window_frames must be at least min_speech_frames_to_start")
-            }
+            Self::InvalidOpeningWindowFrames => formatter
+                .write_str("opening_window_frames must be at least min_speech_frames_to_start"),
             Self::InvalidMaxActiveFrames => {
                 formatter.write_str("max_active_frames must be at least one")
             }
@@ -624,8 +623,7 @@ impl EndpointDetector {
                 return Ok(EndpointEvent::Listening);
             }
             self.opening_buffer.clear();
-            let mut utterance =
-                Vec::with_capacity((overlap_frames + 1) * FRAME_SAMPLES);
+            let mut utterance = Vec::with_capacity((overlap_frames + 1) * FRAME_SAMPLES);
             for overlap_frame in self.hard_split_overlap.drain(..) {
                 utterance.extend_from_slice(&overlap_frame);
             }
@@ -842,15 +840,33 @@ mod tests {
         .unwrap();
 
         // Silence
-        assert_eq!(detector.push(&frame(1), 0.1).unwrap(), EndpointEvent::Listening);
+        assert_eq!(
+            detector.push(&frame(1), 0.1).unwrap(),
+            EndpointEvent::Listening
+        );
         // Isolated speech frames (2 frames of speech + 2 silences, not reaching 3 of 4)
-        assert_eq!(detector.push(&frame(2), 0.9).unwrap(), EndpointEvent::Listening);
-        assert_eq!(detector.push(&frame(3), 0.9).unwrap(), EndpointEvent::Listening);
-        assert_eq!(detector.push(&frame(4), 0.1).unwrap(), EndpointEvent::Listening);
-        assert_eq!(detector.push(&frame(5), 0.1).unwrap(), EndpointEvent::Listening);
+        assert_eq!(
+            detector.push(&frame(2), 0.9).unwrap(),
+            EndpointEvent::Listening
+        );
+        assert_eq!(
+            detector.push(&frame(3), 0.9).unwrap(),
+            EndpointEvent::Listening
+        );
+        assert_eq!(
+            detector.push(&frame(4), 0.1).unwrap(),
+            EndpointEvent::Listening
+        );
+        assert_eq!(
+            detector.push(&frame(5), 0.1).unwrap(),
+            EndpointEvent::Listening
+        );
         assert_eq!(detector.state(), EndpointState::Listening);
         // Next frame is silence again -> debounce resets
-        assert_eq!(detector.push(&frame(6), 0.1).unwrap(), EndpointEvent::Listening);
+        assert_eq!(
+            detector.push(&frame(6), 0.1).unwrap(),
+            EndpointEvent::Listening
+        );
         assert_eq!(detector.state(), EndpointState::Listening);
         // No utterance was started, so flush returns None
         assert_eq!(detector.flush(), None);
@@ -870,16 +886,39 @@ mod tests {
         .unwrap();
 
         // 2 frames of pre-roll silence
-        assert_eq!(detector.push(&frame(10), 0.1).unwrap(), EndpointEvent::Listening);
-        assert_eq!(detector.push(&frame(20), 0.1).unwrap(), EndpointEvent::Listening);
+        assert_eq!(
+            detector.push(&frame(10), 0.1).unwrap(),
+            EndpointEvent::Listening
+        );
+        assert_eq!(
+            detector.push(&frame(20), 0.1).unwrap(),
+            EndpointEvent::Listening
+        );
         // Frames with 3 speech frames and 1 dipped frame: [speech, speech, silence, speech]
-        assert_eq!(detector.push(&frame(30), 0.9).unwrap(), EndpointEvent::Listening);
-        assert_eq!(detector.push(&frame(40), 0.9).unwrap(), EndpointEvent::Listening);
-        assert_eq!(detector.push(&frame(50), 0.1).unwrap(), EndpointEvent::Listening); // dipped below threshold
+        assert_eq!(
+            detector.push(&frame(30), 0.9).unwrap(),
+            EndpointEvent::Listening
+        );
+        assert_eq!(
+            detector.push(&frame(40), 0.9).unwrap(),
+            EndpointEvent::Listening
+        );
+        assert_eq!(
+            detector.push(&frame(50), 0.1).unwrap(),
+            EndpointEvent::Listening
+        ); // dipped below threshold
         assert_eq!(detector.state(), EndpointState::Listening);
         // 4th frame reaches 3 speech frames in the 4-frame window -> confirmed start!
-        assert_eq!(detector.push(&frame(60), 0.9).unwrap(), EndpointEvent::SpeechStarted);
-        assert_eq!(detector.state(), EndpointState::Speaking { trailing_silence_frames: 0 });
+        assert_eq!(
+            detector.push(&frame(60), 0.9).unwrap(),
+            EndpointEvent::SpeechStarted
+        );
+        assert_eq!(
+            detector.state(),
+            EndpointState::Speaking {
+                trailing_silence_frames: 0
+            }
+        );
 
         let utterance = detector.flush().unwrap();
         // Utterance contains: [10 (silence), 20 (silence), 30 (speech 1), 40 (speech 2), 50 (dipped), 60 (speech 3)]
@@ -907,13 +946,33 @@ mod tests {
         .unwrap();
 
         // 2 frames of pre-roll silence
-        assert_eq!(detector.push(&frame(10), 0.1).unwrap(), EndpointEvent::Listening);
-        assert_eq!(detector.push(&frame(20), 0.1).unwrap(), EndpointEvent::Listening);
+        assert_eq!(
+            detector.push(&frame(10), 0.1).unwrap(),
+            EndpointEvent::Listening
+        );
+        assert_eq!(
+            detector.push(&frame(20), 0.1).unwrap(),
+            EndpointEvent::Listening
+        );
         // 3 consecutive speech frames
-        assert_eq!(detector.push(&frame(30), 0.9).unwrap(), EndpointEvent::Listening);
-        assert_eq!(detector.push(&frame(40), 0.9).unwrap(), EndpointEvent::Listening);
-        assert_eq!(detector.push(&frame(50), 0.9).unwrap(), EndpointEvent::SpeechStarted);
-        assert_eq!(detector.state(), EndpointState::Speaking { trailing_silence_frames: 0 });
+        assert_eq!(
+            detector.push(&frame(30), 0.9).unwrap(),
+            EndpointEvent::Listening
+        );
+        assert_eq!(
+            detector.push(&frame(40), 0.9).unwrap(),
+            EndpointEvent::Listening
+        );
+        assert_eq!(
+            detector.push(&frame(50), 0.9).unwrap(),
+            EndpointEvent::SpeechStarted
+        );
+        assert_eq!(
+            detector.state(),
+            EndpointState::Speaking {
+                trailing_silence_frames: 0
+            }
+        );
 
         let utterance = detector.flush().unwrap();
         assert_eq!(utterance.frame_count(), 5);

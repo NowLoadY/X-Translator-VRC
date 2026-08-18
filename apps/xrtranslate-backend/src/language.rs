@@ -69,7 +69,8 @@ impl SupportedLanguage {
                     || code.eq_ignore_ascii_case("zh-mo")
                 {
                     LANGUAGES.iter().find(|l| l.code == "zh-TW").map(Self)
-                } else if code.eq_ignore_ascii_case("zh-hans") || code.eq_ignore_ascii_case("zh-cn") {
+                } else if code.eq_ignore_ascii_case("zh-hans") || code.eq_ignore_ascii_case("zh-cn")
+                {
                     LANGUAGES.iter().find(|l| l.code == "zh").map(Self)
                 } else {
                     None
@@ -410,9 +411,9 @@ fn has_substantial_language_evidence(language: SupportedLanguage, text: &str) ->
             }
             if words.len() == 1 {
                 let word = words[0];
-                let is_all_upper_or_digit = word
-                    .chars()
-                    .all(|c| c.is_ascii_uppercase() || c.is_ascii_digit() || !c.is_ascii_alphanumeric());
+                let is_all_upper_or_digit = word.chars().all(|c| {
+                    c.is_ascii_uppercase() || c.is_ascii_digit() || !c.is_ascii_alphanumeric()
+                });
                 if is_all_upper_or_digit && word.len() <= 3 {
                     return false;
                 }
@@ -420,26 +421,26 @@ fn has_substantial_language_evidence(language: SupportedLanguage, text: &str) ->
             true
         }
         Script::Han => {
-            let has_han = trimmed.chars().any(|c| ('\u{3400}'..='\u{9fff}').contains(&c));
-            let has_kana = trimmed.chars().any(|c| ('\u{3040}'..='\u{31ff}').contains(&c));
+            let has_han = trimmed
+                .chars()
+                .any(|c| ('\u{3400}'..='\u{9fff}').contains(&c));
+            let has_kana = trimmed
+                .chars()
+                .any(|c| ('\u{3040}'..='\u{31ff}').contains(&c));
             has_han && !has_kana
         }
-        Script::Japanese => {
-            trimmed
-                .chars()
-                .any(|c| ('\u{3040}'..='\u{31ff}').contains(&c) || ('\u{3400}'..='\u{9fff}').contains(&c))
-        }
-        Script::Hangul => {
-            trimmed
-                .chars()
-                .any(|c| ('\u{1100}'..='\u{11ff}').contains(&c) || ('\u{ac00}'..='\u{d7af}').contains(&c))
-        }
-        Script::Cyrillic => {
-            trimmed.chars().any(|c| ('\u{0400}'..='\u{04ff}').contains(&c))
-        }
-        Script::Thai => {
-            trimmed.chars().any(|c| ('\u{0e00}'..='\u{0e7f}').contains(&c))
-        }
+        Script::Japanese => trimmed.chars().any(|c| {
+            ('\u{3040}'..='\u{31ff}').contains(&c) || ('\u{3400}'..='\u{9fff}').contains(&c)
+        }),
+        Script::Hangul => trimmed.chars().any(|c| {
+            ('\u{1100}'..='\u{11ff}').contains(&c) || ('\u{ac00}'..='\u{d7af}').contains(&c)
+        }),
+        Script::Cyrillic => trimmed
+            .chars()
+            .any(|c| ('\u{0400}'..='\u{04ff}').contains(&c)),
+        Script::Thai => trimmed
+            .chars()
+            .any(|c| ('\u{0e00}'..='\u{0e7f}').contains(&c)),
     }
 }
 
@@ -504,10 +505,7 @@ mod tests {
         assert!(!is_traditional_chinese("zh"));
         assert!(!is_traditional_chinese("en"));
 
-        assert_eq!(
-            to_traditional_chinese("设置与翻译"),
-            "設置與翻譯"
-        );
+        assert_eq!(to_traditional_chinese("设置与翻译"), "設置與翻譯");
     }
 
     #[test]

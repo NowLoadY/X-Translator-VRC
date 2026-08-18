@@ -231,6 +231,7 @@ mod tests {
         assert!(!plugin.is_busy());
         plugin.clear_pending_audio_import();
 
+        drop(plugin);
         std::fs::remove_dir_all(root).unwrap();
     }
 }

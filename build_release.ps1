@@ -69,7 +69,8 @@ $buildArguments = @(
     '--package', 'xrtranslate-backend',
     '--package', 'xrtranslate-installer',
     '--package', 'xrtranslate-updater',
-    '--package', 'xrtranslate-packager'
+    '--package', 'xrtranslate-packager',
+    '--features', 'rust-client/mpv'
 )
 
 Write-Host 'Building native release binaries...'

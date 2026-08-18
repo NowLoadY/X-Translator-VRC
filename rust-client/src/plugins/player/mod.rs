@@ -22,6 +22,20 @@ pub struct VideoPlayerUiSnapshot {
     pub language: UiLanguage,
 }
 
+pub(crate) fn runtime_bin_directories() -> Vec<PathBuf> {
+    let mut dirs = Vec::new();
+    if let Ok(exe_path) = std::env::current_exe()
+        && let Some(parent) = exe_path.parent()
+    {
+        dirs.push(parent.join("resources").join("bin"));
+    }
+    if let Ok(current_dir) = std::env::current_dir() {
+        dirs.push(current_dir.join("resources").join("bin"));
+    }
+    dirs.push(PathBuf::from("rust-client").join("resources").join("bin"));
+    dirs
+}
+
 #[derive(Debug, Clone, PartialEq)]
 pub enum PlayerTranslationRequest {
     ImportMediaFile {
@@ -79,20 +93,6 @@ impl VideoPlayerPlugin {
                 host.hide();
             }
         }
-    }
-
-    pub fn on_translation_segment(
-        &mut self,
-        id: String,
-        start_ms: i64,
-        end_ms: i64,
-        speaker: Option<String>,
-        source: String,
-        translated: Option<String>,
-        metadata: subtitles::SubtitleMetadata,
-    ) {
-        self.controller
-            .ingest_live_caption(id, start_ms, end_ms, speaker, source, translated, metadata);
     }
 
     pub fn on_translation_cue(

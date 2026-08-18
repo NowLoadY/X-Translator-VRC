@@ -360,17 +360,20 @@ async fn install(
     crate::backend::BackendManager::persist_llama_server_path(&project_root, &executable)
 }
 
+#[cfg(unix)]
 fn make_executable(path: &Path) -> Result<(), String> {
-    #[cfg(unix)]
-    {
-        use std::os::unix::fs::PermissionsExt;
-        let mut permissions = fs::metadata(path)
-            .map_err(|error| format!("Cannot inspect {}: {error}", path.display()))?
-            .permissions();
-        permissions.set_mode(permissions.mode() | 0o111);
-        fs::set_permissions(path, permissions)
-            .map_err(|error| format!("Cannot mark {} executable: {error}", path.display()))?;
-    }
+    use std::os::unix::fs::PermissionsExt;
+    let mut permissions = fs::metadata(path)
+        .map_err(|error| format!("Cannot inspect {}: {error}", path.display()))?
+        .permissions();
+    permissions.set_mode(permissions.mode() | 0o111);
+    fs::set_permissions(path, permissions)
+        .map_err(|error| format!("Cannot mark {} executable: {error}", path.display()))?;
+    Ok(())
+}
+
+#[cfg(not(unix))]
+fn make_executable(_path: &Path) -> Result<(), String> {
     Ok(())
 }
 
@@ -653,14 +656,29 @@ fn select_assets_for_hardware(
             nvidia.compute_capability,
         )
         .ok_or_else(|| {
-            format!(
-                "NVIDIA GPU {} (compute capability {}) requires CUDA {} or newer, and the driver supports up to CUDA {}, but the configured llama.cpp download list has no compatible CUDA package for {}. Update the driver, update config.json, or install llama.cpp manually.",
-                nvidia.gpu,
-                format_version(nvidia.compute_capability),
-                format_version(minimum),
-                nvidia.driver_cuda,
-                target
-            )
+            if nvidia.compute_capability.0 >= 10 {
+                let package_cuda = assets
+                    .iter()
+                    .filter(|asset| asset.kind == LlamaCppAssetKind::ServerCuda)
+                    .filter_map(|asset| asset.cuda_version.as_deref())
+                    .filter_map(parse_version)
+                    .max()
+                    .map(format_version)
+                    .unwrap_or_else(|| "13.3".into());
+                format!(
+                    "This RTX 50-series GPU needs a CUDA {package_cuda}-capable NVIDIA driver to use the packaged llama.cpp runtime. The installed driver only reports CUDA {}, so the GPU build cannot start yet. Update the NVIDIA driver and try again, or install llama.cpp manually.",
+                    nvidia.driver_cuda
+                )
+            } else {
+                format!(
+                    "NVIDIA GPU {} (compute capability {}) requires CUDA {} or newer, and the driver supports up to CUDA {}, but the configured llama.cpp download list has no compatible CUDA package for {}. Update the driver, update config.json, or install llama.cpp manually.",
+                    nvidia.gpu,
+                    format_version(nvidia.compute_capability),
+                    format_version(minimum),
+                    nvidia.driver_cuda,
+                    target
+                )
+            }
         })?;
         let cuda_version = runtime
             .cuda_version
@@ -1209,7 +1227,7 @@ mod tests {
     }
 
     #[test]
-    fn blackwell_never_falls_back_to_incompatible_cuda_or_cpu() {
+    fn blackwell_requires_driver_upgrade_when_only_cuda_13_3_is_available() {
         let assets = vec![
             asset("llama-b1-bin-win-cpu-x64.zip"),
             asset("llama-b1-bin-win-cuda-12.4-x64.zip"),
@@ -1220,12 +1238,12 @@ mod tests {
         let nvidia = NvidiaCuda {
             gpu: "NVIDIA GeForce RTX 5080".into(),
             compute_capability: (12, 0),
-            driver_cuda: "12.8".into(),
+            driver_cuda: "13.2".into(),
         };
         let error = select_assets_for_hardware(&assets, Some(&nvidia))
-            .expect_err("incompatible release must fail");
-        assert!(error.contains("requires CUDA 12.8 or newer"));
-        assert!(error.contains("driver supports up to CUDA 12.8"));
+            .expect_err("Blackwell should require a driver upgrade rather than falling back");
+        assert!(error.contains("CUDA 13.3-capable NVIDIA driver"));
+        assert!(error.contains("Update the NVIDIA driver"));
     }
 
     #[test]

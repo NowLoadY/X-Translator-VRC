@@ -23,7 +23,8 @@ impl Drop for TempFileGuard {
     }
 }
 
-pub(crate) fn build_recognition_pan_filter(recognition_channels: &[usize]) -> Option<String> {
+#[cfg(feature = "mpv")]
+fn build_recognition_pan_filter(recognition_channels: &[usize]) -> Option<String> {
     if recognition_channels.is_empty() {
         return None;
     }
@@ -201,7 +202,7 @@ pub(super) fn run_mpv_extract(
     ))
 }
 
-#[cfg(test)]
+#[cfg(all(test, feature = "mpv"))]
 mod tests {
     use super::*;
 

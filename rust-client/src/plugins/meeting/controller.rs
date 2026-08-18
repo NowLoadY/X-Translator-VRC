@@ -690,6 +690,7 @@ mod tests {
         assert_eq!(controller.active_meeting_id(), None);
         assert_eq!(controller.error.as_deref(), Some("backend failed"));
 
+        drop(controller);
         std::fs::remove_dir_all(root).unwrap();
     }
 }

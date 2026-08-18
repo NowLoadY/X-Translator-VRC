@@ -10,9 +10,12 @@ use super::{
     store::{MeetingStore, NewSegment, SegmentSource},
 };
 use crossbeam_channel::{Sender, unbounded};
-use std::sync::{
-    Arc,
-    atomic::{AtomicBool, AtomicUsize, Ordering},
+use std::{
+    sync::{
+        Arc,
+        atomic::{AtomicBool, AtomicUsize, Ordering},
+    },
+    thread::JoinHandle,
 };
 
 use crate::{CaptureSource, network::SessionEvent, session_coordinator::SessionEventSubscriber};
@@ -46,17 +49,35 @@ enum Command {
 
 #[derive(Clone)]
 pub struct MeetingEventSink {
-    tx: Sender<Command>,
+    inner: Arc<MeetingEventSinkInner>,
+}
+
+struct MeetingEventSinkInner {
+    tx: std::sync::Mutex<Option<Sender<Command>>>,
     active: SharedMeetingCapture,
     active_sessions: Arc<AtomicUsize>,
     finish_requested: Arc<AtomicBool>,
+    worker: std::sync::Mutex<Option<JoinHandle<()>>>,
+}
+
+impl Drop for MeetingEventSinkInner {
+    fn drop(&mut self) {
+        if let Ok(mut tx) = self.tx.lock() {
+            tx.take();
+        }
+        if let Ok(mut worker) = self.worker.lock()
+            && let Some(handle) = worker.take()
+        {
+            let _ = handle.join();
+        }
+    }
 }
 
 impl MeetingEventSink {
     pub fn start(store: Arc<MeetingStore>, active: SharedMeetingCapture) -> Self {
         let (tx, rx) = unbounded();
         let worker_active = Arc::clone(&active);
-        std::thread::Builder::new()
+        let worker = std::thread::Builder::new()
             .name("meeting-event-store".into())
             .spawn(move || {
                 while let Ok(command) = rx.recv() {
@@ -73,27 +94,31 @@ impl MeetingEventSink {
             })
             .expect("failed to start meeting event store");
         Self {
-            tx,
-            active,
-            active_sessions: Arc::new(AtomicUsize::new(0)),
-            finish_requested: Arc::new(AtomicBool::new(false)),
+            inner: Arc::new(MeetingEventSinkInner {
+                tx: std::sync::Mutex::new(Some(tx)),
+                active,
+                active_sessions: Arc::new(AtomicUsize::new(0)),
+                finish_requested: Arc::new(AtomicBool::new(false)),
+                worker: std::sync::Mutex::new(Some(worker)),
+            }),
         }
     }
 
     pub fn persist(&self, event: MeetingSegmentEvent) {
-        let _ = self.tx.send(Command::Segment(event));
+        self.send(Command::Segment(event));
     }
 
     pub fn finish_active(&self) {
-        let _ = self.tx.send(Command::FinishActive);
+        self.send(Command::FinishActive);
     }
 
     pub fn fail_active(&self, error: impl Into<String>) {
-        let _ = self.tx.send(Command::FailActive(error.into()));
+        self.send(Command::FailActive(error.into()));
     }
 
     pub fn active_is_imported(&self) -> bool {
-        self.active
+        self.inner
+            .active
             .lock()
             .ok()
             .and_then(|capture| capture.as_ref().map(|capture| capture.imported_audio))
@@ -102,25 +127,38 @@ impl MeetingEventSink {
 
     /// Registers all recognition streams belonging to one meeting operation.
     pub fn begin_sessions(&self, count: usize) {
-        self.active_sessions.store(count, Ordering::Release);
-        self.finish_requested.store(false, Ordering::Release);
+        self.inner.active_sessions.store(count, Ordering::Release);
+        self.inner.finish_requested.store(false, Ordering::Release);
     }
 
     /// Requests durable completion once every stream has drained.
     pub fn request_finish(&self) {
-        self.finish_requested.store(true, Ordering::Release);
+        self.inner.finish_requested.store(true, Ordering::Release);
     }
 
     pub fn cancel_sessions(&self) {
-        self.active_sessions.store(0, Ordering::Release);
-        self.finish_requested.store(false, Ordering::Release);
+        self.inner.active_sessions.store(0, Ordering::Release);
+        self.inner.finish_requested.store(false, Ordering::Release);
     }
 
     #[cfg(test)]
     fn flush(&self) {
         let (done_tx, done_rx) = crossbeam_channel::bounded(1);
-        self.tx.send(Command::Flush(done_tx)).unwrap();
+        self.command_sender()
+            .expect("meeting event sink is open")
+            .send(Command::Flush(done_tx))
+            .unwrap();
         done_rx.recv().unwrap();
+    }
+
+    fn send(&self, command: Command) {
+        if let Some(tx) = self.command_sender() {
+            let _ = tx.send(command);
+        }
+    }
+
+    fn command_sender(&self) -> Option<Sender<Command>> {
+        self.inner.tx.lock().ok()?.as_ref().cloned()
     }
 }
 
@@ -172,16 +210,18 @@ impl SessionEventSubscriber for MeetingEventSink {
             ),
             SessionEvent::Disconnected(reason) if reason == "Finished" => {
                 let previous = self
+                    .inner
                     .active_sessions
                     .fetch_update(Ordering::AcqRel, Ordering::Acquire, |value| {
                         value.checked_sub(1)
                     })
                     .unwrap_or(0);
                 if previous == 1
-                    && (self.active_is_imported() || self.finish_requested.load(Ordering::Acquire))
+                    && (self.active_is_imported()
+                        || self.inner.finish_requested.load(Ordering::Acquire))
                 {
                     self.finish_active();
-                    self.finish_requested.store(false, Ordering::Release);
+                    self.inner.finish_requested.store(false, Ordering::Release);
                 }
             }
             SessionEvent::Error(error) => {

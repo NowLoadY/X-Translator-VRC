@@ -126,8 +126,8 @@ impl AsyncHttpClient for ReqwestClient {
                 }
                 Err(error) => {
                     let kind = request_error_kind(&error);
-                    let should_retry = attempt + 1 < MAX_ATTEMPTS
-                        && (error.is_connect() || error.is_request());
+                    let should_retry =
+                        attempt + 1 < MAX_ATTEMPTS && (error.is_connect() || error.is_request());
                     last_error = Some(TransportError::new(kind, error.to_string()));
                     if !should_retry {
                         break;
