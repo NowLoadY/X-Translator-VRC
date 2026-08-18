@@ -12,7 +12,9 @@ use xrtranslate_assets::{
     ModelAssetId, ModelAssetsConfig, ModelCapability, ModelFileRole, ResolvedModelAsset,
     ResolvedModelAssets,
 };
-use xrtranslate_config::{AppConfig, LocalModelRuntimeConfig, NativeModelRouteConfig};
+use xrtranslate_config::{
+    AppConfig, LocalModelRuntimeConfig, NativeModelRouteConfig, RuntimeLayout,
+};
 use xrtranslate_inference::{
     AsrTranscript, InferenceError, Qwen3AsrAdapter, Qwen3AsrOptions, ReqwestClient,
     TranslationAdapter, TranslationProvider,
@@ -78,9 +80,11 @@ pub(crate) struct NativeProviderPlan {
 
 impl NativeProviderPlan {
     pub(crate) fn resolve(config: &AppConfig, project_root: &Path) -> Result<Self, String> {
-        let route = config
+        let mut route = config
             .native_model_route()
             .map_err(|error| error.to_string())?;
+        route.llama_server_path = RuntimeLayout::for_project_root(project_root)
+            .resolve_configured_path(&route.llama_server_path);
         let asr_profile = AsrProfile::registered(&route.asr.provider)
             .ok_or_else(|| format!("unsupported ASR provider {:?}", route.asr.provider))?;
         let translation_profile = TranslationProfile::registered(&route.translation.provider)
@@ -334,6 +338,10 @@ mod tests {
         let config = AppConfig::from_json_str(include_str!("../../../config.json")).unwrap();
         let plan = NativeProviderPlan::resolve(&config, Path::new("release-root")).unwrap();
 
+        assert_eq!(
+            plan.llama_server_path(),
+            Path::new("release-root/runtime/llama.cpp/llama-server")
+        );
         let [asr, translation] = plan.managed_server_specs(8101, 8102).unwrap();
 
         assert_eq!(asr.model_alias, "qwen3-asr");
@@ -342,6 +350,21 @@ mod tests {
         assert_eq!(translation.endpoint.port, 8102);
         assert_eq!(translation.context_size, 4_096);
         assert_eq!(translation.parallel_slots, Some(2));
+    }
+
+    #[test]
+    fn runtime_plan_preserves_explicit_external_server_path() {
+        let mut document: serde_json::Value =
+            serde_json::from_str(include_str!("../../../config.json")).unwrap();
+        document["model_manager"]["llama_server_path"] =
+            serde_json::Value::from("/opt/llama.cpp/llama-server");
+        let config = AppConfig::from_value(document).unwrap();
+        let plan = NativeProviderPlan::resolve(&config, Path::new("/srv/xrtranslate")).unwrap();
+
+        assert_eq!(
+            plan.llama_server_path(),
+            Path::new("/opt/llama.cpp/llama-server")
+        );
     }
 
     #[test]

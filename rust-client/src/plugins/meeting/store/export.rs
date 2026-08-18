@@ -14,10 +14,7 @@ pub fn render_markdown(bundle: &MeetingBundle) -> String {
         bundle.meeting.target_language
     );
     if let Some(path) = bundle.meeting.audio_source_path.as_deref() {
-        let display_name = std::path::Path::new(path)
-            .file_name()
-            .and_then(|name| name.to_str())
-            .unwrap_or("external audio");
+        let display_name = display_name(path);
         output.push_str(&format!(
             "- Imported audio: `{}` (external reference)\n",
             escape_inline_code(display_name)
@@ -71,6 +68,13 @@ pub fn render_markdown(bundle: &MeetingBundle) -> String {
         }
     }
     output
+}
+
+fn display_name(path: &str) -> &str {
+    path.rsplit(['/', '\\'])
+        .next()
+        .filter(|name| !name.is_empty())
+        .unwrap_or("external audio")
 }
 
 fn render_segment_markdown(

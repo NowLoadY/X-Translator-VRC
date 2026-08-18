@@ -23,7 +23,8 @@ pub fn render(
                         );
                         ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
                             let status = plugin.manager().listener_status();
-                            let is_active = status.contains("Listening") || status.contains("Active");
+                            let is_active =
+                                status.contains("Listening") || status.contains("Active");
                             components::status_badge(ui, &status, is_active, false);
                         });
                     });
@@ -100,7 +101,9 @@ pub fn render(
                             )
                             .clicked()
                             {
-                                actions.push(super::OscUiAction::SettingsApplied(plugin.apply_draft()));
+                                actions.push(super::OscUiAction::SettingsApplied(
+                                    plugin.apply_draft(),
+                                ));
                                 actions.push(super::OscUiAction::SaveSettings);
                             }
                         });

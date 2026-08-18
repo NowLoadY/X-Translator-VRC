@@ -14,9 +14,9 @@ impl Default for SystemMetrics {
     fn default() -> Self {
         Self {
             time_str: String::new(),
-            cpu_name: "CPU".to_string(),
+            cpu_name: String::new(),
             cpu_usage: 0,
-            gpu_name: "GPU".to_string(),
+            gpu_name: String::new(),
             gpu_usage: 0,
         }
     }
@@ -81,30 +81,15 @@ impl SystemMonitor {
 }
 
 fn get_formatted_time() -> String {
-    #[cfg(target_os = "windows")]
-    unsafe {
-        #[repr(C)]
-        struct SystemTime {
-            w_year: u16,
-            w_month: u16,
-            w_day_of_week: u16,
-            w_day: u16,
-            w_hour: u16,
-            w_minute: u16,
-            w_second: u16,
-            w_milliseconds: u16,
-        }
-        unsafe extern "system" {
-            fn GetLocalTime(lpSystemTime: *mut SystemTime);
-        }
-        let mut st = std::mem::zeroed::<SystemTime>();
-        GetLocalTime(&mut st);
-        format!("{:02}:{:02}:{:02}", st.w_hour, st.w_minute, st.w_second)
-    }
-    #[cfg(not(target_os = "windows"))]
-    {
-        "12:00:00".to_string()
-    }
+    let seconds = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map_or(0, |duration| duration.as_secs() % 86_400);
+    format!(
+        "{:02}:{:02}:{:02}",
+        seconds / 3_600,
+        (seconds / 60) % 60,
+        seconds % 60
+    )
 }
 
 #[cfg(target_os = "windows")]
@@ -329,7 +314,7 @@ fn detect_cpu_name() -> String {
             }
         }
     }
-    "CPU".to_string()
+    String::new()
 }
 
 fn detect_gpu_name() -> String {
@@ -358,7 +343,7 @@ fn detect_gpu_name() -> String {
             }
         }
     }
-    "GPU".to_string()
+    String::new()
 }
 
 fn clean_hardware_name(raw: &str) -> String {
@@ -387,6 +372,15 @@ fn clean_hardware_name(raw: &str) -> String {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn formatted_time_is_current_and_well_formed() {
+        let value = super::get_formatted_time();
+        let parts = value.split(':').collect::<Vec<_>>();
+        assert_eq!(parts.len(), 3);
+        assert!(parts.iter().all(|part| part.len() == 2));
+        assert!(parts.iter().all(|part| part.parse::<u8>().is_ok()));
+    }
+
     #[cfg(target_os = "windows")]
     #[test]
     fn gpu_engine_instances_from_different_processes_share_an_engine_key() {

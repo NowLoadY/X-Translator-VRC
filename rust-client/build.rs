@@ -1,6 +1,12 @@
+#[cfg(windows)]
 use std::env;
+#[cfg(windows)]
 use std::fs;
-use std::path::{Path, PathBuf};
+#[cfg(windows)]
+use std::path::Path;
+#[cfg(windows)]
+use std::path::PathBuf;
+#[cfg(windows)]
 use std::process::Command;
 
 #[cfg(windows)]
@@ -20,11 +26,21 @@ fn find_lib_exe() -> Option<PathBuf> {
         if base_path.exists() {
             if let Ok(entries) = fs::read_dir(base_path) {
                 for entry in entries.flatten() {
-                    let host_x64 = entry.path().join("bin").join("Hostx64").join("x64").join("lib.exe");
+                    let host_x64 = entry
+                        .path()
+                        .join("bin")
+                        .join("Hostx64")
+                        .join("x64")
+                        .join("lib.exe");
                     if host_x64.exists() {
                         return Some(host_x64);
                     }
-                    let host_x86 = entry.path().join("bin").join("Hostx86").join("x64").join("lib.exe");
+                    let host_x86 = entry
+                        .path()
+                        .join("bin")
+                        .join("Hostx86")
+                        .join("x64")
+                        .join("lib.exe");
                     if host_x86.exists() {
                         return Some(host_x86);
                     }
@@ -50,19 +66,21 @@ fn main() {
 
         let out_dir = env::var("OUT_DIR").unwrap();
         let out_path = Path::new(&out_dir);
-        let def_path = Path::new("resources/mpv.def");
-        let lib_path = out_path.join("mpv.lib");
+        if env::var_os("CARGO_FEATURE_MPV").is_some() {
+            let def_path = Path::new("resources/mpv.def");
+            let lib_path = out_path.join("mpv.lib");
 
-        if let Some(lib_exe) = find_lib_exe() {
-            let _ = Command::new(lib_exe)
-                .arg(format!("/def:{}", def_path.display()))
-                .arg(format!("/out:{}", lib_path.display()))
-                .arg("/machine:x64")
-                .status();
+            if let Some(lib_exe) = find_lib_exe() {
+                let _ = Command::new(lib_exe)
+                    .arg(format!("/def:{}", def_path.display()))
+                    .arg(format!("/out:{}", lib_path.display()))
+                    .arg("/machine:x64")
+                    .status();
+            }
+
+            println!("cargo:rustc-link-search=native={}", out_dir);
+            println!("cargo:rustc-link-arg=/DELAYLOAD:mpv-2.dll");
+            println!("cargo:rustc-link-lib=delayimp");
         }
-
-        println!("cargo:rustc-link-search=native={}", out_dir);
-        println!("cargo:rustc-link-arg=/DELAYLOAD:mpv-2.dll");
-        println!("cargo:rustc-link-lib=delayimp");
     }
 }

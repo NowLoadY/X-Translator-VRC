@@ -1,3 +1,7 @@
+#[cfg(feature = "mpv")]
+pub mod mpv;
+#[cfg(not(feature = "mpv"))]
+#[path = "mpv_stub.rs"]
 pub mod mpv;
 pub mod window;
 

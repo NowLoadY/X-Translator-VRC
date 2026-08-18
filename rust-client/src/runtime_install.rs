@@ -1,4 +1,4 @@
-//! Native llama.cpp runtime discovery and installation for Windows releases.
+//! Native llama.cpp runtime discovery and installation.
 //!
 //! The configured `model_manager.llama_cpp.downloads` list is the contract:
 //! we select CUDA when the installed NVIDIA driver reports a compatible
@@ -13,7 +13,9 @@ use std::{
     process::Command,
     thread,
 };
-use xrtranslate_config::{AppConfig, LlamaCppRuntimeConfig};
+use xrtranslate_config::{
+    AppConfig, LlamaCppArchiveFormat, LlamaCppAssetKind, LlamaCppRuntimeConfig, RuntimeLayout,
+};
 use xrtranslate_download::{DownloadClient, DownloadSpec};
 
 const MIN_CUDA_COMPUTE_CAPABILITY: (u16, u16) = (6, 0);
@@ -30,6 +32,9 @@ enum RuntimeBackend {
 struct RuntimeSelection {
     assets: Vec<ReleaseAsset>,
     backend: RuntimeBackend,
+    executable: String,
+    required_files: Vec<String>,
+    required_file_prefixes: Vec<String>,
 }
 
 impl RuntimeSelection {
@@ -251,6 +256,13 @@ struct ReleaseAsset {
     browser_download_url: String,
     size: u64,
     sha256: String,
+    archive_format: LlamaCppArchiveFormat,
+    kind: LlamaCppAssetKind,
+    target: String,
+    cuda_version: Option<String>,
+    executable: String,
+    required_files: Vec<String>,
+    required_file_prefixes: Vec<String>,
 }
 
 async fn install(
@@ -259,13 +271,17 @@ async fn install(
     sender: crossbeam_channel::Sender<Event>,
     proxy_url: Option<&str>,
 ) -> Result<PathBuf, String> {
-    if !cfg!(target_os = "windows") || std::env::consts::ARCH != "x86_64" {
-        return Err("Automatic llama.cpp installation currently supports Windows x64 only.".into());
-    }
-    let target = project_root.join("runtime").join("llama.cpp");
-    let executable = target.join("llama-server.exe");
+    let executable_name = selection.executable.clone();
+    let layout = RuntimeLayout::for_project_root(&project_root);
+    let target = layout.llama_cpp_directory();
+    let executable = target.join(&executable_name);
     if executable.is_file() {
-        validate_runtime_files(&target, selection.backend)?;
+        validate_runtime_files(
+            &target,
+            &selection.executable,
+            &selection.required_files,
+            &selection.required_file_prefixes,
+        )?;
         return crate::backend::BackendManager::persist_llama_server_path(
             &project_root,
             &executable,
@@ -273,8 +289,9 @@ async fn install(
     }
     if target.exists() {
         return Err(format!(
-            "{} already exists but does not contain llama-server.exe. Choose a manual path or remove that incomplete runtime folder.",
-            target.display()
+            "{} already exists but does not contain {}. Choose a manual path or remove that incomplete runtime folder.",
+            target.display(),
+            executable_name
         ));
     }
 
@@ -321,17 +338,40 @@ async fn install(
     fs::create_dir_all(&payload)
         .map_err(|error| format!("Cannot create runtime extraction folder: {error}"))?;
     for asset in &selection.assets {
-        extract_zip(&downloads.join(&asset.name), &payload)?;
+        extract_archive(&downloads.join(&asset.name), &payload, asset.archive_format)?;
     }
-    let staged_executable = payload.join("llama-server.exe");
+    let staged_executable = payload.join(&executable_name);
     if !staged_executable.is_file() {
-        return Err("The selected llama.cpp release did not contain llama-server.exe.".into());
+        return Err(format!(
+            "The selected llama.cpp release did not contain {}.",
+            executable_name
+        ));
     }
-    validate_runtime_files(&payload, selection.backend)?;
+    make_executable(&staged_executable)?;
+    validate_runtime_files(
+        &payload,
+        &selection.executable,
+        &selection.required_files,
+        &selection.required_file_prefixes,
+    )?;
     fs::rename(&payload, &target)
         .map_err(|error| format!("Cannot activate llama.cpp runtime: {error}"))?;
     let _ = fs::remove_dir_all(&staging);
     crate::backend::BackendManager::persist_llama_server_path(&project_root, &executable)
+}
+
+fn make_executable(path: &Path) -> Result<(), String> {
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        let mut permissions = fs::metadata(path)
+            .map_err(|error| format!("Cannot inspect {}: {error}", path.display()))?
+            .permissions();
+        permissions.set_mode(permissions.mode() | 0o111);
+        fs::set_permissions(path, permissions)
+            .map_err(|error| format!("Cannot mark {} executable: {error}", path.display()))?;
+    }
+    Ok(())
 }
 
 fn prune_obsolete_runtime_staging(runtime_root: &Path, current: &Path) -> Result<(), String> {
@@ -362,6 +402,35 @@ fn prune_obsolete_runtime_staging(runtime_root: &Path, current: &Path) -> Result
     Ok(())
 }
 
+fn extract_archive(
+    archive: &Path,
+    destination: &Path,
+    format: LlamaCppArchiveFormat,
+) -> Result<(), String> {
+    match format {
+        LlamaCppArchiveFormat::Zip => extract_zip(archive, destination),
+        LlamaCppArchiveFormat::TarGz => extract_tar_gz(archive, destination),
+    }
+}
+
+fn safe_archive_path(destination: &Path, name: &Path) -> Result<PathBuf, String> {
+    use std::path::Component;
+    if name.is_absolute()
+        || name.components().any(|component| {
+            matches!(
+                component,
+                Component::Prefix(_) | Component::RootDir | Component::ParentDir
+            )
+        })
+    {
+        return Err(format!(
+            "archive entry escapes extraction directory: {}",
+            name.display()
+        ));
+    }
+    Ok(destination.join(name))
+}
+
 fn extract_zip(archive: &Path, destination: &Path) -> Result<(), String> {
     let file = fs::File::open(archive)
         .map_err(|error| format!("Cannot open {}: {error}", archive.display()))?;
@@ -371,10 +440,13 @@ fn extract_zip(archive: &Path, destination: &Path) -> Result<(), String> {
         let mut entry = zip
             .by_index(index)
             .map_err(|error| format!("Cannot read archive entry: {error}"))?;
-        let Some(name) = entry.enclosed_name() else {
-            continue;
-        };
-        let output = destination.join(name);
+        let name = entry.enclosed_name().ok_or_else(|| {
+            format!(
+                "archive entry escapes extraction directory: {}",
+                entry.name()
+            )
+        })?;
+        let output = safe_archive_path(destination, &name)?;
         if entry.is_dir() {
             fs::create_dir_all(&output)
                 .map_err(|error| format!("Cannot create {}: {error}", output.display()))?;
@@ -388,6 +460,51 @@ fn extract_zip(archive: &Path, destination: &Path) -> Result<(), String> {
             .map_err(|error| format!("Cannot create {}: {error}", output.display()))?;
         std::io::copy(&mut entry, &mut file)
             .map_err(|error| format!("Cannot extract {}: {error}", output.display()))?;
+    }
+    Ok(())
+}
+
+fn extract_tar_gz(archive: &Path, destination: &Path) -> Result<(), String> {
+    let file = fs::File::open(archive)
+        .map_err(|error| format!("Cannot open {}: {error}", archive.display()))?;
+    let decoder = flate2::read::GzDecoder::new(file);
+    let mut archive = tar::Archive::new(decoder);
+    for entry in archive
+        .entries()
+        .map_err(|error| format!("Invalid tar.gz archive: {error}"))?
+    {
+        let mut entry = entry.map_err(|error| format!("Cannot read tar entry: {error}"))?;
+        let name = entry
+            .path()
+            .map_err(|error| format!("Cannot read tar entry path: {error}"))?
+            .into_owned();
+        let output = safe_archive_path(destination, &name)?;
+        if entry.header().entry_type().is_dir() {
+            fs::create_dir_all(&output)
+                .map_err(|error| format!("Cannot create {}: {error}", output.display()))?;
+            continue;
+        }
+        if !entry.header().entry_type().is_file() {
+            return Err(format!("unsupported tar entry type: {}", name.display()));
+        }
+        if let Some(parent) = output.parent() {
+            fs::create_dir_all(parent)
+                .map_err(|error| format!("Cannot create {}: {error}", parent.display()))?;
+        }
+        let mut file = fs::File::create(&output)
+            .map_err(|error| format!("Cannot create {}: {error}", output.display()))?;
+        std::io::copy(&mut entry, &mut file)
+            .map_err(|error| format!("Cannot extract {}: {error}", output.display()))?;
+        #[cfg(unix)]
+        if let Ok(mode) = entry.header().mode() {
+            use std::os::unix::fs::PermissionsExt;
+            fs::set_permissions(&output, fs::Permissions::from_mode(mode)).map_err(|error| {
+                format!(
+                    "Cannot restore permissions for {}: {error}",
+                    output.display()
+                )
+            })?;
+        }
     }
     Ok(())
 }
@@ -438,9 +555,14 @@ fn release_assets_from_config(config: &LlamaCppRuntimeConfig) -> Result<Vec<Rele
         .map(|download| {
             let name = download.name.trim();
             let url = download.url.trim();
-            if name.is_empty() || !name.ends_with(".zip") {
+            if name.is_empty()
+                || (download.archive_format == LlamaCppArchiveFormat::Zip
+                    && !name.ends_with(".zip"))
+                || (download.archive_format == LlamaCppArchiveFormat::TarGz
+                    && !name.ends_with(".tar.gz"))
+            {
                 return Err(format!(
-                    "model_manager.llama_cpp.downloads contains an invalid archive name {:?}.",
+                    "model_manager.llama_cpp.downloads contains an archive name incompatible with its declared format: {:?}.",
                     download.name
                 ));
             }
@@ -465,24 +587,57 @@ fn release_assets_from_config(config: &LlamaCppRuntimeConfig) -> Result<Vec<Rele
                     "model_manager.llama_cpp.downloads[{name}].sha256 must be a 64-character hexadecimal digest."
                 ));
             }
+            let target = if download.target.trim().is_empty() {
+                legacy_target_from_name(name)
+            } else {
+                download.target.trim().to_owned()
+            };
+            let (kind, cuda_version, executable, required_files, required_file_prefixes) =
+                normalize_runtime_metadata(download, name, &target)?;
             Ok(ReleaseAsset {
                 name: name.into(),
                 browser_download_url: url.into(),
                 size: download.bytes,
                 sha256: sha256.to_ascii_lowercase(),
+                archive_format: download.archive_format,
+                kind,
+                target,
+                cuda_version,
+                executable,
+                required_files,
+                required_file_prefixes,
             })
         })
         .collect()
 }
 
 fn select_assets(assets: &[ReleaseAsset]) -> Result<RuntimeSelection, String> {
-    select_assets_for_hardware(assets, supported_nvidia_cuda()?.as_ref())
+    // Linux currently ships a verified portable CPU archive. Keep NVIDIA
+    // probing tied to the Windows CUDA capability until Linux CUDA/Vulkan
+    // packages are declared with their own runtime metadata.
+    let nvidia = if cfg!(target_os = "windows") {
+        supported_nvidia_cuda()?
+    } else {
+        None
+    };
+    select_assets_for_hardware(assets, nvidia.as_ref())
 }
 
 fn select_assets_for_hardware(
     assets: &[ReleaseAsset],
     nvidia: Option<&NvidiaCuda>,
 ) -> Result<RuntimeSelection, String> {
+    let target = current_runtime_target();
+    let assets: Vec<_> = assets
+        .iter()
+        .filter(|asset| asset.target == target)
+        .cloned()
+        .collect();
+    if assets.is_empty() {
+        return Err(format!(
+            "no llama.cpp runtime assets are configured for {target}"
+        ));
+    }
     if let Some(nvidia) = nvidia {
         let supported = parse_version(&nvidia.driver_cuda).ok_or_else(|| {
             format!(
@@ -492,48 +647,148 @@ fn select_assets_for_hardware(
         })?;
         let minimum = minimum_cuda_for_compute_capability(nvidia.compute_capability);
         let runtime = best_cuda_asset(
-            assets,
+            &assets,
             supported,
             minimum,
             nvidia.compute_capability,
         )
         .ok_or_else(|| {
             format!(
-                "NVIDIA GPU {} (compute capability {}) requires CUDA {} or newer, and the driver supports up to CUDA {}, but the configured llama.cpp download list has no compatible Windows x64 CUDA package. Update the NVIDIA driver, update config.json, or install llama.cpp manually.",
+                "NVIDIA GPU {} (compute capability {}) requires CUDA {} or newer, and the driver supports up to CUDA {}, but the configured llama.cpp download list has no compatible CUDA package for {}. Update the driver, update config.json, or install llama.cpp manually.",
                 nvidia.gpu,
                 format_version(nvidia.compute_capability),
                 format_version(minimum),
-                nvidia.driver_cuda
+                nvidia.driver_cuda,
+                target
             )
         })?;
-        let suffix = cuda_suffix(&runtime.name).expect("selected CUDA asset has suffix");
-        let cudart_name = format!("cudart-llama-bin-win-cuda-{suffix}-x64.zip");
+        let cuda_version = runtime
+            .cuda_version
+            .as_deref()
+            .ok_or_else(|| "selected CUDA asset has no CUDA version".to_owned())?;
         let cudart = assets
             .iter()
-            .find(|asset| asset.name == cudart_name)
+            .find(|asset| asset.kind == LlamaCppAssetKind::CudaRuntime && asset.cuda_version.as_deref() == Some(cuda_version))
             .cloned()
             .ok_or_else(|| {
                 format!(
-                    "The configured llama.cpp download list is missing the required CUDA runtime package {cudart_name}; refusing to create an incomplete GPU installation."
+                    "The configured llama.cpp download list is missing the CUDA runtime package for version {cuda_version}; refusing to create an incomplete GPU installation."
                 )
             })?;
+        let executable = runtime.executable.clone();
+        let required_files = runtime
+            .required_files
+            .iter()
+            .chain(cudart.required_files.iter())
+            .cloned()
+            .collect();
+        let required_file_prefixes = runtime
+            .required_file_prefixes
+            .iter()
+            .chain(cudart.required_file_prefixes.iter())
+            .cloned()
+            .collect();
         return Ok(RuntimeSelection {
             assets: vec![runtime, cudart],
             backend: RuntimeBackend::Cuda,
+            executable,
+            required_files,
+            required_file_prefixes,
         });
     }
 
     let runtime = assets
         .iter()
-        .find(|asset| asset.name.contains("-bin-win-cpu-x64.zip"))
+        .find(|asset| asset.kind == LlamaCppAssetKind::ServerCpu)
         .cloned()
         .ok_or_else(|| {
-            String::from("The configured llama.cpp download list has no Windows x64 CPU package.")
+            format!("the configured llama.cpp download list has no CPU package for {target}")
         })?;
+    let executable = runtime.executable.clone();
+    let required_files = runtime.required_files.clone();
+    let required_file_prefixes = runtime.required_file_prefixes.clone();
     Ok(RuntimeSelection {
         assets: vec![runtime],
         backend: RuntimeBackend::Cpu,
+        executable,
+        required_files,
+        required_file_prefixes,
     })
+}
+
+/// Converts persisted runtime metadata into the installer representation.
+/// The filename checks here are intentionally limited to legacy entries that
+/// predate the declarative fields; new entries never use vendor filenames.
+fn normalize_runtime_metadata(
+    download: &xrtranslate_config::LlamaCppDownload,
+    name: &str,
+    target: &str,
+) -> Result<
+    (
+        LlamaCppAssetKind,
+        Option<String>,
+        String,
+        Vec<String>,
+        Vec<String>,
+    ),
+    String,
+> {
+    let legacy = download.target.trim().is_empty();
+    let legacy_cuda = legacy && name.contains("-cuda-");
+    let legacy_cudart = legacy && name.contains("cudart");
+    let kind = if legacy_cudart {
+        LlamaCppAssetKind::CudaRuntime
+    } else if legacy_cuda {
+        LlamaCppAssetKind::ServerCuda
+    } else {
+        download.kind
+    };
+    let cuda_version = download.cuda_version.clone().or_else(|| {
+        legacy_cuda
+            .then_some(name)
+            .and_then(|name| name.split("-cuda-").nth(1))
+            .and_then(|version| version.split('-').next())
+            .map(str::to_owned)
+    });
+    let executable = if download.executable.trim().is_empty() {
+        if !legacy && kind != LlamaCppAssetKind::CudaRuntime {
+            return Err(format!(
+                "model_manager.llama_cpp.downloads[{name}].executable must be declared for new-format server assets."
+            ));
+        } else if target.starts_with("windows-") {
+            "llama-server.exe".into()
+        } else {
+            "llama-server".into()
+        }
+    } else {
+        download.executable.trim().to_owned()
+    };
+    let migrate_windows_requirements =
+        download.required_files.is_empty() && target.starts_with("windows-");
+    let required_files = if migrate_windows_requirements {
+        match kind {
+            LlamaCppAssetKind::ServerCpu => vec!["ggml.dll".into()],
+            LlamaCppAssetKind::ServerCuda => vec!["ggml.dll".into(), "ggml-cuda.dll".into()],
+            LlamaCppAssetKind::CudaRuntime => Vec::new(),
+        }
+    } else {
+        download.required_files.clone()
+    };
+    let required_file_prefixes = if download.required_file_prefixes.is_empty()
+        && target.starts_with("windows-")
+        && kind == LlamaCppAssetKind::CudaRuntime
+    {
+        vec!["cudart64_".into(), "cublas64_".into(), "cublasLt64_".into()]
+    } else {
+        download.required_file_prefixes.clone()
+    };
+    Ok((
+        kind,
+        cuda_version,
+        executable,
+        required_files,
+        required_file_prefixes,
+    ))
 }
 
 fn best_cuda_asset(
@@ -545,10 +800,10 @@ fn best_cuda_asset(
     assets
         .iter()
         .filter_map(|asset| {
-            if !asset.name.starts_with("llama-") {
+            if asset.kind != LlamaCppAssetKind::ServerCuda {
                 return None;
             }
-            let version = cuda_suffix(&asset.name)?;
+            let version = asset.cuda_version.as_deref()?;
             let version = parse_version(version)?;
             (version >= minimum
                 && version <= supported
@@ -559,11 +814,16 @@ fn best_cuda_asset(
         .map(|(_, asset)| asset)
 }
 
-fn cuda_suffix(name: &str) -> Option<&str> {
-    let prefix = "-bin-win-cuda-";
-    let suffix = "-x64.zip";
-    let start = name.find(prefix)? + prefix.len();
-    name.strip_suffix(suffix)?.get(start..)
+fn current_runtime_target() -> String {
+    format!("{}-{}", std::env::consts::OS, std::env::consts::ARCH)
+}
+
+fn legacy_target_from_name(name: &str) -> String {
+    if name.contains("-win-") {
+        "windows-x86_64".into()
+    } else {
+        current_runtime_target()
+    }
 }
 
 fn parse_version(value: &str) -> Option<(u16, u16)> {
@@ -732,37 +992,52 @@ fn cuda_version_from_nvidia_smi(version_text: &str) -> Option<String> {
     Some(version.to_owned())
 }
 
-fn validate_runtime_files(directory: &Path, backend: RuntimeBackend) -> Result<(), String> {
-    if !directory.join("ggml.dll").is_file() {
-        return Err("The selected llama.cpp release is missing ggml.dll.".into());
+fn validate_runtime_files(
+    directory: &Path,
+    executable: &str,
+    required_files: &[String],
+    required_file_prefixes: &[String],
+) -> Result<(), String> {
+    let executable_path = directory.join(executable);
+    if !executable_path.is_file() {
+        return Err(format!(
+            "runtime executable is missing: {}",
+            executable_path.display()
+        ));
     }
-    if backend == RuntimeBackend::Cpu {
-        return Ok(());
-    }
-    for (exact, prefix) in [
-        (Some("ggml-cuda.dll"), None),
-        (None, Some("cudart64_")),
-        (None, Some("cublas64_")),
-        (None, Some("cublasLt64_")),
-    ] {
-        let present = if let Some(exact) = exact {
-            directory.join(exact).is_file()
-        } else {
-            directory_contains_dll_prefix(directory, prefix.expect("prefix checked"))?
-        };
-        if !present {
-            let missing = exact
-                .map(str::to_owned)
-                .unwrap_or_else(|| format!("{}*.dll", prefix.expect("prefix checked")));
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        if executable_path
+            .metadata()
+            .map_err(|error| error.to_string())?
+            .permissions()
+            .mode()
+            & 0o111
+            == 0
+        {
             return Err(format!(
-                "The CUDA llama.cpp installation is incomplete: missing {missing}"
+                "runtime executable is not executable: {}",
+                executable_path.display()
+            ));
+        }
+    }
+    for required in required_files {
+        if !directory.join(required).is_file() {
+            return Err(format!("runtime is missing required file: {required}"));
+        }
+    }
+    for prefix in required_file_prefixes {
+        if !directory_contains_file_prefix(directory, prefix)? {
+            return Err(format!(
+                "runtime is missing a required file with prefix: {prefix}"
             ));
         }
     }
     Ok(())
 }
 
-fn directory_contains_dll_prefix(directory: &Path, prefix: &str) -> Result<bool, String> {
+fn directory_contains_file_prefix(directory: &Path, prefix: &str) -> Result<bool, String> {
     let entries = fs::read_dir(directory)
         .map_err(|error| format!("Cannot inspect {}: {error}", directory.display()))?;
     for entry in entries {
@@ -774,7 +1049,7 @@ fn directory_contains_dll_prefix(directory: &Path, prefix: &str) -> Result<bool,
         })?;
         let name = entry.file_name();
         let name = name.to_string_lossy();
-        if name.starts_with(prefix) && name.ends_with(".dll") {
+        if name.starts_with(prefix) {
             return Ok(true);
         }
     }
@@ -791,6 +1066,22 @@ mod tests {
             browser_download_url: "https://example.invalid/file.zip".into(),
             size: 1,
             sha256: "0".repeat(64),
+            archive_format: LlamaCppArchiveFormat::Zip,
+            kind: if name.contains("cudart") {
+                LlamaCppAssetKind::CudaRuntime
+            } else if name.contains("cuda") {
+                LlamaCppAssetKind::ServerCuda
+            } else {
+                LlamaCppAssetKind::ServerCpu
+            },
+            target: current_runtime_target(),
+            cuda_version: name
+                .contains("cuda-12.4")
+                .then(|| "12.4".into())
+                .or_else(|| name.contains("cuda-13.3").then(|| "13.3".into())),
+            executable: "llama-server.exe".into(),
+            required_files: vec!["ggml.dll".into()],
+            required_file_prefixes: Vec::new(),
         }
     }
 
@@ -798,7 +1089,7 @@ mod tests {
     fn automatic_installer_uses_the_configured_download_urls() {
         let config = AppConfig::from_json_str(include_str!("../../config.json")).unwrap();
         let assets = release_assets_from_config(&config.model_manager.llama_cpp).unwrap();
-        assert_eq!(assets.len(), 5);
+        assert_eq!(assets.len(), 6);
         assert_eq!(config.model_manager.llama_cpp.release, "b10333");
         assert!(
             !config
@@ -814,6 +1105,17 @@ mod tests {
             assert!(asset.size > 0);
             assert_eq!(asset.sha256.len(), 64);
         }
+        let linux = release_assets_from_config(&config.model_manager.llama_cpp)
+            .unwrap()
+            .into_iter()
+            .find(|asset| asset.target == "linux-x86_64")
+            .expect("verified Linux x86_64 runtime asset");
+        assert_eq!(linux.archive_format, LlamaCppArchiveFormat::TarGz);
+        assert_eq!(linux.executable, "llama-b10333/llama-server");
+        assert_eq!(
+            linux.sha256,
+            "936ce04d98abe2a977e9dd2ff92659bb96947e136acee8f2bc3e21d8eaebbf23"
+        );
     }
 
     #[test]
@@ -827,12 +1129,14 @@ mod tests {
                     url: "https://example.invalid/one.zip".into(),
                     bytes: 1,
                     sha256: "0".repeat(64),
+                    ..Default::default()
                 },
                 xrtranslate_config::LlamaCppDownload {
                     name: "llama-test-bin-win-cpu-x64.zip".into(),
                     url: "http://example.invalid/two.zip".into(),
                     bytes: 1,
                     sha256: "0".repeat(64),
+                    ..Default::default()
                 },
             ],
         };
@@ -934,7 +1238,7 @@ mod tests {
         };
         let error = select_assets_for_hardware(&assets, Some(&nvidia))
             .expect_err("missing cudart must fail");
-        assert!(error.contains("cudart-llama-bin-win-cuda-13.3-x64.zip"));
+        assert!(error.contains("CUDA runtime package for version 13.3"));
     }
 
     #[test]
@@ -949,10 +1253,59 @@ mod tests {
     }
 
     #[test]
-    fn parses_release_cuda_suffix() {
+    fn runtime_assets_use_declared_cuda_versions() {
+        let assets = release_assets_from_config(&LlamaCppRuntimeConfig {
+            release: "test".into(),
+            downloads: vec![xrtranslate_config::LlamaCppDownload {
+                name: "server.zip".into(),
+                url: "https://example.invalid/server.zip".into(),
+                archive_format: LlamaCppArchiveFormat::Zip,
+                bytes: 1,
+                sha256: "0".repeat(64),
+                kind: LlamaCppAssetKind::ServerCuda,
+                target: current_runtime_target(),
+                cuda_version: Some("13.3".into()),
+                executable: "llama-server".into(),
+                required_files: vec!["libggml.so".into()],
+                required_file_prefixes: Vec::new(),
+            }],
+            ..Default::default()
+        })
+        .unwrap();
+        assert_eq!(assets[0].cuda_version.as_deref(), Some("13.3"));
+    }
+
+    #[test]
+    fn declared_tar_gz_format_is_preserved_without_filename_inference() {
+        let assets = release_assets_from_config(&LlamaCppRuntimeConfig {
+            release: "test".into(),
+            downloads: vec![xrtranslate_config::LlamaCppDownload {
+                name: "server.tar.gz".into(),
+                url: "https://example.invalid/server.tar.gz".into(),
+                bytes: 1,
+                sha256: "0".repeat(64),
+                archive_format: LlamaCppArchiveFormat::TarGz,
+                target: current_runtime_target(),
+                kind: LlamaCppAssetKind::ServerCpu,
+                executable: "bin/llama-server".into(),
+                required_files: vec!["lib/libggml.so".into()],
+                ..Default::default()
+            }],
+            ..Default::default()
+        })
+        .unwrap();
+        assert_eq!(assets[0].archive_format, LlamaCppArchiveFormat::TarGz);
+        assert_eq!(assets[0].kind, LlamaCppAssetKind::ServerCpu);
+    }
+
+    #[test]
+    fn archive_paths_reject_parent_and_absolute_entries() {
+        let root = Path::new("runtime/staging");
+        assert!(safe_archive_path(root, Path::new("../escape")).is_err());
+        assert!(safe_archive_path(root, Path::new("/absolute")).is_err());
         assert_eq!(
-            cuda_suffix("llama-b10330-bin-win-cuda-13.3-x64.zip"),
-            Some("13.3")
+            safe_archive_path(root, Path::new("bin/server")).unwrap(),
+            root.join("bin/server")
         );
     }
 

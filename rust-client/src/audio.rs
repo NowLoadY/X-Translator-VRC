@@ -7,10 +7,11 @@ use rubato::{Fft, FixedSync, Resampler};
 use std::collections::VecDeque;
 use std::sync::{
     Arc,
-    atomic::{AtomicBool, AtomicU32, Ordering},
+    atomic::{AtomicU32, Ordering},
 };
 use std::thread;
-use std::time::Duration;
+#[cfg(windows)]
+use std::{sync::atomic::AtomicBool, time::Duration};
 
 #[cfg(windows)]
 use wasapi::{
@@ -602,6 +603,29 @@ impl AudioSystem {
                 Err("Timed out while opening the WASAPI loopback device".into())
             }
         }
+    }
+}
+
+#[cfg(not(windows))]
+impl AudioSystem {
+    /// Linux capture uses CPAL input devices. System-audio loopback is
+    /// backend-specific (PipeWire/PulseAudio) and is intentionally reported as
+    /// unavailable until a dedicated implementation is selected.
+    pub fn available_loopback_devices(&self) -> Vec<InputDevice> {
+        Vec::new()
+    }
+
+    pub fn loopback_config(&self, _device_id: &str) -> Result<InputConfigInfo, String> {
+        Err("system-audio loopback is not available on this build".into())
+    }
+
+    pub fn start_loopback_capture(
+        &mut self,
+        _device_id: &str,
+        _output_tx: Sender<Vec<f32>>,
+        _level: Arc<AtomicU32>,
+    ) -> Result<(), String> {
+        Err("system-audio loopback is not available on this build".into())
     }
 }
 

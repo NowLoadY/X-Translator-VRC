@@ -12,6 +12,7 @@ use crate::session_coordinator::{
 };
 use controller::VideoPlayerController;
 use std::path::PathBuf;
+use std::time::Duration;
 #[allow(unused_imports)]
 pub use task::MediaType;
 pub use task::VideoSubtitleMode;
@@ -93,6 +94,66 @@ impl VideoPlayerPlugin {
         self.controller
             .ingest_live_caption(id, start_ms, end_ms, speaker, source, translated, metadata);
     }
+
+    pub fn on_translation_cue(
+        &mut self,
+        cue: subtitles::SubtitleCue,
+        metadata: subtitles::SubtitleMetadata,
+    ) {
+        self.controller
+            .subtitles
+            .add_cue_with_metadata(cue, metadata);
+    }
+
+    pub fn active_task_id(&self) -> Option<String> {
+        self.controller.active_task_id.clone()
+    }
+    pub fn has_active_task(&self) -> bool {
+        self.controller.active_task_id.is_some()
+    }
+    pub fn pause_task(&mut self) {
+        self.controller.pause_task();
+    }
+    pub fn set_error(&mut self, error: impl Into<String>) {
+        self.controller.error = Some(error.into());
+    }
+    pub fn update_import_progress(
+        &mut self,
+        stage: ImportProgressStage,
+        fraction: Option<f32>,
+        position: Duration,
+        duration: Option<Duration>,
+    ) {
+        match stage {
+            ImportProgressStage::Extracting => {
+                self.controller.is_extracting = true;
+                self.controller.extraction_progress = fraction;
+                self.controller.extract_position = Some(position);
+                self.controller.extract_duration = duration;
+            }
+            ImportProgressStage::Recognizing => {
+                self.controller.is_extracting = false;
+                self.controller.extraction_progress = Some(1.0);
+                self.controller.recognition_progress = fraction;
+                self.controller.recognize_position = Some(position);
+                self.controller.recognize_duration = duration;
+            }
+        }
+    }
+    pub fn complete_import(&mut self) {
+        self.controller.is_extracting = false;
+        self.controller.extraction_progress = Some(1.0);
+        self.controller.recognition_progress = Some(1.0);
+    }
+    pub fn stop_import(&mut self) {
+        self.controller.is_extracting = false;
+    }
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum ImportProgressStage {
+    Extracting,
+    Recognizing,
 }
 
 impl TranslationSessionPlugin for VideoPlayerPlugin {

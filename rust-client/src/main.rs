@@ -808,7 +808,7 @@ impl XRTranslateApp {
                 if self
                     .session_owner
                     .is_plugin(PluginId::VIDEO_PLAYER.as_str())
-                    || self.player_plugin.controller.active_task_id.is_some()
+                    || self.player_plugin.has_active_task()
                 {
                     Some("Stop the active video playback before disabling this plugin".into())
                 } else {
@@ -1041,7 +1041,7 @@ impl XRTranslateApp {
             }
             Err(error) => {
                 session.finish();
-                self.player_plugin.controller.pause_task();
+                self.player_plugin.pause_task();
                 self.set_startup_error("Media import failed", error.to_string());
                 log::error!("Media audio import failed: {error}");
             }
@@ -1097,7 +1097,7 @@ impl XRTranslateApp {
                     == Some(id.as_str())
                     && self.resume_active_meeting();
                 if !resumed_in_place && self.meeting_plugin.controller.begin_capture(&id) {
-                    if let Ok(meeting) = self.meeting_plugin.controller.store.get_meeting(&id) {
+                    if let Ok(meeting) = self.meeting_plugin.controller.meeting(&id) {
                         self.source_lang = meeting.source_language;
                         self.target_lang = meeting.target_language;
                         self.capture_source = meeting
@@ -1260,21 +1260,7 @@ impl XRTranslateApp {
     fn set_startup_error(&mut self, status: &str, error: String) {
         self.set_connection_status(status);
         self.last_error = Some(error.clone());
-        self.meeting_plugin.pending_audio_import = None;
-        if let Some(meeting_id) = self.meeting_plugin.controller.active_meeting_id() {
-            if let Err(store_error) = self
-                .meeting_plugin
-                .controller
-                .store
-                .fail_meeting(&meeting_id, error.clone())
-            {
-                log::error!("Could not mark failed meeting startup: {store_error}");
-            }
-            self.meeting_plugin.controller.clear_active_capture();
-            self.meeting_plugin.controller.reload_open_meeting();
-            self.meeting_plugin.controller.refresh_library();
-            self.meeting_plugin.controller.error = Some(error.clone());
-        }
+        self.meeting_plugin.fail_active_startup(&error);
         if let Ok(mut state) = self.shared_session_state.lock() {
             state.last_error = Some(error);
             state.is_translating = false;
@@ -1305,24 +1291,20 @@ impl XRTranslateApp {
         path: std::path::PathBuf,
         ctx: Option<eframe::egui::Context>,
     ) {
-        if self.backend_start_deadline.is_some() || self.meeting_plugin.audio_import.is_some() {
+        if self.backend_start_deadline.is_some() || self.meeting_plugin.has_audio_import() {
             return;
         }
-        if let Ok(mut active) = self.meeting_plugin.controller.active_capture.lock()
-            && let Some(active) = active.as_mut()
-        {
-            active.imported_audio = true;
-        }
+        self.meeting_plugin.controller.mark_imported_audio();
         match self.backend_manager.prepare(&self.server_url) {
             Ok(backend::BackendStart::Ready) => self.start_audio_import_session(path, ctx),
             Ok(backend::BackendStart::Starting(stage)) => {
-                self.meeting_plugin.pending_audio_import = Some(path);
+                self.meeting_plugin.set_pending_audio_import(path);
                 self.backend_start_deadline =
                     Some(std::time::Instant::now() + std::time::Duration::from_secs(180));
                 self.set_connection_status(stage.message());
             }
             Err(error) => {
-                self.meeting_plugin.controller.error = Some(error.clone());
+                self.meeting_plugin.set_error(error.clone());
                 self.set_startup_error("Startup failed", error);
             }
         }
@@ -1334,8 +1316,8 @@ impl XRTranslateApp {
         ctx: Option<eframe::egui::Context>,
     ) {
         let Some(plugin_session) = self.meeting_plugin.translation_session_binding() else {
-            self.meeting_plugin.controller.error =
-                Some("Meeting did not provide an active session binding".into());
+            self.meeting_plugin
+                .set_error("Meeting did not provide an active session binding");
             return;
         };
         self.meeting_plugin.event_sink.begin_sessions(1);
@@ -1356,7 +1338,7 @@ impl XRTranslateApp {
         ) {
             Ok(import) => {
                 self.sessions = vec![session];
-                self.meeting_plugin.audio_import = Some(import);
+                self.meeting_plugin.set_audio_import(import);
                 self.audio_txs.clear();
                 self.session_owner = TranslationSessionOwner::Plugin(plugin_session.owner);
                 self.is_translating = true;
@@ -1369,17 +1351,13 @@ impl XRTranslateApp {
             Err(error) => {
                 session.finish();
                 self.meeting_plugin.event_sink.cancel_sessions();
-                self.meeting_plugin.controller.error = Some(error.to_string());
-                if let Some(meeting_id) = self.meeting_plugin.controller.active_meeting_id()
-                    && let Err(store_error) = self
-                        .meeting_plugin
-                        .controller
-                        .store
-                        .fail_meeting(&meeting_id, error.to_string())
+                let error = error.to_string();
+                self.meeting_plugin.set_error(error.clone());
+                if let Some(store_error) =
+                    self.meeting_plugin.controller.fail_active_meeting(&error)
                 {
-                    log::error!("Could not mark failed audio import: {store_error}");
+                    self.meeting_plugin.set_error(store_error.to_string());
                 }
-                self.meeting_plugin.controller.clear_active_capture();
             }
         }
     }
@@ -1388,18 +1366,18 @@ impl XRTranslateApp {
         if self.session_owner.is_plugin(PluginId::MEETING.as_str())
             || self.meeting_plugin.controller.active_meeting_id().is_some()
         {
-            self.meeting_plugin.controller.error =
-                Some("Finish the active meeting before changing service configuration".into());
+            self.meeting_plugin
+                .set_error("Finish the active meeting before changing service configuration");
             self.navigation.page = Page::Plugin(PluginId::MEETING);
             return;
         }
         if self
             .session_owner
             .is_plugin(PluginId::VIDEO_PLAYER.as_str())
-            || self.player_plugin.controller.active_task_id.is_some()
+            || self.player_plugin.has_active_task()
         {
-            self.player_plugin.controller.error =
-                Some("Stop the active video task before changing service configuration".into());
+            self.player_plugin
+                .set_error("Stop the active video task before changing service configuration");
             self.navigation.page = Page::Plugin(PluginId::VIDEO_PLAYER);
             return;
         }
@@ -1540,8 +1518,8 @@ impl XRTranslateApp {
                 Some(sink)
             }
             Err(error) => {
-                self.meeting_plugin.controller.error =
-                    Some(format!("Could not start meeting recording: {error}"));
+                self.meeting_plugin
+                    .set_error(format!("Could not start meeting recording: {error}"));
                 None
             }
         }
@@ -1564,7 +1542,7 @@ impl XRTranslateApp {
                         pacing,
                         ctx,
                     );
-                } else if let Some(path) = self.meeting_plugin.pending_audio_import.take() {
+                } else if let Some(path) = self.meeting_plugin.take_pending_audio_import() {
                     self.start_audio_import_session(path, ctx);
                 } else {
                     self.start_session(ctx);
@@ -1695,27 +1673,21 @@ impl XRTranslateApp {
             // sender. The network producer then drains every queued frame and
             // emits `input_ended`; the meeting is ended only after the backend
             // acknowledges its ordered inference drain.
-            self.meeting_plugin.audio_import = None;
+            self.meeting_plugin.clear_audio_import();
             self.set_connection_status("Finishing imported audio");
         }
         if let Some(error) = terminal_error {
             for session in &self.sessions {
                 session.finish();
             }
-            if let Some(meeting_id) = self.meeting_plugin.controller.active_meeting_id() {
-                self.meeting_plugin.controller.error = Some(error.clone());
-                let result = self
-                    .meeting_plugin
-                    .controller
-                    .store
-                    .fail_meeting(&meeting_id, error);
-                if let Err(error) = result {
-                    self.meeting_plugin.controller.error = Some(error.to_string());
+            if self.meeting_plugin.controller.active_meeting_id().is_some() {
+                if let Some(store_error) =
+                    self.meeting_plugin.controller.fail_active_meeting(&error)
+                {
+                    self.meeting_plugin.set_error(store_error.to_string());
                 }
-                self.meeting_plugin.controller.reload_open_meeting();
-                self.meeting_plugin.controller.refresh_library();
             }
-            self.meeting_plugin.audio_import = None;
+            self.meeting_plugin.clear_audio_import();
         }
 
         let host_events = self
@@ -1736,11 +1708,12 @@ impl XRTranslateApp {
                     let percentage = progress.fraction.map(|value| value * 100.0);
                     match progress.stage {
                         media_import::AudioImportStage::Extracting => {
-                            self.player_plugin.controller.is_extracting = true;
-                            self.player_plugin.controller.extraction_progress = progress.fraction;
-                            self.player_plugin.controller.extract_position =
-                                Some(progress.position);
-                            self.player_plugin.controller.extract_duration = progress.duration;
+                            self.player_plugin.update_import_progress(
+                                plugins::player::ImportProgressStage::Extracting,
+                                progress.fraction,
+                                progress.position,
+                                progress.duration,
+                            );
                             self.set_connection_status(percentage.map_or_else(
                                 || {
                                     format!(
@@ -1752,12 +1725,12 @@ impl XRTranslateApp {
                             ));
                         }
                         media_import::AudioImportStage::Recognizing => {
-                            self.player_plugin.controller.is_extracting = false;
-                            self.player_plugin.controller.extraction_progress = Some(1.0);
-                            self.player_plugin.controller.recognition_progress = progress.fraction;
-                            self.player_plugin.controller.recognize_position =
-                                Some(progress.position);
-                            self.player_plugin.controller.recognize_duration = progress.duration;
+                            self.player_plugin.update_import_progress(
+                                plugins::player::ImportProgressStage::Recognizing,
+                                progress.fraction,
+                                progress.position,
+                                progress.duration,
+                            );
                             self.set_connection_status(percentage.map_or_else(
                                 || {
                                     format!(
@@ -1771,19 +1744,17 @@ impl XRTranslateApp {
                     }
                 }
                 media_import::AudioImportEvent::Completed { .. } => {
-                    self.player_plugin.controller.is_extracting = false;
-                    self.player_plugin.controller.extraction_progress = Some(1.0);
-                    self.player_plugin.controller.recognition_progress = Some(1.0);
+                    self.player_plugin.complete_import();
                     host_completed = true;
                 }
                 media_import::AudioImportEvent::Stopped { .. } => {
-                    self.player_plugin.controller.is_extracting = false;
+                    self.player_plugin.stop_import();
                     self.host_audio_import = None;
                 }
                 media_import::AudioImportEvent::Error(error) => {
                     log::error!("Host audio import error: {error}");
-                    self.player_plugin.controller.is_extracting = false;
-                    self.player_plugin.controller.error = Some(error.clone());
+                    self.player_plugin.stop_import();
+                    self.player_plugin.set_error(error.clone());
                     self.set_startup_error("Media audio error", error);
                     self.host_audio_import = None;
                 }
@@ -2038,8 +2009,8 @@ impl XRTranslateApp {
         if let Some(recording) = &self.meeting_plugin.meeting_recording
             && let Err(error) = recording.checkpoint()
         {
-            self.meeting_plugin.controller.error =
-                Some(format!("Could not checkpoint meeting audio: {error}"));
+            self.meeting_plugin
+                .set_error(format!("Could not checkpoint meeting audio: {error}"));
         }
         let _ = self.meeting_plugin.controller.pause_capture();
     }
@@ -2055,24 +2026,17 @@ impl XRTranslateApp {
                 for session in &self.sessions {
                     session.resume();
                 }
-                if let Some(meeting_id) = self.meeting_plugin.controller.active_meeting_id() {
-                    match self
-                        .meeting_plugin
-                        .controller
-                        .store
-                        .resume_meeting(&meeting_id)
-                    {
-                        Ok(_) => self.meeting_plugin.controller.reload_open_meeting(),
-                        Err(error) => {
-                            self.meeting_plugin.controller.error = Some(error.to_string())
-                        }
+                if self.meeting_plugin.controller.active_meeting_id().is_some() {
+                    match self.meeting_plugin.controller.resume_active_meeting() {
+                        Ok(_) => {}
+                        Err(error) => self.meeting_plugin.set_error(error.to_string()),
                     }
                 }
                 true
             }
             Err(error) => {
-                self.meeting_plugin.controller.error =
-                    Some(format!("Could not resume meeting audio: {error}"));
+                self.meeting_plugin
+                    .set_error(format!("Could not resume meeting audio: {error}"));
                 false
             }
         }
@@ -2092,8 +2056,8 @@ impl XRTranslateApp {
         };
         let markdown = plugins::meeting::store::render_markdown(bundle);
         if let Err(error) = std::fs::write(path, markdown) {
-            self.meeting_plugin.controller.error =
-                Some(format!("Could not export meeting: {error}"));
+            self.meeting_plugin
+                .set_error(format!("Could not export meeting: {error}"));
         }
     }
 
@@ -2103,8 +2067,8 @@ impl XRTranslateApp {
         for worker in self.meeting_audio_routers.drain(..) {
             let _ = worker.join();
         }
-        self.meeting_plugin.audio_import = None;
-        self.meeting_plugin.pending_audio_import = None;
+        self.meeting_plugin.clear_audio_import();
+        self.meeting_plugin.clear_pending_audio_import();
         self.host_audio_import = None;
         self.pending_audio_import = None;
         self.backend_start_deadline = None;
@@ -2117,8 +2081,8 @@ impl XRTranslateApp {
         if let Some(recording) = self.meeting_plugin.meeting_recording.take()
             && let Err(error) = recording.finalize()
         {
-            self.meeting_plugin.controller.error =
-                Some(format!("Could not finalize meeting recording: {error}"));
+            self.meeting_plugin
+                .set_error(format!("Could not finalize meeting recording: {error}"));
         }
         self.input_level.store(0.0_f32.to_bits(), Ordering::Relaxed);
         self.loopback_level
@@ -2187,7 +2151,7 @@ impl XRTranslateApp {
                     .session_owner
                     .is_plugin(PluginId::VIDEO_PLAYER.as_str())
             {
-                self.player_plugin.controller.pause_task();
+                self.player_plugin.pause_task();
                 self.session_owner = TranslationSessionOwner::None;
                 for session in &self.sessions {
                     session.finish();
@@ -2266,7 +2230,7 @@ impl XRTranslateApp {
         {
             return;
         }
-        let active_task_id = self.player_plugin.controller.active_task_id.clone();
+        let active_task_id = self.player_plugin.active_task_id();
         let Some(active_id) = active_task_id else {
             return;
         };
@@ -2287,32 +2251,23 @@ impl XRTranslateApp {
                     continue;
                 }
 
-                let speaker = if entry.speaker_id.is_empty() {
-                    None
-                } else {
-                    Some(entry.speaker_id.clone())
-                };
-                let cue_id = if !entry.turn_id.is_empty() {
-                    format!("turn_{}_segment_{}", entry.turn_id, entry.segment_index)
-                } else if let Some(sid) = entry.stream_id {
-                    format!("stream_{}_{}", sid, entry.source_start_ms.round() as i64)
-                } else {
-                    format!("cue_{}", entry.source_start_ms.round() as i64)
-                };
-                self.player_plugin.on_translation_segment(
-                    cue_id,
-                    entry.source_start_ms as i64,
-                    entry.source_end_ms as i64,
-                    speaker,
-                    entry.source.clone(),
-                    Some(entry.translated.clone()),
-                    plugins::player::subtitles::SubtitleMetadata {
+                let (cue, metadata) = plugins::player::subtitles::cue_from_translation(
+                    plugins::player::subtitles::TranslationCueInput {
+                        turn_id: entry.turn_id.clone(),
+                        segment_index: entry.segment_index,
+                        stream_id: entry.stream_id,
+                        start_ms: entry.source_start_ms.round() as i64,
+                        end_ms: entry.source_end_ms.round() as i64,
+                        speaker_id: entry.speaker_id.clone(),
+                        source: entry.source.clone(),
+                        translated: entry.translated.clone(),
                         timing: entry.timing,
                         boundary: entry.boundary,
                         revisable: entry.revisable,
                         finalized: !entry.live,
                     },
                 );
+                self.player_plugin.on_translation_cue(cue, metadata);
             }
         }
     }

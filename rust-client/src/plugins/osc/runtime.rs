@@ -130,14 +130,18 @@ impl BannerConfig {
                 }
             }
             BannerContentType::CpuStatus => {
-                if self.show_device_name && !metrics.cpu_name.is_empty() {
+                if metrics.cpu_name.is_empty() {
+                    "[CPU unavailable]".to_string()
+                } else if self.show_device_name {
                     format!("[{} {}%]", metrics.cpu_name, metrics.cpu_usage)
                 } else {
                     format!("[CPU {}%]", metrics.cpu_usage)
                 }
             }
             BannerContentType::GpuStatus => {
-                if self.show_device_name && !metrics.gpu_name.is_empty() {
+                if metrics.gpu_name.is_empty() {
+                    "[GPU unavailable]".to_string()
+                } else if self.show_device_name {
                     format!("[{} {}%]", metrics.gpu_name, metrics.gpu_usage)
                 } else {
                     format!("[GPU {}%]", metrics.gpu_usage)

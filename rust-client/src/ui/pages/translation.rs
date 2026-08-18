@@ -153,9 +153,7 @@ pub fn render(app: &mut crate::XRTranslateApp, ui: &mut egui::Ui) {
             egui::ComboBox::from_id_salt("capture_source")
                 .selected_text(match app.capture_source {
                     CaptureSource::Microphone => crate::i18n::tr(app.ui_language, "Microphone"),
-                    CaptureSource::SystemAudio => {
-                        crate::i18n::tr(app.ui_language, "System Audio (WASAPI)")
-                    }
+                    CaptureSource::SystemAudio => crate::i18n::tr(app.ui_language, "System Audio"),
                     CaptureSource::Both => crate::i18n::tr(app.ui_language, "Both"),
                 })
                 .show_ui(ui, |ui| {
@@ -164,16 +162,18 @@ pub fn render(app: &mut crate::XRTranslateApp, ui: &mut egui::Ui) {
                         CaptureSource::Microphone,
                         crate::i18n::tr(app.ui_language, "Microphone"),
                     );
-                    ui.selectable_value(
-                        &mut app.capture_source,
-                        CaptureSource::SystemAudio,
-                        crate::i18n::tr(app.ui_language, "System Audio (WASAPI)"),
-                    );
-                    ui.selectable_value(
-                        &mut app.capture_source,
-                        CaptureSource::Both,
-                        crate::i18n::tr(app.ui_language, "Both"),
-                    );
+                    ui.add_enabled_ui(!app.loopback_devices.is_empty(), |ui| {
+                        ui.selectable_value(
+                            &mut app.capture_source,
+                            CaptureSource::SystemAudio,
+                            crate::i18n::tr(app.ui_language, "System Audio"),
+                        );
+                        ui.selectable_value(
+                            &mut app.capture_source,
+                            CaptureSource::Both,
+                            crate::i18n::tr(app.ui_language, "Both"),
+                        );
+                    });
                 });
             if app.capture_source != previous_source {
                 app.switch_capture_source(previous_source);
@@ -195,7 +195,7 @@ pub fn render(app: &mut crate::XRTranslateApp, ui: &mut egui::Ui) {
         render_capture_device_selector(app, ui);
 
         ui.add_space(10.0);
-        if app.capture_source == CaptureSource::Both {
+        if app.capture_source == CaptureSource::Both && !app.loopback_devices.is_empty() {
             let avail_w = ui.available_width();
             if avail_w < 620.0 {
                 egui::Frame::new()
@@ -585,7 +585,7 @@ fn render_input_adaptation(
         let title = match source {
             CaptureSource::Microphone => crate::i18n::tr(app.ui_language, "Microphone").to_string(),
             CaptureSource::SystemAudio => {
-                crate::i18n::tr(app.ui_language, "System Audio (WASAPI)").to_string()
+                crate::i18n::tr(app.ui_language, "System Audio").to_string()
             }
             CaptureSource::Both => unreachable!(),
         };
@@ -703,6 +703,13 @@ fn render_capture_device_selector(app: &mut crate::XRTranslateApp, ui: &mut egui
                 }
             }
             CaptureSource::SystemAudio => {
+                if app.loopback_devices.is_empty() {
+                    ui.label(crate::i18n::tr(
+                        app.ui_language,
+                        "System audio capture is unavailable on this host",
+                    ));
+                    return;
+                }
                 let previous_device = app.selected_loopback_device_id.clone();
                 let current_name = app
                     .loopback_devices
@@ -770,11 +777,11 @@ fn render_capture_device_selector(app: &mut crate::XRTranslateApp, ui: &mut egui
         render_audio_level(ui, level, vad_active, true, app.is_translating);
     });
 
-    if app.capture_source == CaptureSource::Both {
+    if app.capture_source == CaptureSource::Both && !app.loopback_devices.is_empty() {
         ui.add_space(6.0);
         ui.horizontal(|ui| {
             ui.label(
-                egui::RichText::new(crate::i18n::tr(app.ui_language, "System Audio (WASAPI)"))
+                egui::RichText::new(crate::i18n::tr(app.ui_language, "System Audio"))
                     .color(crate::ui::theme::text_strong())
                     .strong(),
             );

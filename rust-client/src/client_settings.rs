@@ -270,6 +270,24 @@ impl ClientSettings {
             );
             self.selected_loopback_device_id.clear();
         }
+
+        // Loopback is a host capability. Do not leave a persisted session in a
+        // source mode that this host cannot provide (Linux currently exposes
+        // microphone capture but no system-audio loopback).
+        if available_loopbacks.is_empty()
+            && matches!(
+                self.capture_source,
+                CaptureSource::SystemAudio | CaptureSource::Both
+            )
+        {
+            if !available_mics.is_empty() || self.selected_device_id.is_empty() {
+                log::warn!(
+                    "System-audio loopback is unavailable; falling back to microphone capture."
+                );
+                self.capture_source = CaptureSource::Microphone;
+                self.selected_loopback_device_id.clear();
+            }
+        }
     }
 
     pub fn save(&self, project_root: &Path) -> Result<(), String> {

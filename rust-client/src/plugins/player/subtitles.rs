@@ -13,6 +13,54 @@ pub struct SubtitleCue {
     pub translated_text: Option<String>,
 }
 
+/// Neutral translation facts converted into a player-owned subtitle cue.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct TranslationCueInput {
+    pub turn_id: String,
+    pub segment_index: u32,
+    pub stream_id: Option<u64>,
+    pub start_ms: i64,
+    pub end_ms: i64,
+    pub speaker_id: String,
+    pub source: String,
+    pub translated: String,
+    pub timing: SegmentTiming,
+    pub boundary: SegmentBoundary,
+    pub revisable: bool,
+    pub finalized: bool,
+}
+
+/// Applies player subtitle identity and presentation metadata to a generic
+/// translation result. Audio-source/session ownership decisions stay in host
+/// coordination; this function is deterministic and platform-independent.
+pub fn cue_from_translation(input: TranslationCueInput) -> (SubtitleCue, SubtitleMetadata) {
+    let id = if !input.turn_id.is_empty() {
+        format!("turn_{}_segment_{}", input.turn_id, input.segment_index)
+    } else if let Some(stream_id) = input.stream_id {
+        format!("stream_{}_{}", stream_id, input.start_ms)
+    } else {
+        format!("cue_{}", input.start_ms)
+    };
+    let speaker_name = (!input.speaker_id.is_empty()).then_some(input.speaker_id);
+    let metadata = SubtitleMetadata {
+        timing: input.timing,
+        boundary: input.boundary,
+        revisable: input.revisable,
+        finalized: input.finalized,
+    };
+    (
+        SubtitleCue {
+            id,
+            start_ms: input.start_ms,
+            end_ms: input.end_ms,
+            speaker_name,
+            original_text: input.source,
+            translated_text: Some(input.translated),
+        },
+        metadata,
+    )
+}
+
 /// Generic recognition metadata used to turn a transcript window into a
 /// display cue. It deliberately contains no player-specific or backend-model
 /// details, so other subtitle-producing plugins can apply their own policy.
@@ -250,6 +298,55 @@ fn format_timestamp_srt(ms: i64) -> String {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn translation_cue_identity_prefers_turn_and_segment() {
+        let (cue, metadata) = super::cue_from_translation(super::TranslationCueInput {
+            turn_id: "turn-a".into(),
+            segment_index: 2,
+            stream_id: Some(7),
+            start_ms: 1_234,
+            end_ms: 2_345,
+            speaker_id: String::new(),
+            source: "hello".into(),
+            translated: "你好".into(),
+            timing: xrtranslate_protocol::SegmentTiming::UtteranceWindow,
+            boundary: xrtranslate_protocol::SegmentBoundary::Silence,
+            revisable: true,
+            finalized: false,
+        });
+        assert_eq!(cue.id, "turn_turn-a_segment_2");
+        assert_eq!(cue.speaker_name, None);
+        assert_eq!(cue.translated_text.as_deref(), Some("你好"));
+        assert!(metadata.revisable);
+        assert!(!metadata.finalized);
+    }
+
+    #[test]
+    fn translation_cue_identity_falls_back_to_stream_or_time() {
+        let base = super::TranslationCueInput {
+            turn_id: String::new(),
+            segment_index: 0,
+            stream_id: Some(9),
+            start_ms: 1_234,
+            end_ms: 2_000,
+            speaker_id: "speaker-1".into(),
+            source: "hello".into(),
+            translated: "你好".into(),
+            timing: Default::default(),
+            boundary: Default::default(),
+            revisable: false,
+            finalized: true,
+        };
+        let (stream_cue, _) = super::cue_from_translation(base.clone());
+        assert_eq!(stream_cue.id, "stream_9_1234");
+        assert_eq!(stream_cue.speaker_name.as_deref(), Some("speaker-1"));
+        let (time_cue, _) = super::cue_from_translation(super::TranslationCueInput {
+            stream_id: None,
+            ..base
+        });
+        assert_eq!(time_cue.id, "cue_1234");
+    }
+
     use super::*;
 
     #[test]

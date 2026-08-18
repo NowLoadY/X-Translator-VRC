@@ -1,14 +1,19 @@
 use std::{
     path::{Path, PathBuf},
-    sync::atomic::{AtomicBool, Ordering},
+    sync::atomic::AtomicBool,
+};
+
+#[cfg(feature = "mpv")]
+use crossbeam_channel::Sender;
+#[cfg(feature = "mpv")]
+use std::{
+    sync::atomic::Ordering,
     time::{Duration, Instant},
 };
 
-use crossbeam_channel::Sender;
-
-use super::types::{
-    AudioImportError, AudioImportEvent, AudioImportProgress, AudioImportStage, IMPORT_SAMPLE_RATE,
-};
+use super::types::{AudioImportError, AudioImportEvent};
+#[cfg(feature = "mpv")]
+use super::types::{AudioImportProgress, AudioImportStage, IMPORT_SAMPLE_RATE};
 
 pub(super) struct TempFileGuard(pub(super) PathBuf);
 
@@ -38,6 +43,7 @@ pub(crate) fn build_recognition_pan_filter(recognition_channels: &[usize]) -> Op
     Some(format!("lavfi=[pan=stereo|c0={sum_expr}|c1={sum_expr}]"))
 }
 
+#[cfg(feature = "mpv")]
 pub(super) fn run_mpv_extract(
     source_path: &Path,
     target_wav: &Path,
@@ -180,6 +186,19 @@ pub(super) fn run_mpv_extract(
         ));
     }
     Ok(())
+}
+
+#[cfg(not(feature = "mpv"))]
+pub(super) fn run_mpv_extract(
+    _source_path: &Path,
+    _target_wav: &Path,
+    _recognition_channels: &[usize],
+    _stop_requested: &AtomicBool,
+    _event_tx: &crossbeam_channel::Sender<AudioImportEvent>,
+) -> Result<(), AudioImportError> {
+    Err(AudioImportError::Unsupported(
+        "MPV media extraction is unavailable; rebuild with the `mpv` feature".into(),
+    ))
 }
 
 #[cfg(test)]

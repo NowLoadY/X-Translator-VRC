@@ -851,13 +851,23 @@ pub fn target_language_pair_selector(
         let options_a: Vec<_> = crate::LANGUAGE_OPTIONS
             .iter()
             .filter(|(code, _)| !crate::languages_conflict(code, &b))
-            .map(|(code, label)| ((*code).to_string(), crate::i18n::tr(language, label).to_string()))
+            .map(|(code, label)| {
+                (
+                    (*code).to_string(),
+                    crate::i18n::tr(language, label).to_string(),
+                )
+            })
             .collect();
 
         let options_b: Vec<_> = crate::LANGUAGE_OPTIONS
             .iter()
             .filter(|(code, _)| !crate::languages_conflict(code, &a))
-            .map(|(code, label)| ((*code).to_string(), crate::i18n::tr(language, label).to_string()))
+            .map(|(code, label)| {
+                (
+                    (*code).to_string(),
+                    crate::i18n::tr(language, label).to_string(),
+                )
+            })
             .collect();
 
         ui.horizontal(|ui| {
@@ -901,7 +911,11 @@ pub fn target_language_pair_selector(
             }
         }
         if crate::languages_conflict(target_language, source_language) {
-            let fallback = if crate::languages_conflict(source_language, "zh") { "en" } else { "zh" };
+            let fallback = if crate::languages_conflict(source_language, "zh") {
+                "en"
+            } else {
+                "zh"
+            };
             *target_language = fallback.to_string();
             changed = true;
         }
@@ -928,9 +942,6 @@ pub fn target_language_pair_selector(
     }
     changed
 }
-
-
-
 
 pub fn language_selector(
     ui: &mut Ui,

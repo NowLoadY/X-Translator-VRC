@@ -60,6 +60,7 @@ impl AppUpdateState {
 #[derive(Clone, Debug)]
 pub struct PreparedUpdate {
     source: PathBuf,
+    project_root: PathBuf,
     updater_entrypoint: String,
     info: AppUpdateInfo,
 }
@@ -165,7 +166,7 @@ impl AppUpdateManager {
         Ok(AppUpdateInstall {
             updater,
             source: prepared.source,
-            target: PathBuf::from("."),
+            target: prepared.project_root,
         })
     }
 
@@ -440,6 +441,7 @@ async fn download_and_stage(
     let updater_entrypoint = validate_staged_release(&source)?;
     Ok(PreparedUpdate {
         source,
+        project_root,
         updater_entrypoint,
         info: asset.info(),
     })
@@ -676,6 +678,40 @@ fn safe_path_segment(value: &str) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::time::{SystemTime, UNIX_EPOCH};
+
+    #[test]
+    fn begin_install_targets_the_project_root() {
+        let root = std::env::temp_dir().join(format!(
+            "xrtranslate-update-test-{}",
+            SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .expect("system clock before epoch")
+                .as_nanos()
+        ));
+        let source = root.join("staging");
+        std::fs::create_dir_all(&source).expect("create staging directory");
+        let updater = source.join("updater");
+        std::fs::write(&updater, b"test").expect("create updater entrypoint");
+
+        let mut manager = AppUpdateManager {
+            prepared: Some(PreparedUpdate {
+                source: source.clone(),
+                project_root: root.clone(),
+                updater_entrypoint: "updater".into(),
+                info: AppUpdateInfo {
+                    version: "test".into(),
+                    asset_name: "test.zip".into(),
+                    size: 1,
+                },
+            }),
+            ..Default::default()
+        };
+        let install = manager.begin_install().expect("begin install");
+        assert_eq!(install.target, root);
+        assert_eq!(install.source, source);
+        let _ = std::fs::remove_dir_all(install.target);
+    }
 
     #[test]
     fn selects_current_platform_zip_assets() {

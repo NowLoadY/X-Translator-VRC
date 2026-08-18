@@ -10,7 +10,7 @@ use std::{
     time::Duration,
 };
 use xrtranslate_assets::{ModelAssetId, ModelAssetsConfig, ModelCapability, manifest_for};
-use xrtranslate_config::{AppConfig, StorageConfig};
+use xrtranslate_config::{AppConfig, RuntimeLayout, StorageConfig};
 
 const MIN_LOG_FILE_BYTES: u64 = 64 * 1024;
 const MAX_LOG_FILE_BYTES: u64 = 64 * 1024 * 1024;
@@ -147,7 +147,10 @@ impl BackendManager {
                 path.display()
             ));
         }
-        let value = path.display().to_string();
+        let value = RuntimeLayout::for_project_root(project_root)
+            .config_path_for(&path)
+            .display()
+            .to_string();
         Self::write_llama_server_path(project_root, &value)?;
         Ok(path)
     }
@@ -768,11 +771,7 @@ fn project_root() -> PathBuf {
 }
 
 fn absolute_from_project_root(project_root: &std::path::Path, path: PathBuf) -> PathBuf {
-    let candidate = if path.is_absolute() {
-        path
-    } else {
-        project_root.join(path)
-    };
+    let candidate = RuntimeLayout::for_project_root(project_root).resolve_configured_path(path);
     std::path::absolute(&candidate).unwrap_or(candidate)
 }
 
@@ -785,12 +784,9 @@ fn preferred_llama_server_path(project_root: &std::path::Path, configured: &str)
         }
     }
 
-    let installed = absolute_from_project_root(
-        project_root,
-        PathBuf::from("runtime")
-            .join("llama.cpp")
-            .join("llama-server.exe"),
-    );
+    let installed = RuntimeLayout::for_project_root(project_root)
+        .managed_llama_server(format!("llama-server{}", std::env::consts::EXE_SUFFIX));
+    let installed = std::path::absolute(&installed).unwrap_or(installed);
     if installed.is_file() {
         installed.display().to_string()
     } else {
@@ -930,7 +926,7 @@ mod tests {
         let server = root
             .join("runtime")
             .join("llama.cpp")
-            .join("llama-server.exe");
+            .join(format!("llama-server{}", std::env::consts::EXE_SUFFIX));
         std::fs::create_dir_all(server.parent().unwrap()).unwrap();
         std::fs::write(&server, b"test").unwrap();
         server
@@ -940,7 +936,11 @@ mod tests {
     fn relative_configured_runtime_is_resolved_from_project_root() {
         let root = temp_root("relative");
         let server = create_server(&root);
-        let selected = preferred_llama_server_path(&root, "runtime/llama.cpp/llama-server.exe");
+        let configured = format!(
+            "runtime/llama.cpp/llama-server{}",
+            std::env::consts::EXE_SUFFIX
+        );
+        let selected = preferred_llama_server_path(&root, &configured);
         assert_eq!(PathBuf::from(selected), server);
         std::fs::remove_dir_all(root).unwrap();
     }
@@ -964,7 +964,7 @@ mod tests {
     }
 
     #[test]
-    fn installed_runtime_is_written_to_config_as_an_absolute_valid_path() {
+    fn installed_runtime_is_written_to_config_as_a_project_relative_path() {
         let root = temp_root("persist");
         let server = create_server(&root);
         std::fs::write(root.join("config.json"), b"{\"model_manager\":{}}").unwrap();
@@ -977,7 +977,10 @@ mod tests {
         assert!(persisted.is_absolute());
         assert_eq!(
             config["model_manager"]["llama_server_path"],
-            persisted.display().to_string()
+            format!(
+                "runtime/llama.cpp/llama-server{}",
+                std::env::consts::EXE_SUFFIX
+            )
         );
         std::fs::remove_dir_all(root).unwrap();
     }

@@ -20,7 +20,7 @@ use xr_corpus_core::load_markdown_directory;
 use xrtranslate_assets::{
     ModelAssetId, ModelAssetManifest, ModelAssetsConfig, ResolvedModelAssets,
 };
-use xrtranslate_config::AppConfig;
+use xrtranslate_config::{AppConfig, RuntimeLayout};
 
 const RELEASE_LAYOUT_VERSION: u32 = 3;
 const VAD_RELATIVE_PATH: &str = "models/silero-vad/src/silero_vad/data/silero_vad.onnx";
@@ -273,6 +273,7 @@ impl ReleasePlan {
             &arguments.updater_bin,
             arguments.include_models,
             &assets,
+            &RuntimeLayout::for_project_root(&project_root),
         );
 
         Ok(Self {
@@ -455,12 +456,19 @@ fn release_manifest(
     updater: &Path,
     include_models: bool,
     assets: &ResolvedModelAssets,
+    runtime_layout: &RuntimeLayout,
 ) -> Value {
     let model_packages = assets
         .iter()
         .iter()
         .map(|asset| manifest_json(asset.manifest()))
         .collect::<Vec<_>>();
+    let runtime_directory = runtime_layout
+        .llama_cpp_directory()
+        .strip_prefix(runtime_layout.project_root())
+        .unwrap_or_else(|_| std::path::Path::new(RuntimeLayout::LLAMA_CPP_DIRECTORY))
+        .to_string_lossy()
+        .replace('\\', "/");
     json!({
         "layout_version": RELEASE_LAYOUT_VERSION,
         "python": false,
@@ -473,7 +481,8 @@ fn release_manifest(
         },
         "runtime": {
             "included": false,
-            "setup_required": "Choose llama-server.exe in the client welcome flow.",
+            "directory": runtime_directory,
+            "setup_required": "Choose the llama-server executable in the client welcome flow.",
         },
         "vad_model": VAD_RELATIVE_PATH,
         "speaker_model": {

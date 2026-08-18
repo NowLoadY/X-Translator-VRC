@@ -20,6 +20,63 @@ pub use xr_corpus_core::CorpusConfig as PromptContextConfig;
 /// schema on optional providers.
 pub type ProviderConfigs = Map<String, Value>;
 
+/// Stable on-disk layout for managed native runtimes.
+///
+/// This is deliberately limited to path resolution. Archive selection and
+/// executable validation remain owned by the installer/backend layers.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct RuntimeLayout {
+    project_root: PathBuf,
+}
+
+impl RuntimeLayout {
+    pub const LLAMA_CPP_DIRECTORY: &'static str = "runtime/llama.cpp";
+
+    #[must_use]
+    pub fn for_project_root(project_root: impl AsRef<Path>) -> Self {
+        Self {
+            project_root: project_root.as_ref().to_path_buf(),
+        }
+    }
+
+    #[must_use]
+    pub fn project_root(&self) -> &Path {
+        &self.project_root
+    }
+
+    #[must_use]
+    pub fn llama_cpp_directory(&self) -> PathBuf {
+        self.project_root.join(Self::LLAMA_CPP_DIRECTORY)
+    }
+
+    /// Resolves a config path against the config/project root while preserving
+    /// explicit absolute paths for existing manual installations.
+    #[must_use]
+    pub fn resolve_configured_path(&self, configured: impl AsRef<Path>) -> PathBuf {
+        let configured = configured.as_ref();
+        if configured.is_absolute() {
+            configured.to_path_buf()
+        } else {
+            self.project_root.join(configured)
+        }
+    }
+
+    #[must_use]
+    pub fn managed_llama_server(&self, executable: impl AsRef<Path>) -> PathBuf {
+        self.llama_cpp_directory().join(executable)
+    }
+
+    /// Returns a stable config value: managed files are stored relative to the
+    /// project root, while manually selected external files remain absolute.
+    #[must_use]
+    pub fn config_path_for(&self, path: impl AsRef<Path>) -> PathBuf {
+        let path = path.as_ref();
+        path.strip_prefix(&self.project_root)
+            .map(Path::to_path_buf)
+            .unwrap_or_else(|_| path.to_path_buf())
+    }
+}
+
 /// The parsed native-backend configuration and the complete original JSON.
 #[derive(Debug, Clone, PartialEq)]
 pub struct AppConfig {
@@ -643,7 +700,7 @@ pub struct ModelManagerConfig {
     pub hunyuan_mt_gguf_directory: Option<PathBuf>,
 }
 
-/// A fixed llama.cpp release and its downloadable Windows archives.
+/// A fixed llama.cpp release and its downloadable runtime archives.
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
 pub struct LlamaCppRuntimeConfig {
     /// Human-readable release identifier used in installer diagnostics.
@@ -658,14 +715,55 @@ pub struct LlamaCppRuntimeConfig {
 }
 
 /// One llama.cpp archive available from the configured release.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
 pub struct LlamaCppDownload {
     pub name: String,
     pub url: String,
+    /// Archive encoding used by the release artifact.
+    #[serde(default)]
+    pub archive_format: LlamaCppArchiveFormat,
     #[serde(default)]
     pub bytes: u64,
     #[serde(default)]
     pub sha256: String,
+    /// Rust target family this archive can run on, for example
+    /// `windows-x86_64` or `linux-x86_64`.
+    #[serde(default)]
+    pub target: String,
+    /// Runtime role. This keeps selection independent from vendor filenames.
+    #[serde(default)]
+    pub kind: LlamaCppAssetKind,
+    /// Executable produced by a server archive, relative to its extracted root.
+    /// An empty value is normalized by the runtime installer for legacy config
+    /// entries; new entries must declare it explicitly.
+    #[serde(default)]
+    pub executable: String,
+    /// CUDA runtime version for CUDA server/runtime archives.
+    #[serde(default)]
+    pub cuda_version: Option<String>,
+    /// Exact files required after extraction, excluding `executable`.
+    #[serde(default)]
+    pub required_files: Vec<String>,
+    /// Required file-name prefixes, used for versioned shared libraries.
+    #[serde(default)]
+    pub required_file_prefixes: Vec<String>,
+}
+
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "kebab-case")]
+pub enum LlamaCppArchiveFormat {
+    #[default]
+    Zip,
+    TarGz,
+}
+
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "kebab-case")]
+pub enum LlamaCppAssetKind {
+    #[default]
+    ServerCpu,
+    ServerCuda,
+    CudaRuntime,
 }
 
 impl Default for ModelManagerConfig {
@@ -921,12 +1019,31 @@ fn default_hunyuan_gguf_repo() -> String {
     "tencent/Hy-MT2-1.8B-GGUF".into()
 }
 fn default_llama_server_path() -> String {
-    "D:/app_install_path/AI/llama.cpp/llama-server.exe".into()
+    "runtime/llama.cpp/llama-server".into()
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn runtime_layout_resolves_and_persists_managed_paths_relative_to_root() {
+        let root = PathBuf::from("/tmp/xrtranslate-release");
+        let layout = RuntimeLayout::for_project_root(&root);
+        let configured = layout.resolve_configured_path("runtime/llama.cpp/llama-server");
+        assert_eq!(configured, layout.managed_llama_server("llama-server"));
+        assert_eq!(
+            layout.config_path_for(&configured),
+            PathBuf::from("runtime/llama.cpp/llama-server")
+        );
+    }
+
+    #[test]
+    fn runtime_layout_keeps_external_manual_paths_absolute() {
+        let layout = RuntimeLayout::for_project_root("/tmp/xrtranslate-release");
+        let external = PathBuf::from("/opt/llama.cpp/llama-server");
+        assert_eq!(layout.config_path_for(&external), external);
+    }
 
     #[test]
     fn root_config_is_read_with_optional_sections_preserved() {
@@ -994,7 +1111,7 @@ mod tests {
 
         assert_eq!(
             gguf.llama_server_path,
-            PathBuf::from("D:/app_install_path/AI/llama.cpp/llama-server.exe")
+            PathBuf::from("runtime/llama.cpp/llama-server")
         );
         assert_eq!(gguf.hunyuan_gguf_repo, "tencent/Hy-MT2-1.8B-GGUF");
         assert_eq!(gguf.asr_url, "http://127.0.0.1:8001/v1/chat/completions");

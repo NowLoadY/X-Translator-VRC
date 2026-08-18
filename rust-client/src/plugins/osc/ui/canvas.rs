@@ -115,7 +115,10 @@ pub fn render_bottom_input_bar(
 
             egui::Frame::new()
                 .fill(egui::Color32::from_rgb(248, 250, 252))
-                .stroke(egui::Stroke::new(1.0, egui::Color32::from_rgb(226, 232, 240)))
+                .stroke(egui::Stroke::new(
+                    1.0,
+                    egui::Color32::from_rgb(226, 232, 240),
+                ))
                 .corner_radius(egui::CornerRadius::same(14))
                 .inner_margin(egui::Margin::symmetric(14, 8))
                 .show(ui, |ui| {

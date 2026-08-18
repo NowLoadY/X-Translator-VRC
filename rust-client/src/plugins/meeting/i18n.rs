@@ -153,13 +153,7 @@ const DICTIONARY: &[(&str, &str, &str, &str, &str)] = &[
         "오디오 소스",
         "Источник аудио",
     ),
-    (
-        "Microphone",
-        "麦克风",
-        "マイク",
-        "마이크",
-        "Микрофон",
-    ),
+    ("Microphone", "麦克风", "マイク", "마이크", "Микрофон"),
     (
         "System audio",
         "系统音频",
@@ -245,13 +239,7 @@ const DICTIONARY: &[(&str, &str, &str, &str, &str)] = &[
         "타임ライン",
         "Хронология",
     ),
-    (
-        "Minutes",
-        "会议纪要",
-        "議事録",
-        "회의록",
-        "Протокол",
-    ),
+    ("Minutes", "会议纪要", "議事録", "회의록", "Протокол"),
     (
         "Full transcript",
         "完整逐字稿",
@@ -339,7 +327,13 @@ const DICTIONARY: &[(&str, &str, &str, &str, &str)] = &[
         "Задачник",
     ),
     ("Note", "笔记", "メモ", "메모", "Заметка"),
-    ("Updating…", "更新中…", "更新中…", "업데이트 중…", "Обновление…"),
+    (
+        "Updating…",
+        "更新中…",
+        "更新中…",
+        "업데이트 중…",
+        "Обновление…",
+    ),
     (
         "Editable Markdown minutes. Nothing is generated automatically.",
         "可编辑的 Markdown 会议纪要，不会自动覆盖。",

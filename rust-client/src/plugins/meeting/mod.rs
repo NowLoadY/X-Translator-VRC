@@ -135,6 +135,41 @@ impl MeetingPlugin {
             || self.meeting_recording.is_some()
     }
 
+    pub fn has_audio_import(&self) -> bool {
+        self.audio_import.is_some()
+    }
+
+    pub fn set_audio_import(&mut self, import: audio_file::AudioImportHandle) {
+        self.audio_import = Some(import);
+    }
+
+    pub fn clear_audio_import(&mut self) {
+        self.audio_import = None;
+    }
+
+    pub fn set_pending_audio_import(&mut self, path: PathBuf) {
+        self.pending_audio_import = Some(path);
+    }
+
+    pub fn take_pending_audio_import(&mut self) -> Option<PathBuf> {
+        self.pending_audio_import.take()
+    }
+
+    pub fn clear_pending_audio_import(&mut self) {
+        self.pending_audio_import = None;
+    }
+
+    pub fn set_error(&mut self, error: impl Into<String>) {
+        self.controller.set_host_error(error);
+    }
+
+    pub fn fail_active_startup(&mut self, error: &str) {
+        self.clear_pending_audio_import();
+        if let Some(store_error) = self.controller.fail_active_meeting(error) {
+            log::error!("Could not mark failed meeting startup: {store_error}");
+        }
+    }
+
     pub fn disable_block_reason(&self) -> Option<&'static str> {
         self.is_busy()
             .then_some("Finish the active meeting before disabling this plugin")
@@ -171,5 +206,31 @@ impl TranslationSessionPlugin for MeetingPlugin {
             external_audio_gate: false,
             finish_when_audio_ends: active.imported_audio,
         })
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::sync::atomic::{AtomicU64, Ordering};
+
+    #[test]
+    fn pending_import_is_owned_by_the_plugin_boundary() {
+        static NEXT: AtomicU64 = AtomicU64::new(0);
+        let root = std::env::temp_dir().join(format!(
+            "xrtranslate-meeting-plugin-{}-{}",
+            std::process::id(),
+            NEXT.fetch_add(1, Ordering::Relaxed)
+        ));
+        let mut plugin = MeetingPlugin::open(&root);
+        let path = PathBuf::from("recording.wav");
+
+        plugin.set_pending_audio_import(path.clone());
+        assert!(plugin.is_busy());
+        assert_eq!(plugin.take_pending_audio_import(), Some(path));
+        assert!(!plugin.is_busy());
+        plugin.clear_pending_audio_import();
+
+        std::fs::remove_dir_all(root).unwrap();
     }
 }

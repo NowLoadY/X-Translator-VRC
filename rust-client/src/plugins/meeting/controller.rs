@@ -524,6 +524,44 @@ impl MeetingController {
             .and_then(|active| active.as_ref().map(|capture| capture.meeting_id.clone()))
     }
 
+    pub fn meeting(&self, meeting_id: &str) -> Result<Meeting, MeetingStoreError> {
+        self.store.get_meeting(meeting_id)
+    }
+
+    pub fn mark_imported_audio(&self) {
+        if let Ok(mut active) = self.active_capture.lock()
+            && let Some(active) = active.as_mut()
+        {
+            active.imported_audio = true;
+        }
+    }
+
+    /// Records a host-side startup failure and restores the controller to an
+    /// idle, reloadable state. The store error is returned for host logging.
+    pub fn fail_active_meeting(&mut self, error: &str) -> Option<MeetingStoreError> {
+        let store_error = self
+            .active_meeting_id()
+            .and_then(|meeting_id| self.store.fail_meeting(&meeting_id, error).err());
+        self.clear_active_capture();
+        self.reload_open_meeting();
+        self.refresh_library();
+        self.error = Some(error.to_owned());
+        store_error
+    }
+
+    pub fn resume_active_meeting(&mut self) -> Result<bool, MeetingStoreError> {
+        let Some(meeting_id) = self.active_meeting_id() else {
+            return Ok(false);
+        };
+        self.store.resume_meeting(&meeting_id)?;
+        self.reload_open_meeting();
+        Ok(true)
+    }
+
+    pub fn set_host_error(&mut self, error: impl Into<String>) {
+        self.error = Some(error.into());
+    }
+
     pub fn is_recording(&self, meeting_id: &str) -> bool {
         self.active_meeting_id().as_deref() == Some(meeting_id)
     }
@@ -625,4 +663,33 @@ pub fn can_continue(meeting: &Meeting) -> bool {
                 | MeetingStatus::Ended
                 | MeetingStatus::Interrupted
         )
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::sync::atomic::{AtomicU64, Ordering};
+
+    fn temp_root(label: &str) -> std::path::PathBuf {
+        static NEXT: AtomicU64 = AtomicU64::new(0);
+        let root = std::env::temp_dir().join(format!(
+            "xrtranslate-meeting-controller-{label}-{}-{}",
+            std::process::id(),
+            NEXT.fetch_add(1, Ordering::Relaxed)
+        ));
+        std::fs::create_dir_all(&root).unwrap();
+        root
+    }
+
+    #[test]
+    fn fail_active_meeting_clears_capture_and_retains_host_error() {
+        let root = temp_root("failure");
+        let mut controller = MeetingController::open(&root);
+
+        assert!(controller.fail_active_meeting("backend failed").is_none());
+        assert_eq!(controller.active_meeting_id(), None);
+        assert_eq!(controller.error.as_deref(), Some("backend failed"));
+
+        std::fs::remove_dir_all(root).unwrap();
+    }
 }

@@ -82,6 +82,8 @@ Supports fast typing and real-time translation through OSC.
 
 Download the latest Windows version from [GitHub Releases](https://github.com/NowLoadY/XRTranslate/releases), extract it, and open XRTranslate. The first-run guide prepares the runtime and models automatically; once it finishes, you can start translating.
 
+Linux build instructions are available in [docs/linux-build.md](docs/linux-build.md); the platform boundary is described in [docs/platform-architecture.md](docs/platform-architecture.md).
+
 ---
 
 ## Common Locations

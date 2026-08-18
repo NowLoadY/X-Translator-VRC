@@ -280,12 +280,13 @@ async fn run_backend() -> Result<(), Box<dyn std::error::Error>> {
 
     let args = Arguments::parse();
     let config = AppConfig::from_path(&args.config)?;
-    let project_root = args
+    let configured_root = args
         .config
         .parent()
         .filter(|path| !path.as_os_str().is_empty())
         .map(PathBuf::from)
         .unwrap_or_else(|| PathBuf::from("."));
+    let project_root = std::path::absolute(&configured_root).unwrap_or(configured_root);
     let model_plan = Arc::new(NativeProviderPlan::resolve(&config, &project_root)?);
     validate_native_route(&config, &project_root, &model_plan)?;
     let corpus_client = CorpusClient::new(&args.corpus_url)?;

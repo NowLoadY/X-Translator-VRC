@@ -67,7 +67,11 @@ impl LlamaServerCommand {
 
 #[cfg(test)]
 mod tests {
-    use std::{ffi::OsString, net::Ipv4Addr, path::PathBuf};
+    use std::{
+        ffi::OsString,
+        net::Ipv4Addr,
+        path::{Path, PathBuf},
+    };
 
     use crate::{
         FlashAttention, GpuLayers, LlamaServerCommand, LlamaServerEndpoint, LlamaServerSpec,
@@ -161,6 +165,29 @@ mod tests {
         assert_eq!(
             LlamaServerCommand::from_spec(&spec),
             Err(SpecValidationError::MissingMultimodalProjection)
+        );
+    }
+
+    #[test]
+    fn command_keeps_absolute_runtime_and_model_paths_independent_of_cwd() {
+        let mut spec = LlamaServerSpec::hunyuan_mt_gguf(
+            "/srv/xrtranslate/runtime/llama.cpp/llama-server",
+            "/srv/xrtranslate/models/Hy-MT2.gguf",
+        );
+        spec.working_directory = Some(PathBuf::from("/srv/xrtranslate"));
+
+        let command = LlamaServerCommand::from_spec(&spec).expect("valid absolute spec");
+
+        assert_eq!(
+            command.program(),
+            Path::new("/srv/xrtranslate/runtime/llama.cpp/llama-server")
+        );
+        assert_eq!(command.current_dir(), Some(Path::new("/srv/xrtranslate")));
+        let arguments = strings(command.arguments());
+        assert!(
+            arguments
+                .windows(2)
+                .any(|pair| { pair == ["--model", "/srv/xrtranslate/models/Hy-MT2.gguf"] })
         );
     }
 }

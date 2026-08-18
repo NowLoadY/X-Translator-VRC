@@ -1,3 +1,5 @@
+#![cfg(feature = "mpv")]
+
 use super::{MediaBackend, PlaybackStatus};
 use std::ffi::{CStr, CString};
 use std::path::PathBuf;
