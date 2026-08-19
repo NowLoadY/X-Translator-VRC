@@ -473,6 +473,7 @@ mod tests {
             timing: xrtranslate_protocol::SegmentTiming::UtteranceWindow,
             boundary: xrtranslate_protocol::SegmentBoundary::Silence,
             term_matches: Vec::new(),
+            prompt_trace: None,
             revisable: false,
             overlap_ratio: 0.0,
         });

@@ -1,5 +1,6 @@
 use serde_json::{Map, Value};
 use std::path::PathBuf;
+use xrtranslate_prompt::PromptProviderTarget;
 
 use crate::ui::components;
 use provider_schema::{ProviderFieldEditor, provider_field_descriptor};
@@ -72,6 +73,29 @@ impl ServiceConfigEditor {
         self.dirty = false;
         self.message = None;
         Ok(())
+    }
+
+    pub fn translation_prompt_target(&self) -> PromptProviderTarget {
+        let Some(category) = self
+            .categories
+            .iter()
+            .find(|category| category.key == "translation")
+        else {
+            return PromptProviderTarget::Hunyuan;
+        };
+        let transport = category
+            .providers
+            .iter()
+            .find(|provider| provider.name == category.selected_provider)
+            .and_then(|provider| {
+                provider
+                    .fields
+                    .iter()
+                    .find(|field| field.name == "transport")
+            })
+            .map(|field| field.value.as_str())
+            .unwrap_or("local");
+        prompt_target_for_translation_provider(&category.selected_provider, transport)
     }
 
     fn make_category(document: &Value, key: &'static str, title: &'static str) -> ServiceCategory {
@@ -584,6 +608,14 @@ impl ServiceConfigEditor {
     }
 }
 
+fn prompt_target_for_translation_provider(provider: &str, transport: &str) -> PromptProviderTarget {
+    if provider.trim() == "hunyuan" && transport.trim() != "openai" {
+        PromptProviderTarget::Hunyuan
+    } else {
+        PromptProviderTarget::OpenAiCompatible
+    }
+}
+
 fn validate_native_provider_asset(
     provider: &xrtranslate_config::NativeProviderConfig,
     capability: xrtranslate_assets::ModelCapability,
@@ -993,9 +1025,10 @@ fn parse_value(value: &str, kind: JsonFieldKind) -> Result<Value, String> {
 
 #[cfg(test)]
 mod tests {
-    use super::validate_native_provider_asset;
+    use super::{prompt_target_for_translation_provider, validate_native_provider_asset};
     use xrtranslate_assets::ModelCapability;
     use xrtranslate_config::{LocalModelRuntimeConfig, NativeProviderConfig};
+    use xrtranslate_prompt::PromptProviderTarget;
 
     fn provider(name: &str, model_asset: Option<&str>) -> NativeProviderConfig {
         NativeProviderConfig {
@@ -1030,5 +1063,21 @@ mod tests {
         )
         .unwrap_err();
         assert!(error.contains("does not belong to provider future-provider"));
+    }
+
+    #[test]
+    fn translation_provider_selects_its_matching_prompt_page() {
+        assert_eq!(
+            prompt_target_for_translation_provider("hunyuan", "local"),
+            PromptProviderTarget::Hunyuan
+        );
+        assert_eq!(
+            prompt_target_for_translation_provider("hunyuan", "openai"),
+            PromptProviderTarget::OpenAiCompatible
+        );
+        assert_eq!(
+            prompt_target_for_translation_provider("openai-custom", "openai"),
+            PromptProviderTarget::OpenAiCompatible
+        );
     }
 }

@@ -1,0 +1,640 @@
+mod canvas;
+mod runtime_preview;
+mod style;
+
+use eframe::egui::{
+    self, Align, Color32, CornerRadius, Frame, Layout, Margin, Pos2, Rect, RichText, Sense, Stroke,
+    UiBuilder, Vec2,
+};
+use std::collections::{HashMap, HashSet};
+use xrtranslate_prompt::{
+    PromptCondition, PromptExecutionTrace, PromptLink, PromptMessageRole, PromptNode,
+    PromptNodeGraph, PromptNodeKind, PromptNodePage, PromptProviderTarget, PromptTemplateLibrary,
+    PromptTemplateProfile, PromptVariable, TranslationPromptBlock, compose_input_indexes,
+};
+
+const NODE_WIDTH: f32 = 220.0;
+const NODE_HEADER_HEIGHT: f32 = 28.0;
+const SOCKET_RADIUS: f32 = 5.0;
+const GRAPH_ACCENT: Color32 = style::GRAPH_ACCENT;
+
+#[derive(Clone, Debug)]
+pub struct PromptStudioController {
+    selected_id: String,
+    draft: Option<PromptTemplateProfile>,
+    dirty: bool,
+    wire_from: Option<String>,
+    pan: Vec2,
+    zoom: f32,
+    fit_pending: bool,
+    selected_nodes: HashSet<String>,
+    drag_node: Option<String>,
+    drag_origins: HashMap<String, [f32; 2]>,
+    box_select_start: Option<Pos2>,
+    box_select_current: Option<Pos2>,
+    canvas_size: Vec2,
+    add_node_center: Option<[f32; 2]>,
+    active_provider: PromptProviderTarget,
+    runtime_trace: Option<PromptExecutionTrace>,
+}
+
+impl Default for PromptStudioController {
+    fn default() -> Self {
+        Self::for_provider(PromptProviderTarget::OpenAiCompatible)
+    }
+}
+
+impl PromptStudioController {
+    pub fn for_provider(active_provider: PromptProviderTarget) -> Self {
+        Self {
+            selected_id: String::new(),
+            draft: None,
+            dirty: false,
+            wire_from: None,
+            pan: Vec2::ZERO,
+            zoom: 1.0,
+            fit_pending: true,
+            selected_nodes: HashSet::new(),
+            drag_node: None,
+            drag_origins: HashMap::new(),
+            box_select_start: None,
+            box_select_current: None,
+            canvas_size: Vec2::new(960.0, 540.0),
+            add_node_center: None,
+            active_provider,
+            runtime_trace: None,
+        }
+    }
+
+    pub fn sync_provider(&mut self, target: PromptProviderTarget) {
+        self.select_provider(target);
+    }
+
+    pub fn snapshot(&mut self, library: &PromptTemplateLibrary) -> PromptStudioSnapshot {
+        if self.selected_id.is_empty()
+            || !library
+                .profiles
+                .iter()
+                .any(|profile| profile.id == self.selected_id)
+        {
+            self.selected_id = library.active_id.clone();
+        }
+
+        let selected = library
+            .profiles
+            .iter()
+            .find(|profile| profile.id == self.selected_id)
+            .cloned()
+            .or_else(|| library.profiles.first().cloned())
+            .unwrap_or_else(default_profile);
+        if self.draft.is_none()
+            || self
+                .draft
+                .as_ref()
+                .is_some_and(|draft| draft.id != selected.id)
+        {
+            self.draft = Some(selected.clone());
+            self.dirty = false;
+            self.fit_pending = true;
+            self.selected_nodes.clear();
+            self.box_select_start = None;
+            self.box_select_current = None;
+        }
+
+        PromptStudioSnapshot {
+            profiles: library.profiles.clone(),
+            active_id: library.active_id.clone(),
+            selected_id: self.selected_id.clone(),
+            draft: self.draft.clone().unwrap_or(selected),
+        }
+    }
+
+    pub fn select_profile(&mut self, id: String, library: &PromptTemplateLibrary) {
+        if self.dirty {
+            return;
+        }
+        self.selected_id = id;
+        self.draft = library
+            .profiles
+            .iter()
+            .find(|profile| profile.id == self.selected_id)
+            .cloned();
+        self.wire_from = None;
+        self.selected_nodes.clear();
+        self.box_select_start = None;
+        self.box_select_current = None;
+        self.fit_pending = true;
+    }
+
+    pub fn set_draft(&mut self, profile: PromptTemplateProfile) {
+        self.selected_id = profile.id.clone();
+        self.draft = Some(profile);
+        self.dirty = true;
+        self.fit_pending = true;
+        self.selected_nodes.clear();
+        self.box_select_start = None;
+        self.box_select_current = None;
+    }
+
+    pub fn is_dirty(&self) -> bool {
+        self.dirty
+    }
+
+    pub fn set_runtime_trace(&mut self, trace: Option<PromptExecutionTrace>) {
+        self.runtime_trace = trace;
+    }
+
+    fn mark_dirty(&mut self) {
+        self.dirty = true;
+    }
+
+    fn finish_wire(&mut self) -> Option<String> {
+        self.wire_from.take()
+    }
+
+    fn new_node_position(&self, graph: &PromptNodeGraph) -> [f32; 2] {
+        let center = (self.canvas_size * 0.5 - self.pan) / self.zoom;
+        self.new_node_position_near(graph, [center.x, center.y])
+    }
+
+    fn new_node_position_near(&self, graph: &PromptNodeGraph, center: [f32; 2]) -> [f32; 2] {
+        let candidate_size = Vec2::new(540.0, 220.0);
+        let mut candidate = [
+            ((center[0] - candidate_size.x * 0.5) / 16.0).round() * 16.0,
+            ((center[1] - candidate_size.y * 0.5) / 16.0).round() * 16.0,
+        ];
+
+        while graph
+            .nodes
+            .iter()
+            .filter(|node| self.node_is_visible(node))
+            .any(|node| {
+                graph_space_rect(candidate, candidate_size)
+                    .expand(8.0)
+                    .intersects(graph_space_rect(node.position, node_size(node)).expand(8.0))
+            })
+        {
+            candidate[0] += 32.0;
+            candidate[1] += 32.0;
+        }
+        candidate
+    }
+
+    fn select_provider(&mut self, target: PromptProviderTarget) {
+        if self.active_provider == target {
+            return;
+        }
+        self.active_provider = target;
+        self.selected_nodes.clear();
+        self.wire_from = None;
+        self.box_select_start = None;
+        self.box_select_current = None;
+        self.fit_pending = true;
+    }
+
+    fn node_is_visible(&self, node: &PromptNode) -> bool {
+        node.page.is_visible_on(self.active_provider)
+    }
+}
+
+#[derive(Clone, Debug)]
+pub struct PromptStudioSnapshot {
+    pub profiles: Vec<PromptTemplateProfile>,
+    pub active_id: String,
+    pub selected_id: String,
+    pub draft: PromptTemplateProfile,
+}
+
+#[derive(Clone, Debug)]
+pub enum PromptStudioAction {
+    SelectProfile(String),
+    CreateProfile(PromptTemplateProfile),
+    DeleteProfile(String),
+    SaveProfile(PromptTemplateProfile),
+    ActivateProfile(PromptTemplateProfile),
+    CloneProfile(PromptTemplateProfile),
+}
+
+pub fn render(
+    snapshot: &PromptStudioSnapshot,
+    controller: &mut PromptStudioController,
+    ui: &mut egui::Ui,
+) -> Vec<PromptStudioAction> {
+    ui.scope(|ui| {
+        style::apply(ui);
+        let mut actions = Vec::new();
+        render_header(snapshot, controller, ui, &mut actions);
+        ui.add_space(6.0);
+        canvas::render_graph_editor(snapshot, controller, ui, &mut actions);
+        actions
+    })
+    .inner
+}
+
+fn render_header(
+    snapshot: &PromptStudioSnapshot,
+    controller: &mut PromptStudioController,
+    ui: &mut egui::Ui,
+    actions: &mut Vec<PromptStudioAction>,
+) {
+    Frame::new()
+        .fill(style::BAR_FILL)
+        .stroke(Stroke::new(1.0, style::BAR_BORDER))
+        .corner_radius(CornerRadius::same(1))
+        .inner_margin(Margin::symmetric(9, 5))
+        .show(ui, |ui| {
+            ui.horizontal(|ui| {
+                ui.label(
+                    RichText::new("PROMPT STUDIO")
+                        .font(egui::FontId::monospace(10.0))
+                        .color(style::INK)
+                        .strong(),
+                );
+                ui.separator();
+                ui.label(
+                    RichText::new("TRANSLATION GRAPH")
+                        .font(egui::FontId::monospace(10.0))
+                        .color(style::MUTED),
+                );
+                ui.add_space(5.0);
+                egui::ComboBox::from_id_salt("prompt_design_select")
+                    .width(180.0)
+                    .selected_text(&snapshot.draft.name)
+                    .show_ui(ui, |ui| {
+                        for profile in &snapshot.profiles {
+                            let label = if profile.id == snapshot.active_id {
+                                format!("{}  ACTIVE", profile.name)
+                            } else {
+                                profile.name.clone()
+                            };
+                            if ui
+                                .selectable_label(profile.id == snapshot.selected_id, label)
+                                .clicked()
+                            {
+                                save_before_switch(snapshot, controller, actions);
+                                controller.select_profile(
+                                    profile.id.clone(),
+                                    &PromptTemplateLibrary {
+                                        active_id: snapshot.active_id.clone(),
+                                        profiles: snapshot.profiles.clone(),
+                                    },
+                                );
+                                actions.push(PromptStudioAction::SelectProfile(profile.id.clone()));
+                            }
+                        }
+                    });
+                if small_outline_button(ui, "NEW GRAPH", "Create complete provider graph").clicked()
+                {
+                    let profile = new_profile();
+                    actions.push(PromptStudioAction::CreateProfile(profile.clone()));
+                    controller.set_draft(profile);
+                }
+                ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
+                    if controller.is_dirty() {
+                        if style::command_button(ui, "SAVE *", true).clicked() {
+                            if let Some(profile) = controller.draft.clone() {
+                                actions.push(if profile.id == snapshot.active_id {
+                                    PromptStudioAction::ActivateProfile(profile)
+                                } else {
+                                    PromptStudioAction::SaveProfile(profile)
+                                });
+                                controller.dirty = false;
+                            }
+                        }
+                    } else {
+                        status_chip(ui, "SAVED");
+                    }
+                });
+            })
+        });
+}
+
+fn save_before_switch(
+    snapshot: &PromptStudioSnapshot,
+    controller: &mut PromptStudioController,
+    actions: &mut Vec<PromptStudioAction>,
+) {
+    if !controller.is_dirty() {
+        return;
+    }
+    if let Some(profile) = controller.draft.clone() {
+        actions.push(if profile.id == snapshot.active_id {
+            PromptStudioAction::ActivateProfile(profile)
+        } else {
+            PromptStudioAction::SaveProfile(profile)
+        });
+        controller.dirty = false;
+    }
+}
+
+fn available_blocks() -> Vec<(&'static str, TranslationPromptBlock)> {
+    vec![
+        ("Language order", TranslationPromptBlock::LanguageOrder),
+        ("Terminology", TranslationPromptBlock::Terminology),
+        (
+            "Recent turns",
+            TranslationPromptBlock::RecentTurns { limit: Some(3) },
+        ),
+        (
+            "Previous revision",
+            TranslationPromptBlock::PreviousRevision,
+        ),
+        (
+            "Surrounding source",
+            TranslationPromptBlock::SurroundingSource,
+        ),
+        (
+            "Custom instruction",
+            TranslationPromptBlock::CustomText {
+                text: "Keep the translation natural and preserve the speaker's tone.".into(),
+            },
+        ),
+    ]
+}
+
+fn node_size(node: &PromptNode) -> Vec2 {
+    Vec2::new(
+        runtime_preview::base_width(&node.kind) + runtime_preview::WIDTH,
+        node.layout_height().max(156.0),
+    )
+}
+
+fn graph_space_rect(position: [f32; 2], size: Vec2) -> Rect {
+    Rect::from_min_size(Pos2::new(position[0], position[1]), size)
+}
+
+fn node_display_label(node: &PromptNode) -> String {
+    if !node.label.trim().is_empty() && node.label != "COMPOSE TEXT" {
+        return node.label.trim().to_uppercase();
+    }
+    if let PromptNodeKind::Compose { text } = &node.kind {
+        let mut summary = text
+            .lines()
+            .map(str::trim)
+            .find(|line| !line.is_empty())
+            .unwrap_or("COMPOSE TEXT")
+            .to_owned();
+        for input in 0..=PromptNodeGraph::MAX_COMPOSE_INPUT_INDEX {
+            summary = summary.replace(&format!("{{{input}}}"), "");
+        }
+        let summary = summary.trim_matches(|character: char| {
+            character.is_ascii_whitespace() || character.is_ascii_punctuation()
+        });
+        let summary = summary.split_whitespace().collect::<Vec<_>>().join(" ");
+        if !summary.is_empty() {
+            return truncate_preview(&summary, 32).to_uppercase();
+        }
+    }
+    if node.label.trim().is_empty() {
+        block_or_kind_label(&node.kind).into()
+    } else {
+        node.label.trim().to_uppercase()
+    }
+}
+
+fn truncate_preview(value: &str, max_chars: usize) -> String {
+    let mut preview = value.chars().take(max_chars).collect::<String>();
+    if value.chars().count() > max_chars {
+        preview.push_str(" …");
+    }
+    preview
+}
+
+fn block_or_kind_label(kind: &PromptNodeKind) -> &'static str {
+    match kind {
+        PromptNodeKind::Input { block } => block.preview_name(),
+        PromptNodeKind::Variable { variable } => variable_name(*variable),
+        PromptNodeKind::Compose { .. } => "COMPOSE TEXT",
+        PromptNodeKind::Switch { condition } => condition_name(*condition),
+        PromptNodeKind::Request { .. } => "PROVIDER REQUEST",
+    }
+}
+
+fn default_profile() -> PromptTemplateProfile {
+    PromptTemplateLibrary::default()
+        .profiles
+        .into_iter()
+        .next()
+        .unwrap_or_else(new_profile)
+}
+
+fn new_profile() -> PromptTemplateProfile {
+    let builtin = default_profile();
+    let mut profile = PromptTemplateLibrary::editable_copy_of(
+        &builtin,
+        format!("custom-{}", uuid::Uuid::new_v4()),
+    );
+    profile.name = "Untitled design".into();
+    profile.description = String::new();
+    profile
+}
+
+fn variable_name(variable: PromptVariable) -> &'static str {
+    match variable {
+        PromptVariable::SourceLanguage => "SOURCE LANGUAGE",
+        PromptVariable::TargetLanguage => "TARGET LANGUAGE",
+        PromptVariable::CurrentInput => "CURRENT INPUT",
+    }
+}
+
+fn condition_name(condition: PromptCondition) -> &'static str {
+    match condition {
+        PromptCondition::SourceIsAuto => "SOURCE IS AUTO",
+        PromptCondition::HasReferenceContext => "HAS REFERENCE CONTEXT",
+    }
+}
+
+fn input_socket_label(node: &PromptNode, input: u8) -> String {
+    match &node.kind {
+        PromptNodeKind::Switch {
+            condition: PromptCondition::SourceIsAuto,
+        } if input == 0 => "EXPLICIT".into(),
+        PromptNodeKind::Switch {
+            condition: PromptCondition::SourceIsAuto,
+        } => "AUTO".into(),
+        PromptNodeKind::Switch {
+            condition: PromptCondition::HasReferenceContext,
+        } if input == 0 => "NO CONTEXT".into(),
+        PromptNodeKind::Switch {
+            condition: PromptCondition::HasReferenceContext,
+        } => "WITH CONTEXT".into(),
+        PromptNodeKind::Compose { .. } => format!("{{{input}}}"),
+        PromptNodeKind::Request { roles, .. } => roles
+            .get(usize::from(input))
+            .map(|role| match role {
+                PromptMessageRole::System => "SYSTEM",
+                PromptMessageRole::User => "USER",
+            })
+            .map_or_else(|| "MESSAGE".into(), |role| format!("{} {role}", input + 1)),
+        _ => String::new(),
+    }
+}
+
+fn status_chip(ui: &mut egui::Ui, text: &str) {
+    Frame::new()
+        .fill(Color32::from_gray(224))
+        .stroke(Stroke::new(1.0, style::BAR_BORDER))
+        .corner_radius(CornerRadius::same(1))
+        .inner_margin(Margin::symmetric(7, 3))
+        .show(ui, |ui| {
+            ui.label(
+                RichText::new(text)
+                    .font(egui::FontId::monospace(9.0))
+                    .color(style::INK),
+            );
+        });
+}
+
+fn small_outline_button(ui: &mut egui::Ui, text: &str, tooltip: &str) -> egui::Response {
+    style::command_button(ui, text, false).on_hover_text(tooltip)
+}
+
+fn small_icon_button(ui: &mut egui::Ui, text: &str, tooltip: &str) -> egui::Response {
+    ui.add(
+        egui::Button::new(
+            RichText::new(text)
+                .font(egui::FontId::monospace(12.0))
+                .color(style::MUTED),
+        )
+        .fill(Color32::TRANSPARENT)
+        .stroke(Stroke::NONE)
+        .corner_radius(CornerRadius::same(1))
+        .min_size(Vec2::new(20.0, 20.0)),
+    )
+    .on_hover_text(tooltip)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn new_node_position_avoids_the_existing_node_bounds() {
+        let controller = PromptStudioController::default();
+        let mut graph = PromptNodeGraph::empty();
+        let first = controller.new_node_position(&graph);
+        graph.add_compose(PromptNodePage::OpenAiCompatible, "{0}".into(), first);
+
+        let second = controller.new_node_position(&graph);
+        let existing = &graph.nodes[0];
+
+        assert!(
+            !graph_space_rect(second, Vec2::new(320.0, 220.0))
+                .expand(8.0)
+                .intersects(graph_space_rect(existing.position, node_size(existing)).expand(8.0))
+        );
+    }
+
+    #[test]
+    fn custom_compose_title_follows_its_first_text_line() {
+        let mut graph = PromptNodeGraph::empty();
+        graph.add_compose(
+            PromptNodePage::OpenAiCompatible,
+            "Translate {0} naturally.\nIgnored second line".into(),
+            [0.0, 0.0],
+        );
+
+        assert_eq!(node_display_label(&graph.nodes[0]), "TRANSLATE NATURALLY");
+
+        graph.nodes[0].label = "Context-aware translation".into();
+        assert_eq!(
+            node_display_label(&graph.nodes[0]),
+            "CONTEXT-AWARE TRANSLATION"
+        );
+    }
+
+    #[test]
+    fn a_new_profile_contains_both_provider_pages() {
+        let profile = new_profile();
+
+        assert!(!profile.read_only);
+        assert!(profile.graph.validate_for_activation().is_ok());
+        for target in [
+            PromptProviderTarget::OpenAiCompatible,
+            PromptProviderTarget::Hunyuan,
+        ] {
+            assert!(profile.graph.nodes.iter().any(|node| {
+                matches!(
+                    node.kind,
+                    PromptNodeKind::Request { target: value, .. } if value == target
+                )
+            }));
+        }
+    }
+
+    #[test]
+    fn provider_tabs_show_shared_and_matching_nodes_only() {
+        let mut controller = PromptStudioController::default();
+        let graph = PromptNodeGraph::builtin_default();
+
+        assert!(
+            controller.node_is_visible(
+                graph
+                    .nodes
+                    .iter()
+                    .find(|node| node.id == "reference-context")
+                    .unwrap()
+            )
+        );
+        assert!(
+            controller.node_is_visible(
+                graph
+                    .nodes
+                    .iter()
+                    .find(|node| node.id == "openai-request")
+                    .unwrap()
+            )
+        );
+        assert!(
+            !controller.node_is_visible(
+                graph
+                    .nodes
+                    .iter()
+                    .find(|node| node.id == "hunyuan-request")
+                    .unwrap()
+            )
+        );
+
+        controller.select_provider(PromptProviderTarget::Hunyuan);
+
+        assert!(
+            controller.node_is_visible(
+                graph
+                    .nodes
+                    .iter()
+                    .find(|node| node.id == "reference-context")
+                    .unwrap()
+            )
+        );
+        assert!(
+            !controller.node_is_visible(
+                graph
+                    .nodes
+                    .iter()
+                    .find(|node| node.id == "openai-request")
+                    .unwrap()
+            )
+        );
+        assert!(
+            controller.node_is_visible(
+                graph
+                    .nodes
+                    .iter()
+                    .find(|node| node.id == "hunyuan-request")
+                    .unwrap()
+            )
+        );
+    }
+
+    #[test]
+    fn runtime_provider_selects_the_initial_graph_page() {
+        let mut controller = PromptStudioController::for_provider(PromptProviderTarget::Hunyuan);
+        assert_eq!(controller.active_provider, PromptProviderTarget::Hunyuan);
+
+        controller.sync_provider(PromptProviderTarget::OpenAiCompatible);
+        assert_eq!(
+            controller.active_provider,
+            PromptProviderTarget::OpenAiCompatible
+        );
+    }
+}

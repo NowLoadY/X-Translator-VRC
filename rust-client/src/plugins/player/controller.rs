@@ -108,6 +108,16 @@ impl Default for VideoPlayerController {
 }
 
 impl VideoPlayerController {
+    pub fn release_native_host(&mut self) {
+        if self.native_host.is_none() {
+            return;
+        }
+        if let Some(backend) = &mut self.backend {
+            backend.attach_native_host(std::ptr::null_mut());
+        }
+        self.native_host.take();
+    }
+
     pub fn open_library(&mut self) {
         if let Some(backend) = &mut self.backend {
             backend.stop();
@@ -117,9 +127,7 @@ impl VideoPlayerController {
         self.active_task_id = None;
         self.current_source = None;
         self.last_auto_scrolled_cue_id = None;
-        if let Some(host) = &self.native_host {
-            host.hide();
-        }
+        self.release_native_host();
     }
 
     pub fn open_create(&mut self) {
@@ -142,9 +150,7 @@ impl VideoPlayerController {
             continuous_recognition: false,
         };
         self.error = None;
-        if let Some(host) = &self.native_host {
-            host.hide();
-        }
+        self.release_native_host();
     }
 
     pub fn start_draft_task(&mut self) -> Result<String, String> {
@@ -224,9 +230,7 @@ impl VideoPlayerController {
         self.error = None;
 
         if task.media_type == super::task::MediaType::AudioOnly {
-            if let Some(host) = &self.native_host {
-                host.hide();
-            }
+            self.release_native_host();
         }
 
         if let Some(backend) = &mut self.backend {
@@ -318,9 +322,7 @@ impl VideoPlayerController {
             if let Some(backend) = &mut self.backend {
                 backend.stop();
             }
-            if let Some(host) = &self.native_host {
-                host.hide();
-            }
+            self.release_native_host();
             self.active_task_id = None;
             self.current_source = None;
             self.route = VideoPlayerRoute::Library;

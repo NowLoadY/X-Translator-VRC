@@ -62,6 +62,7 @@ pub trait MediaBackend: Send {
     fn get_diagnostics(&self) -> PlayerDiagnostics;
 
     fn tick(&mut self);
+    /// Attach to a native video host. A null handle detaches the current host.
     fn attach_native_host(&mut self, host_handle: *mut std::ffi::c_void);
     fn set_osd_subtitle(&mut self, text: &str);
     fn show_osd_title(&mut self, title: &str);

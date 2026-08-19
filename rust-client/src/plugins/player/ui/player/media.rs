@@ -264,9 +264,7 @@ pub(super) fn render_viewport_card(
                     host.show();
                 }
             } else {
-                if let Some(host) = &controller.native_host {
-                    host.hide();
-                }
+                controller.release_native_host();
                 ui.painter().rect_filled(
                     video_rect,
                     corner_radius,

@@ -13,6 +13,7 @@ pub enum Page {
     Translation,
     Plugin(crate::plugins::PluginId),
     Settings,
+    PromptStudio,
 }
 
 impl Serialize for Page {
@@ -23,6 +24,7 @@ impl Serialize for Page {
         match self {
             Self::Translation => serializer.serialize_str("Translation"),
             Self::Settings => serializer.serialize_str("Settings"),
+            Self::PromptStudio => serializer.serialize_str("PromptStudio"),
             Self::Plugin(id) => serializer.serialize_str(&format!("plugin:{}", id.as_str())),
         }
     }
@@ -37,6 +39,7 @@ impl<'de> Deserialize<'de> for Page {
         match value.as_str() {
             "Translation" | "translation" => Ok(Self::Translation),
             "Settings" | "settings" => Ok(Self::Settings),
+            "PromptStudio" | "prompt_studio" | "prompt-studio" => Ok(Self::PromptStudio),
             // Compatibility with the former derived enum representation.
             "Osc" | "osc" => Ok(Self::Plugin(crate::plugins::PluginId::OSC)),
             "Meeting" | "meeting" => Ok(Self::Plugin(crate::plugins::PluginId::MEETING)),
@@ -939,6 +942,7 @@ pub fn render_sidebar(
     let icon_tr = include_image!("../../resources/icons/translation.svg");
     let icon_settings = include_image!("../../resources/icons/settings.svg");
     let icon_guide = include_image!("../../resources/icons/guide.svg");
+    let icon_prompt = include_image!("../../resources/icons/guide.svg");
     let icon_expand = include_image!("../../resources/icons/chevron-right.svg");
     let icon_collapse = include_image!("../../resources/icons/chevron-left.svg");
 
@@ -1015,6 +1019,15 @@ pub fn render_sidebar(
             );
             ui.add_space(4.0);
         }
+        nav_item_animated(
+            ui,
+            navigation,
+            Page::PromptStudio,
+            icon_prompt,
+            crate::i18n::tr(language, "Prompt Studio"),
+            expand_factor,
+        );
+        ui.add_space(4.0);
         nav_item_animated(
             ui,
             navigation,

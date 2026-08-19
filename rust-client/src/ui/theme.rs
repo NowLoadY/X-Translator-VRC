@@ -3,8 +3,8 @@ use eframe::egui::{self, Color32, CornerRadius, Margin, Stroke, Visuals};
 pub fn apply_theme(ctx: &egui::Context) {
     let mut visuals = Visuals::light();
 
-    visuals.window_fill = Color32::from_rgb(245, 248, 252);
-    visuals.panel_fill = Color32::from_rgb(245, 248, 252);
+    visuals.window_fill = Color32::from_rgba_unmultiplied(248, 250, 252, 196);
+    visuals.panel_fill = Color32::TRANSPARENT;
     visuals.faint_bg_color = Color32::from_rgb(238, 244, 253);
     visuals.extreme_bg_color = Color32::WHITE;
 

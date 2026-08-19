@@ -1,7 +1,5 @@
 use crate::openai::remove_completion_markers;
 
-use super::prompt_context::normalized_optional;
-
 pub(super) fn clean_hunyuan(text: &str) -> String {
     clean_shared(text)
 }
@@ -81,7 +79,10 @@ pub fn is_probable_translation_context_leak(
         return true;
     }
 
-    if let Some(context) = normalized_optional(prompt_context) {
+    if let Some(context) = prompt_context
+        .map(str::trim)
+        .filter(|context| !context.is_empty())
+    {
         let copied_lines = output
             .lines()
             .map(str::trim)

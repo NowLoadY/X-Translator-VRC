@@ -22,6 +22,7 @@ xr-corpus-protocol = { path = "../../XR-Corpus/crates/protocol" }
 xrtranslate-config = { path = "../../crates/xrtranslate-config" }
 xrtranslate-engine = { path = "../../crates/xrtranslate-engine" }
 xrtranslate-inference = { path = "../../crates/xrtranslate-inference" }
+xrtranslate-prompt = { path = "../../crates/xrtranslate-prompt" }
 xrtranslate-protocol = { path = "../../crates/xrtranslate-protocol" }
 xrtranslate-denoise = { path = "../../crates/xrtranslate-denoise" }
 xrtranslate-speaker = { path = "../../crates/xrtranslate-speaker" }

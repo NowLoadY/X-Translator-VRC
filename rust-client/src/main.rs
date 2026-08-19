@@ -32,6 +32,7 @@ pub mod session_coordinator;
 mod streaming;
 mod ui;
 pub mod version;
+mod window_backdrop;
 
 use audio::{AudioSystem, InputConfigInfo, InputDevice};
 use client_settings::{CaptureSource, ClientSettings, RecognitionSettings};
@@ -53,6 +54,7 @@ use session_coordinator::{
     SessionEventSubscriber, TranslationSessionOwner, TranslationSessionPlugin,
 };
 use ui::{NavigationState, Page};
+use xrtranslate_prompt::{PromptExecutionTrace, PromptTemplateLibrary};
 
 pub const LANGUAGE_OPTIONS: &[(&str, &str)] = &[
     ("zh", "Chinese"),
@@ -179,11 +181,14 @@ struct XRTranslateApp {
     notified_ready_update_version: Option<String>,
     backend_start_deadline: Option<std::time::Instant>,
     pub settings_section: ui::pages::settings::SettingsSection,
+    pub prompt_library: PromptTemplateLibrary,
+    pub prompt_studio: ui::pages::prompt_studio::PromptStudioController,
     pub modal_dialog: ui::modal::ModalDialog,
     pub first_run: bool,
     pub onboarding_page: usize,
     pub ui_language: UiLanguage,
     navigation: NavigationState,
+    window_backdrop: window_backdrop::WindowBackdrop,
     mute_self_pauses_translation: Arc<AtomicBool>,
     pub floating_subtitles_enabled: bool,
     pub floating_subtitles_max_count: usize,
@@ -211,6 +216,7 @@ struct SharedSessionState {
     last_error: Option<String>,
     is_translating: bool,
     pending_route_change: Option<(String, String)>,
+    latest_prompt_trace: Option<PromptExecutionTrace>,
 }
 
 fn publish_host_output(subscribers: &[Box<dyn HostOutputSubscriber>], event: HostOutputEvent<'_>) {
@@ -496,12 +502,14 @@ impl Default for XRTranslateApp {
                             timing,
                             boundary,
                             term_matches,
+                            prompt_trace,
                             revisable,
                             overlap_ratio,
                         } => {
                             if !publish_to_host_outputs {
                                 continue;
                             }
+                            state.latest_prompt_trace = prompt_trace;
                             let fragment = TranslationHistoryEntry {
                                 turn_id: turn_id.clone(),
                                 segment_index,
@@ -659,6 +667,8 @@ impl Default for XRTranslateApp {
             })
             .expect("failed to spawn session-event-pump thread");
 
+        let service_config = service_config::ServiceConfigEditor::load();
+        let prompt_provider = service_config.translation_prompt_target();
         let mut app = Self {
             audio_system,
             devices,
@@ -697,7 +707,7 @@ impl Default for XRTranslateApp {
             host_audio_import: None,
             pending_audio_import: None,
             plugin_preferences: settings.plugin_preferences,
-            service_config: service_config::ServiceConfigEditor::load(),
+            service_config,
             backend_manager,
             model_task_manager,
             runtime_installer,
@@ -706,6 +716,10 @@ impl Default for XRTranslateApp {
             notified_ready_update_version: None,
             backend_start_deadline: None,
             settings_section: ui::pages::settings::SettingsSection::default(),
+            prompt_library: settings.prompt_library,
+            prompt_studio: ui::pages::prompt_studio::PromptStudioController::for_provider(
+                prompt_provider,
+            ),
             modal_dialog: ui::modal::ModalDialog::default(),
             first_run: settings.first_run || managed_runtime_missing,
             onboarding_page: if settings.first_run {
@@ -720,6 +734,7 @@ impl Default for XRTranslateApp {
                 collapsed: settings.sidebar_collapsed,
                 page: settings.active_page,
             },
+            window_backdrop: window_backdrop::WindowBackdrop::default(),
             mute_self_pauses_translation: Arc::new(AtomicBool::new(
                 settings.mute_self_pauses_translation,
             )),
@@ -796,7 +811,107 @@ impl XRTranslateApp {
             continuous_recognition: recognition.continuous_recognition,
             audio_source,
             finish_when_audio_ends,
+            prompt_graph: Some(self.prompt_library.active_graph()),
         }
+    }
+
+    pub(crate) fn activate_prompt_template(&mut self, id: String) {
+        let Some(graph) = self
+            .prompt_library
+            .profiles
+            .iter()
+            .find(|profile| profile.id == id)
+            .map(|profile| profile.graph.clone())
+        else {
+            return;
+        };
+        if let Err(error) = graph.validate_for_activation() {
+            log::error!("Cannot activate invalid prompt graph: {error}");
+            return;
+        }
+        self.prompt_library.active_id = id;
+        self.prompt_studio.set_runtime_trace(None);
+        if let Ok(mut state) = self.shared_session_state.lock() {
+            state.latest_prompt_trace = None;
+        }
+        for session in &self.sessions {
+            session.update_prompt_template(graph.clone());
+        }
+        self.save_settings();
+    }
+
+    fn apply_prompt_studio_actions(
+        &mut self,
+        actions: Vec<ui::pages::prompt_studio::PromptStudioAction>,
+    ) {
+        use ui::pages::prompt_studio::PromptStudioAction;
+
+        for action in actions {
+            match action {
+                PromptStudioAction::SelectProfile(id) => {
+                    self.prompt_studio.select_profile(id, &self.prompt_library);
+                }
+                PromptStudioAction::CreateProfile(profile) => {
+                    let id = profile.id.clone();
+                    self.commit_prompt_profile(profile);
+                    self.prompt_studio.select_profile(id, &self.prompt_library);
+                }
+                PromptStudioAction::CloneProfile(profile) => {
+                    let id = profile.id.clone();
+                    self.commit_prompt_profile(profile);
+                    self.prompt_studio.select_profile(id, &self.prompt_library);
+                }
+                PromptStudioAction::DeleteProfile(id) => {
+                    if self.prompt_library.profiles.len() > 1
+                        && !self
+                            .prompt_library
+                            .profiles
+                            .iter()
+                            .any(|profile| profile.id == id && profile.read_only)
+                    {
+                        self.prompt_library
+                            .profiles
+                            .retain(|profile| profile.id != id);
+                        self.prompt_library.normalize();
+                        self.prompt_studio.select_profile(
+                            self.prompt_library.active_id.clone(),
+                            &self.prompt_library,
+                        );
+                        self.save_settings();
+                    }
+                }
+                PromptStudioAction::ActivateProfile(profile) => {
+                    self.commit_prompt_profile(profile.clone());
+                    self.activate_prompt_template(profile.id);
+                }
+                PromptStudioAction::SaveProfile(profile) => {
+                    self.commit_prompt_profile(profile);
+                }
+            }
+        }
+    }
+
+    fn commit_prompt_profile(&mut self, profile: xrtranslate_prompt::PromptTemplateProfile) {
+        if self
+            .prompt_library
+            .profiles
+            .iter()
+            .any(|existing| existing.id == profile.id && existing.read_only)
+        {
+            return;
+        }
+        if let Some(existing) = self
+            .prompt_library
+            .profiles
+            .iter_mut()
+            .find(|existing| existing.id == profile.id)
+        {
+            *existing = profile;
+        } else {
+            self.prompt_library.profiles.push(profile);
+        }
+        self.prompt_library.normalize();
+        self.save_settings();
     }
 
     pub(crate) fn open_plugin(&mut self, id: PluginId) {
@@ -1171,6 +1286,7 @@ impl XRTranslateApp {
             floating_subtitles_enabled: self.floating_subtitles_enabled,
             floating_subtitles_max_count: self.floating_subtitles_max_count,
             floating_subtitles_font_size: self.floating_subtitles_font_size,
+            prompt_library: self.prompt_library.clone(),
         };
         if let Err(e) = settings.save(&self.project_root()) {
             log::error!("Failed to save client settings: {e}");
@@ -1389,6 +1505,8 @@ impl XRTranslateApp {
             self.navigation.page = Page::Plugin(PluginId::VIDEO_PLAYER);
             return;
         }
+        self.prompt_studio
+            .sync_provider(self.service_config.translation_prompt_target());
         let resume_translation = self.is_translating;
         if resume_translation {
             self.stop();
@@ -2151,6 +2269,8 @@ impl XRTranslateApp {
             self.partial_text = state.partial_text.clone();
             self.recognition_history = state.recognition_history.clone();
             self.translations = state.translations.clone();
+            self.prompt_studio
+                .set_runtime_trace(state.latest_prompt_trace.clone());
             let was_translating = self.is_translating;
             self.is_translating = state.is_translating;
             if was_translating
@@ -2335,7 +2455,7 @@ impl eframe::App for XRTranslateApp {
                 .exact_size(sidebar_width)
                 .frame(
                     egui::Frame::new()
-                        .fill(egui::Color32::WHITE)
+                        .fill(egui::Color32::from_rgba_unmultiplied(255, 255, 255, 112))
                         .stroke(egui::Stroke::new(
                             1.0,
                             egui::Color32::from_rgb(226, 232, 240),
@@ -2370,16 +2490,13 @@ impl eframe::App for XRTranslateApp {
                 .inner_margin(egui::Margin::ZERO)
         } else {
             egui::Frame::new()
-                .fill(egui::Color32::from_rgb(248, 250, 252))
+                .fill(egui::Color32::TRANSPARENT)
                 .inner_margin(egui::Margin::symmetric(24, 20))
         };
 
         egui::CentralPanel::default()
             .frame(central_frame)
             .show(ui, |ui| {
-                if !is_player_fullscreen {
-                    ui::components::sparse_dot_background(ui);
-                }
                 let plugin_owned_scroll = match self.navigation.page {
                     Page::Plugin(id) => {
                         PluginRegistry::builtin()
@@ -2398,6 +2515,22 @@ impl eframe::App for XRTranslateApp {
                         ui,
                         Page::Plugin(id),
                         |ui| self.render_plugin_page(id, ui),
+                    );
+                    return;
+                }
+                if self.navigation.page == Page::PromptStudio {
+                    ui::animation::AnimationSystem::render_animated_page(
+                        ui,
+                        Page::PromptStudio,
+                        |ui| {
+                            let snapshot = self.prompt_studio.snapshot(&self.prompt_library);
+                            let actions = ui::pages::prompt_studio::render(
+                                &snapshot,
+                                &mut self.prompt_studio,
+                                ui,
+                            );
+                            self.apply_prompt_studio_actions(actions);
+                        },
                     );
                     return;
                 }
@@ -2426,6 +2559,7 @@ impl eframe::App for XRTranslateApp {
                                 |ui| ui::pages::settings::render(self, ui),
                             );
                         }
+                        Page::PromptStudio => unreachable!(),
                     });
             });
 
@@ -2435,6 +2569,10 @@ impl eframe::App for XRTranslateApp {
             Some(ui::modal::ModalAction::InstallUpdate) => self.install_update_and_restart(),
             None => {}
         }
+    }
+
+    fn clear_color(&self, _visuals: &egui::Visuals) -> [f32; 4] {
+        self.window_backdrop.clear_color()
     }
 }
 
@@ -2486,26 +2624,36 @@ fn main() -> eframe::Result<()> {
         return Ok(());
     }
 
+    let window_backdrop = window_backdrop::WindowBackdrop::from_environment();
+    let start_undecorated = cfg!(windows) && window_backdrop.uses_transparent_surface();
     let options = eframe::NativeOptions {
         viewport: egui::ViewportBuilder::default()
             .with_inner_size([1080.0, 720.0])
             .with_min_inner_size([880.0, 600.0])
+            .with_decorations(!start_undecorated)
+            .with_transparent(window_backdrop.uses_transparent_surface())
             .with_icon(
                 eframe::icon_data::from_png_bytes(include_bytes!(
                     "../resources/branding/xrtranslate-logo.png"
                 ))
                 .expect("embedded application icon must be valid PNG"),
             ),
+        renderer: eframe::Renderer::Wgpu,
         ..Default::default()
     };
     eframe::run_native(
         "XRTranslate",
         options,
-        Box::new(|cc| {
+        Box::new(move |cc| {
             egui_extras::install_image_loaders(&cc.egui_ctx);
             configure_cjk_fonts(&cc.egui_ctx);
             ui::theme::apply_theme(&cc.egui_ctx);
-            Ok(Box::new(XRTranslateApp::default()))
+            if let Err(error) = window_backdrop::apply(cc, window_backdrop) {
+                log::warn!("Unable to configure {window_backdrop:?} window backdrop: {error}");
+            }
+            let mut app = XRTranslateApp::default();
+            app.window_backdrop = window_backdrop;
+            Ok(Box::new(app))
         }),
     )
 }

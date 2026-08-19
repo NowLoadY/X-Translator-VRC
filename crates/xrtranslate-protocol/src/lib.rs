@@ -10,6 +10,7 @@ use std::{error::Error, fmt};
 
 use serde::{Deserialize, Serialize};
 pub use xr_corpus_protocol::{CorpusRecognitionCorrection, CorpusTermMatch, CorpusTermSource};
+use xrtranslate_prompt::{PromptExecutionTrace, PromptNodeGraph};
 
 /// The current WebSocket contract version.
 ///
@@ -158,7 +159,12 @@ pub enum ActionControl {
         target_lang: String,
         #[serde(default, skip_serializing_if = "Option::is_none")]
         sample_rate: Option<u32>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        prompt_graph: Option<PromptNodeGraph>,
     },
+    /// Replaces the prompt composition for future translation requests without
+    /// resetting the active audio recognition pipeline.
+    SetPromptGraph { prompt_graph: PromptNodeGraph },
     /// Enables or disables a session feature.
     ToggleFeature { feature: Feature, enabled: bool },
 }
@@ -357,6 +363,8 @@ pub struct TranslationReady {
     pub translated_text: String,
     #[serde(default)]
     pub term_matches: Vec<CorpusTermMatch>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub prompt_trace: Option<PromptExecutionTrace>,
     pub turn_id: String,
     pub segment_index: u32,
     pub segment_count: u32,
@@ -442,11 +450,26 @@ mod tests {
             source_lang: "auto".into(),
             target_lang: "zh,en".into(),
             sample_rate: None,
+            prompt_graph: None,
         });
 
         assert_eq!(
             serde_json::to_string(&control).unwrap(),
             r#"{"action":"session_config","source_lang":"auto","target_lang":"zh,en"}"#
+        );
+    }
+
+    #[test]
+    fn prompt_graph_controls_use_a_typed_json_object() {
+        let graph = PromptNodeGraph::builtin_default();
+        let control = ClientControl::Action(ActionControl::SetPromptGraph {
+            prompt_graph: graph.clone(),
+        });
+        let json = serde_json::to_value(&control).unwrap();
+        assert!(json["prompt_graph"].is_object());
+        assert_eq!(
+            serde_json::from_value::<ClientControl>(json).unwrap(),
+            control
         );
     }
 
@@ -556,6 +579,7 @@ mod tests {
                 source_text: "hello".into(),
                 translated_text: "你好".into(),
                 term_matches: Vec::new(),
+                prompt_trace: None,
                 turn_id: "native-1".into(),
                 segment_index: 1,
                 segment_count: 1,
@@ -577,6 +601,50 @@ mod tests {
                 },
             })
         );
+    }
+
+    #[test]
+    fn translation_prompt_trace_round_trips_with_node_outputs() {
+        let trace = PromptNodeGraph::builtin_default()
+            .render_with_trace(
+                xrtranslate_prompt::PromptProviderTarget::Hunyuan,
+                "hello",
+                "English",
+                "Chinese",
+                &xrtranslate_prompt::TranslationPromptContext::default(),
+            )
+            .unwrap()
+            .trace;
+        let event = ServerEvent::TranslationReady(TranslationReady {
+            source_text: "hello".into(),
+            translated_text: "你好".into(),
+            term_matches: Vec::new(),
+            prompt_trace: Some(trace.clone()),
+            turn_id: "turn-1".into(),
+            segment_index: 1,
+            segment_count: 1,
+            speaker_id: String::new(),
+            source_start_ms: 0.0,
+            source_end_ms: 1.0,
+            timing: SegmentTiming::Unknown,
+            boundary: SegmentBoundary::Unknown,
+            revisable: false,
+            overlap_ratio: 0.0,
+            clone_audio_path: String::new(),
+            tts_audio_path: String::new(),
+            metrics: LatencyMetrics {
+                queue_ms: 0,
+                asr_ms: 0,
+                mt_ms: 1,
+                tts_ms: 0,
+                total_ms: 1,
+            },
+        });
+
+        let json = serde_json::to_string(&event).unwrap();
+        let decoded: ServerEvent = serde_json::from_str(&json).unwrap();
+        assert_eq!(decoded, event);
+        assert!(json.contains(r#""node_id":"current-input""#));
     }
 
     #[test]

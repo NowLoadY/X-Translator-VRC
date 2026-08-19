@@ -4311,6 +4311,7 @@ dependencies = [
  "libmpv-sys",
  "log",
  "parking_lot",
+ "raw-window-handle",
  "reqwest",
  "rfd",
  "rosc",
@@ -4327,11 +4328,13 @@ dependencies = [
  "wasapi",
  "windows 0.60.0",
  "windows-sys 0.61.2",
+ "winit",
  "winres",
  "xrtranslate-assets",
  "xrtranslate-config",
  "xrtranslate-download",
  "xrtranslate-engine",
+ "xrtranslate-prompt",
  "xrtranslate-protocol",
  "zip",
 ]
@@ -6991,6 +6994,7 @@ dependencies = [
  "xrtranslate-denoise",
  "xrtranslate-engine",
  "xrtranslate-inference",
+ "xrtranslate-prompt",
  "xrtranslate-protocol",
  "xrtranslate-speaker",
  "xrtranslate-supervisor",
@@ -7039,6 +7043,7 @@ dependencies = [
  "serde",
  "serde_json",
  "tokio",
+ "xrtranslate-prompt",
 ]
 
 [[package]]
@@ -7064,12 +7069,21 @@ dependencies = [
 ]
 
 [[package]]
+name = "xrtranslate-prompt"
+version = "0.2.7-beta.1"
+dependencies = [
+ "serde",
+ "serde_json",
+]
+
+[[package]]
 name = "xrtranslate-protocol"
 version = "0.2.7-beta.1"
 dependencies = [
  "serde",
  "serde_json",
  "xr-corpus-protocol",
+ "xrtranslate-prompt",
 ]
 
 [[package]]

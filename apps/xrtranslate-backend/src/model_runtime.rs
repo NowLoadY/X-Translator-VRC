@@ -77,7 +77,7 @@ pub(crate) struct NativeProviderPlan {
     assets: ResolvedModelAssets,
     asr_profile: AsrProfile,
     translation_profile: TranslationProfile,
-    translation_supports_prompt_context: bool,
+    translation_supports_reference_context: bool,
 }
 
 impl NativeProviderPlan {
@@ -126,14 +126,14 @@ impl NativeProviderPlan {
             project_root,
             asr_asset_id.into_iter().chain(translation_asset_id),
         );
-        let translation_supports_prompt_context = route.translation.supports_prompt_context;
+        let translation_supports_reference_context = route.translation.supports_prompt_context;
 
         Ok(Self {
             route,
             assets,
             asr_profile,
             translation_profile,
-            translation_supports_prompt_context,
+            translation_supports_reference_context,
         })
     }
 
@@ -209,8 +209,8 @@ impl NativeProviderPlan {
         }
     }
 
-    pub(crate) fn translation_supports_prompt_context(&self) -> bool {
-        self.translation_supports_prompt_context
+    pub(crate) fn translation_supports_reference_context(&self) -> bool {
+        self.translation_supports_reference_context
     }
 
     pub(crate) fn asr_adapter(
@@ -531,7 +531,7 @@ mod tests {
                 .id,
             ModelAssetId::HunyuanMt7bGguf
         );
-        assert!(plan.translation_supports_prompt_context());
+        assert!(plan.translation_supports_reference_context());
     }
 
     #[test]

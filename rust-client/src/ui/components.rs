@@ -269,31 +269,6 @@ pub fn segmented_audio_meter(
     }
 }
 
-pub fn sparse_dot_background(ui: &mut Ui) {
-    let rect = ui.max_rect();
-    if ui.is_rect_visible(rect) {
-        let painter = ui.painter();
-        let spacing = 26.0;
-        let radius = 1.0;
-        let color = Color32::from_rgba_unmultiplied(148, 163, 184, 38);
-
-        let start_x = (rect.min.x / spacing).floor() * spacing + (spacing / 2.0);
-        let start_y = (rect.min.y / spacing).floor() * spacing + (spacing / 2.0);
-
-        let mut y = start_y;
-        while y < rect.max.y {
-            let mut x = start_x;
-            while x < rect.max.x {
-                if rect.contains(egui::pos2(x, y)) {
-                    painter.circle_filled(egui::pos2(x, y), radius, color);
-                }
-                x += spacing;
-            }
-            y += spacing;
-        }
-    }
-}
-
 pub fn wavy_divider_black_shadow(ui: &mut Ui) {
     let available_width = ui.available_width();
     let (rect, _) = ui.allocate_exact_size(Vec2::new(available_width, 8.0), egui::Sense::hover());

@@ -60,10 +60,10 @@ impl<C: AsyncHttpClient> TranslationAdapter<C> {
         options: TranslationOptions,
     ) -> Result<TranslationResult, InferenceError> {
         let profile = registered(self.provider);
-        let messages = profile.build_messages(source_text, &options)?;
+        let prompt = profile.build_prompt(source_text, &options)?;
         let mut payload = non_streaming_chat_payload(
             &self.model,
-            messages,
+            prompt.messages,
             profile.temperature(),
             options.max_tokens,
         );
@@ -76,7 +76,10 @@ impl<C: AsyncHttpClient> TranslationAdapter<C> {
                 operation: "translation",
             });
         }
-        Ok(TranslationResult { text })
+        Ok(TranslationResult {
+            text,
+            prompt_trace: prompt.trace,
+        })
     }
 }
 
@@ -131,20 +134,19 @@ mod tests {
             TranslationProvider::Hunyuan,
         )
         .unwrap();
-        let result = adapter
-            .translate(
-                "hello",
-                TranslationOptions {
-                    source_language: "English".into(),
-                    target_language: "Chinese".into(),
-                    prompt_context: Some("A previous sentence.".into()),
-                    context_window_tokens: 4_096,
-                    max_tokens: 256,
-                },
-            )
-            .await
-            .unwrap();
+        let mut options = TranslationOptions::new("English", "Chinese");
+        options.prompt_context.terminology_rows = vec!["A previous sentence.".into()];
+        options.context_window_tokens = 4_096;
+        let result = adapter.translate("hello", options).await.unwrap();
         assert_eq!(result.text, "你好");
+        assert_eq!(
+            result
+                .prompt_trace
+                .node("current-input")
+                .map(|node| node.output.as_str()),
+            Some("hello")
+        );
+        assert!(result.prompt_trace.node("hunyuan-request").is_some());
 
         let http = adapter.chat.into_inner();
         let request = http.requests.lock().unwrap().pop().unwrap();

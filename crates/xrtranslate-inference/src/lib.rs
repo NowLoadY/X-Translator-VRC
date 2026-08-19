@@ -19,8 +19,10 @@ pub use http::{AsyncHttpClient, HttpRequest, HttpResponse, ReqwestClient};
 pub use openai::{ChatCompletion, OpenAiCompatibleClient};
 pub use qwen3::{AsrTranscript, Qwen3AsrAdapter, Qwen3AsrOptions, is_probable_asr_hallucination};
 pub use translation::{
-    PromptTurn, SurroundingSource, TranslationAdapter, TranslationOptions, TranslationPromptBlock,
-    TranslationPromptContext, TranslationPromptTemplate, TranslationProvider, TranslationResult,
-    build_hunyuan_prompt, build_translation_messages, is_probable_translation_context_leak,
+    PromptCondition, PromptGraphError, PromptLink, PromptMessage, PromptMessageRole, PromptNode,
+    PromptNodeGraph, PromptNodeKind, PromptProviderTarget, PromptTemplateLibrary,
+    PromptTemplateProfile, PromptTurn, PromptVariable, SurroundingSource, TranslationAdapter,
+    TranslationOptions, TranslationPromptBlock, TranslationPromptContext, TranslationProvider,
+    TranslationResult, build_translation_messages, is_probable_translation_context_leak,
 };
 pub use wav::{PCM16_MONO_16KHZ_FORMAT, pcm16_mono_16khz_to_wav};

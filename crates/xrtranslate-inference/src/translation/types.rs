@@ -1,3 +1,5 @@
+use xrtranslate_prompt::{PromptExecutionTrace, PromptNodeGraph, TranslationPromptContext};
+
 /// Prompt style selected for a translation endpoint.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum TranslationProvider {
@@ -8,12 +10,12 @@ pub enum TranslationProvider {
 }
 
 /// Options that accompany a single source segment.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq)]
 pub struct TranslationOptions {
     pub source_language: String,
     pub target_language: String,
-    /// Reference context for terminology and recent conversation continuity.
-    pub prompt_context: Option<String>,
+    pub prompt_graph: PromptNodeGraph,
+    pub prompt_context: TranslationPromptContext,
     /// Context capacity available to one endpoint request. Provider profiles
     /// use this when a sampling parameter needs the concrete slot window.
     pub context_window_tokens: u32,
@@ -25,7 +27,8 @@ impl TranslationOptions {
         Self {
             source_language: source_language.into(),
             target_language: target_language.into(),
-            prompt_context: None,
+            prompt_graph: PromptNodeGraph::builtin_default(),
+            prompt_context: TranslationPromptContext::default(),
             context_window_tokens: 2_048,
             max_tokens: 256,
         }
@@ -36,4 +39,5 @@ impl TranslationOptions {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct TranslationResult {
     pub text: String,
+    pub prompt_trace: PromptExecutionTrace,
 }

@@ -89,9 +89,7 @@ impl VideoPlayerPlugin {
     pub fn on_visibility_changed(&mut self, is_visible: bool) {
         if !is_visible || self.controller.route != controller::VideoPlayerRoute::Player {
             self.controller.fullscreen_mode = false;
-            if let Some(host) = &self.controller.native_host {
-                host.hide();
-            }
+            self.controller.release_native_host();
         }
     }
 

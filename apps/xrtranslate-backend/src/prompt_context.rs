@@ -1,16 +1,14 @@
 use xr_corpus_protocol::SegmentContext as CorpusSegmentContext;
-use xrtranslate_inference::{
-    PromptTurn, SurroundingSource, TranslationPromptContext, TranslationPromptTemplate,
-};
+use xrtranslate_prompt::{PromptTurn, SurroundingSource, TranslationPromptContext};
 
 /// Builds the built-in prompt from neutral context facts. XR Corpus remains a
 /// data provider; template ownership stays in the shared translation layer.
-pub(crate) fn default_prompt_for_segment(
+pub(crate) fn prompt_context_for_segment(
     source_language: &str,
     target_language: &str,
     context: &CorpusSegmentContext,
-) -> Option<String> {
-    TranslationPromptTemplate::default().compose(&TranslationPromptContext {
+) -> TranslationPromptContext {
+    TranslationPromptContext {
         language_order: vec![source_language.to_owned(), target_language.to_owned()],
         terminology_rows: context.prompt_terms.iter().map(render_term_row).collect(),
         recent_turns: context
@@ -48,7 +46,7 @@ pub(crate) fn default_prompt_for_segment(
                 before: source.before.clone(),
                 after: source.after.clone(),
             }),
-    })
+    }
 }
 
 fn render_term_row(term: &xr_corpus_protocol::CorpusPromptTerm) -> String {
@@ -65,6 +63,7 @@ mod tests {
     use xr_corpus_protocol::{
         BilingualContextTurn, CorpusPromptTerm, SurroundingSourceContext, TranslationContextData,
     };
+    use xrtranslate_prompt::{PromptNodeGraph, PromptProviderTarget};
 
     fn context() -> CorpusSegmentContext {
         CorpusSegmentContext {
@@ -98,8 +97,21 @@ mod tests {
 
     #[test]
     fn structured_context_uses_the_default_template_instead_of_legacy_prompt() {
-        let prompt = default_prompt_for_segment("en", "zh", &context()).unwrap();
-        assert!(prompt.contains("## Recent Bilingual History"));
-        assert!(prompt.contains("天使,Mercy"));
+        let prompt_context = prompt_context_for_segment("en", "zh", &context());
+        let prompt = PromptNodeGraph::builtin_default()
+            .render(
+                PromptProviderTarget::Hunyuan,
+                "Tell the team.",
+                "English",
+                "Chinese",
+                &prompt_context,
+            )
+            .unwrap();
+        assert!(
+            prompt.messages[0]
+                .content
+                .contains("## Recent Bilingual History")
+        );
+        assert!(prompt.messages[0].content.contains("天使,Mercy"));
     }
 }

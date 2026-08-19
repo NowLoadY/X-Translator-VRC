@@ -30,6 +30,12 @@ multipart `/audio/transcriptions` API: an adapter for that contract can be
 added later without changing provider selection, prompt composition, or the
 session pipeline.
 
+Translation message content is rendered by the active Prompt Studio graph in
+`xrtranslate-prompt`. An online provider profile selects the
+`openai_compatible` Request messages and adds transport credentials, model and
+sampling fields; it must not prepend, append, or rewrite prompt text. The
+built-in graph produces the original system/user message pair exactly.
+
 ASR and translation are independent capabilities. It is valid to select a
 remote ASR provider while keeping Hy-MT2 local, or the reverse. When no
 selected capability uses `local`, the desktop client does not require or launch

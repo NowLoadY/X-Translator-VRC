@@ -12,6 +12,7 @@ use tokio_tungstenite::{
     connect_async,
     tungstenite::{self, Message},
 };
+use xrtranslate_prompt::{PromptExecutionTrace, PromptNodeGraph};
 use xrtranslate_protocol::{
     CorpusTermMatch, DrainReason, InferenceWorkload, SegmentBoundary, SegmentTiming,
     ServerEvent as ProtocolServerEvent,
@@ -101,6 +102,7 @@ pub enum SessionEvent {
         timing: SegmentTiming,
         boundary: SegmentBoundary,
         term_matches: Vec<CorpusTermMatch>,
+        prompt_trace: Option<PromptExecutionTrace>,
         revisable: bool,
         overlap_ratio: f32,
     },
@@ -145,6 +147,9 @@ enum SessionCommand {
         target_lang: String,
     },
     SetTtsEnabled(bool),
+    UpdatePromptTemplate {
+        graph: PromptNodeGraph,
+    },
     Pause,
     Resume,
     Finish,
@@ -243,6 +248,12 @@ impl SessionHandle {
             .try_send(SessionCommand::SetTtsEnabled(enabled));
     }
 
+    pub fn update_prompt_template(&self, graph: PromptNodeGraph) {
+        let _ = self
+            .command_tx
+            .try_send(SessionCommand::UpdatePromptTemplate { graph });
+    }
+
     /// Reconfigure the backend audio stream after replacing the local capture
     /// source. This clears any partially accumulated VAD utterance.
     pub fn reset_audio_pipeline(
@@ -304,6 +315,7 @@ pub struct SessionConfig {
     /// websocket writer. This is required for file import and graceful live
     /// capture shutdown, where a producer disconnect marks end-of-input.
     pub finish_when_audio_ends: bool,
+    pub prompt_graph: Option<PromptNodeGraph>,
 }
 
 pub fn start_session(
@@ -379,6 +391,7 @@ async fn run_session(
         mut continuous_recognition,
         mut audio_source,
         finish_when_audio_ends,
+        prompt_graph,
     } = config;
     let workload = if finish_when_audio_ends {
         InferenceWorkload::Offline
@@ -403,6 +416,7 @@ async fn run_session(
             "source_lang": source_lang,
             "target_lang": target_lang,
             "sample_rate": 16_000,
+            "prompt_graph": prompt_graph,
             "vad_threshold": vad_threshold,
             "vad_silence_ms": vad_silence_ms,
             "continuous_recognition": continuous_recognition,
@@ -639,6 +653,16 @@ where
                     "action": "toggle_feature",
                     "feature": "tts",
                     "enabled": enabled,
+                }),
+            )
+            .await
+        }
+        SessionCommand::UpdatePromptTemplate { graph } => {
+            send_json(
+                write,
+                json!({
+                    "action": "set_prompt_graph",
+                    "prompt_graph": graph,
                 }),
             )
             .await
@@ -910,6 +934,7 @@ fn forward_server_event(
                     .cloned()
                     .and_then(|value| serde_json::from_value(value).ok())
                     .unwrap_or_default(),
+                prompt_trace: event_metadata(data, "prompt_trace"),
                 revisable,
                 overlap_ratio: overlap_ratio as f32,
             });
@@ -1126,6 +1151,32 @@ mod tests {
             term_matches[0].sources[0].corpus_id,
             "games.overwatch.heroes"
         );
+    }
+
+    #[test]
+    fn translation_event_retains_the_prompt_execution_trace() {
+        let (sender, receiver) = crossbeam_channel::unbounded();
+        forward_server_event(
+            &sender,
+            r#"{"action":"translation_ready","data":{"source_text":"hello","translated_text":"你好","speaker_id":"","revisable":false,"overlap_ratio":0.0,"prompt_trace":{"target":"hunyuan","nodes":[{"node_id":"current-input","output":"hello"}]}}}"#,
+            42,
+            false,
+            true,
+            CaptureSource::Microphone,
+        );
+
+        let SessionEvent::Translation {
+            prompt_trace: Some(trace),
+            ..
+        } = receiver.try_recv().unwrap()
+        else {
+            panic!("expected translation trace");
+        };
+        assert_eq!(
+            trace.target,
+            xrtranslate_prompt::PromptProviderTarget::Hunyuan
+        );
+        assert_eq!(trace.node("current-input").unwrap().output, "hello");
     }
 
     #[test]

@@ -31,6 +31,7 @@ use xrtranslate_inference::{
     AsrTranscript, InferenceError, ReqwestClient, TranslationAdapter, TranslationOptions,
     is_probable_asr_hallucination, is_probable_translation_context_leak,
 };
+use xrtranslate_prompt::{PromptExecutionTrace, PromptNodeGraph, TranslationPromptContext};
 use xrtranslate_protocol::AudioSource;
 use xrtranslate_speaker::{
     OnlineSpeakerDiarizer, StreamingDiarizerConfig, StreamingSpeakerEvent,
@@ -127,6 +128,7 @@ pub(crate) struct TranslationOutput {
     pub(crate) source_language: String,
     pub(crate) target_language: String,
     pub(crate) term_matches: Vec<xrtranslate_protocol::CorpusTermMatch>,
+    pub(crate) prompt_trace: Option<PromptExecutionTrace>,
     pub(crate) mt_elapsed: Duration,
 }
 
@@ -404,7 +406,7 @@ enum FixedWindowEvent {
 pub(crate) struct NativeInference {
     asr: NativeAsrAdapter,
     translation: TranslationAdapter<ReqwestClient>,
-    translation_supports_prompt_context: bool,
+    translation_supports_reference_context: bool,
     asr_max_output_tokens: u32,
     translation_max_output_tokens: u32,
     asr_context_window_tokens: u32,
@@ -554,8 +556,8 @@ impl NativePipeline {
             inference: NativeInference {
                 asr,
                 translation,
-                translation_supports_prompt_context: model_plan
-                    .translation_supports_prompt_context(),
+                translation_supports_reference_context: model_plan
+                    .translation_supports_reference_context(),
                 asr_max_output_tokens: model_plan.asr_runtime().max_tokens,
                 translation_max_output_tokens: model_plan.translation_runtime().max_tokens,
                 asr_context_window_tokens: model_plan.asr_runtime().context_window_tokens,
@@ -1095,7 +1097,8 @@ impl NativeInference {
         segment: &TranslationSegmentPair,
         source_language: &str,
         target_language: &str,
-        prompt_context: Option<String>,
+        prompt_graph: PromptNodeGraph,
+        prompt_context: TranslationPromptContext,
     ) -> Result<TranslationOutput, String> {
         let route = translation_route(source_language, target_language);
         if route.source_code == "zh" && is_traditional_chinese(&route.target_code) {
@@ -1107,29 +1110,34 @@ impl NativeInference {
                 source_language: route.source_code,
                 target_language: route.target_code,
                 term_matches: Vec::new(),
+                prompt_trace: None,
                 mt_elapsed: mt_started.elapsed(),
             });
         }
         let mut options = TranslationOptions::new(route.source.clone(), route.target.clone());
+        options.prompt_graph = prompt_graph;
         options.context_window_tokens = self.translation_context_window_tokens;
         options.max_tokens = self.translation_max_output_tokens;
-        if self.translation_supports_prompt_context {
+        if self.translation_supports_reference_context {
             options.prompt_context = prompt_context;
         }
         let mt_started = Instant::now();
-        let had_prompt_context = options.prompt_context.is_some();
+        let had_prompt_context = options.prompt_context.has_reference_context();
         let mut translated = match self
             .translation
             .translate(&segment.translation_text, options.clone())
             .await
         {
             Ok(translated) => translated,
-            Err(error) if options.prompt_context.is_some() && is_context_window_error(&error) => {
+            Err(error)
+                if options.prompt_context.has_reference_context()
+                    && is_context_window_error(&error) =>
+            {
                 warn!(
                     %error,
                     "translation context exceeded the provider window; retrying current segment without optional context"
                 );
-                options.prompt_context = None;
+                options.prompt_context = TranslationPromptContext::default();
                 self.translation
                     .translate(&segment.translation_text, options.clone())
                     .await
@@ -1138,17 +1146,18 @@ impl NativeInference {
             Err(error) => return Err(format!("translation request failed: {error}")),
         };
 
+        let rendered_reference = options.prompt_context.reference_text_for_quality_checks();
         if had_prompt_context
             && is_probable_translation_context_leak(
                 &segment.translation_text,
                 &translated.text,
-                options.prompt_context.as_deref(),
+                rendered_reference.as_deref(),
             )
         {
             warn!(
                 "translation output copied optional context; retrying current segment without context"
             );
-            options.prompt_context = None;
+            options.prompt_context = TranslationPromptContext::default();
             translated = self
                 .translation
                 .translate(&segment.translation_text, options)
@@ -1171,6 +1180,7 @@ impl NativeInference {
             source_language: route.source_code,
             target_language: route.target_code,
             term_matches: Vec::new(),
+            prompt_trace: Some(translated.prompt_trace),
             mt_elapsed: mt_started.elapsed(),
         })
     }

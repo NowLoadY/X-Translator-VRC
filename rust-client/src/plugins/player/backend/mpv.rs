@@ -421,10 +421,8 @@ impl MediaBackend for MpvBackend {
     }
 
     fn attach_native_host(&mut self, host_handle: *mut std::ffi::c_void) {
-        if !host_handle.is_null() {
-            let wid = host_handle as i64;
-            let _ = self.mpv.set_property_i64("wid", wid);
-        }
+        let wid = host_handle as i64;
+        let _ = self.mpv.set_property_i64("wid", wid);
     }
 
     fn set_osd_subtitle(&mut self, text: &str) {

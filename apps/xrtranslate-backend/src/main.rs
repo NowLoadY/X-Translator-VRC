@@ -35,6 +35,7 @@ use tracing::{info, warn};
 use xrtranslate_config::AppConfig;
 use xrtranslate_engine::RouteEpoch;
 use xrtranslate_inference::{AsyncHttpClient, HttpRequest, ReqwestClient};
+use xrtranslate_prompt::PromptNodeGraph;
 use xrtranslate_protocol::{
     ActionControl, ClientControl, DrainReason, ErrorEvent, EventControl, Feature,
     InferenceWorkload, LatencyMetrics, PcmFormat, PcmFrame, PipelineDrained,
@@ -53,7 +54,7 @@ use crate::{
         NativeInference, NativePipeline, PipelineEvent, RecognizedOutput, TimedUtterance,
         TranslationOutput, validate_input_chunk_size, validate_input_sample_rate,
     },
-    prompt_context::default_prompt_for_segment,
+    prompt_context::prompt_context_for_segment,
     session::{SegmentContext, SessionAdapter, WireOutput},
     terminology::{rewrite_recognition_terms, rewrite_translation_terms},
 };
@@ -407,6 +408,7 @@ async fn serve_session(socket: WebSocket, state: BackendState) {
 
     let (job_sender, job_receiver) = mpsc::channel(INFERENCE_QUEUE_CAPACITY);
     let (result_sender, mut result_receiver) = mpsc::channel(INFERENCE_RESULT_CAPACITY);
+    let prompt_graph = Arc::new(tokio::sync::RwLock::new(PromptNodeGraph::builtin_default()));
     let worker = tokio::spawn(run_inference_worker(
         pipeline.inference(),
         job_receiver,
@@ -416,6 +418,7 @@ async fn serve_session(socket: WebSocket, state: BackendState) {
         state.inference_scheduler.clone(),
         Arc::clone(&speaker_recognition_enabled),
         Arc::clone(&speaker_state_revision),
+        Arc::clone(&prompt_graph),
     ));
     let mut job_sender = Some(job_sender);
     let mut input_state = SessionInputState::Running;
@@ -484,7 +487,23 @@ async fn serve_session(socket: WebSocket, state: BackendState) {
                             source_lang: source,
                             target_lang: target,
                             sample_rate,
+                            prompt_graph: graph,
                         })) => {
+                            if let Some(graph) = graph {
+                                if let Err(error) = graph.validate_for_activation() {
+                                    if send_error(
+                                        &outbound_sender,
+                                        format!("Invalid prompt graph: {error}"),
+                                    )
+                                    .await
+                                    .is_err()
+                                    {
+                                        break;
+                                    }
+                                    continue;
+                                }
+                                *prompt_graph.write().await = graph;
+                            }
                             if let Some(sample_rate) = sample_rate {
                                 if let Err(error) = validate_input_sample_rate(sample_rate) {
                                     if send_error(&outbound_sender, error).await.is_err() {
@@ -505,6 +524,23 @@ async fn serve_session(socket: WebSocket, state: BackendState) {
                             generation.audio_epoch.advance();
                             generation_sender.send_replace(generation);
                             info!(%session_id, source_lang = session.source_lang(), target_lang = session.target_lang(), "session route configured");
+                        }
+                        Ok(ClientControl::Action(ActionControl::SetPromptGraph {
+                            prompt_graph: graph,
+                        })) => {
+                            if let Err(error) = graph.validate_for_activation() {
+                                if send_error(
+                                    &outbound_sender,
+                                    format!("Invalid prompt graph: {error}"),
+                                )
+                                .await
+                                .is_err()
+                                {
+                                    break;
+                                }
+                                continue;
+                            }
+                            *prompt_graph.write().await = graph;
                         }
                         Ok(ClientControl::Event(EventControl::ConfigAudio {
                             sample_rate,
@@ -1144,6 +1180,7 @@ async fn run_inference_worker(
     scheduler: InferenceScheduler,
     speaker_recognition_enabled: Arc<AtomicBool>,
     speaker_state_revision: Arc<AtomicU64>,
+    prompt_graph: Arc<tokio::sync::RwLock<PromptNodeGraph>>,
 ) {
     let mut previous_transcript: Option<(PipelineGeneration, String)> = None;
     let mut adaptive_route = AdaptiveLanguageRoute::default();
@@ -1573,6 +1610,7 @@ async fn run_inference_worker(
         let history_speaker_id = speaker_id;
         let history_source_language = source_language.clone();
         let history_target_language = target_language.clone();
+        let prompt_graph_for_turn = Arc::clone(&prompt_graph);
         pending_translation = Some(tokio::spawn(async move {
             let translations = futures_util::stream::iter(
                 segments
@@ -1587,15 +1625,21 @@ async fn run_inference_worker(
                 let target_language = target_language.clone();
                 let source_for_terms = segment.translation_text.clone();
                 let prompt_terms = corpus_context.prompt_terms.clone();
-                let prompt_context =
-                    default_prompt_for_segment(&source_language, &target_language, &corpus_context);
+                let prompt_graph = Arc::clone(&prompt_graph_for_turn);
                 async move {
                     let _permit = scheduler.acquire_translation(workload).await;
+                    let prompt_graph = prompt_graph.read().await.clone();
+                    let prompt_context = prompt_context_for_segment(
+                        &source_language,
+                        &target_language,
+                        &corpus_context,
+                    );
                     let output = inference
                         .translate_segment(
                             &segment,
                             &source_language,
                             &target_language,
+                            prompt_graph,
                             prompt_context,
                         )
                         .await;
@@ -1743,6 +1787,7 @@ async fn handle_inference_event(
                     output.source_text,
                     output.translated_text,
                     output.term_matches,
+                    output.prompt_trace,
                     LatencyMetrics {
                         queue_ms: millis(queue_elapsed),
                         asr_ms: millis(asr_elapsed),

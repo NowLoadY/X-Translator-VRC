@@ -7,6 +7,7 @@ use crate::plugins::{PluginPreferences, PluginRegistry};
 use crate::ui::Page;
 use serde::{Deserialize, Serialize};
 use std::path::Path;
+use xrtranslate_prompt::PromptTemplateLibrary;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, Serialize, Deserialize, Default)]
 pub enum CaptureSource {
@@ -96,6 +97,8 @@ pub struct ClientSettings {
     pub floating_subtitles_max_count: usize,
     #[serde(default = "default_floating_font_size")]
     pub floating_subtitles_font_size: f64,
+    #[serde(default)]
+    pub prompt_library: PromptTemplateLibrary,
 }
 
 fn default_source_lang() -> String {
@@ -156,6 +159,7 @@ impl Default for ClientSettings {
             floating_subtitles_enabled: false,
             floating_subtitles_max_count: default_floating_max_count(),
             floating_subtitles_font_size: default_floating_font_size(),
+            prompt_library: PromptTemplateLibrary::default(),
         }
     }
 }
@@ -173,6 +177,7 @@ impl ClientSettings {
         // Keep lifecycle state authoritative across development and packaged launches.
         settings.apply_app_state(project_root);
         settings.normalize_feature_dependencies();
+        settings.prompt_library.normalize();
         let registry = PluginRegistry::builtin();
         registry.initialize_preferences(&mut settings.plugin_preferences);
         registry.normalize_active_page(&settings.plugin_preferences, &mut settings.active_page);
@@ -295,6 +300,7 @@ impl ClientSettings {
         let _ = std::fs::create_dir_all(&directory);
         let path = directory.join("rust-client-settings.json");
         let mut normalized = self.clone();
+        normalized.prompt_library.normalize();
         let registry = PluginRegistry::builtin();
         registry.initialize_preferences(&mut normalized.plugin_preferences);
         registry.normalize_active_page(&normalized.plugin_preferences, &mut normalized.active_page);

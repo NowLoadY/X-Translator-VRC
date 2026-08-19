@@ -4,6 +4,7 @@ use xrtranslate_engine::{
     EngineConfig, Language, LanguageRoute, OutboundPayload, ProtocolEvent, RouteEpoch,
     SessionEngine,
 };
+use xrtranslate_prompt::PromptExecutionTrace;
 use xrtranslate_protocol::{
     AsrResult, AsrResultKind, CorpusTermMatch, LatencyMetrics, SegmentBoundary, SegmentTiming,
     ServerEvent, SourceSegmentReady, TranslationReady, TtsFinished,
@@ -48,6 +49,7 @@ struct TranslationMetadata {
     metrics: LatencyMetrics,
     context: SegmentContext,
     term_matches: Vec<CorpusTermMatch>,
+    prompt_trace: Option<PromptExecutionTrace>,
 }
 
 impl SessionAdapter {
@@ -207,6 +209,7 @@ impl SessionAdapter {
             source_text,
             translated_text,
             Vec::new(),
+            None,
             metrics,
             SegmentContext {
                 turn_id: self.turn_id.clone(),
@@ -233,6 +236,7 @@ impl SessionAdapter {
         source_text: String,
         translated_text: String,
         term_matches: Vec<CorpusTermMatch>,
+        prompt_trace: Option<PromptExecutionTrace>,
         metrics: LatencyMetrics,
         context: SegmentContext,
     ) -> Result<bool, String> {
@@ -251,6 +255,7 @@ impl SessionAdapter {
             metrics,
             context,
             term_matches,
+            prompt_trace,
         });
         Ok(true)
     }
@@ -358,12 +363,14 @@ impl SessionAdapter {
                                     context_matches: Vec::new(),
                                 },
                                 term_matches: Vec::new(),
+                                prompt_trace: None,
                             });
                     output.push(WireOutput::Event(ServerEvent::TranslationReady(
                         TranslationReady {
                             source_text,
                             translated_text,
                             term_matches: metadata.term_matches,
+                            prompt_trace: metadata.prompt_trace,
                             turn_id: metadata.context.turn_id,
                             segment_index: metadata.context.segment_index,
                             segment_count: metadata.context.segment_count,
@@ -499,6 +506,7 @@ mod tests {
                     "source".into(),
                     "translation".into(),
                     Vec::new(),
+                    None,
                     LatencyMetrics {
                         queue_ms: 0,
                         asr_ms: 1,
