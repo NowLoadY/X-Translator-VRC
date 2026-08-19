@@ -501,4 +501,33 @@ mod tests {
 
         let _ = fs::remove_dir_all(&temp);
     }
+
+    #[test]
+    fn update_preserves_runtime_prompt_studio_settings() {
+        let temp =
+            std::env::temp_dir().join(format!("xrt_updater_prompt_test_{}", std::process::id()));
+        let _ = fs::remove_dir_all(&temp);
+        let source = temp.join("source");
+        let target = temp.join("target");
+        let backup = temp.join("backup");
+
+        fs::create_dir_all(&source).unwrap();
+        fs::create_dir_all(target.join("runtime")).unwrap();
+        fs::write(
+            target.join("runtime/rust-client-settings.json"),
+            br#"{"prompt_library":{"active_id":"user-profile-1","profiles":[{"id":"user-profile-1","name":"My saved project"}]}}"#,
+        )
+        .unwrap();
+        fs::write(source.join("rust-client.exe"), b"new client").unwrap();
+
+        let source_entries = source_entries(&source).unwrap();
+        replace_entries(&source, &target, &source_entries, &backup).unwrap();
+
+        let settings =
+            fs::read_to_string(target.join("runtime/rust-client-settings.json")).unwrap();
+        assert!(settings.contains("user-profile-1"));
+        assert!(settings.contains("My saved project"));
+
+        let _ = fs::remove_dir_all(&temp);
+    }
 }

@@ -111,7 +111,8 @@ pub fn render_bottom_input_bar(
         ui.horizontal(|ui| {
             let send_btn_width = 76.0;
             let spacing = 8.0;
-            let input_width = (ui.available_width() - send_btn_width - spacing).max(100.0);
+            let input_frame_width = (ui.available_width() - send_btn_width - spacing).max(120.0);
+            let input_content_width = (input_frame_width - 28.0).max(72.0);
 
             egui::Frame::new()
                 .fill(egui::Color32::from_rgb(248, 250, 252))
@@ -122,7 +123,7 @@ pub fn render_bottom_input_bar(
                 .corner_radius(egui::CornerRadius::same(14))
                 .inner_margin(egui::Margin::symmetric(14, 8))
                 .show(ui, |ui| {
-                    ui.set_width(input_width);
+                    ui.set_width(input_content_width);
                     ui.horizontal(|ui| {
                         let text_frame = egui::Frame::new()
                             .fill(egui::Color32::TRANSPARENT)
@@ -130,11 +131,8 @@ pub fn render_bottom_input_bar(
                             .corner_radius(egui::CornerRadius::ZERO)
                             .inner_margin(egui::Margin::ZERO);
 
-                        let edit_width = if has_text {
-                            (input_width - 50.0).max(50.0)
-                        } else {
-                            (input_width - 24.0).max(50.0)
-                        };
+                        let clear_width = if has_text { 32.0 } else { 0.0 };
+                        let edit_width = (input_content_width - clear_width - 8.0).max(50.0);
 
                         let edit_resp = ui.add_enabled(
                             is_enabled,

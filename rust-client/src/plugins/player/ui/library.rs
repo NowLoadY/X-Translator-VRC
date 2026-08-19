@@ -163,7 +163,13 @@ pub(super) fn render_library(
 
                         // 2. Action Buttons Row
                         ui.horizontal_wrapped(|ui| {
-                            if components::primary_button(ui, tr(language, "Play")).clicked() {
+                            if components::primary_button_with_id(
+                                ui,
+                                ("play", task.created_at_sec, task.title.as_str()),
+                                tr(language, "Play"),
+                            )
+                            .clicked()
+                            {
                                 task_to_play = Some(task.clone());
                             }
 
@@ -180,8 +186,12 @@ pub(super) fn render_library(
                                     .trim_end_matches(".mkv")
                                     .to_string();
 
-                                if components::animated_button(ui, tr(language, "Export LRC"))
-                                    .clicked()
+                                if components::animated_button_with_id(
+                                    ui,
+                                    ("export_lrc", task.created_at_sec, task.title.as_str()),
+                                    tr(language, "Export LRC"),
+                                )
+                                .clicked()
                                 {
                                     lrc_to_export = Some((
                                         format!("{}.lrc", stem),
@@ -189,8 +199,12 @@ pub(super) fn render_library(
                                     ));
                                 }
                                 ui.add_space(4.0);
-                                if components::animated_button(ui, tr(language, "Export SRT"))
-                                    .clicked()
+                                if components::animated_button_with_id(
+                                    ui,
+                                    ("export_srt", task.created_at_sec, task.title.as_str()),
+                                    tr(language, "Export SRT"),
+                                )
+                                .clicked()
                                 {
                                     srt_to_export = Some((
                                         format!("{}.srt", stem),

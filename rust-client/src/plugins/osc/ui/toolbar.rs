@@ -56,7 +56,7 @@ pub fn render_toolbar(
                     }
 
                     ui.add_space(8.0);
-                    components::wavy_divider(ui, egui::Color32::from_rgb(226, 232, 240));
+                    components::wavy_divider(ui, crate::ui::theme::text_strong());
                     ui.add_space(8.0);
 
                     ui.horizontal_wrapped(|ui| {
@@ -66,6 +66,7 @@ pub fn render_toolbar(
                             |ui| {
                                 ui.label(
                                     egui::RichText::new(crate::i18n::tr(language, "Format:"))
+                                        .color(crate::ui::theme::text_strong())
                                         .strong(),
                                 );
                             },
@@ -137,6 +138,7 @@ pub fn render_toolbar(
                                             "Message layout:"
                                         },
                                     ))
+                                    .color(crate::ui::theme::text_strong())
                                     .strong(),
                                 );
                             },
@@ -230,7 +232,11 @@ fn render_banner_selector(
             egui::vec2(100.0, 20.0),
             egui::Layout::left_to_right(egui::Align::Center),
             |ui| {
-                ui.label(egui::RichText::new(label).strong());
+                ui.label(
+                    egui::RichText::new(label)
+                        .color(crate::ui::theme::text_strong())
+                        .strong(),
+                );
             },
         );
 

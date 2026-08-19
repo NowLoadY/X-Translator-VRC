@@ -361,7 +361,7 @@ fn onboarding_feature_card(
 ) {
     Frame::new()
         .fill(tint)
-        .corner_radius(CornerRadius::same(16))
+        .corner_radius(CornerRadius::same(10))
         .inner_margin(Margin::same(20))
         .stroke(Stroke::new(1.0, Color32::from_black_alpha(12)))
         .show(ui, |ui| {
@@ -428,7 +428,7 @@ fn render_onboarding_runtime(app: &mut crate::XRTranslateApp, ui: &mut egui::Ui)
     // Option A: Automatic Setup
     Frame::new()
         .fill(Color32::from_rgb(240, 253, 250))
-        .corner_radius(CornerRadius::same(16))
+        .corner_radius(CornerRadius::same(8))
         .inner_margin(Margin::same(18))
         .stroke(Stroke::new(1.0, Color32::from_rgb(167, 243, 208)))
         .show(ui, |ui| {
@@ -1089,19 +1089,15 @@ fn sidebar_text_button(
     let active_factor =
         animation::AnimationSystem::animate_bool(ui.ctx(), id.with("active"), active, 0.08);
 
-    let bg_fill = animation::AnimationSystem::lerp_color(
-        animation::AnimationSystem::lerp_color(
-            Color32::TRANSPARENT,
-            Color32::from_rgb(238, 244, 253),
-            hover,
-        ),
-        Color32::from_rgb(229, 239, 255),
-        active_factor,
-    );
+    let bg_fill = Color32::TRANSPARENT;
+    let foreground =
+        animation::AnimationSystem::lerp_color(theme::text_strong(), theme::primary(), hover);
+    let foreground =
+        animation::AnimationSystem::lerp_color(foreground, theme::primary_dark(), active_factor);
 
     let response = Frame::new()
         .fill(bg_fill)
-        .corner_radius(CornerRadius::same(16))
+        .corner_radius(CornerRadius::same(8))
         .inner_margin(Margin::symmetric(
             (12.0 * expand_factor + 8.0 * (1.0 - expand_factor)).round() as i8,
             8,
@@ -1115,13 +1111,13 @@ fn sidebar_text_button(
                 ui.add(
                     egui::Image::new(icon)
                         .fit_to_exact_size(egui::vec2(16.0, 16.0))
-                        .tint(theme::text_strong()),
+                        .tint(foreground),
                 );
                 if expand_factor > 0.1 {
                     ui.add_space(10.0 * ((expand_factor - 0.1) / 0.9).clamp(0.0, 1.0));
                     ui.label(
                         RichText::new(crate::i18n::tr(language, label))
-                            .color(theme::text_strong())
+                            .color(foreground)
                             .size(13.0),
                     );
                 }
@@ -1203,33 +1199,22 @@ fn nav_item_animated(
     let select_factor =
         animation::AnimationSystem::animate_bool(ui.ctx(), id.with("select"), is_selected, 0.20);
 
-    let base_hover = animation::AnimationSystem::lerp_color(
-        Color32::TRANSPARENT,
-        Color32::from_rgb(238, 244, 253),
-        hover_factor,
-    );
-    let base_active = animation::AnimationSystem::lerp_color(
-        base_hover,
-        Color32::from_rgb(229, 239, 255),
-        active_factor,
-    );
-    let bg_fill = animation::AnimationSystem::lerp_color(
-        base_active,
-        Color32::from_rgb(239, 246, 255),
-        select_factor,
-    );
-
+    let bg_fill = Color32::TRANSPARENT;
     let text_color = animation::AnimationSystem::lerp_color(
         theme::text_normal(),
-        Color32::from_rgb(37, 99, 235),
-        select_factor,
+        theme::primary(),
+        hover_factor,
     );
+    let text_color =
+        animation::AnimationSystem::lerp_color(text_color, theme::primary_dark(), active_factor);
+    let text_color =
+        animation::AnimationSystem::lerp_color(text_color, theme::primary_dark(), select_factor);
 
     let inner_padding_x = (12.0 * expand_factor + 8.0 * (1.0 - expand_factor)).round();
 
     let frame_response = Frame::new()
         .fill(bg_fill)
-        .corner_radius(CornerRadius::same(16))
+        .corner_radius(CornerRadius::same(8))
         .inner_margin(Margin::symmetric(inner_padding_x as i8, 9))
         .stroke(Stroke::NONE)
         .show(ui, |ui| {
@@ -1243,10 +1228,11 @@ fn nav_item_animated(
                 if select_factor > 0.05 && expand_factor > 0.2 {
                     let (bar_rect, _) =
                         ui.allocate_exact_size(egui::vec2(3.0, 14.0), egui::Sense::hover());
+                    let base = theme::primary_dark();
                     let bar_color = Color32::from_rgba_premultiplied(
-                        37,
-                        99,
-                        235,
+                        base.r(),
+                        base.g(),
+                        base.b(),
                         (255.0 * select_factor) as u8,
                     );
                     ui.painter()
@@ -1331,22 +1317,20 @@ fn guide_button_animated(
         0.08,
     );
 
-    let base_hover = animation::AnimationSystem::lerp_color(
-        Color32::TRANSPARENT,
-        Color32::from_rgb(238, 244, 253),
+    let bg_fill = Color32::TRANSPARENT;
+    let foreground = animation::AnimationSystem::lerp_color(
+        theme::text_strong(),
+        theme::primary(),
         hover_factor,
     );
-    let bg_fill = animation::AnimationSystem::lerp_color(
-        base_hover,
-        Color32::from_rgb(229, 239, 255),
-        active_factor,
-    );
+    let foreground =
+        animation::AnimationSystem::lerp_color(foreground, theme::primary_dark(), active_factor);
 
     let inner_padding_x = (12.0 * expand_factor + 8.0 * (1.0 - expand_factor)).round();
 
     let frame_response = Frame::new()
         .fill(bg_fill)
-        .corner_radius(CornerRadius::same(16))
+        .corner_radius(CornerRadius::same(8))
         .inner_margin(Margin::symmetric(inner_padding_x as i8, 8))
         .show(ui, |ui| {
             ui.set_width(ui.available_width());
@@ -1358,7 +1342,7 @@ fn guide_button_animated(
 
                 let guide_img = egui::Image::new(icon)
                     .fit_to_exact_size(egui::vec2(16.0, 16.0))
-                    .tint(theme::text_strong());
+                    .tint(foreground);
                 ui.add(guide_img);
 
                 if expand_factor > 0.1 {
@@ -1368,7 +1352,7 @@ fn guide_button_animated(
                         ui.set_opacity(text_opacity);
                         ui.label(
                             RichText::new(crate::i18n::tr(language, "User Guide"))
-                                .color(theme::text_strong())
+                                .color(foreground)
                                 .size(13.0),
                         );
                     });

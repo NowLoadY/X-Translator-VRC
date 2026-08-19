@@ -2433,6 +2433,7 @@ impl eframe::App for XRTranslateApp {
 
         let is_player_fullscreen = self.navigation.page == Page::Plugin(PluginId::VIDEO_PLAYER)
             && self.player_plugin.controller.fullscreen_mode;
+        let viewport_focused = ui.input(|input| input.viewport().focused.unwrap_or(true));
 
         if !is_player_fullscreen {
             let expand_target = if self.navigation.collapsed { 0.0 } else { 1.0 };
@@ -2455,11 +2456,8 @@ impl eframe::App for XRTranslateApp {
                 .exact_size(sidebar_width)
                 .frame(
                     egui::Frame::new()
-                        .fill(egui::Color32::from_rgba_unmultiplied(255, 255, 255, 112))
-                        .stroke(egui::Stroke::new(
-                            1.0,
-                            egui::Color32::from_rgb(226, 232, 240),
-                        ))
+                        .fill(ui::theme::sidebar(viewport_focused))
+                        .stroke(egui::Stroke::new(1.0, ui::theme::border()))
                         .inner_margin(egui::Margin::symmetric(margin_x.round() as i8, 14)),
                 )
                 .show(ui, |ui| {
@@ -2490,7 +2488,13 @@ impl eframe::App for XRTranslateApp {
                 .inner_margin(egui::Margin::ZERO)
         } else {
             egui::Frame::new()
-                .fill(egui::Color32::TRANSPARENT)
+                .fill(ui::theme::content_backdrop(viewport_focused))
+                .shadow(egui::Shadow {
+                    offset: [0, 0],
+                    blur: 14,
+                    spread: 0,
+                    color: egui::Color32::from_black_alpha(24),
+                })
                 .inner_margin(egui::Margin::symmetric(24, 20))
         };
 
@@ -2625,12 +2629,14 @@ fn main() -> eframe::Result<()> {
     }
 
     let window_backdrop = window_backdrop::WindowBackdrop::from_environment();
-    let start_undecorated = cfg!(windows) && window_backdrop.uses_transparent_surface();
     let options = eframe::NativeOptions {
         viewport: egui::ViewportBuilder::default()
             .with_inner_size([1080.0, 720.0])
             .with_min_inner_size([880.0, 600.0])
-            .with_decorations(!start_undecorated)
+            // Keep the native non-client frame stable from CreateWindowExW
+            // onward. Toggling decorations after the first transparent frame
+            // can leave a stale DWM frame behind on Windows.
+            .with_decorations(true)
             .with_transparent(window_backdrop.uses_transparent_surface())
             .with_icon(
                 eframe::icon_data::from_png_bytes(include_bytes!(
@@ -2641,6 +2647,8 @@ fn main() -> eframe::Result<()> {
         renderer: eframe::Renderer::Wgpu,
         ..Default::default()
     };
+    #[cfg(windows)]
+    let options = configure_transparent_wgpu(options, window_backdrop);
     eframe::run_native(
         "XRTranslate",
         options,
@@ -2648,6 +2656,11 @@ fn main() -> eframe::Result<()> {
             egui_extras::install_image_loaders(&cc.egui_ctx);
             configure_cjk_fonts(&cc.egui_ctx);
             ui::theme::apply_theme(&cc.egui_ctx);
+            if let Some(state) = cc.wgpu_render_state.as_ref() {
+                log::info!("wgpu adapter: {:?}", state.adapter.get_info());
+            } else {
+                log::warn!("wgpu render state is unavailable during app creation");
+            }
             if let Err(error) = window_backdrop::apply(cc, window_backdrop) {
                 log::warn!("Unable to configure {window_backdrop:?} window backdrop: {error}");
             }
@@ -2656,6 +2669,31 @@ fn main() -> eframe::Result<()> {
             Ok(Box::new(app))
         }),
     )
+}
+
+#[cfg(windows)]
+fn configure_transparent_wgpu(
+    mut options: eframe::NativeOptions,
+    backdrop: window_backdrop::WindowBackdrop,
+) -> eframe::NativeOptions {
+    if backdrop.uses_transparent_surface()
+        && let eframe::egui_wgpu::WgpuSetup::CreateNew(setup) = &mut options.wgpu_options.wgpu_setup
+    {
+        // A HWND swapchain is composited through the opaque GDI redirection
+        // bitmap. DirectComposition owns the visual instead, which lets the
+        // premultiplied alpha surface reach the desktop directly.
+        setup.instance_descriptor.backends = eframe::wgpu::Backends::DX12;
+        setup
+            .instance_descriptor
+            .backend_options
+            .dx12
+            .presentation_system = eframe::wgpu::Dx12SwapchainKind::DxgiFromVisual;
+        log::info!(
+            "transparent WGPU configuration: backends={:?}, dx12_presentation=DxgiFromVisual",
+            setup.instance_descriptor.backends
+        );
+    }
+    options
 }
 
 fn configure_cjk_fonts(ctx: &egui::Context) {

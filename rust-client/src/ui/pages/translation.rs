@@ -199,12 +199,9 @@ pub fn render(app: &mut crate::XRTranslateApp, ui: &mut egui::Ui) {
             let avail_w = ui.available_width();
             if avail_w < 620.0 {
                 egui::Frame::new()
-                    .fill(egui::Color32::from_rgb(248, 250, 252))
-                    .corner_radius(egui::CornerRadius::same(14))
-                    .stroke(egui::Stroke::new(
-                        1.0,
-                        egui::Color32::from_rgb(226, 232, 240),
-                    ))
+                    .fill(egui::Color32::TRANSPARENT)
+                    .corner_radius(egui::CornerRadius::same(8))
+                    .stroke(egui::Stroke::new(1.0, crate::ui::theme::border()))
                     .inner_margin(egui::Margin::same(12))
                     .show(ui, |ui| {
                         render_input_adaptation(app, ui, CaptureSource::Microphone);
@@ -213,12 +210,9 @@ pub fn render(app: &mut crate::XRTranslateApp, ui: &mut egui::Ui) {
                 ui.add_space(8.0);
 
                 egui::Frame::new()
-                    .fill(egui::Color32::from_rgb(248, 250, 252))
-                    .corner_radius(egui::CornerRadius::same(14))
-                    .stroke(egui::Stroke::new(
-                        1.0,
-                        egui::Color32::from_rgb(226, 232, 240),
-                    ))
+                    .fill(egui::Color32::TRANSPARENT)
+                    .corner_radius(egui::CornerRadius::same(8))
+                    .stroke(egui::Stroke::new(1.0, crate::ui::theme::border()))
                     .inner_margin(egui::Margin::same(12))
                     .show(ui, |ui| {
                         render_input_adaptation(app, ui, CaptureSource::SystemAudio);
@@ -226,24 +220,18 @@ pub fn render(app: &mut crate::XRTranslateApp, ui: &mut egui::Ui) {
             } else {
                 ui.columns(2, |columns| {
                     egui::Frame::new()
-                        .fill(egui::Color32::from_rgb(248, 250, 252))
-                        .corner_radius(egui::CornerRadius::same(14))
-                        .stroke(egui::Stroke::new(
-                            1.0,
-                            egui::Color32::from_rgb(226, 232, 240),
-                        ))
+                        .fill(egui::Color32::TRANSPARENT)
+                        .corner_radius(egui::CornerRadius::same(8))
+                        .stroke(egui::Stroke::new(1.0, crate::ui::theme::border()))
                         .inner_margin(egui::Margin::same(12))
                         .show(&mut columns[0], |ui| {
                             render_input_adaptation(app, ui, CaptureSource::Microphone);
                         });
 
                     egui::Frame::new()
-                        .fill(egui::Color32::from_rgb(248, 250, 252))
-                        .corner_radius(egui::CornerRadius::same(14))
-                        .stroke(egui::Stroke::new(
-                            1.0,
-                            egui::Color32::from_rgb(226, 232, 240),
-                        ))
+                        .fill(egui::Color32::TRANSPARENT)
+                        .corner_radius(egui::CornerRadius::same(8))
+                        .stroke(egui::Stroke::new(1.0, crate::ui::theme::border()))
                         .inner_margin(egui::Margin::same(12))
                         .show(&mut columns[1], |ui| {
                             render_input_adaptation(app, ui, CaptureSource::SystemAudio);
@@ -286,7 +274,7 @@ pub fn render(app: &mut crate::XRTranslateApp, ui: &mut egui::Ui) {
                         }
                     }
                 } else {
-                    if components::primary_button_enabled(
+                    if components::animated_button_enabled(
                         ui,
                         crate::i18n::tr(app.ui_language, "Start Translation"),
                         app.backend_start_deadline.is_none(),
@@ -356,68 +344,100 @@ pub fn render(app: &mut crate::XRTranslateApp, ui: &mut egui::Ui) {
             |ui| {
                 let history_height = (ui.available_height() - 10.0).max(180.0);
                 ui.set_min_height(history_height);
+                let scroll_state_id = ui.make_persistent_id("recognition_history_scroll_state");
+                let (previous_count, previous_partial) = ui.memory(|memory| {
+                    memory
+                        .data
+                        .get_temp::<(usize, bool)>(scroll_state_id)
+                        .unwrap_or((0, false))
+                });
+                let current_count = app.recognition_history.len();
+                let current_partial = !app.partial_text.is_empty();
+                let should_scroll =
+                    current_count > previous_count || (current_partial && !previous_partial);
 
-                egui::ScrollArea::vertical()
-                    .id_salt("recognition_history_scroll")
-                    .stick_to_bottom(true)
+                egui::Frame::new()
+                    // Paint a stable, low-alpha layer across the whole viewport. Without a
+                    // content shape in the empty area, a transparent WGPU surface can expose
+                    // an older compositor tile while the live history is changing size.
+                    .fill(crate::ui::theme::history_viewport())
+                    .corner_radius(egui::CornerRadius::same(8))
+                    .inner_margin(egui::Margin::symmetric(4, 4))
                     .show(ui, |ui| {
-                        ui.set_width(ui.available_width());
-                        if app.recognition_history.is_empty() && app.partial_text.is_empty() {
-                            ui.label(
-                                egui::RichText::new(crate::i18n::tr(app.ui_language, "No speech"))
-                                    .color(crate::ui::theme::text_weak())
-                                    .italics(),
-                            );
-                        } else {
-                            let total = app.recognition_history.len();
-                            for (i, entry) in app.recognition_history.iter().enumerate() {
-                                let is_last = i == total - 1 && app.partial_text.is_empty();
-                                let resp = components::history_entry_card(ui, |ui| {
-                                    ui.set_width(ui.available_width());
-                                    if let Some(speaker) =
-                                        crate::compact_speaker_label(&entry.speaker_id)
-                                    {
-                                        ui.horizontal(|ui| {
-                                            components::speaker_badge(ui, &speaker);
-                                        });
-                                        ui.add_space(2.0);
-                                    }
-                                    render_text_with_term_matches(
-                                        ui,
-                                        &entry.text,
-                                        &entry.activation_matches,
-                                        &entry.context_matches,
-                                        crate::ui::theme::text_normal(),
-                                        false,
+                        egui::ScrollArea::vertical()
+                            .id_salt("recognition_history_scroll")
+                            .animated(false)
+                            .auto_shrink([false, false])
+                            .show(ui, |ui| {
+                                ui.set_width(ui.available_width());
+                                if app.recognition_history.is_empty() && app.partial_text.is_empty()
+                                {
+                                    ui.label(
+                                        egui::RichText::new(crate::i18n::tr(
+                                            app.ui_language,
+                                            "No speech",
+                                        ))
+                                        .color(crate::ui::theme::text_weak())
+                                        .italics(),
                                     );
-                                });
-                                if is_last {
-                                    resp.scroll_to_me(Some(egui::Align::BOTTOM));
+                                } else {
+                                    let total = app.recognition_history.len();
+                                    for (i, entry) in app.recognition_history.iter().enumerate() {
+                                        let is_last = i == total - 1 && app.partial_text.is_empty();
+                                        let resp = components::history_entry_card(ui, |ui| {
+                                            ui.set_width(ui.available_width());
+                                            if let Some(speaker) =
+                                                crate::compact_speaker_label(&entry.speaker_id)
+                                            {
+                                                ui.horizontal(|ui| {
+                                                    components::speaker_badge(ui, &speaker);
+                                                });
+                                                ui.add_space(2.0);
+                                            }
+                                            render_text_with_term_matches(
+                                                ui,
+                                                &entry.text,
+                                                &entry.activation_matches,
+                                                &entry.context_matches,
+                                                crate::ui::theme::text_normal(),
+                                                false,
+                                            );
+                                        });
+                                        if is_last && should_scroll {
+                                            resp.scroll_to_me(Some(egui::Align::BOTTOM));
+                                        }
+                                        ui.add_space(4.0);
+                                    }
+                                    if !app.partial_text.is_empty() {
+                                        let resp = ui
+                                            .horizontal(|ui| {
+                                                ui.label(
+                                                    egui::RichText::new("• • •")
+                                                        .color(crate::ui::theme::primary())
+                                                        .size(11.0)
+                                                        .strong(),
+                                                );
+                                                ui.add_space(2.0);
+                                                ui.label(
+                                                    egui::RichText::new(&app.partial_text)
+                                                        .color(crate::ui::theme::primary_dark())
+                                                        .size(13.0)
+                                                        .italics(),
+                                                )
+                                            })
+                                            .response;
+                                        if should_scroll {
+                                            resp.scroll_to_me(Some(egui::Align::BOTTOM));
+                                        }
+                                    }
                                 }
-                                ui.add_space(4.0);
-                            }
-                            if !app.partial_text.is_empty() {
-                                let resp = ui
-                                    .horizontal(|ui| {
-                                        ui.label(
-                                            egui::RichText::new("• • •")
-                                                .color(egui::Color32::from_rgb(59, 130, 246))
-                                                .size(11.0)
-                                                .strong(),
-                                        );
-                                        ui.add_space(2.0);
-                                        ui.label(
-                                            egui::RichText::new(&app.partial_text)
-                                                .color(egui::Color32::from_rgb(37, 99, 235))
-                                                .size(13.0)
-                                                .italics(),
-                                        )
-                                    })
-                                    .response;
-                                resp.scroll_to_me(Some(egui::Align::BOTTOM));
-                            }
-                        }
+                            });
                     });
+                ui.memory_mut(|memory| {
+                    memory
+                        .data
+                        .insert_temp(scroll_state_id, (current_count, current_partial));
+                });
             },
         );
 
@@ -431,60 +451,76 @@ pub fn render(app: &mut crate::XRTranslateApp, ui: &mut egui::Ui) {
             |ui| {
                 let history_height = (ui.available_height() - 10.0).max(180.0);
                 ui.set_min_height(history_height);
+                let scroll_state_id = ui.make_persistent_id("translation_history_scroll_state");
+                let previous_count = ui
+                    .memory(|memory| memory.data.get_temp::<usize>(scroll_state_id))
+                    .unwrap_or(0);
+                let current_count = app.translations.len();
+                let should_scroll = current_count > previous_count;
 
-                egui::ScrollArea::vertical()
-                    .id_salt("translation_history_scroll")
-                    .stick_to_bottom(true)
+                egui::Frame::new()
+                    .fill(crate::ui::theme::history_viewport())
+                    .corner_radius(egui::CornerRadius::same(8))
+                    .inner_margin(egui::Margin::symmetric(4, 4))
                     .show(ui, |ui| {
-                        ui.set_width(ui.available_width());
-                        if app.translations.is_empty() {
-                            ui.label(
-                                egui::RichText::new(crate::i18n::tr(
-                                    app.ui_language,
-                                    "No translations",
-                                ))
-                                .color(crate::ui::theme::text_weak())
-                                .italics(),
-                            );
-                        } else {
-                            let total = app.translations.len();
-                            for (i, entry) in app.translations.iter().enumerate() {
-                                let is_last = i == total - 1;
-                                let group_resp = components::history_entry_card(ui, |ui| {
-                                    ui.set_width(ui.available_width());
-                                    if let Some(speaker) =
-                                        crate::compact_speaker_label(&entry.speaker_id)
-                                    {
-                                        ui.horizontal(|ui| {
-                                            components::speaker_badge(ui, &speaker);
-                                        });
-                                        ui.add_space(2.0);
-                                    }
-                                    if !entry.source.is_empty() {
-                                        ui.label(
-                                            egui::RichText::new(&entry.source)
-                                                .color(crate::ui::theme::text_weak())
-                                                .size(11.5),
-                                        );
-                                        ui.add_space(2.0);
-                                    }
-                                    render_text_with_term_matches(
-                                        ui,
-                                        &entry.translated,
-                                        &entry.term_matches,
-                                        &[],
-                                        crate::ui::theme::text_strong(),
-                                        true,
+                        egui::ScrollArea::vertical()
+                            .id_salt("translation_history_scroll")
+                            .animated(false)
+                            .auto_shrink([false, false])
+                            .show(ui, |ui| {
+                                ui.set_width(ui.available_width());
+                                if app.translations.is_empty() {
+                                    ui.label(
+                                        egui::RichText::new(crate::i18n::tr(
+                                            app.ui_language,
+                                            "No translations",
+                                        ))
+                                        .color(crate::ui::theme::text_weak())
+                                        .italics(),
                                     );
-                                });
+                                } else {
+                                    let total = app.translations.len();
+                                    for (i, entry) in app.translations.iter().enumerate() {
+                                        let is_last = i == total - 1;
+                                        let group_resp = components::history_entry_card(ui, |ui| {
+                                            ui.set_width(ui.available_width());
+                                            if let Some(speaker) =
+                                                crate::compact_speaker_label(&entry.speaker_id)
+                                            {
+                                                ui.horizontal(|ui| {
+                                                    components::speaker_badge(ui, &speaker);
+                                                });
+                                                ui.add_space(2.0);
+                                            }
+                                            if !entry.source.is_empty() {
+                                                ui.label(
+                                                    egui::RichText::new(&entry.source)
+                                                        .color(crate::ui::theme::text_weak())
+                                                        .size(11.5),
+                                                );
+                                                ui.add_space(2.0);
+                                            }
+                                            render_text_with_term_matches(
+                                                ui,
+                                                &entry.translated,
+                                                &entry.term_matches,
+                                                &[],
+                                                crate::ui::theme::text_strong(),
+                                                true,
+                                            );
+                                        });
 
-                                if is_last {
-                                    group_resp.scroll_to_me(Some(egui::Align::BOTTOM));
+                                        if is_last && should_scroll {
+                                            group_resp.scroll_to_me(Some(egui::Align::BOTTOM));
+                                        }
+                                        ui.add_space(4.0);
+                                    }
                                 }
-                                ui.add_space(4.0);
-                            }
-                        }
+                            });
                     });
+                ui.memory_mut(|memory| {
+                    memory.data.insert_temp(scroll_state_id, current_count);
+                });
             },
         );
     });
@@ -552,7 +588,7 @@ fn render_text_with_term_matches(
                 .join("\n\n");
             let mut highlighted = egui::RichText::new(&text[start..end])
                 .color(if primary {
-                    egui::Color32::from_rgb(37, 99, 235)
+                    crate::ui::theme::primary_dark()
                 } else {
                     egui::Color32::from_rgb(96, 165, 250)
                 })
@@ -607,7 +643,11 @@ fn render_input_adaptation(
         let recognition = app.recognition_settings_mut(source);
         let timing_changed = ui
             .horizontal(|ui| {
-                ui.label(egui::RichText::new(recognize_when).strong());
+                ui.label(
+                    egui::RichText::new(recognize_when)
+                        .color(crate::ui::theme::text_strong())
+                        .strong(),
+                );
                 let previous = recognition.continuous_recognition;
                 egui::ComboBox::from_id_salt(("recognition_timing", source))
                     .selected_text(if recognition.continuous_recognition {

@@ -373,7 +373,7 @@ fn render_plugins_section(app: &mut crate::XRTranslateApp, ui: &mut egui::Ui) {
                         == crate::plugins::PluginSettingsContribution::Plugin
                 {
                     ui.add_space(14.0);
-                    components::wavy_divider(ui, egui::Color32::from_rgb(226, 232, 240));
+                    components::wavy_divider(ui, crate::ui::theme::text_strong());
                     ui.add_space(14.0);
                     app.render_plugin_settings(descriptor.id, ui);
                 }

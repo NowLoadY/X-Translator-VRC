@@ -393,6 +393,38 @@ mod tests {
     }
 
     #[test]
+    fn prompt_studio_user_profile_survives_save_and_reload() {
+        let root = std::env::temp_dir().join("xrtranslate_test_prompt_profile_persistence");
+        let _ = std::fs::remove_dir_all(&root);
+
+        let mut settings = ClientSettings::default();
+        let mut profile = PromptTemplateLibrary::editable_copy_of(
+            &settings.prompt_library.profiles[0],
+            "user-profile-1",
+        );
+        profile.name = "My saved project".into();
+        profile.description = "User-authored prompt graph".into();
+        settings.prompt_library.profiles.push(profile);
+        settings.prompt_library.active_id = "user-profile-1".into();
+
+        settings.save(&root).unwrap();
+        let loaded = ClientSettings::load(&root);
+        let loaded_profile = loaded
+            .prompt_library
+            .profiles
+            .iter()
+            .find(|profile| profile.id == "user-profile-1")
+            .expect("user profile must be persisted");
+
+        assert_eq!(loaded.prompt_library.active_id, "user-profile-1");
+        assert_eq!(loaded_profile.name, "My saved project");
+        assert_eq!(loaded_profile.description, "User-authored prompt graph");
+        assert!(!loaded_profile.read_only);
+
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    #[test]
     fn osc_speaker_number_visibility_is_independent() {
         let root = std::env::temp_dir().join("xrtranslate_test_speaker_number_visibility");
         let _ = std::fs::remove_dir_all(&root);

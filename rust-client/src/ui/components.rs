@@ -1,26 +1,22 @@
+use crate::ui::theme;
 use eframe::egui::{self, Color32, CornerRadius, Frame, Margin, Stroke, Ui, Vec2};
 
 pub fn card<R>(ui: &mut Ui, add_contents: impl FnOnce(&mut Ui) -> R) -> R {
     Frame::new()
-        .fill(Color32::WHITE)
-        .corner_radius(CornerRadius::same(20))
-        .inner_margin(Margin::same(18))
-        .stroke(Stroke::new(1.0, Color32::from_rgb(235, 240, 248)))
-        .shadow(egui::Shadow {
-            offset: [0, 4],
-            blur: 16,
-            spread: 0,
-            color: Color32::from_rgba_unmultiplied(15, 23, 42, 10),
-        })
+        .fill(Color32::TRANSPARENT)
+        .corner_radius(CornerRadius::same(10))
+        .inner_margin(Margin::same(16))
+        .stroke(Stroke::new(1.0, theme::border()))
+        .shadow(egui::Shadow::NONE)
         .show(ui, add_contents)
         .inner
 }
 
 pub fn action_card<R>(ui: &mut Ui, add_contents: impl FnOnce(&mut Ui) -> R) -> R {
     Frame::new()
-        .fill(Color32::from_rgb(245, 248, 252))
-        .corner_radius(CornerRadius::same(18))
-        .stroke(Stroke::NONE)
+        .fill(Color32::TRANSPARENT)
+        .corner_radius(CornerRadius::same(10))
+        .stroke(Stroke::new(1.0, theme::border()))
         .inner_margin(Margin::symmetric(16, 12))
         .show(ui, add_contents)
         .inner
@@ -31,10 +27,10 @@ pub fn history_entry_card<R>(
     add_contents: impl FnOnce(&mut Ui) -> R,
 ) -> egui::Response {
     Frame::new()
-        .fill(Color32::from_rgb(245, 248, 252))
-        .corner_radius(CornerRadius::same(14))
+        .fill(theme::history_surface())
+        .corner_radius(CornerRadius::same(8))
         .inner_margin(Margin::symmetric(12, 9))
-        .stroke(Stroke::NONE)
+        .stroke(Stroke::new(1.0, theme::border()))
         .show(ui, add_contents)
         .response
 }
@@ -43,7 +39,7 @@ pub fn dark_container_frame<R>(ui: &mut Ui, add_contents: impl FnOnce(&mut Ui) -
     Frame::new()
         .fill(Color32::from_rgb(15, 23, 42))
         .stroke(Stroke::new(1.0, Color32::from_rgb(51, 65, 85)))
-        .corner_radius(CornerRadius::same(14))
+        .corner_radius(CornerRadius::same(10))
         .inner_margin(Margin::same(12))
         .show(ui, add_contents)
         .inner
@@ -51,14 +47,14 @@ pub fn dark_container_frame<R>(ui: &mut Ui, add_contents: impl FnOnce(&mut Ui) -
 
 pub fn speaker_badge(ui: &mut Ui, speaker: &str) {
     Frame::new()
-        .fill(Color32::from_rgb(239, 246, 255))
-        .stroke(Stroke::NONE)
+        .fill(Color32::TRANSPARENT)
+        .stroke(Stroke::new(1.0, theme::border()))
         .corner_radius(CornerRadius::same(6))
         .inner_margin(Margin::symmetric(6, 2))
         .show(ui, |ui| {
             ui.label(
                 egui::RichText::new(speaker)
-                    .color(Color32::from_rgb(37, 99, 235))
+                    .color(theme::primary_dark())
                     .size(11.5)
                     .strong(),
             );
@@ -103,89 +99,32 @@ pub fn swap_capsule_button(ui: &mut Ui, enabled: bool) -> egui::Response {
         0.0
     };
 
-    let rest_fill = Color32::WHITE;
-    let hover_fill = Color32::from_rgb(245, 248, 253);
-    let active_fill = Color32::from_rgb(235, 242, 254);
-
-    let fill = if enabled {
-        let base =
-            crate::ui::animation::AnimationSystem::lerp_color(rest_fill, hover_fill, hover_factor);
-        let base =
-            crate::ui::animation::AnimationSystem::lerp_color(base, active_fill, active_factor);
-        crate::ui::animation::AnimationSystem::lerp_color(
-            base,
-            Color32::from_rgb(230, 240, 255),
-            click_factor,
-        )
-    } else {
-        Color32::from_rgb(245, 248, 252)
-    };
+    let fill = theme::surface_control();
 
     let text_color = if enabled {
         let base = crate::ui::animation::AnimationSystem::lerp_color(
-            Color32::from_rgb(59, 130, 246),
-            Color32::from_rgb(37, 99, 235),
+            theme::primary(),
+            theme::primary_dark(),
             hover_factor,
         );
-        crate::ui::animation::AnimationSystem::lerp_color(
+        let base = crate::ui::animation::AnimationSystem::lerp_color(
             base,
-            Color32::from_rgb(29, 78, 216),
+            theme::primary_dark(),
             active_factor,
-        )
+        );
+        crate::ui::animation::AnimationSystem::lerp_color(base, theme::primary_dark(), click_factor)
     } else {
         Color32::from_rgb(148, 163, 184)
     };
 
-    let rest_stroke = Stroke::new(1.0, Color32::from_rgb(226, 232, 240));
-    let hover_stroke = Stroke::new(1.0, Color32::from_rgb(203, 213, 225));
-    let active_stroke = Stroke::new(1.0, Color32::from_rgb(148, 163, 184));
-    let stroke_color = if enabled {
-        let base = crate::ui::animation::AnimationSystem::lerp_color(
-            rest_stroke.color,
-            hover_stroke.color,
-            hover_factor,
-        );
-        crate::ui::animation::AnimationSystem::lerp_color(base, active_stroke.color, active_factor)
-    } else {
-        rest_stroke.color
-    };
-
-    let rest_shadow = egui::Shadow {
-        offset: [0, 2],
-        blur: 4,
-        spread: 0,
-        color: Color32::from_black_alpha(10),
-    };
-    let hover_shadow = egui::Shadow {
-        offset: [0, 3],
-        blur: 6,
-        spread: 0,
-        color: Color32::from_black_alpha(15),
-    };
-    let active_shadow = egui::Shadow {
-        offset: [0, 1],
-        blur: 2,
-        spread: 0,
-        color: Color32::from_black_alpha(6),
-    };
-
-    let shadow = if enabled {
-        let base = crate::ui::animation::AnimationSystem::lerp_shadow(
-            rest_shadow,
-            hover_shadow,
-            hover_factor,
-        );
-        crate::ui::animation::AnimationSystem::lerp_shadow(base, active_shadow, active_factor)
-    } else {
-        egui::Shadow::NONE
-    };
+    let stroke_color = theme::border();
 
     let resp = Frame::new()
         .fill(fill)
         .stroke(Stroke::new(1.0, stroke_color))
-        .corner_radius(CornerRadius::same(12))
+        .corner_radius(CornerRadius::same(8))
         .inner_margin(Margin::symmetric(9, 4))
-        .shadow(shadow)
+        .shadow(egui::Shadow::NONE)
         .show(ui, |ui| {
             ui.label(
                 egui::RichText::new("↔")
@@ -227,44 +166,74 @@ pub fn segmented_audio_meter(
             ui.ctx()
                 .request_repaint_after(std::time::Duration::from_millis(33));
         }
-        let animated_fraction = raw_fraction.clamp(0.0, 1.0);
+        let level = raw_fraction.clamp(0.0, 1.0);
+        const POINTS: usize = 24;
+        const HEIGHT: f32 = 11.0;
+        const WIDTH: f32 = 68.0;
 
-        let seg_count = 6;
-        let seg_w = 8.5;
-        let seg_h = 8.5;
-        let gap = 3.5;
-        let total_w = (seg_count as f32) * seg_w + (seg_count - 1) as f32 * gap;
+        let id = ui.make_persistent_id("audio_waveform_samples");
+        let mut history = ui.memory(|memory| {
+            memory
+                .data
+                .get_temp::<Vec<f32>>(id)
+                .unwrap_or_else(|| vec![0.0; POINTS])
+        });
+        if history.len() != POINTS {
+            history.resize(POINTS, 0.0);
+        }
+        if updating {
+            history.push(level);
+            let excess = history.len().saturating_sub(POINTS);
+            if excess > 0 {
+                history.drain(..excess);
+            }
+        } else {
+            // A stopped session must not keep repainting the previous audio
+            // envelope. Reset the visual state immediately on the next frame.
+            history.fill(0.0);
+        }
+        ui.memory_mut(|memory| memory.data.insert_temp(id, history.clone()));
 
-        let (rect, _) = ui.allocate_exact_size(Vec2::new(total_w, seg_h), egui::Sense::hover());
-
+        let (rect, _) = ui.allocate_exact_size(Vec2::new(WIDTH, HEIGHT), egui::Sense::hover());
         if ui.is_rect_visible(rect) {
             let painter = ui.painter();
-            let step = 1.0 / seg_count as f32;
-
-            for i in 0..seg_count {
-                let seg_threshold = (i as f32) * step;
-                let is_filled = animated_fraction > seg_threshold;
-
-                let min_x = rect.min.x + (i as f32) * (seg_w + gap);
-                let seg_rect = egui::Rect::from_min_size(
-                    egui::pos2(min_x, rect.min.y),
-                    Vec2::new(seg_w, seg_h),
+            let baseline = rect.center().y;
+            let max_deviation = (HEIGHT * 0.5 - 0.7).max(1.0);
+            let base_color = if !updating {
+                theme::border()
+            } else if active {
+                Color32::from_rgb(48, 145, 98)
+            } else {
+                theme::primary()
+            };
+            let mut points = Vec::with_capacity(POINTS);
+            for (index, sample) in history.iter().enumerate() {
+                let x = egui::lerp(
+                    rect.left()..=rect.right(),
+                    index as f32 / (POINTS - 1) as f32,
                 );
-
-                let radius = CornerRadius::same(4);
-
-                let color = if is_filled {
-                    if active {
-                        Color32::from_rgb(16, 185, 129)
-                    } else {
-                        Color32::from_rgb(59, 130, 246)
-                    }
+                let envelope = if *sample < 0.025 {
+                    0.0
                 } else {
-                    Color32::from_rgb(226, 232, 240)
+                    (sample.sqrt() * 1.65).clamp(0.0, 1.0)
                 };
-
-                painter.rect_filled(seg_rect, radius, color);
+                let phase = index as f32 * std::f32::consts::PI * 0.62;
+                let y = baseline + phase.sin() * envelope * max_deviation;
+                points.push(egui::pos2(x, y));
             }
+
+            // Keep a visible baseline even when the input is silent.
+            painter.line_segment(
+                [
+                    egui::pos2(rect.left(), baseline),
+                    egui::pos2(rect.right(), baseline),
+                ],
+                Stroke::new(1.2, base_color),
+            );
+
+            // Draw one continuous stroke so the waveform keeps a single,
+            // stable feedback color regardless of its amplitude.
+            painter.add(egui::Shape::line(points, Stroke::new(1.8, base_color)));
         }
     }
 }
@@ -356,6 +325,14 @@ pub fn animated_button(ui: &mut Ui, text: &str) -> egui::Response {
     animated_button_enabled(ui, text, true)
 }
 
+pub fn animated_button_with_id(
+    ui: &mut Ui,
+    id_source: impl std::hash::Hash + std::fmt::Debug,
+    text: &str,
+) -> egui::Response {
+    animated_button_enabled_with_id(ui, id_source, text, true)
+}
+
 /// Formats a byte count for display.
 pub fn format_file_size(bytes: u64) -> String {
     const UNITS: [&str; 4] = ["B", "KiB", "MiB", "GiB"];
@@ -373,7 +350,16 @@ pub fn format_file_size(bytes: u64) -> String {
 }
 
 pub fn animated_button_enabled(ui: &mut Ui, text: &str, enabled: bool) -> egui::Response {
-    let id = ui.make_persistent_id(text);
+    animated_button_enabled_with_id(ui, text, text, enabled)
+}
+
+pub fn animated_button_enabled_with_id(
+    ui: &mut Ui,
+    id_source: impl std::hash::Hash + std::fmt::Debug,
+    text: &str,
+    enabled: bool,
+) -> egui::Response {
+    let id = ui.make_persistent_id(id_source);
     let is_hovered = ui.memory(|m| {
         m.data
             .get_temp::<bool>(id.with("hover_state"))
@@ -410,94 +396,34 @@ pub fn animated_button_enabled(ui: &mut Ui, text: &str, enabled: bool) -> egui::
         0.0
     };
 
-    let rest_fill = Color32::WHITE;
-    let hover_fill = Color32::from_rgb(245, 248, 253);
-    let active_fill = Color32::from_rgb(235, 241, 250);
-
-    let fill = if enabled {
-        let base =
-            crate::ui::animation::AnimationSystem::lerp_color(rest_fill, hover_fill, hover_factor);
-        let base =
-            crate::ui::animation::AnimationSystem::lerp_color(base, active_fill, active_factor);
-        crate::ui::animation::AnimationSystem::lerp_color(
-            base,
-            Color32::from_rgb(230, 240, 255),
-            click_factor,
-        )
-    } else {
-        Color32::from_rgb(241, 245, 249)
-    };
+    let fill = theme::surface_control();
 
     let text_color = if enabled {
-        crate::ui::theme::text_strong()
+        let base = crate::ui::animation::AnimationSystem::lerp_color(
+            theme::text_strong(),
+            theme::primary(),
+            hover_factor,
+        );
+        let base = crate::ui::animation::AnimationSystem::lerp_color(
+            base,
+            theme::primary_dark(),
+            active_factor,
+        );
+        crate::ui::animation::AnimationSystem::lerp_color(base, theme::primary_dark(), click_factor)
     } else {
         crate::ui::theme::text_weak()
     };
 
-    let rest_stroke = Stroke::new(1.0, Color32::from_rgb(226, 232, 240));
-    let hover_stroke = Stroke::new(1.0, Color32::from_rgb(203, 213, 225));
-    let active_stroke = Stroke::new(1.0, Color32::from_rgb(148, 163, 184));
-    let click_stroke = Stroke::new(1.0, Color32::from_rgb(147, 197, 253));
-
-    let stroke = if enabled {
-        let base = crate::ui::animation::AnimationSystem::lerp_color(
-            rest_stroke.color,
-            hover_stroke.color,
-            hover_factor,
-        );
-        let base = crate::ui::animation::AnimationSystem::lerp_color(
-            base,
-            active_stroke.color,
-            active_factor,
-        );
-        let color = crate::ui::animation::AnimationSystem::lerp_color(
-            base,
-            click_stroke.color,
-            click_factor,
-        );
-        Stroke::new(1.0, color)
-    } else {
-        Stroke::new(1.0, Color32::from_rgb(226, 232, 240))
-    };
-
-    let rest_shadow = egui::Shadow {
-        offset: [0, 2],
-        blur: 5,
-        spread: 0,
-        color: Color32::from_black_alpha(12),
-    };
-    let hover_shadow = egui::Shadow {
-        offset: [0, 3],
-        blur: 7,
-        spread: 0,
-        color: Color32::from_black_alpha(16),
-    };
-    let active_shadow = egui::Shadow {
-        offset: [0, 1],
-        blur: 2,
-        spread: 0,
-        color: Color32::from_black_alpha(6),
-    };
-
-    let shadow = if enabled {
-        let base = crate::ui::animation::AnimationSystem::lerp_shadow(
-            rest_shadow,
-            hover_shadow,
-            hover_factor,
-        );
-        crate::ui::animation::AnimationSystem::lerp_shadow(base, active_shadow, active_factor)
-    } else {
-        egui::Shadow::NONE
-    };
+    let stroke = Stroke::new(1.0, theme::border());
 
     let resp = ui
         .add_enabled_ui(enabled, |ui| {
             Frame::new()
                 .fill(fill)
                 .stroke(stroke)
-                .corner_radius(CornerRadius::same(14))
+                .corner_radius(CornerRadius::same(8))
                 .inner_margin(Margin::symmetric(14, 7))
-                .shadow(shadow)
+                .shadow(egui::Shadow::NONE)
                 .show(ui, |ui| {
                     ui.label(
                         egui::RichText::new(text)
@@ -533,8 +459,25 @@ pub fn primary_button(ui: &mut Ui, text: &str) -> egui::Response {
     primary_button_enabled(ui, text, true)
 }
 
+pub fn primary_button_with_id(
+    ui: &mut Ui,
+    id_source: impl std::hash::Hash + std::fmt::Debug,
+    text: &str,
+) -> egui::Response {
+    primary_button_enabled_with_id(ui, id_source, text, true)
+}
+
 pub fn primary_button_enabled(ui: &mut Ui, text: &str, enabled: bool) -> egui::Response {
-    let id = ui.make_persistent_id(text);
+    primary_button_enabled_with_id(ui, text, text, enabled)
+}
+
+pub fn primary_button_enabled_with_id(
+    ui: &mut Ui,
+    id_source: impl std::hash::Hash + std::fmt::Debug,
+    text: &str,
+    enabled: bool,
+) -> egui::Response {
+    let id = ui.make_persistent_id(id_source);
     let is_hovered = ui.memory(|m| {
         m.data
             .get_temp::<bool>(id.with("hover_state"))
@@ -559,8 +502,8 @@ pub fn primary_button_enabled(ui: &mut Ui, text: &str, enabled: bool) -> egui::R
         0.08,
     );
 
-    let rest_fill = Color32::from_rgb(59, 130, 246);
-    let hover_fill = Color32::from_rgb(37, 99, 235);
+    let rest_fill = theme::primary();
+    let hover_fill = theme::primary_dark();
     let active_fill = Color32::from_rgb(29, 78, 216);
 
     let fill = if enabled {
@@ -577,44 +520,14 @@ pub fn primary_button_enabled(ui: &mut Ui, text: &str, enabled: bool) -> egui::R
         Color32::from_rgb(147, 197, 253)
     };
 
-    let rest_shadow = egui::Shadow {
-        offset: [0, 2],
-        blur: 4,
-        spread: 0,
-        color: Color32::from_black_alpha(15),
-    };
-    let hover_shadow = egui::Shadow {
-        offset: [0, 3],
-        blur: 6,
-        spread: 0,
-        color: Color32::from_black_alpha(20),
-    };
-    let active_shadow = egui::Shadow {
-        offset: [0, 1],
-        blur: 2,
-        spread: 0,
-        color: Color32::from_black_alpha(8),
-    };
-
-    let shadow = if enabled {
-        let base = crate::ui::animation::AnimationSystem::lerp_shadow(
-            rest_shadow,
-            hover_shadow,
-            hover_factor,
-        );
-        crate::ui::animation::AnimationSystem::lerp_shadow(base, active_shadow, active_factor)
-    } else {
-        egui::Shadow::NONE
-    };
-
     let resp = ui
         .add_enabled_ui(enabled, |ui| {
             Frame::new()
                 .fill(fill)
-                .stroke(Stroke::NONE)
-                .corner_radius(CornerRadius::same(16))
-                .inner_margin(Margin::symmetric(18, 8))
-                .shadow(shadow)
+                .stroke(Stroke::new(1.0, theme::border_strong()))
+                .corner_radius(CornerRadius::same(8))
+                .inner_margin(Margin::symmetric(14, 7))
+                .shadow(egui::Shadow::NONE)
                 .show(ui, |ui| {
                     ui.label(
                         egui::RichText::new(text)
@@ -713,10 +626,10 @@ pub fn search_bar(ui: &mut Ui, query: &mut String, hint: &str) -> bool {
     let mut changed = false;
     let has_query = !query.is_empty();
     Frame::new()
-        .fill(Color32::from_rgb(248, 250, 252))
-        .stroke(Stroke::new(1.0, Color32::from_rgb(226, 232, 240)))
-        .corner_radius(CornerRadius::same(16))
-        .inner_margin(Margin::symmetric(16, 10))
+        .fill(theme::surface_control())
+        .stroke(Stroke::new(1.0, theme::border()))
+        .corner_radius(CornerRadius::same(10))
+        .inner_margin(Margin::symmetric(12, 8))
         .show(ui, |ui| {
             ui.horizontal(|ui| {
                 let text_frame = Frame::new()
@@ -737,8 +650,8 @@ pub fn search_bar(ui: &mut Ui, query: &mut String, hint: &str) -> bool {
                 if !query.is_empty() {
                     ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
                         let clear_btn = Frame::new()
-                            .fill(Color32::from_rgb(226, 232, 240))
-                            .corner_radius(CornerRadius::same(10))
+                            .fill(Color32::from_black_alpha(10))
+                            .corner_radius(CornerRadius::same(6))
                             .inner_margin(Margin::symmetric(6, 2))
                             .show(ui, |ui| {
                                 ui.label(
@@ -764,9 +677,9 @@ pub fn search_bar(ui: &mut Ui, query: &mut String, hint: &str) -> bool {
 pub fn input_field(ui: &mut Ui, text: &mut String, hint: &str) -> egui::Response {
     let mut resp = None;
     Frame::new()
-        .fill(Color32::from_rgb(248, 250, 252))
-        .stroke(Stroke::new(1.0, Color32::from_rgb(226, 232, 240)))
-        .corner_radius(CornerRadius::same(12))
+        .fill(theme::surface_control())
+        .stroke(Stroke::new(1.0, theme::border()))
+        .corner_radius(CornerRadius::same(8))
         .inner_margin(Margin::symmetric(12, 8))
         .show(ui, |ui| {
             let text_frame = Frame::new()
@@ -1078,43 +991,27 @@ pub fn pill_toggle(ui: &mut Ui, checked: &mut bool) -> egui::Response {
     if ui.is_rect_visible(rect) {
         let painter = ui.painter();
 
-        let track_checked_base = Color32::from_rgb(59, 130, 246);
-        let track_checked_hover = Color32::from_rgb(37, 99, 235);
-        let track_checked_active = Color32::from_rgb(29, 78, 216);
-
-        let track_unchecked_base = Color32::from_rgb(226, 232, 240);
-        let track_unchecked_hover = Color32::from_rgb(203, 213, 225);
-        let track_unchecked_active = Color32::from_rgb(186, 198, 214);
-
-        let track_checked = crate::ui::animation::AnimationSystem::lerp_color(
-            track_checked_base,
-            track_checked_hover,
+        let interaction_color = crate::ui::animation::AnimationSystem::lerp_color(
+            theme::border_strong(),
+            theme::primary(),
             hover_factor,
         );
-        let track_checked = crate::ui::animation::AnimationSystem::lerp_color(
-            track_checked,
-            track_checked_active,
+        let interaction_color = crate::ui::animation::AnimationSystem::lerp_color(
+            interaction_color,
+            theme::primary_dark(),
             active_factor,
         );
-
-        let track_unchecked = crate::ui::animation::AnimationSystem::lerp_color(
-            track_unchecked_base,
-            track_unchecked_hover,
-            hover_factor,
-        );
-        let track_unchecked = crate::ui::animation::AnimationSystem::lerp_color(
-            track_unchecked,
-            track_unchecked_active,
-            active_factor,
-        );
-
-        let track_fill = crate::ui::animation::AnimationSystem::lerp_color(
-            track_unchecked,
-            track_checked,
+        let track_stroke = crate::ui::animation::AnimationSystem::lerp_color(
+            interaction_color,
+            theme::primary_dark(),
             switch_factor,
         );
-
-        painter.rect_filled(rect, CornerRadius::same(10), track_fill);
+        painter.rect_stroke(
+            rect,
+            CornerRadius::same(10),
+            Stroke::new(1.0, track_stroke),
+            egui::StrokeKind::Inside,
+        );
 
         let knob_radius = 7.5;
         let min_x = rect.min.x + 10.0;
@@ -1122,7 +1019,12 @@ pub fn pill_toggle(ui: &mut Ui, checked: &mut bool) -> egui::Response {
         let current_x = min_x + (max_x - min_x) * switch_factor;
 
         let knob_center = egui::pos2(current_x, rect.center().y);
-        painter.circle_filled(knob_center, knob_radius, Color32::WHITE);
+        let knob_color = crate::ui::animation::AnimationSystem::lerp_color(
+            interaction_color,
+            theme::primary(),
+            switch_factor,
+        );
+        painter.circle_filled(knob_center, knob_radius, knob_color);
     }
 
     ui.memory_mut(|m| {
@@ -1228,30 +1130,18 @@ pub fn file_path_input(
 }
 
 pub fn status_badge(ui: &mut Ui, status: &str, is_active: bool, is_error: bool) {
-    let (bg_color, fg_color, dot) = if is_error {
-        (
-            Color32::from_rgb(254, 242, 242),
-            Color32::from_rgb(220, 38, 38),
-            "● ",
-        )
+    let (fg_color, dot) = if is_error {
+        (Color32::from_rgb(220, 38, 38), "● ")
     } else if is_active {
-        (
-            Color32::from_rgb(236, 253, 245),
-            Color32::from_rgb(5, 150, 105),
-            "● ",
-        )
+        (Color32::from_rgb(5, 150, 105), "● ")
     } else {
-        (
-            Color32::from_rgb(239, 246, 255),
-            Color32::from_rgb(37, 99, 235),
-            "",
-        )
+        (theme::primary_dark(), "")
     };
 
     Frame::new()
-        .fill(bg_color)
+        .fill(Color32::TRANSPARENT)
         .corner_radius(CornerRadius::same(14))
-        .stroke(Stroke::NONE)
+        .stroke(Stroke::new(1.0, fg_color))
         .inner_margin(Margin::symmetric(12, 5))
         .show(ui, |ui| {
             ui.label(
@@ -1275,49 +1165,25 @@ pub fn sub_sidebar<T: Copy + PartialEq>(
     items: &[SubNavItem<T>],
     language: crate::i18n::UiLanguage,
 ) {
-    let width = 175.0;
-    let card_id = ui.make_persistent_id("sub_sidebar_layout_measurement");
-
-    let header_h = ui.memory(|m| m.data.get_temp::<f32>(card_id).unwrap_or(32.0));
-
-    let card_height = ui.available_height().max(240.0);
-    let inner_height = card_height - 24.0;
-    let count = items.len();
-
-    let gap = 8.0;
-    let total_gaps = count.saturating_sub(1) as f32 * gap;
-    let space_for_buttons = (inner_height - header_h - total_gaps).max(0.0);
-
-    let item_height = if count > 0 {
-        (space_for_buttons / count as f32).max(38.0)
-    } else {
-        38.0
-    };
+    let width = 180.0;
+    let gap = 5.0;
+    let item_height = 42.0_f32;
 
     Frame::new()
-        .fill(Color32::from_rgb(245, 248, 252))
-        .corner_radius(CornerRadius::same(18))
-        .stroke(Stroke::new(1.0, Color32::from_rgb(226, 232, 240)))
-        .inner_margin(Margin::symmetric(10, 12))
+        .fill(Color32::TRANSPARENT)
+        .corner_radius(CornerRadius::same(10))
+        .stroke(Stroke::new(1.0, theme::border()))
+        .inner_margin(Margin::symmetric(10, 10))
         .show(ui, |ui| {
             ui.set_width(width);
-            ui.set_min_height(card_height);
             ui.vertical(|ui| {
-                let start_y = ui.cursor().top();
-
                 ui.label(
                     egui::RichText::new(crate::i18n::tr(language, "NAVIGATE"))
                         .size(10.5)
                         .color(crate::ui::theme::text_weak())
                         .strong(),
                 );
-                ui.add_space(8.0);
-
-                let header_end_y = ui.cursor().top();
-                ui.memory_mut(|m| {
-                    m.data
-                        .insert_temp(card_id, (header_end_y - start_y).max(20.0))
-                });
+                ui.add_space(6.0);
 
                 for (idx, item) in items.iter().enumerate() {
                     if idx > 0 {
@@ -1359,31 +1225,20 @@ pub fn sub_sidebar<T: Copy + PartialEq>(
                         0.08,
                     );
 
-                    let bg_fill = if select_factor > 0.0 {
-                        crate::ui::animation::AnimationSystem::lerp_color(
-                            Color32::TRANSPARENT,
-                            Color32::from_rgb(239, 246, 255),
-                            select_factor,
-                        )
-                    } else if active_factor > 0.0 {
-                        crate::ui::animation::AnimationSystem::lerp_color(
-                            Color32::TRANSPARENT,
-                            Color32::from_rgb(229, 239, 255),
-                            active_factor,
-                        )
-                    } else if hover_factor > 0.0 {
-                        crate::ui::animation::AnimationSystem::lerp_color(
-                            Color32::TRANSPARENT,
-                            Color32::from_rgb(238, 244, 253),
-                            hover_factor,
-                        )
-                    } else {
-                        Color32::TRANSPARENT
-                    };
-
+                    let bg_fill = Color32::TRANSPARENT;
                     let text_color = crate::ui::animation::AnimationSystem::lerp_color(
-                        crate::ui::theme::text_normal(),
-                        Color32::from_rgb(37, 99, 235),
+                        theme::text_normal(),
+                        theme::primary(),
+                        hover_factor,
+                    );
+                    let text_color = crate::ui::animation::AnimationSystem::lerp_color(
+                        text_color,
+                        theme::primary_dark(),
+                        active_factor,
+                    );
+                    let text_color = crate::ui::animation::AnimationSystem::lerp_color(
+                        text_color,
+                        theme::primary_dark(),
                         select_factor,
                     );
 
@@ -1393,13 +1248,13 @@ pub fn sub_sidebar<T: Copy + PartialEq>(
                         format!("{} {}", item.icon, item.label)
                     };
 
-                    let button_h = item_height.clamp(38.0, 52.0);
+                    let button_h = item_height;
                     let v_padding = ((button_h - 18.0) / 2.0).max(8.0);
 
                     let resp = Frame::new()
                         .fill(bg_fill)
-                        .corner_radius(CornerRadius::same(14))
-                        .inner_margin(Margin::symmetric(14, v_padding as i8))
+                        .corner_radius(CornerRadius::same(8))
+                        .inner_margin(Margin::symmetric(12, v_padding as i8))
                         .stroke(Stroke::NONE)
                         .show(ui, |ui| {
                             ui.set_width(ui.available_width());
@@ -1409,10 +1264,11 @@ pub fn sub_sidebar<T: Copy + PartialEq>(
                                         Vec2::new(3.0, 14.0),
                                         egui::Sense::hover(),
                                     );
+                                    let accent = theme::primary_dark();
                                     let bar_color = Color32::from_rgba_premultiplied(
-                                        37,
-                                        99,
-                                        235,
+                                        accent.r(),
+                                        accent.g(),
+                                        accent.b(),
                                         (255.0 * select_factor) as u8,
                                     );
                                     ui.painter().rect_filled(
@@ -1484,21 +1340,32 @@ pub fn modern_slider_f64(
             .trailing_fill(true);
 
         let slider_w = (ui.available_width() - 82.0).max(50.0);
-        let response = ui.add_sized(Vec2::new(slider_w, 20.0), slider);
+        let response = ui
+            .scope(|ui| {
+                let style = ui.style_mut();
+                style.spacing.slider_rail_height = 8.0;
+                style.visuals.widgets.inactive.bg_fill =
+                    Color32::from_rgba_unmultiplied(130, 139, 143, 170);
+                style.visuals.widgets.hovered.bg_fill = theme::primary();
+                style.visuals.widgets.hovered.fg_stroke = Stroke::NONE;
+                style.visuals.widgets.active.bg_fill = theme::primary();
+                style.visuals.widgets.active.fg_stroke = Stroke::NONE;
+                style.visuals.widgets.inactive.fg_stroke = Stroke::NONE;
+                style.visuals.selection.bg_fill = theme::primary_fill();
+                style.visuals.widgets.inactive.corner_radius = CornerRadius::same(4);
+                style.visuals.handle_shape = egui::style::HandleShape::Rect { aspect_ratio: 0.0 };
+                ui.add_sized(Vec2::new(slider_w, 20.0), slider)
+            })
+            .inner;
 
         let value_text = format!("{:.1}{}", *value, suffix);
         ui.add_space(4.0);
         Frame::new()
-            .fill(Color32::WHITE)
-            .corner_radius(CornerRadius::same(12))
+            .fill(Color32::TRANSPARENT)
+            .corner_radius(CornerRadius::same(8))
             .inner_margin(Margin::symmetric(10, 4))
-            .stroke(Stroke::new(1.0, Color32::from_rgb(226, 232, 240)))
-            .shadow(egui::Shadow {
-                offset: [0, 2],
-                blur: 4,
-                spread: 0,
-                color: Color32::from_black_alpha(15),
-            })
+            .stroke(Stroke::new(1.0, theme::border()))
+            .shadow(egui::Shadow::NONE)
             .show(ui, |ui| {
                 ui.label(
                     egui::RichText::new(value_text)
@@ -1545,25 +1412,36 @@ pub fn modern_slider_f32(
             },
         );
         let slider_w = (ui.available_width() - 82.0).max(50.0);
-        let response = ui.add_sized(
-            Vec2::new(slider_w, 20.0),
-            egui::Slider::new(value, range.clone())
-                .show_value(false)
-                .step_by(0.01)
-                .trailing_fill(true),
-        );
+        let response = ui
+            .scope(|ui| {
+                let style = ui.style_mut();
+                style.spacing.slider_rail_height = 8.0;
+                style.visuals.widgets.inactive.bg_fill =
+                    Color32::from_rgba_unmultiplied(130, 139, 143, 170);
+                style.visuals.widgets.hovered.bg_fill = theme::primary();
+                style.visuals.widgets.hovered.fg_stroke = Stroke::NONE;
+                style.visuals.widgets.active.bg_fill = theme::primary();
+                style.visuals.widgets.active.fg_stroke = Stroke::NONE;
+                style.visuals.widgets.inactive.fg_stroke = Stroke::NONE;
+                style.visuals.selection.bg_fill = theme::primary_fill();
+                style.visuals.widgets.inactive.corner_radius = CornerRadius::same(4);
+                style.visuals.handle_shape = egui::style::HandleShape::Rect { aspect_ratio: 0.0 };
+                ui.add_sized(
+                    Vec2::new(slider_w, 20.0),
+                    egui::Slider::new(value, range.clone())
+                        .show_value(false)
+                        .step_by(0.01)
+                        .trailing_fill(true),
+                )
+            })
+            .inner;
         ui.add_space(4.0);
         Frame::new()
-            .fill(Color32::WHITE)
-            .corner_radius(CornerRadius::same(12))
+            .fill(Color32::TRANSPARENT)
+            .corner_radius(CornerRadius::same(8))
             .inner_margin(Margin::symmetric(10, 4))
-            .stroke(Stroke::new(1.0, Color32::from_rgb(226, 232, 240)))
-            .shadow(egui::Shadow {
-                offset: [0, 2],
-                blur: 4,
-                spread: 0,
-                color: Color32::from_black_alpha(15),
-            })
+            .stroke(Stroke::new(1.0, theme::border()))
+            .shadow(egui::Shadow::NONE)
             .show(ui, |ui| {
                 let label = slider_state_label(*value, &range, states)
                     .map(str::to_owned)
@@ -1646,65 +1524,20 @@ pub fn reset_button(ui: &mut Ui, id_salt: &str) -> egui::Response {
         (0.0, 0.0)
     };
 
-    let rest_fill = Color32::WHITE;
-    let hover_fill = Color32::from_rgb(248, 250, 252);
-    let active_fill = Color32::from_rgb(235, 241, 250);
-    let spin_fill = Color32::from_rgb(239, 246, 255);
+    let fill = theme::surface_control();
 
-    let base_fill =
-        crate::ui::animation::AnimationSystem::lerp_color(rest_fill, hover_fill, hover_factor);
-    let fill =
-        crate::ui::animation::AnimationSystem::lerp_color(base_fill, active_fill, active_factor);
-    let fill =
-        crate::ui::animation::AnimationSystem::lerp_color(fill, spin_fill, spin_accent_factor);
+    let stroke_color = theme::border();
 
-    let rest_stroke = Color32::from_rgb(226, 232, 240);
-    let hover_stroke = Color32::from_rgb(203, 213, 225);
-    let active_stroke = Color32::from_rgb(148, 163, 184);
-    let spin_stroke = Color32::from_rgb(147, 197, 253);
-
-    let stroke_color =
-        crate::ui::animation::AnimationSystem::lerp_color(rest_stroke, hover_stroke, hover_factor);
-    let stroke_color = crate::ui::animation::AnimationSystem::lerp_color(
-        stroke_color,
-        active_stroke,
+    let icon_rest_tint = crate::ui::animation::AnimationSystem::lerp_color(
+        theme::text_normal(),
+        theme::primary(),
+        hover_factor,
+    );
+    let icon_rest_tint = crate::ui::animation::AnimationSystem::lerp_color(
+        icon_rest_tint,
+        theme::primary_dark(),
         active_factor,
     );
-    let stroke_color = crate::ui::animation::AnimationSystem::lerp_color(
-        stroke_color,
-        spin_stroke,
-        spin_accent_factor,
-    );
-
-    let rest_shadow = egui::Shadow {
-        offset: [0, 2],
-        blur: 4,
-        spread: 0,
-        color: Color32::from_black_alpha(10),
-    };
-    let hover_shadow = egui::Shadow {
-        offset: [0, 3],
-        blur: 6,
-        spread: 0,
-        color: Color32::from_black_alpha(15),
-    };
-    let active_shadow = egui::Shadow {
-        offset: [0, 1],
-        blur: 2,
-        spread: 0,
-        color: Color32::from_black_alpha(6),
-    };
-
-    let shadow = {
-        let s = crate::ui::animation::AnimationSystem::lerp_shadow(
-            rest_shadow,
-            hover_shadow,
-            hover_factor,
-        );
-        crate::ui::animation::AnimationSystem::lerp_shadow(s, active_shadow, active_factor)
-    };
-
-    let icon_rest_tint = crate::ui::theme::text_strong();
     let icon_spin_tint = Color32::from_rgb(37, 99, 235);
     let icon_tint = crate::ui::animation::AnimationSystem::lerp_color(
         icon_rest_tint,
@@ -1725,7 +1558,7 @@ pub fn reset_button(ui: &mut Ui, id_salt: &str) -> egui::Response {
         .corner_radius(CornerRadius::same(12))
         .inner_margin(Margin::same(6))
         .stroke(Stroke::new(1.0, stroke_color))
-        .shadow(shadow)
+        .shadow(egui::Shadow::NONE)
         .show(ui, |ui| {
             ui.add(image);
         })
