@@ -72,6 +72,22 @@ impl ModelAssetsConfig {
     /// Resolves configured paths with a stable project-root base.
     #[must_use]
     pub fn resolve(&self, project_root: impl AsRef<Path>) -> ResolvedModelAssets {
+        self.resolve_inner(project_root, true)
+    }
+
+    /// Resolves paths while treating only explicitly selected packages as
+    /// active. This is used by provider-driven flows where an empty selection
+    /// means every active provider is remote.
+    #[must_use]
+    pub fn resolve_selected(&self, project_root: impl AsRef<Path>) -> ResolvedModelAssets {
+        self.resolve_inner(project_root, false)
+    }
+
+    fn resolve_inner(
+        &self,
+        project_root: impl AsRef<Path>,
+        include_default_assets: bool,
+    ) -> ResolvedModelAssets {
         let project_root = project_root.as_ref().to_path_buf();
         let models_directory = resolve_from_project_root(
             &project_root,
@@ -110,11 +126,17 @@ impl ModelAssetsConfig {
 
         let qwen3_asr = catalog_asset(&catalog, qwen3_id).clone();
         let hunyuan_mt = catalog_asset(&catalog, hunyuan_id).clone();
+        let active_asset_ids = if include_default_assets && self.active_assets.is_empty() {
+            vec![qwen3_id, hunyuan_id]
+        } else {
+            self.active_assets.clone()
+        };
         ResolvedModelAssets {
             project_root,
             models_directory,
             qwen3_asr,
             hunyuan_mt,
+            active_asset_ids,
             catalog,
         }
     }
@@ -153,6 +175,7 @@ pub struct ResolvedModelAssets {
     pub qwen3_asr: ResolvedModelAsset,
     /// Active translation package. Prefer [`Self::active_asset`] in new code.
     pub hunyuan_mt: ResolvedModelAsset,
+    active_asset_ids: Vec<ModelAssetId>,
     catalog: Vec<ResolvedModelAsset>,
 }
 
@@ -205,7 +228,7 @@ impl ResolvedModelAssets {
 
     /// Iterates active runtime packages in ASR, translation order.
     pub fn active_assets(&self) -> impl ExactSizeIterator<Item = &ResolvedModelAsset> {
-        [&self.qwen3_asr, &self.hunyuan_mt].into_iter()
+        self.active_asset_ids.iter().map(|id| self.asset(*id))
     }
 }
 

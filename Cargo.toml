@@ -20,10 +20,19 @@ members = [
 ]
 
 [workspace.package]
-version = "0.2.7-beta.3"
+version = "0.2.7"
 edition = "2024"
 license = "AGPL-3.0-only"
 repository = "https://github.com/NowLoadY/XRTranslate"
+
+# Keep useful file/line backtraces without retaining full debugger metadata.
+# Development remains incremental; test artifacts favor bounded disk usage.
+[profile.dev]
+debug = "line-tables-only"
+
+[profile.test]
+debug = "line-tables-only"
+incremental = false
 
 [patch.crates-io]
 winit = { path = "third_party/winit" }

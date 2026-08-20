@@ -15,6 +15,12 @@ use sentence_boundary::is_translation_boundary;
 /// otherwise unfinished translation segment.
 pub const TRANSLATION_SOFT_SEGMENT_LIMIT: usize = 72;
 
+/// Adjacent sentences at or below this content size are translated together.
+/// One isolated short sentence remains independent so normal sentence timing
+/// and revision behavior do not change.
+const ULTRA_SHORT_TRANSLATION_TOKENS: usize = 2;
+const ULTRA_SHORT_TRANSLATION_CHARACTERS: usize = 12;
+
 const HARD_TRANSLATION_BOUNDARIES: &[char] =
     &['。', '！', '？', '；', '：', '.', '!', '?', ';', ':'];
 const SOFT_TRANSLATION_BOUNDARIES: &[char] = &['，', '、', ','];
@@ -78,7 +84,66 @@ fn split_translation_segments_internal(text: &str, emit_unterminated: bool) -> V
     }
 
     push_translation_segment(&mut segments, &buffer, emit_unterminated);
-    segments
+    merge_adjacent_ultra_short_segments(segments)
+}
+
+fn merge_adjacent_ultra_short_segments(segments: Vec<String>) -> Vec<String> {
+    let mut merged = Vec::with_capacity(segments.len());
+    let mut index = 0;
+    while index < segments.len() {
+        if !is_ultra_short_translation_segment(&segments[index]) {
+            merged.push(segments[index].clone());
+            index += 1;
+            continue;
+        }
+
+        let run_start = index;
+        while index < segments.len() && is_ultra_short_translation_segment(&segments[index]) {
+            index += 1;
+        }
+        if index - run_start == 1 {
+            merged.push(segments[run_start].clone());
+            continue;
+        }
+
+        let mut combined = String::new();
+        for segment in &segments[run_start..index] {
+            if !combined.is_empty() && needs_segment_space(&combined, segment) {
+                combined.push(' ');
+            }
+            combined.push_str(segment);
+        }
+        merged.push(combined);
+    }
+    merged
+}
+
+fn is_ultra_short_translation_segment(segment: &str) -> bool {
+    let tokens = content_token_count(segment);
+    let characters = segment
+        .chars()
+        .filter(|character| character.is_alphanumeric())
+        .count();
+    tokens > 0
+        && tokens <= ULTRA_SHORT_TRANSLATION_TOKENS
+        && characters <= ULTRA_SHORT_TRANSLATION_CHARACTERS
+}
+
+fn needs_segment_space(left: &str, right: &str) -> bool {
+    let Some(left) = left
+        .chars()
+        .rev()
+        .find(|character| character.is_alphanumeric())
+    else {
+        return false;
+    };
+    let Some(right) = right.chars().find(|character| character.is_alphanumeric()) else {
+        return false;
+    };
+    !(is_content_cjk_or_kana(left)
+        || is_hangul(left)
+        || is_content_cjk_or_kana(right)
+        || is_hangul(right))
 }
 
 /// Collapses only obvious adjacent ASR repetitions across all alphabetic and CJK scripts,
@@ -1110,9 +1175,8 @@ mod tests {
 
         let multi_pairs =
             translation_segment_pairs_for_final_text_with_lang("Сюжет. Закончено.", "ru");
-        assert_eq!(multi_pairs.len(), 2);
-        assert_eq!(multi_pairs[0].source_text, "Сюжет.");
-        assert_eq!(multi_pairs[1].source_text, "Закончено.");
+        assert_eq!(multi_pairs.len(), 1);
+        assert_eq!(multi_pairs[0].source_text, "Сюжет. Закончено.");
     }
 
     #[test]
@@ -1152,6 +1216,26 @@ mod tests {
                 format!("{}，", "a".repeat(30)),
                 format!("{}。", "b".repeat(50))
             ]
+        );
+    }
+
+    #[test]
+    fn merges_only_consecutive_ultra_short_sentences() {
+        assert_eq!(
+            split_translation_segments("Twenty-two years old. Okay. Fine."),
+            vec!["Twenty-two years old.", "Okay. Fine."]
+        );
+        assert_eq!(
+            split_translation_segments("A long enough sentence stays separate. Okay."),
+            vec!["A long enough sentence stays separate.", "Okay."]
+        );
+        assert_eq!(
+            split_translation_segments("好。可以。今天的天气非常不错。"),
+            vec!["好。可以。", "今天的天气非常不错。"]
+        );
+        assert_eq!(
+            translation_segment_pairs_for_final_text("Okay. fine")[0].source_text,
+            "Okay. fine"
         );
     }
 

@@ -429,6 +429,8 @@ pub struct TtsFinished {
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct ErrorEvent {
     pub message: String,
+    #[serde(default, skip_serializing_if = "is_false")]
+    pub configuration_required: bool,
 }
 
 /// Notifies the client that the active language route was dynamically adapted or updated.
@@ -441,6 +443,20 @@ pub struct RouteChanged {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn legacy_error_event_defaults_to_no_configuration_redirect() {
+        let event: ServerEvent =
+            serde_json::from_str(r#"{"action":"error","data":{"message":"temporary failure"}}"#)
+                .unwrap();
+        assert!(matches!(
+            event,
+            ServerEvent::Error(ErrorEvent {
+                configuration_required: false,
+                ..
+            })
+        ));
+    }
 
     #[test]
     fn route_changed_event_matches_the_wire_shape() {

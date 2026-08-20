@@ -125,10 +125,23 @@ pub fn load_user_config_document(
             path: override_path.clone(),
             source,
         })?;
-        let overlay: Value = serde_json::from_str(&contents).map_err(ConfigError::InvalidJson)?;
+        let mut overlay: Value =
+            serde_json::from_str(&contents).map_err(ConfigError::InvalidJson)?;
+        migrate_legacy_openai_asr_model(&mut overlay);
         merge_config_values(&mut document, overlay);
     }
     Ok(document)
+}
+
+fn migrate_legacy_openai_asr_model(document: &mut Value) -> bool {
+    let path = "/asr/providers/openai/model";
+    if document.pointer(path).and_then(Value::as_str) != Some("gpt-4o-audio-preview") {
+        return false;
+    }
+    *document
+        .pointer_mut(path)
+        .expect("model path was resolved above") = Value::from("gpt-4o-transcribe");
+    true
 }
 
 /// Computes the minimal recursive override needed to represent `effective`
@@ -222,7 +235,48 @@ pub struct AppConfig {
     pub source_path: Option<PathBuf>,
 }
 
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+pub struct RuntimeRequirements {
+    pub llama_cpp: bool,
+    pub missing_api_key: bool,
+}
+
 impl AppConfig {
+    /// Resolves host runtime prerequisites from every selected provider that
+    /// follows the shared `provider` / `providers` / `transport` contract.
+    /// New model capabilities therefore participate without UI changes.
+    #[must_use]
+    pub fn runtime_requirements(&self) -> RuntimeRequirements {
+        let mut requirements = RuntimeRequirements::default();
+        let Some(root) = self.raw.as_object() else {
+            return requirements;
+        };
+        for section in root.values().filter_map(Value::as_object) {
+            let Some(selected) = section.get("provider").and_then(Value::as_str) else {
+                continue;
+            };
+            let Some(provider) = section
+                .get("providers")
+                .and_then(Value::as_object)
+                .and_then(|providers| providers.get(selected))
+                .and_then(Value::as_object)
+            else {
+                continue;
+            };
+            match provider.get("transport").and_then(Value::as_str) {
+                Some("openai") => {
+                    requirements.missing_api_key |= provider
+                        .get("api_key")
+                        .and_then(Value::as_str)
+                        .is_none_or(|key| key.trim().is_empty());
+                }
+                Some("local") | None => requirements.llama_cpp = true,
+                Some(_) => {}
+            }
+        }
+        requirements
+    }
+
     /// Reads and validates JSON syntax from `path`.
     pub fn from_path(path: impl AsRef<Path>) -> Result<Self, ConfigError> {
         let path = path.as_ref().to_path_buf();
@@ -287,11 +341,6 @@ impl AppConfig {
                 self.tts.provider
             ));
         }
-        let llama_server_path = required_non_empty(
-            &self.model_manager.llama_server_path,
-            "model_manager.llama_server_path",
-            &mut issues,
-        );
         let asr = active_native_provider(
             &self.asr.provider,
             &self.asr.providers,
@@ -314,10 +363,11 @@ impl AppConfig {
             },
             &mut issues,
         );
+        let llama_server_path = self.model_manager.llama_server_path.trim();
 
         if issues.is_empty() {
             Ok(NativeModelRouteConfig {
-                llama_server_path: PathBuf::from(llama_server_path.expect("checked above")),
+                llama_server_path: PathBuf::from(llama_server_path),
                 asr: asr.expect("checked above"),
                 translation: translation.expect("checked above"),
             })
@@ -1151,6 +1201,18 @@ fn active_native_provider(
         .map(str::trim)
         .filter(|value| !value.is_empty())
         .map(str::to_owned);
+    if transport == "openai" && api_key.is_none() {
+        issues.push(format!(
+            "{path}.api_key is required for remote API providers"
+        ));
+    }
+    if transport == "openai" && provider == "openai" {
+        if url.as_deref() != Some("https://api.openai.com/v1/chat/completions") {
+            issues.push(format!(
+                "{path}.url must use the official OpenAI Chat Completions endpoint"
+            ));
+        }
+    }
     let model_asset = object
         .and_then(|provider| provider.get("model_asset"))
         .and_then(Value::as_str)
@@ -1393,13 +1455,66 @@ mod tests {
             serde_json::from_str(include_str!("../../../config.json")).unwrap();
         document["asr"]["provider"] = Value::from("openai");
         document["translation"]["provider"] = Value::from("openai");
+        document["asr"]["providers"]["openai"]["api_key"] = Value::from("test-key");
+        document["translation"]["providers"]["openai"]["api_key"] = Value::from("test-key");
+        document["model_manager"]["llama_server_path"] = Value::from("");
         let config = AppConfig::from_value(document).unwrap();
         let route = config.native_model_route().unwrap();
 
         assert!(!route.uses_local_runtime());
-        assert_eq!(route.asr.model, "gpt-4o-audio-preview");
+        assert_eq!(route.asr.model, "gpt-4o-transcribe");
         assert_eq!(route.translation.model, "gpt-4o-mini");
-        assert!(route.asr.api_key.is_none());
+        assert_eq!(route.asr.api_key.as_deref(), Some("test-key"));
+    }
+
+    #[test]
+    fn runtime_requirements_cover_future_provider_sections() {
+        let mut document: Value =
+            serde_json::from_str(include_str!("../../../config.json")).unwrap();
+        document["asr"]["provider"] = Value::from("openai");
+        document["translation"]["provider"] = Value::from("openai");
+        document["asr"]["providers"]["openai"]["api_key"] = Value::from("asr-key");
+        document["translation"]["providers"]["openai"]["api_key"] = Value::from("translation-key");
+
+        let remote = AppConfig::from_value(document.clone())
+            .unwrap()
+            .runtime_requirements();
+        assert_eq!(remote, RuntimeRequirements::default());
+
+        document["future_model"] = serde_json::json!({
+            "provider": "future-local",
+            "providers": {
+                "future-local": {"transport": "local"}
+            }
+        });
+        let local = AppConfig::from_value(document.clone())
+            .unwrap()
+            .runtime_requirements();
+        assert!(local.llama_cpp);
+        assert!(!local.missing_api_key);
+
+        document["future_model"]["provider"] = Value::from("future-api");
+        document["future_model"]["providers"]["future-api"] =
+            serde_json::json!({"transport": "openai", "api_key": ""});
+        let missing_key = AppConfig::from_value(document)
+            .unwrap()
+            .runtime_requirements();
+        assert!(!missing_key.llama_cpp);
+        assert!(missing_key.missing_api_key);
+    }
+
+    #[test]
+    fn local_provider_selection_can_be_saved_before_llama_cpp_is_installed() {
+        let mut document: Value =
+            serde_json::from_str(include_str!("../../../config.json")).unwrap();
+        document["model_manager"]["llama_server_path"] = Value::from("");
+
+        let route = AppConfig::from_value(document)
+            .unwrap()
+            .native_model_route()
+            .unwrap();
+        assert!(route.uses_local_runtime());
+        assert!(route.llama_server_path.as_os_str().is_empty());
     }
 
     #[test]
@@ -1433,6 +1548,49 @@ mod tests {
             base
         );
         fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn user_config_migrates_only_the_deprecated_openai_asr_default() {
+        let root = std::env::temp_dir().join(format!(
+            "xrtranslate-config-openai-migration-{}",
+            std::process::id()
+        ));
+        let _ = fs::remove_dir_all(&root);
+        fs::create_dir_all(root.join("runtime")).unwrap();
+        let base_path = root.join("config.json");
+        fs::write(
+            &base_path,
+            include_bytes!("../../../config.json").as_slice(),
+        )
+        .unwrap();
+        let override_path = RuntimeLayout::user_config_path(&root);
+        fs::write(
+            &override_path,
+            r#"{"asr":{"providers":{"openai":{"model":"gpt-4o-audio-preview"}}}}"#,
+        )
+        .unwrap();
+
+        let migrated = load_user_config_document(&base_path, &root).unwrap();
+        assert_eq!(
+            migrated.pointer("/asr/providers/openai/model"),
+            Some(&Value::from("gpt-4o-transcribe"))
+        );
+        saved_custom_model_is_preserved(&base_path, &root, &override_path);
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    fn saved_custom_model_is_preserved(base_path: &Path, root: &Path, override_path: &Path) {
+        fs::write(
+            override_path,
+            r#"{"asr":{"providers":{"openai":{"model":"custom-transcribe-model"}}}}"#,
+        )
+        .unwrap();
+        let loaded = load_user_config_document(base_path, root).unwrap();
+        assert_eq!(
+            loaded.pointer("/asr/providers/openai/model"),
+            Some(&Value::from("custom-transcribe-model"))
+        );
     }
 
     #[test]

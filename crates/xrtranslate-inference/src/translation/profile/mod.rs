@@ -3,13 +3,16 @@ mod openai_compatible;
 mod output;
 
 use serde_json::{Value, json};
-use xrtranslate_prompt::{PromptExecutionTrace, PromptMessageRole, PromptProviderTarget};
+use xrtranslate_prompt::{
+    PromptExecutionTrace, PromptMessage, PromptMessageRole, PromptProviderTarget,
+};
 
 use crate::InferenceError;
 
 use super::{TranslationOptions, TranslationProvider};
 
 pub use output::is_probable_translation_context_leak;
+pub(super) use output::translation_output_rejection;
 
 pub(super) struct TranslationProfile {
     target: PromptProviderTarget,
@@ -54,12 +57,31 @@ pub fn build_translation_messages(
 ) -> Result<Value, InferenceError> {
     registered(provider)
         .build_prompt(source_text, options)
-        .map(|prompt| prompt.messages)
+        .map(|prompt| prompt.messages_json())
 }
 
 pub(super) struct RenderedTranslationPrompt {
-    pub(super) messages: Value,
+    pub(super) messages: Vec<PromptMessage>,
     pub(super) trace: PromptExecutionTrace,
+}
+
+impl RenderedTranslationPrompt {
+    pub(super) fn messages_json(&self) -> Value {
+        Value::Array(
+            self.messages
+                .iter()
+                .map(|message| {
+                    json!({
+                        "role": match message.role {
+                            PromptMessageRole::System => "system",
+                            PromptMessageRole::User => "user",
+                        },
+                        "content": message.content,
+                    })
+                })
+                .collect(),
+        )
+    }
 }
 
 fn render_prompt(
@@ -81,22 +103,7 @@ fn render_prompt(
             message: error.to_string(),
         })?;
     Ok(RenderedTranslationPrompt {
-        messages: Value::Array(
-            execution
-                .render
-                .messages
-                .into_iter()
-                .map(|message| {
-                    json!({
-                        "role": match message.role {
-                            PromptMessageRole::System => "system",
-                            PromptMessageRole::User => "user",
-                        },
-                        "content": message.content,
-                    })
-                })
-                .collect(),
-        ),
+        messages: execution.render.messages,
         trace: execution.trace,
     })
 }

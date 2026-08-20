@@ -97,14 +97,18 @@ mod page_tests {
 }
 
 pub fn render_onboarding_fullscreen(app: &mut crate::XRTranslateApp, ui: &mut egui::Ui) {
-    const STEPS: [&str; 3] = ["Welcome", "Get llama.cpp", "Install models"];
+    const STEPS: [&str; 3] = ["Welcome", "Install models", "Get llama.cpp"];
 
-    let total_pages = STEPS.len();
+    let runtime_requirements = app.service_config.runtime_requirements();
+    let show_runtime =
+        runtime_requirements.llama_cpp && !app.backend_manager.llama_server_path_is_valid();
+    let total_pages = if show_runtime { STEPS.len() } else { 2 };
     if app.onboarding_page >= total_pages {
-        app.onboarding_page = 0;
+        app.onboarding_page = total_pages - 1;
     }
     let requirement = onboarding_requirement(app);
-    let can_advance = requirement.is_none();
+    let can_advance = requirement.is_none()
+        && !(app.onboarding_page == 1 && runtime_requirements.missing_api_key);
     let viewport_focused = ui.input(|input| input.viewport().focused.unwrap_or(true));
 
     egui::Panel::bottom("onboarding_bottom_nav")
@@ -227,7 +231,12 @@ pub fn render_onboarding_fullscreen(app: &mut crate::XRTranslateApp, ui: &mut eg
 
                 ui.add_space(14.0);
 
-                render_onboarding_steps(ui, app.ui_language, app.onboarding_page, &STEPS);
+                render_onboarding_steps(
+                    ui,
+                    app.ui_language,
+                    app.onboarding_page,
+                    &STEPS[..total_pages],
+                );
 
                 ui.add_space(14.0);
 
@@ -248,8 +257,8 @@ pub fn render_onboarding_fullscreen(app: &mut crate::XRTranslateApp, ui: &mut eg
                                     cur,
                                     |ui| match cur {
                                         0 => render_onboarding_welcome(app.ui_language, ui),
-                                        1 => render_onboarding_runtime(app, ui),
-                                        _ => render_onboarding_models(app, ui),
+                                        1 => render_onboarding_models(app, ui),
+                                        _ => render_onboarding_runtime(app, ui),
                                     },
                                 );
                             });
@@ -263,13 +272,10 @@ pub fn render_onboarding_fullscreen(app: &mut crate::XRTranslateApp, ui: &mut eg
 fn onboarding_requirement(app: &crate::XRTranslateApp) -> Option<&'static str> {
     match app.onboarding_page {
         1 => {
-            if app.backend_manager.llama_server_path_is_valid() {
-                None
-            } else {
-                Some("Choose an existing llama-server.exe to continue.")
+            let requirements = app.service_config.runtime_requirements();
+            if !requirements.llama_cpp {
+                return None;
             }
-        }
-        2 => {
             if app.model_task_manager.is_busy() {
                 return Some("Wait for the current model task to finish.");
             }
@@ -278,16 +284,17 @@ fn onboarding_requirement(app: &crate::XRTranslateApp) -> Option<&'static str> {
                     Ok(packages) => packages,
                     Err(_) => return Some("Install every required model package to continue."),
                 };
-            if !packages.is_empty()
-                && packages
-                    .iter()
-                    .all(|package| app.model_task_manager.is_model_present(package.id))
+            if packages
+                .iter()
+                .all(|package| app.model_task_manager.is_model_present(package.id))
             {
                 None
             } else {
                 Some("Install every required model package to continue.")
             }
         }
+        2 => (!app.backend_manager.llama_server_path_is_valid())
+            .then_some("Choose an existing llama-server.exe to continue."),
         _ => None,
     }
 }
@@ -324,12 +331,7 @@ fn render_onboarding_steps(
                 .corner_radius(CornerRadius::same(14))
                 .inner_margin(Margin::symmetric(14, 7))
                 .show(ui, |ui| {
-                    ui.label(
-                        RichText::new(step_label)
-                            .size(12.5)
-                            .color(text)
-                            .strong(),
-                    );
+                    ui.label(RichText::new(step_label).size(12.5).color(text).strong());
                 });
 
             if index + 1 < steps.len() {
@@ -677,6 +679,7 @@ fn render_onboarding_models(app: &mut crate::XRTranslateApp, ui: &mut egui::Ui) 
         app.last_error = Some(error);
     }
     let busy = app.model_task_manager.is_busy();
+    let requires_local_models = app.service_config.runtime_requirements().llama_cpp;
     let packages = match configured_model_packages(&project_root) {
         Ok(packages) => packages,
         Err(error) => {
@@ -686,23 +689,44 @@ fn render_onboarding_models(app: &mut crate::XRTranslateApp, ui: &mut egui::Ui) 
     };
     let mut install = None;
     let mut level_change = None;
+    let mut provider_change = None;
+    let mut remote_fields = None;
     let retry = matches!(
         app.model_task_manager.state(),
         NativeModelTaskState::Failed(_)
     );
-    ui.columns(packages.len().max(1), |columns| {
-        for (index, package) in packages.iter().enumerate() {
-            let installed = app.model_task_manager.is_model_present(package.id);
-            let (download_clicked, selected_level) = onboarding_model_card(
+    let capabilities = [
+        (
+            "asr",
+            xrtranslate_assets::ModelCapability::Asr,
+            "Speech Recognition Model",
+        ),
+        (
+            "translation",
+            xrtranslate_assets::ModelCapability::Translation,
+            "Translation Model",
+        ),
+    ];
+    ui.columns(capabilities.len(), |columns| {
+        for (index, (category, capability, title)) in capabilities.iter().enumerate() {
+            let package = packages
+                .iter()
+                .find(|package| package.capability == *capability);
+            let provider = app.service_config.onboarding_provider_state(category);
+            let installed =
+                package.is_some_and(|package| app.model_task_manager.is_model_present(package.id));
+            let levels = package.map_or_else(Vec::new, |package| {
+                model_level_packages_for_provider(package.provider, package.capability)
+            });
+            let result = onboarding_model_card(
                 &mut columns[index],
                 language,
                 OnboardingModelCard {
-                    title: package.label,
-                    selected_level: package.level,
-                    levels: &model_level_packages_for_provider(
-                        package.provider,
-                        package.capability,
-                    ),
+                    category,
+                    title,
+                    provider,
+                    selected_level: package.map(|package| package.level),
+                    levels: &levels,
                     action: if installed {
                         "Installed"
                     } else if retry {
@@ -711,7 +735,9 @@ fn render_onboarding_models(app: &mut crate::XRTranslateApp, ui: &mut egui::Ui) 
                         "Download"
                     },
                     enabled: !busy && !installed,
-                    download_bytes: (!installed).then_some(package.download_bytes),
+                    download_bytes: package
+                        .filter(|_| !installed)
+                        .map(|package| package.download_bytes),
                     tint: if index % 2 == 0 {
                         Color32::from_rgb(239, 246, 255)
                     } else {
@@ -719,14 +745,60 @@ fn render_onboarding_models(app: &mut crate::XRTranslateApp, ui: &mut egui::Ui) 
                     },
                 },
             );
-            if download_clicked {
-                install = Some(package.id);
+            if result.download_clicked {
+                install = package.map(|package| package.id);
             }
-            if let Some(level) = selected_level {
-                level_change = Some((package.capability, level));
+            if let Some(level) = result.selected_level {
+                level_change = Some((*capability, level));
+            }
+            if let Some(provider) = result.selected_provider {
+                provider_change = Some((*category, provider));
+            }
+            if let Some(fields) = result.remote_fields {
+                remote_fields = Some((*category, fields));
             }
         }
     });
+    if let Some((category, provider)) = provider_change {
+        app.service_config
+            .select_onboarding_provider(category, &provider);
+        let state = app.service_config.onboarding_provider_state(category);
+        if state
+            .as_ref()
+            .is_some_and(|state| !state.remote || !state.api_key.trim().is_empty())
+        {
+            match app.service_config.save_onboarding_configuration() {
+                Ok(()) => app.apply_service_configuration(Some(ui.ctx().clone())),
+                Err(_) => {}
+            }
+        }
+    }
+    if let Some((category, fields)) = remote_fields {
+        app.service_config
+            .set_onboarding_remote_fields(category, fields.model, fields.api_key);
+        if fields.commit {
+            match app.service_config.save_onboarding_configuration() {
+                Ok(()) => app.apply_service_configuration(Some(ui.ctx().clone())),
+                Err(_) => {}
+            }
+        }
+    }
+    if let Some(message) = app.service_config.onboarding_message() {
+        ui.add_space(10.0);
+        ui.label(
+            RichText::new(message)
+                .size(12.0)
+                .color(Color32::from_rgb(220, 38, 38)),
+        );
+    }
+    if let Some(error) = app.last_error.as_deref() {
+        ui.add_space(10.0);
+        ui.label(
+            RichText::new(error)
+                .size(12.0)
+                .color(Color32::from_rgb(220, 38, 38)),
+        );
+    }
     if let Some((capability, level)) = level_change {
         install = None;
         match set_model_level(&project_root, capability, level) {
@@ -745,8 +817,21 @@ fn render_onboarding_models(app: &mut crate::XRTranslateApp, ui: &mut egui::Ui) 
     {
         app.last_error = Some(error);
     }
+    if !requires_local_models {
+        ui.add_space(16.0);
+        ui.label(
+            RichText::new(crate::i18n::tr(
+                language,
+                "Your selected online providers are ready. No local model packages are required.",
+            ))
+            .size(14.0)
+            .color(Color32::from_rgb(5, 150, 105)),
+        );
+        return;
+    }
     ui.add_space(16.0);
-    if components::animated_button(ui, crate::i18n::tr(language, "Verify models")).clicked()
+    if !packages.is_empty()
+        && components::animated_button(ui, crate::i18n::tr(language, "Verify models")).clicked()
         && let Err(error) = app.model_task_manager.verify(project_root)
     {
         app.last_error = Some(error);
@@ -829,8 +914,10 @@ fn render_onboarding_models(app: &mut crate::XRTranslateApp, ui: &mut egui::Ui) 
 }
 
 struct OnboardingModelCard<'a> {
+    category: &'static str,
     title: &'static str,
-    selected_level: xrtranslate_assets::ModelLevel,
+    provider: Option<crate::service_config::OnboardingProviderState>,
+    selected_level: Option<xrtranslate_assets::ModelLevel>,
     levels: &'a [crate::model_install::NativeModelPackage],
     action: &'static str,
     enabled: bool,
@@ -838,11 +925,25 @@ struct OnboardingModelCard<'a> {
     tint: Color32,
 }
 
+#[derive(Default)]
+struct OnboardingModelCardResult {
+    download_clicked: bool,
+    selected_level: Option<xrtranslate_assets::ModelLevel>,
+    selected_provider: Option<String>,
+    remote_fields: Option<RemoteProviderFields>,
+}
+
+struct RemoteProviderFields {
+    model: String,
+    api_key: String,
+    commit: bool,
+}
+
 fn onboarding_model_card(
     ui: &mut egui::Ui,
     language: crate::i18n::UiLanguage,
-    card: OnboardingModelCard<'_>,
-) -> (bool, Option<xrtranslate_assets::ModelLevel>) {
+    mut card: OnboardingModelCard<'_>,
+) -> OnboardingModelCardResult {
     Frame::new()
         .fill(card.tint)
         .corner_radius(CornerRadius::same(16))
@@ -857,42 +958,141 @@ fn onboarding_model_card(
                     .strong(),
             );
             ui.add_space(10.0);
-            let mut level = card.selected_level;
+            let mut result = OnboardingModelCardResult::default();
+            let Some(provider) = card.provider.as_mut() else {
+                ui.label(crate::i18n::tr(language, "No providers configured"));
+                return result;
+            };
             ui.horizontal(|ui| {
-                ui.label(crate::i18n::tr(language, "Level"));
-                egui::ComboBox::from_id_salt((card.title, "model_level"))
-                    .selected_text(crate::i18n::tr(language, level.as_str()))
+                ui.label(crate::i18n::tr(language, "Mode"));
+                let mut remote = provider.remote;
+                egui::ComboBox::from_id_salt((card.category, "provider_mode"))
+                    .selected_text(crate::i18n::tr(
+                        language,
+                        if remote { "Online API" } else { "Local model" },
+                    ))
                     .show_ui(ui, |ui| {
-                        for package in card.levels {
-                            ui.selectable_value(
-                                &mut level,
-                                package.level,
-                                crate::i18n::tr(language, package.level.as_str()),
-                            );
-                        }
+                        ui.selectable_value(
+                            &mut remote,
+                            false,
+                            crate::i18n::tr(language, "Local model"),
+                        );
+                        ui.selectable_value(
+                            &mut remote,
+                            true,
+                            crate::i18n::tr(language, "Online API"),
+                        );
                     });
+                if remote != provider.remote
+                    && let Some((name, _)) = provider
+                        .choices
+                        .iter()
+                        .find(|(_, is_remote)| *is_remote == remote)
+                {
+                    result.selected_provider = Some(name.clone());
+                }
+
+                if !provider.remote {
+                    let Some(mut level) = card.selected_level else {
+                        return;
+                    };
+                    ui.add_space(12.0);
+                    ui.label(crate::i18n::tr(language, "Level"));
+                    egui::ComboBox::from_id_salt((card.category, "model_level"))
+                        .selected_text(crate::i18n::tr(language, level.as_str()))
+                        .show_ui(ui, |ui| {
+                            for package in card.levels {
+                                ui.selectable_value(
+                                    &mut level,
+                                    package.level,
+                                    crate::i18n::tr(language, package.level.as_str()),
+                                );
+                            }
+                        });
+                    if Some(level) != card.selected_level {
+                        result.selected_level = Some(level);
+                    }
+                } else {
+                    ui.add_space(12.0);
+                    ui.label(crate::i18n::tr(language, "Provider:"));
+                    egui::ComboBox::from_id_salt((card.category, "online_provider"))
+                        .selected_text(&provider.selected)
+                        .show_ui(ui, |ui| {
+                            for (name, is_remote) in &provider.choices {
+                                if *is_remote
+                                    && ui
+                                        .selectable_label(provider.selected == *name, name)
+                                        .clicked()
+                                {
+                                    result.selected_provider = Some(name.clone());
+                                }
+                            }
+                        });
+                }
             });
             ui.add_space(14.0);
-            let action_label = card.download_bytes.map_or_else(
-                || crate::i18n::tr(language, card.action).to_owned(),
-                |bytes| {
-                    format!(
-                        "{} · {}",
-                        crate::i18n::tr(language, card.action),
-                        components::format_file_size(bytes),
-                    )
-                },
-            );
-            let clicked = ui
-                .add_enabled(
-                    card.enabled,
-                    egui::Button::new(RichText::new(action_label).color(Color32::WHITE).strong())
+            if provider.remote {
+                ui.horizontal(|ui| {
+                    ui.label(crate::i18n::tr(language, "Model"));
+                    let model_response = components::singleline_input(
+                        ui,
+                        &mut provider.model,
+                        crate::i18n::tr(language, "Model"),
+                        (ui.available_width() - 60.0).max(160.0),
+                        false,
+                    );
+                    if model_response.changed() || model_response.lost_focus() {
+                        result.remote_fields = Some(RemoteProviderFields {
+                            model: provider.model.clone(),
+                            api_key: provider.api_key.clone(),
+                            commit: model_response.lost_focus(),
+                        });
+                    }
+                });
+                ui.add_space(8.0);
+                ui.horizontal(|ui| {
+                    ui.label(crate::i18n::tr(language, "API key"));
+                    let key_response = components::singleline_input(
+                        ui,
+                        &mut provider.api_key,
+                        crate::i18n::tr(language, "API key"),
+                        (ui.available_width() - 70.0).max(160.0),
+                        true,
+                    );
+                    let commit = key_response.lost_focus()
+                        || ui.input(|input| input.key_pressed(egui::Key::Enter));
+                    if key_response.changed() || commit {
+                        result.remote_fields = Some(RemoteProviderFields {
+                            model: provider.model.clone(),
+                            api_key: provider.api_key.clone(),
+                            commit,
+                        });
+                    }
+                });
+            } else {
+                let action_label = card.download_bytes.map_or_else(
+                    || crate::i18n::tr(language, card.action).to_owned(),
+                    |bytes| {
+                        format!(
+                            "{} · {}",
+                            crate::i18n::tr(language, card.action),
+                            components::format_file_size(bytes),
+                        )
+                    },
+                );
+                result.download_clicked = ui
+                    .add_enabled(
+                        card.enabled,
+                        egui::Button::new(
+                            RichText::new(action_label).color(Color32::WHITE).strong(),
+                        )
                         .fill(Color32::from_rgb(37, 99, 235))
                         .min_size(egui::Vec2::new(100.0, 32.0))
                         .corner_radius(CornerRadius::same(10)),
-                )
-                .clicked();
-            (clicked, (level != card.selected_level).then_some(level))
+                    )
+                    .clicked();
+            }
+            result
         })
         .inner
 }

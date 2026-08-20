@@ -115,7 +115,10 @@ pub enum SessionEvent {
         target_lang: String,
     },
     TtsAudio(Vec<u8>),
-    BackendError(String),
+    BackendError {
+        message: String,
+        configuration_required: bool,
+    },
     Error(String),
 }
 
@@ -1004,12 +1007,17 @@ fn forward_server_event(
             }
         }
         Some("error") => {
-            let _ = event_tx.send(SessionEvent::BackendError(
-                data.and_then(|d| d.get("message"))
+            let _ = event_tx.send(SessionEvent::BackendError {
+                message: data
+                    .and_then(|d| d.get("message"))
                     .and_then(Value::as_str)
                     .unwrap_or("Unknown backend error")
                     .into(),
-            ));
+                configuration_required: data
+                    .and_then(|d| d.get("configuration_required"))
+                    .and_then(Value::as_bool)
+                    .unwrap_or(false),
+            });
         }
         _ => {}
     }
@@ -1164,7 +1172,29 @@ mod tests {
 
         assert!(matches!(
             receiver.try_recv().unwrap(),
-            SessionEvent::BackendError(message) if message == "speaker recognition is unavailable"
+            SessionEvent::BackendError { message, configuration_required: false }
+                if message == "speaker recognition is unavailable"
+        ));
+    }
+
+    #[test]
+    fn provider_configuration_errors_keep_the_redirect_signal() {
+        let (sender, receiver) = crossbeam_channel::unbounded();
+        forward_server_event(
+            &sender,
+            r#"{"action":"error","data":{"message":"HTTP 401","configuration_required":true}}"#,
+            42,
+            false,
+            true,
+            CaptureSource::Microphone,
+        );
+
+        assert!(matches!(
+            receiver.try_recv().unwrap(),
+            SessionEvent::BackendError {
+                message,
+                configuration_required: true
+            } if message == "HTTP 401"
         ));
     }
 

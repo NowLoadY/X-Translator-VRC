@@ -13,7 +13,7 @@ use std::{
 
 use clap::Parser;
 
-const PROTECTED_TOP_LEVEL: &[&str] = &["runtime", "config.json"];
+const PROTECTED_TOP_LEVEL: &[&str] = &["runtime"];
 const RETRY_TIMEOUT: Duration = Duration::from_secs(45);
 
 #[derive(Debug, Parser)]
@@ -130,10 +130,6 @@ fn replace_entries(
             continue;
         }
         if is_protected(&name) {
-            if name.eq_ignore_ascii_case(OsStr::new("config.json")) && !target.join(&name).exists()
-            {
-                copy_path(&entry.path(), &target.join(&name))?;
-            }
             continue;
         }
         let destination = target.join(&name);
@@ -523,11 +519,43 @@ mod tests {
         let source_entries = source_entries(&source).unwrap();
         replace_entries(&source, &target, &source_entries, &backup).unwrap();
 
-        let settings =
-            fs::read_to_string(target.join("runtime/prompt-studio.json")).unwrap();
+        let settings = fs::read_to_string(target.join("runtime/prompt-studio.json")).unwrap();
         assert!(settings.contains("user-profile-1"));
         assert!(settings.contains("My saved project"));
 
+        let _ = fs::remove_dir_all(&temp);
+    }
+
+    #[test]
+    fn update_replaces_release_config_catalogue() {
+        let temp =
+            std::env::temp_dir().join(format!("xrt_updater_config_test_{}", std::process::id()));
+        let _ = fs::remove_dir_all(&temp);
+        let source = temp.join("source");
+        let target = temp.join("target");
+        let backup = temp.join("backup");
+
+        fs::create_dir_all(&source).unwrap();
+        fs::create_dir_all(&target).unwrap();
+        fs::write(
+            source.join("config.json"),
+            br#"{"models":{"new-model":{}}}"#,
+        )
+        .unwrap();
+        fs::write(
+            target.join("config.json"),
+            br#"{"models":{"old-model":{}}}"#,
+        )
+        .unwrap();
+
+        let source_entries = source_entries(&source).unwrap();
+        replace_entries(&source, &target, &source_entries, &backup).unwrap();
+
+        assert_eq!(
+            fs::read(target.join("config.json")).unwrap(),
+            br#"{"models":{"new-model":{}}}"#
+        );
+        assert!(backup.join("config.json").is_file());
         let _ = fs::remove_dir_all(&temp);
     }
 }

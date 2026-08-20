@@ -196,9 +196,12 @@ fn render_general_appearance_section(app: &mut crate::XRTranslateApp, ui: &mut e
                             if contributor.contributions.len() == 1 {
                                 ui.add_space(4.0);
                                 ui.label(
-                                    egui::RichText::new(format!("— {}", contributor.contributions[0]))
-                                        .size(12.0)
-                                        .color(crate::ui::theme::text_weak()),
+                                    egui::RichText::new(format!(
+                                        "— {}",
+                                        contributor.contributions[0]
+                                    ))
+                                    .size(12.0)
+                                    .color(crate::ui::theme::text_weak()),
                                 );
                             }
                         });
@@ -254,8 +257,24 @@ fn render_social_link_chip(ui: &mut egui::Ui, label: &str, url: &str) {
 
 fn render_update_controls(app: &mut crate::XRTranslateApp, ui: &mut egui::Ui) {
     use crate::app_update::AppUpdateState;
+    use crate::client_settings::UpdateChannel;
 
     let state = app.app_update_state().clone();
+    let mut beta_enabled = app.update_channel == UpdateChannel::Beta;
+    if ui
+        .checkbox(&mut beta_enabled, "Receive beta updates")
+        .on_hover_text(
+            "Include prerelease builds. Beta builds can still update to stable releases.",
+        )
+        .changed()
+    {
+        app.set_update_channel(if beta_enabled {
+            UpdateChannel::Beta
+        } else {
+            UpdateChannel::Stable
+        });
+    }
+    ui.add_space(8.0);
     ui.horizontal_wrapped(|ui| {
         ui.label(
             egui::RichText::new("Update")

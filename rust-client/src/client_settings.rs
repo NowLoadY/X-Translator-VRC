@@ -9,6 +9,14 @@ use serde::{Deserialize, Serialize};
 use std::path::Path;
 use xrtranslate_prompt::PromptTemplateLibrary;
 
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum UpdateChannel {
+    #[default]
+    Stable,
+    Beta,
+}
+
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, Serialize, Deserialize, Default)]
 pub enum CaptureSource {
     #[default]
@@ -83,6 +91,8 @@ pub struct ClientSettings {
     pub server_url: String,
     #[serde(default)]
     pub download_proxy_url: String,
+    #[serde(default)]
+    pub update_channel: UpdateChannel,
     #[serde(default = "OscSettings::from_project_config")]
     pub osc_settings: OscSettings,
     #[serde(default, rename = "plugins", alias = "plugin_preferences")]
@@ -152,6 +162,7 @@ impl Default for ClientSettings {
             first_run: true,
             server_url: default_server_url(),
             download_proxy_url: String::new(),
+            update_channel: UpdateChannel::Stable,
             osc_settings: OscSettings::from_project_config(),
             plugin_preferences: PluginPreferences::default(),
             active_page: Page::default(),
@@ -348,6 +359,7 @@ mod tests {
             tts_enabled: true,
             source_lang: "en".into(),
             download_proxy_url: "socks5://127.0.0.1:1080".into(),
+            update_channel: UpdateChannel::Beta,
             sidebar_collapsed: true,
             active_page: Page::Plugin(PluginId::OSC),
             osc_settings: OscSettings {
@@ -367,6 +379,7 @@ mod tests {
         assert!(!loaded.tts_enabled);
         assert_eq!(loaded.source_lang, "en");
         assert_eq!(loaded.download_proxy_url, "socks5://127.0.0.1:1080");
+        assert_eq!(loaded.update_channel, UpdateChannel::Beta);
         assert!(loaded.sidebar_collapsed);
         assert_eq!(loaded.active_page, Page::Plugin(PluginId::OSC));
         assert!(loaded.osc_settings.show_speaker_number);
@@ -409,16 +422,19 @@ mod tests {
 
         settings.save(&root).unwrap();
 
-        assert!(root.join("runtime").join(PromptTemplateLibrary::FILE_NAME).exists());
+        assert!(
+            root.join("runtime")
+                .join(PromptTemplateLibrary::FILE_NAME)
+                .exists()
+        );
         let settings_json =
             std::fs::read_to_string(root.join("runtime/rust-client-settings.json")).unwrap();
         assert!(!settings_json.contains("prompt_library"));
         assert!(!settings_json.contains("user-profile-1"));
 
-        let prompt_studio_json = std::fs::read_to_string(
-            root.join("runtime").join(PromptTemplateLibrary::FILE_NAME),
-        )
-        .unwrap();
+        let prompt_studio_json =
+            std::fs::read_to_string(root.join("runtime").join(PromptTemplateLibrary::FILE_NAME))
+                .unwrap();
         assert!(prompt_studio_json.contains("user-profile-1"));
         assert!(prompt_studio_json.contains("My saved project"));
 

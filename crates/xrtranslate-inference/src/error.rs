@@ -55,6 +55,12 @@ pub enum InferenceError {
     },
     /// The model completed the request but produced no usable text.
     EmptyOutput { operation: &'static str },
+    /// The model completed the request but echoed instructions or other prompt
+    /// material instead of producing a usable domain result.
+    RejectedOutput {
+        operation: &'static str,
+        reason: &'static str,
+    },
 }
 
 impl fmt::Display for InferenceError {
@@ -89,11 +95,44 @@ impl fmt::Display for InferenceError {
             Self::EmptyOutput { operation } => {
                 write!(formatter, "{operation} completed without usable text")
             }
+            Self::RejectedOutput { operation, reason } => {
+                write!(formatter, "{operation} output was rejected: {reason}")
+            }
         }
     }
 }
 
 impl Error for InferenceError {}
+
+impl InferenceError {
+    /// Whether retrying requires the user to correct a remote provider's
+    /// credentials, endpoint, model, or request configuration.
+    #[must_use]
+    pub fn requires_provider_configuration(&self) -> bool {
+        match self {
+            Self::InvalidConfiguration { .. } => true,
+            Self::HttpStatus {
+                endpoint, status, ..
+            } => {
+                [400, 401, 403, 404, 422].contains(status)
+                    && reqwest::Url::parse(endpoint)
+                        .ok()
+                        .and_then(|url| url.host_str().map(str::to_owned))
+                        .is_some_and(|host| {
+                            host != "localhost" && host != "127.0.0.1" && host != "::1"
+                        })
+            }
+            _ => false,
+        }
+    }
+
+    /// Whether the provider returned text that failed a deterministic output
+    /// quality gate and may be worth regenerating once.
+    #[must_use]
+    pub fn is_rejected_output(&self) -> bool {
+        matches!(self, Self::RejectedOutput { .. })
+    }
+}
 
 pub(crate) fn preview(body: &str) -> String {
     const LIMIT: usize = 512;
@@ -103,4 +142,34 @@ pub(crate) fn preview(body: &str) -> String {
     }
     let prefix = normalized.chars().take(LIMIT).collect::<String>();
     format!("{prefix}…")
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn only_actionable_remote_http_failures_require_configuration() {
+        let failure = |endpoint: &str, status| InferenceError::HttpStatus {
+            endpoint: endpoint.into(),
+            status,
+            body_preview: String::new(),
+        };
+        assert!(
+            failure("https://api.openai.com/v1/audio/transcriptions", 401)
+                .requires_provider_configuration()
+        );
+        assert!(
+            failure("http://provider.internal/v1/chat/completions", 404)
+                .requires_provider_configuration()
+        );
+        assert!(
+            !failure("http://127.0.0.1:8080/v1/chat/completions", 400)
+                .requires_provider_configuration()
+        );
+        assert!(
+            !failure("https://api.openai.com/v1/chat/completions", 429)
+                .requires_provider_configuration()
+        );
+    }
 }

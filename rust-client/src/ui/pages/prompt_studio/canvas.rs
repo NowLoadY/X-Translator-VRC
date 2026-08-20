@@ -168,6 +168,7 @@ pub(super) fn render_graph_editor(
     snapshot: &PromptStudioSnapshot,
     controller: &mut PromptStudioController,
     ui: &mut egui::Ui,
+    language: crate::i18n::UiLanguage,
     actions: &mut Vec<PromptStudioAction>,
 ) {
     let Some(mut draft) = controller.draft.clone() else {
@@ -185,7 +186,7 @@ pub(super) fn render_graph_editor(
     let editable = !draft.read_only;
     ui.horizontal(|ui| {
         ui.label(
-            RichText::new("GRAPH /")
+            RichText::new(crate::i18n::tr(language, "GRAPH /"))
                 .font(egui::FontId::monospace(10.0))
                 .color(style::MUTED)
                 .strong(),
@@ -204,7 +205,7 @@ pub(super) fn render_graph_editor(
             }
         } else {
             ui.label(
-                RichText::new(&draft.name)
+                RichText::new(crate::i18n::tr_dynamic(language, &draft.name))
                     .font(egui::FontId::monospace(12.0))
                     .color(style::INK)
                     .strong(),
@@ -212,21 +213,31 @@ pub(super) fn render_graph_editor(
         }
         ui.add_space(10.0);
         if !editable {
-            status_chip(ui, "LOCKED");
+            status_chip(ui, crate::i18n::tr(language, "LOCKED"));
         }
         ui.separator();
         render_provider_tabs(controller, ui);
         if editable {
             ui.separator();
-            render_node_toolbar(&mut draft, controller, ui);
+            render_node_toolbar(&mut draft, controller, ui, language);
         }
         ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
             if editable {
-                if small_outline_button(ui, "DELETE", "Delete prompt design").clicked() {
+                if small_outline_button(
+                    ui,
+                    crate::i18n::tr(language, "DELETE"),
+                    crate::i18n::tr(language, "Delete prompt design"),
+                )
+                .clicked()
+                {
                     actions.push(PromptStudioAction::DeleteProfile(draft.id.clone()));
                 }
-            } else if small_outline_button(ui, "EDIT COPY", "Create an editable graph copy")
-                .clicked()
+            } else if small_outline_button(
+                ui,
+                crate::i18n::tr(language, "EDIT COPY"),
+                crate::i18n::tr(language, "Create an editable graph copy"),
+            )
+            .clicked()
             {
                 let mut copy = PromptTemplateLibrary::editable_copy_of(
                     &draft,
@@ -238,33 +249,49 @@ pub(super) fn render_graph_editor(
             }
             if validation_error.is_none()
                 && draft.id != snapshot.active_id
-                && style::command_button(ui, "ACTIVATE", true).clicked()
+                && style::command_button(ui, crate::i18n::tr(language, "ACTIVATE"), true).clicked()
             {
                 actions.push(PromptStudioAction::ActivateProfile(draft.clone()));
                 controller.dirty = false;
             }
-            if editable && small_outline_button(ui, "AUTO", "Automatically arrange nodes").clicked()
+            if editable
+                && small_outline_button(
+                    ui,
+                    crate::i18n::tr(language, "AUTO LAYOUT"),
+                    crate::i18n::tr(language, "Automatically arrange nodes"),
+                )
+                .clicked()
             {
                 draft.graph.auto_layout();
                 controller.fit_pending = true;
                 controller.mark_dirty();
             }
-            if editable && small_outline_button(ui, "FIT", "Fit graph to canvas").clicked() {
+            if editable
+                && small_outline_button(
+                    ui,
+                    crate::i18n::tr(language, "FIT"),
+                    crate::i18n::tr(language, "Fit graph to canvas"),
+                )
+                .clicked()
+            {
                 controller.fit_pending = true;
             }
-            if small_icon_button(ui, "-", "Zoom out").clicked() {
+            if small_icon_button(ui, "-", crate::i18n::tr(language, "Zoom out")).clicked() {
                 controller.zoom = (controller.zoom - 0.1).clamp(0.25, 1.6);
             }
-            if small_icon_button(ui, "+", "Zoom in").clicked() {
+            if small_icon_button(ui, "+", crate::i18n::tr(language, "Zoom in")).clicked() {
                 controller.zoom = (controller.zoom + 0.1).clamp(0.25, 1.6);
             }
         });
     });
     if let Some(error) = &validation_error {
         ui.label(
-            RichText::new(format!("INVALID GRAPH / {error}"))
-                .font(egui::FontId::monospace(10.0))
-                .color(style::ERROR_BORDER),
+            RichText::new(format!(
+                "{} / {error}",
+                crate::i18n::tr(language, "INVALID GRAPH")
+            ))
+            .font(egui::FontId::monospace(10.0))
+            .color(style::ERROR_BORDER),
         );
     }
     ui.add_space(4.0);
@@ -282,36 +309,40 @@ pub(super) fn render_graph_editor(
             );
             controller.canvas_size = canvas.size();
 
-            let pointer_over_node_or_link = response.interact_pointer_pos().is_some_and(|pointer| {
-                let over_node = draft
-                    .graph
-                    .nodes
-                    .iter()
-                    .filter(|node| controller.node_is_visible(node))
-                    .any(|node| {
-                        graph_rect(canvas, controller, node.position, node_size(node))
-                            .contains(pointer)
-                    });
-                let over_link = draft.graph.links.iter().any(|link| {
-                    let endpoints_visible = draft
+            let pointer_over_node_or_link =
+                response.interact_pointer_pos().is_some_and(|pointer| {
+                    let over_node = draft
                         .graph
                         .nodes
                         .iter()
-                        .filter(|node| node.id == link.from || node.id == link.to)
-                        .all(|node| controller.node_is_visible(node));
-                    if !endpoints_visible {
-                        return false;
-                    }
-                    if let Some((from, to)) = link_points(canvas, controller, &draft.graph, link) {
-                        distance_to_curve(pointer, bezier_points(from, to)) <= 12.0
-                    } else {
-                        false
-                    }
+                        .filter(|node| controller.node_is_visible(node))
+                        .any(|node| {
+                            graph_rect(canvas, controller, node.position, node_size(node))
+                                .contains(pointer)
+                        });
+                    let over_link = draft.graph.links.iter().any(|link| {
+                        let endpoints_visible = draft
+                            .graph
+                            .nodes
+                            .iter()
+                            .filter(|node| node.id == link.from || node.id == link.to)
+                            .all(|node| controller.node_is_visible(node));
+                        if !endpoints_visible {
+                            return false;
+                        }
+                        if let Some((from, to)) =
+                            link_points(canvas, controller, &draft.graph, link)
+                        {
+                            distance_to_curve(pointer, bezier_points(from, to)) <= 12.0
+                        } else {
+                            false
+                        }
+                    });
+                    over_node || over_link
                 });
-                over_node || over_link
-            });
 
-            let is_pulling_wire = controller.wire_from.is_some() || controller.wire_from_input.is_some();
+            let is_pulling_wire =
+                controller.wire_from.is_some() || controller.wire_from_input.is_some();
 
             if editable && response.secondary_clicked() {
                 if is_pulling_wire {
@@ -327,7 +358,7 @@ pub(super) fn render_graph_editor(
             if editable && !pointer_over_node_or_link && !is_pulling_wire {
                 let preferred_center = controller.add_node_center;
                 response.context_menu(|ui| {
-                    render_node_menu(&mut draft, controller, ui, preferred_center);
+                    render_node_menu(&mut draft, controller, ui, language, preferred_center);
                 });
             }
             if controller.fit_pending {
@@ -483,10 +514,11 @@ pub(super) fn render_graph_editor(
                 editable,
                 runtime_trace.as_ref(),
                 &error_target,
+                language,
             );
             render_wire_preview(&mut canvas_ui, canvas, &draft, controller);
             render_selection_box(&mut canvas_ui, controller);
-            render_canvas_navigation_hint(&canvas_ui, canvas);
+            render_canvas_navigation_hint(&canvas_ui, canvas, language);
         });
     controller.draft = Some(draft);
 }
@@ -516,9 +548,10 @@ fn render_node_toolbar(
     draft: &mut PromptTemplateProfile,
     controller: &mut PromptStudioController,
     ui: &mut egui::Ui,
+    language: crate::i18n::UiLanguage,
 ) {
-    ui.menu_button("+ ADD NODE", |ui| {
-        render_node_menu(draft, controller, ui, None);
+    ui.menu_button(crate::i18n::tr(language, "+ ADD NODE"), |ui| {
+        render_node_menu(draft, controller, ui, language, None);
     });
 }
 
@@ -526,17 +559,22 @@ fn render_node_menu(
     draft: &mut PromptTemplateProfile,
     controller: &mut PromptStudioController,
     ui: &mut egui::Ui,
+    language: crate::i18n::UiLanguage,
     preferred_center: Option<[f32; 2]>,
 ) {
     let page = PromptNodePage::for_target(controller.active_provider);
-    ui.menu_button("Input", |ui| {
-        ui.label(RichText::new("RUNTIME VALUES").small().strong());
+    ui.menu_button(crate::i18n::tr(language, "Input"), |ui| {
+        ui.label(
+            RichText::new(crate::i18n::tr(language, "RUNTIME VALUES"))
+                .small()
+                .strong(),
+        );
         for (label, variable) in [
             ("Source language", PromptVariable::SourceLanguage),
             ("Target language", PromptVariable::TargetLanguage),
             ("Current input", PromptVariable::CurrentInput),
         ] {
-            if ui.button(label).clicked() {
+            if ui.button(crate::i18n::tr(language, label)).clicked() {
                 let position = node_add_position(controller, &draft.graph, preferred_center);
                 let id = draft.graph.add_variable(page, variable, position);
                 finish_node_add(draft, controller, id);
@@ -544,9 +582,13 @@ fn render_node_menu(
             }
         }
         ui.separator();
-        ui.label(RichText::new("REFERENCE DATA").small().strong());
+        ui.label(
+            RichText::new(crate::i18n::tr(language, "REFERENCE DATA"))
+                .small()
+                .strong(),
+        );
         for (label, block) in available_blocks() {
-            if ui.button(label).clicked() {
+            if ui.button(crate::i18n::tr(language, label)).clicked() {
                 let position = node_add_position(controller, &draft.graph, preferred_center);
                 let id = draft.graph.add_input(page, block, position);
                 finish_node_add(draft, controller, id);
@@ -554,7 +596,7 @@ fn render_node_menu(
             }
         }
     });
-    ui.menu_button("Logic", |ui| {
+    ui.menu_button(crate::i18n::tr(language, "Logic"), |ui| {
         for (label, condition) in [
             ("Source is auto", PromptCondition::SourceIsAuto),
             (
@@ -562,7 +604,7 @@ fn render_node_menu(
                 PromptCondition::HasReferenceContext,
             ),
         ] {
-            if ui.button(label).clicked() {
+            if ui.button(crate::i18n::tr(language, label)).clicked() {
                 let position = node_add_position(controller, &draft.graph, preferred_center);
                 let id = draft.graph.add_switch(page, condition, position);
                 finish_node_add(draft, controller, id);
@@ -570,10 +612,13 @@ fn render_node_menu(
             }
         }
     });
-    ui.menu_button("Compose", |ui| {
+    ui.menu_button(crate::i18n::tr(language, "Compose"), |ui| {
         if ui
-            .button("Compose")
-            .on_hover_text("Arrange fixed text and connected {0}-{4} input slots")
+            .button(crate::i18n::tr(language, "Compose"))
+            .on_hover_text(crate::i18n::tr(
+                language,
+                "Arrange fixed text and connected {0}-{4} input slots",
+            ))
             .clicked()
         {
             let position = node_add_position(controller, &draft.graph, preferred_center);
@@ -584,7 +629,7 @@ fn render_node_menu(
             ui.close();
         }
     });
-    ui.menu_button("Request", |ui| {
+    ui.menu_button(crate::i18n::tr(language, "Request"), |ui| {
         let target = controller.active_provider;
         let exists = draft.graph.nodes.iter().any(
             |node| matches!(node.kind, PromptNodeKind::Request { target: value, .. } if value == target),
@@ -599,8 +644,8 @@ fn render_node_menu(
             }
         };
         if ui
-            .add_enabled(!exists, egui::Button::new(label))
-            .on_disabled_hover_text("This provider page already has its API request")
+            .add_enabled(!exists, egui::Button::new(crate::i18n::tr(language, label)))
+            .on_disabled_hover_text(crate::i18n::tr(language, "This provider page already has its API request"))
             .clicked()
         {
             let position = node_add_position(controller, &draft.graph, preferred_center);
@@ -811,6 +856,7 @@ fn render_nodes(
     editable: bool,
     runtime_trace: Option<&PromptExecutionTrace>,
     error_target: &GraphErrorTarget,
+    language: crate::i18n::UiLanguage,
 ) {
     let nodes = profile
         .graph
@@ -922,6 +968,7 @@ fn render_nodes(
             selected,
             runtime_trace,
             error_target,
+            language,
         );
         render_node_sockets(
             ui,
@@ -931,6 +978,7 @@ fn render_nodes(
             controller,
             editable,
             error_target,
+            language,
         );
     }
     if let Some(id) = remove_id {
@@ -950,11 +998,12 @@ fn draw_node(
     selected: bool,
     runtime_trace: Option<&PromptExecutionTrace>,
     error_target: &GraphErrorTarget,
+    language: crate::i18n::UiLanguage,
 ) {
     let scale = node_scale(rect, node);
     let header_height = NODE_HEADER_HEIGHT * scale;
     let palette = node_palette(&node.kind);
-    let title = node_display_label(node);
+    let title = crate::i18n::tr_dynamic(language, &node_display_label(node)).into_owned();
     let is_error = error_target.node_id.as_deref() == Some(node.id.as_str());
 
     ui.painter()
@@ -982,7 +1031,8 @@ fn draw_node(
         },
     );
     let show_kind = scale >= 0.72;
-    let kind_tag = node_kind_tag(&profile.graph, node);
+    let kind_tag =
+        crate::i18n::tr_dynamic(language, &node_kind_tag(&profile.graph, node)).into_owned();
     let title_font_size = (9.5 * scale).max(7.0);
     let kind_font_size = 7.5 * scale;
     let kind_width = if show_kind {
@@ -1013,7 +1063,7 @@ fn draw_node(
                     .desired_width(title_width)
                     .frame(egui::Frame::NONE),
             )
-            .on_hover_text("Rename this Compose node")
+            .on_hover_text(crate::i18n::tr(language, "Rename this Compose node"))
             .changed();
         if changed {
             if let Some(actual) = profile
@@ -1230,7 +1280,7 @@ fn draw_node(
             );
         }
     }
-    runtime_preview::render(ui, rect, node, runtime_trace, scale);
+    runtime_preview::render(ui, rect, node, runtime_trace, scale, language);
 }
 
 fn render_node_sockets(
@@ -1241,6 +1291,7 @@ fn render_node_sockets(
     controller: &mut PromptStudioController,
     editable: bool,
     error_target: &GraphErrorTarget,
+    language: crate::i18n::UiLanguage,
 ) {
     let scale = node_scale(rect, node);
     if !matches!(node.kind, PromptNodeKind::Request { .. }) {
@@ -1335,8 +1386,11 @@ fn render_node_sockets(
                     if input_response.drag_started() {
                         controller.wire_from_input = Some((node.id.clone(), input));
                     } else if input_response.secondary_clicked() {
-                        if let Some(actual) =
-                            profile.graph.nodes.iter_mut().find(|actual| actual.id == node.id)
+                        if let Some(actual) = profile
+                            .graph
+                            .nodes
+                            .iter_mut()
+                            .find(|actual| actual.id == node.id)
                         {
                             if let PromptNodeKind::Compose { text } = &mut actual.kind {
                                 remove_compose_placeholder(text, input);
@@ -1356,11 +1410,8 @@ fn render_node_sockets(
                 style::NODE_MUTED
             };
 
-            ui.painter().circle_filled(
-                position,
-                (SOCKET_RADIUS * scale).max(2.5),
-                socket_color,
-            );
+            ui.painter()
+                .circle_filled(position, (SOCKET_RADIUS * scale).max(2.5), socket_color);
 
             if is_error_socket {
                 ui.painter().circle_stroke(
@@ -1384,7 +1435,7 @@ fn render_node_sockets(
                 ui.painter().text(
                     Pos2::new(position.x + 12.0 * scale, position.y - 6.0 * scale),
                     egui::Align2::LEFT_TOP,
-                    input_socket_label(node, input),
+                    crate::i18n::tr_dynamic(language, &input_socket_label(node, input)),
                     egui::FontId::monospace((9.0 * scale).max(6.5)),
                     label_color,
                 );
@@ -1497,15 +1548,27 @@ fn render_selection_box(ui: &egui::Ui, controller: &PromptStudioController) {
     );
 }
 
-fn render_canvas_navigation_hint(ui: &egui::Ui, canvas: Rect) {
+fn render_canvas_navigation_hint(ui: &egui::Ui, canvas: Rect, language: crate::i18n::UiLanguage) {
     let font_id = egui::FontId::monospace(9.5);
     let text_color = Color32::BLACK;
 
     let items = [
-        ("NAVIGATE", "Space + Left Drag / Middle Drag to pan · Mouse Wheel to zoom"),
-        ("SELECT", "Left Drag on canvas to box select · Shift + Click to multi-select"),
-        ("CONNECT", "Drag socket to connect / unplug · Click empty space to cancel wire"),
-        ("ACTIONS", "Del / Backspace to delete · Right-Click socket to disconnect"),
+        (
+            "NAVIGATE",
+            "Space + Left Drag / Middle Drag to pan · Mouse Wheel to zoom",
+        ),
+        (
+            "SELECT",
+            "Left Drag on canvas to box select · Shift + Click to multi-select",
+        ),
+        (
+            "CONNECT",
+            "Drag socket to connect / unplug · Click empty space to cancel wire",
+        ),
+        (
+            "ACTIONS",
+            "Del / Backspace to delete · Right-Click socket to disconnect",
+        ),
     ];
 
     let line_height = 16.0;
@@ -1514,7 +1577,11 @@ fn render_canvas_navigation_hint(ui: &egui::Ui, canvas: Rect) {
 
     for (index, (tag, detail)) in items.iter().rev().enumerate() {
         let y = base_y - index as f32 * line_height;
-        let line_text = format!("{tag} · {detail}");
+        let line_text = format!(
+            "{} · {}",
+            crate::i18n::tr(language, tag),
+            crate::i18n::tr(language, detail)
+        );
         ui.painter().text(
             Pos2::new(right_x, y),
             egui::Align2::RIGHT_BOTTOM,

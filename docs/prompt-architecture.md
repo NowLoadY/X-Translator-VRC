@@ -19,6 +19,33 @@ Provider profiles in `xrtranslate-inference` select a graph provider target and
 own sampling parameters and output cleanup. The OpenAI adapter converts the
 already-rendered messages to JSON without changing their content.
 
+## Output validation and regeneration
+
+Translation output is validated in `xrtranslate-inference` after provider
+cleanup and before it can become a successful `TranslationResult`. The quality
+gate consumes the exact ordered `PromptMessage` values rendered for that
+request; it does not inspect a built-in template, provider name, graph node ID,
+or hard-coded instruction. Custom Prompt Studio graphs therefore receive the
+same protection as the canonical graph.
+
+The prompt-echo detector normalizes Unicode letters and numbers, removes the
+current input and rendered runtime reference facts from the comparison corpus,
+then combines three independent forms of evidence: a substantial exact prompt
+fragment, high character-shingle coverage, or multiple copied prompt lines.
+Removing runtime values prevents an unchanged proper name or a legitimate
+translation reused from dialogue history from being classified as an
+instruction leak. Reference-context structural checks remain responsible for
+detecting dumped terminology and history blocks.
+
+Rejected text never enters session state, translation history, terminology
+rewriting, or the wire protocol. The backend owns retry coordination: it clears
+optional reference facts and regenerates the same source segment exactly once
+through the same graph and provider target. The regenerated request retains all
+main translation instructions, message roles, current input, and sampling
+policy. If that output is also rejected, the segment fails and no translation
+is published. As with a context-window retry, a successful regenerated result
+carries the execution trace of the final request.
+
 XR Corpus and the backend provide structured facts. They do not concatenate
 prompt strings. The desktop client owns template selection and persistence but
 does not execute provider policy.

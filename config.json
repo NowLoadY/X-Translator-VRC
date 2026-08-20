@@ -6,7 +6,7 @@
         "api_key": "",
         "context_window_tokens": 8192,
         "max_tokens": 256,
-        "model": "gpt-4o-audio-preview",
+        "model": "gpt-4o-transcribe",
         "parallel_slots": 2,
         "supports_prompt_context": true,
         "transport": "openai",

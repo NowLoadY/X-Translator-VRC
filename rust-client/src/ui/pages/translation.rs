@@ -1,6 +1,177 @@
 use crate::ui::components::{self, danger_button, section, status_badge};
 use crate::{CaptureSource, LANGUAGE_OPTIONS, language_label};
 use eframe::egui;
+use std::hash::{Hash, Hasher};
+
+const HISTORY_ROW_HEIGHT: f32 = 88.0;
+const HISTORY_ROW_GAP: f32 = 8.0;
+
+fn history_content_height(row_count: usize) -> f32 {
+    if row_count == 0 {
+        return 0.0;
+    }
+    row_count as f32 * HISTORY_ROW_HEIGHT + row_count.saturating_sub(1) as f32 * HISTORY_ROW_GAP
+}
+
+fn history_bottom_scroll_offset(row_count: usize, viewport_height: f32) -> f32 {
+    (history_content_height(row_count) - viewport_height).max(0.0)
+}
+
+fn visible_history_range(viewport: egui::Rect, row_count: usize) -> std::ops::Range<usize> {
+    let row_extent = HISTORY_ROW_HEIGHT + HISTORY_ROW_GAP;
+    let first = ((viewport.min.y / row_extent).floor() as isize - 1).max(0) as usize;
+    let end = ((viewport.max.y / row_extent).ceil() as isize + 1).max(0) as usize;
+    first.min(row_count)..end.min(row_count)
+}
+
+fn show_virtual_history_rows(
+    ui: &mut egui::Ui,
+    id_salt: &'static str,
+    row_count: usize,
+    scroll_to_end: bool,
+    mut render_row: impl FnMut(&mut egui::Ui, usize),
+) {
+    let viewport_height_id = ui.make_persistent_id((id_salt, "viewport_height"));
+    let viewport_height = ui
+        .memory(|memory| memory.data.get_temp::<f32>(viewport_height_id))
+        .unwrap_or_else(|| ui.available_height())
+        .max(0.0);
+    let mut scroll_area = egui::ScrollArea::vertical()
+        .id_salt(id_salt)
+        .animated(false)
+        .auto_shrink([false, false]);
+    if scroll_to_end {
+        scroll_area = scroll_area
+            .vertical_scroll_offset(history_bottom_scroll_offset(row_count, viewport_height));
+    }
+
+    let output = scroll_area.show_viewport(ui, |ui, viewport| {
+        let content_top = ui.max_rect().top();
+        let content_left = ui.max_rect().left();
+        let content_width = ui.available_width();
+        let row_extent = HISTORY_ROW_HEIGHT + HISTORY_ROW_GAP;
+        ui.set_height(history_content_height(row_count));
+
+        for index in visible_history_range(viewport, row_count) {
+            let row_top = content_top + index as f32 * row_extent;
+            let row_rect = egui::Rect::from_min_size(
+                egui::pos2(content_left, row_top),
+                egui::vec2(content_width, HISTORY_ROW_HEIGHT),
+            );
+            ui.scope_builder(
+                egui::UiBuilder::new()
+                    .id_salt((id_salt, index))
+                    .max_rect(row_rect),
+                |ui| {
+                    render_row(ui, index);
+                },
+            );
+        }
+    });
+    ui.memory_mut(|memory| {
+        memory
+            .data
+            .insert_temp(viewport_height_id, output.inner_rect.height());
+    });
+}
+
+fn recognition_history_fingerprint(
+    entries: &[crate::history::RecognitionHistoryEntry],
+    partial_text: &str,
+) -> u64 {
+    let mut hasher = std::collections::hash_map::DefaultHasher::new();
+    entries.len().hash(&mut hasher);
+    if let Some(first) = entries.first() {
+        first.stream_id.hash(&mut hasher);
+        first.turn_id.hash(&mut hasher);
+        first.text.hash(&mut hasher);
+    }
+    if let Some(last) = entries.last() {
+        last.stream_id.hash(&mut hasher);
+        last.turn_id.hash(&mut hasher);
+        last.speaker_id.hash(&mut hasher);
+        last.text.hash(&mut hasher);
+    }
+    partial_text.hash(&mut hasher);
+    hasher.finish()
+}
+
+fn translation_history_fingerprint(entries: &[crate::history::TranslationHistoryEntry]) -> u64 {
+    let mut hasher = std::collections::hash_map::DefaultHasher::new();
+    entries.len().hash(&mut hasher);
+    if let Some(first) = entries.first() {
+        first.stream_id.hash(&mut hasher);
+        first.turn_id.hash(&mut hasher);
+        first.segment_index.hash(&mut hasher);
+        first.source.hash(&mut hasher);
+        first.translated.hash(&mut hasher);
+    }
+    if let Some(last) = entries.last() {
+        last.stream_id.hash(&mut hasher);
+        last.turn_id.hash(&mut hasher);
+        last.segment_index.hash(&mut hasher);
+        last.speaker_id.hash(&mut hasher);
+        last.source.hash(&mut hasher);
+        last.translated.hash(&mut hasher);
+    }
+    hasher.finish()
+}
+
+fn fixed_height_history_card(ui: &mut egui::Ui, add_contents: impl FnOnce(&mut egui::Ui)) {
+    components::history_entry_card(ui, |ui| {
+        // Keep every virtual row's layout height identical to the height used
+        // by the scroll-position math. Text stays on a single-line preview,
+        // just like the VideoPlayer subtitle rows.
+        ui.set_width(ui.available_width());
+        ui.set_height(HISTORY_ROW_HEIGHT - 18.0);
+        add_contents(ui);
+    });
+}
+
+#[cfg(test)]
+mod virtual_history_tests {
+    use super::*;
+
+    #[test]
+    fn content_height_has_no_trailing_gap() {
+        assert_eq!(history_content_height(0), 0.0);
+        assert_eq!(history_content_height(1), HISTORY_ROW_HEIGHT);
+        assert_eq!(
+            history_content_height(3),
+            3.0 * HISTORY_ROW_HEIGHT + 2.0 * HISTORY_ROW_GAP
+        );
+    }
+
+    #[test]
+    fn last_row_ends_at_the_virtual_content_bottom() {
+        let row_count = 100;
+        let last_row_top = (row_count - 1) as f32 * (HISTORY_ROW_HEIGHT + HISTORY_ROW_GAP);
+        assert_eq!(
+            last_row_top + HISTORY_ROW_HEIGHT,
+            history_content_height(row_count)
+        );
+        assert_eq!(
+            history_bottom_scroll_offset(row_count, 180.0) + 180.0,
+            history_content_height(row_count)
+        );
+        assert_eq!(history_bottom_scroll_offset(1, 180.0), 0.0);
+    }
+
+    #[test]
+    fn visible_range_is_bounded_near_the_end() {
+        let row_count = 100;
+        let content_height = history_content_height(row_count);
+        let viewport = egui::Rect::from_min_max(
+            egui::pos2(0.0, content_height - 180.0),
+            egui::pos2(500.0, content_height),
+        );
+        let range = visible_history_range(viewport, row_count);
+
+        assert!(range.start < range.end);
+        assert_eq!(range.end, row_count);
+        assert!(range.len() <= 5);
+    }
+}
 
 pub fn render(app: &mut crate::XRTranslateApp, ui: &mut egui::Ui) {
     ui.horizontal(|ui| {
@@ -345,16 +516,17 @@ pub fn render(app: &mut crate::XRTranslateApp, ui: &mut egui::Ui) {
                 let history_height = (ui.available_height() - 10.0).max(180.0);
                 ui.set_min_height(history_height);
                 let scroll_state_id = ui.make_persistent_id("recognition_history_scroll_state");
-                let (previous_count, previous_partial) = ui.memory(|memory| {
+                let previous_fingerprint = ui.memory(|memory| {
                     memory
                         .data
-                        .get_temp::<(usize, bool)>(scroll_state_id)
-                        .unwrap_or((0, false))
+                        .get_temp::<u64>(scroll_state_id)
+                        .unwrap_or_default()
                 });
-                let current_count = app.recognition_history.len();
-                let current_partial = !app.partial_text.is_empty();
-                let should_scroll =
-                    current_count > previous_count || (current_partial && !previous_partial);
+                let current_fingerprint =
+                    recognition_history_fingerprint(&app.recognition_history, &app.partial_text);
+                let has_partial = !app.partial_text.is_empty();
+                let row_count = app.recognition_history.len() + usize::from(has_partial);
+                let should_scroll = row_count > 0 && current_fingerprint != previous_fingerprint;
 
                 egui::Frame::new()
                     // Paint a stable, low-alpha layer across the whole viewport. Without a
@@ -364,28 +536,22 @@ pub fn render(app: &mut crate::XRTranslateApp, ui: &mut egui::Ui) {
                     .corner_radius(egui::CornerRadius::same(8))
                     .inner_margin(egui::Margin::symmetric(4, 4))
                     .show(ui, |ui| {
-                        egui::ScrollArea::vertical()
-                            .id_salt("recognition_history_scroll")
-                            .animated(false)
-                            .auto_shrink([false, false])
-                            .show(ui, |ui| {
-                                ui.set_width(ui.available_width());
-                                if app.recognition_history.is_empty() && app.partial_text.is_empty()
-                                {
-                                    ui.label(
-                                        egui::RichText::new(crate::i18n::tr(
-                                            app.ui_language,
-                                            "No speech",
-                                        ))
-                                        .color(crate::ui::theme::text_weak())
-                                        .italics(),
-                                    );
-                                } else {
-                                    let total = app.recognition_history.len();
-                                    for (i, entry) in app.recognition_history.iter().enumerate() {
-                                        let is_last = i == total - 1 && app.partial_text.is_empty();
-                                        let resp = components::history_entry_card(ui, |ui| {
-                                            ui.set_width(ui.available_width());
+                        ui.set_min_height((history_height - 8.0).max(0.0));
+                        if row_count == 0 {
+                            ui.label(
+                                egui::RichText::new(crate::i18n::tr(app.ui_language, "No speech"))
+                                    .color(crate::ui::theme::text_weak())
+                                    .italics(),
+                            );
+                        } else {
+                            show_virtual_history_rows(
+                                ui,
+                                "recognition_history_scroll",
+                                row_count,
+                                should_scroll,
+                                |ui, index| {
+                                    if let Some(entry) = app.recognition_history.get(index) {
+                                        fixed_height_history_card(ui, |ui| {
                                             if let Some(speaker) =
                                                 crate::compact_speaker_label(&entry.speaker_id)
                                             {
@@ -403,14 +569,9 @@ pub fn render(app: &mut crate::XRTranslateApp, ui: &mut egui::Ui) {
                                                 false,
                                             );
                                         });
-                                        if is_last && should_scroll {
-                                            resp.scroll_to_me(Some(egui::Align::BOTTOM));
-                                        }
-                                        ui.add_space(4.0);
-                                    }
-                                    if !app.partial_text.is_empty() {
-                                        let resp = ui
-                                            .horizontal(|ui| {
+                                    } else {
+                                        fixed_height_history_card(ui, |ui| {
+                                            ui.horizontal(|ui| {
                                                 ui.label(
                                                     egui::RichText::new("• • •")
                                                         .color(crate::ui::theme::primary())
@@ -424,19 +585,17 @@ pub fn render(app: &mut crate::XRTranslateApp, ui: &mut egui::Ui) {
                                                         .size(13.0)
                                                         .italics(),
                                                 )
-                                            })
-                                            .response;
-                                        if should_scroll {
-                                            resp.scroll_to_me(Some(egui::Align::BOTTOM));
-                                        }
+                                            });
+                                        });
                                     }
-                                }
-                            });
+                                },
+                            );
+                        }
                     });
                 ui.memory_mut(|memory| {
                     memory
                         .data
-                        .insert_temp(scroll_state_id, (current_count, current_partial));
+                        .insert_temp(scroll_state_id, current_fingerprint);
                 });
             },
         );
@@ -452,74 +611,73 @@ pub fn render(app: &mut crate::XRTranslateApp, ui: &mut egui::Ui) {
                 let history_height = (ui.available_height() - 10.0).max(180.0);
                 ui.set_min_height(history_height);
                 let scroll_state_id = ui.make_persistent_id("translation_history_scroll_state");
-                let previous_count = ui
-                    .memory(|memory| memory.data.get_temp::<usize>(scroll_state_id))
-                    .unwrap_or(0);
-                let current_count = app.translations.len();
-                let should_scroll = current_count > previous_count;
+                let previous_fingerprint = ui
+                    .memory(|memory| memory.data.get_temp::<u64>(scroll_state_id))
+                    .unwrap_or_default();
+                let current_fingerprint = translation_history_fingerprint(&app.translations);
+                let row_count = app.translations.len();
+                let should_scroll = row_count > 0 && current_fingerprint != previous_fingerprint;
 
                 egui::Frame::new()
                     .fill(crate::ui::theme::history_viewport())
                     .corner_radius(egui::CornerRadius::same(8))
                     .inner_margin(egui::Margin::symmetric(4, 4))
                     .show(ui, |ui| {
-                        egui::ScrollArea::vertical()
-                            .id_salt("translation_history_scroll")
-                            .animated(false)
-                            .auto_shrink([false, false])
-                            .show(ui, |ui| {
-                                ui.set_width(ui.available_width());
-                                if app.translations.is_empty() {
-                                    ui.label(
-                                        egui::RichText::new(crate::i18n::tr(
-                                            app.ui_language,
-                                            "No translations",
-                                        ))
-                                        .color(crate::ui::theme::text_weak())
-                                        .italics(),
-                                    );
-                                } else {
-                                    let total = app.translations.len();
-                                    for (i, entry) in app.translations.iter().enumerate() {
-                                        let is_last = i == total - 1;
-                                        let group_resp = components::history_entry_card(ui, |ui| {
-                                            ui.set_width(ui.available_width());
-                                            if let Some(speaker) =
-                                                crate::compact_speaker_label(&entry.speaker_id)
-                                            {
-                                                ui.horizontal(|ui| {
-                                                    components::speaker_badge(ui, &speaker);
-                                                });
-                                                ui.add_space(2.0);
-                                            }
-                                            if !entry.source.is_empty() {
-                                                ui.label(
+                        ui.set_min_height((history_height - 8.0).max(0.0));
+                        if app.translations.is_empty() {
+                            ui.label(
+                                egui::RichText::new(crate::i18n::tr(
+                                    app.ui_language,
+                                    "No translations",
+                                ))
+                                .color(crate::ui::theme::text_weak())
+                                .italics(),
+                            );
+                        } else {
+                            show_virtual_history_rows(
+                                ui,
+                                "translation_history_scroll",
+                                row_count,
+                                should_scroll,
+                                |ui, index| {
+                                    let entry = &app.translations[index];
+                                    fixed_height_history_card(ui, |ui| {
+                                        if let Some(speaker) =
+                                            crate::compact_speaker_label(&entry.speaker_id)
+                                        {
+                                            ui.horizontal(|ui| {
+                                                components::speaker_badge(ui, &speaker);
+                                            });
+                                            ui.add_space(2.0);
+                                        }
+                                        if !entry.source.is_empty() {
+                                            ui.add(
+                                                egui::Label::new(
                                                     egui::RichText::new(&entry.source)
                                                         .color(crate::ui::theme::text_weak())
                                                         .size(11.5),
-                                                );
-                                                ui.add_space(2.0);
-                                            }
-                                            render_text_with_term_matches(
-                                                ui,
-                                                &entry.translated,
-                                                &entry.term_matches,
-                                                &[],
-                                                crate::ui::theme::text_strong(),
-                                                true,
+                                                )
+                                                .truncate(),
                                             );
-                                        });
-
-                                        if is_last && should_scroll {
-                                            group_resp.scroll_to_me(Some(egui::Align::BOTTOM));
+                                            ui.add_space(2.0);
                                         }
-                                        ui.add_space(4.0);
-                                    }
-                                }
-                            });
+                                        render_text_with_term_matches(
+                                            ui,
+                                            &entry.translated,
+                                            &entry.term_matches,
+                                            &[],
+                                            crate::ui::theme::text_strong(),
+                                            true,
+                                        );
+                                    });
+                                },
+                            );
+                        }
                     });
                 ui.memory_mut(|memory| {
-                    memory.data.insert_temp(scroll_state_id, current_count);
+                    memory
+                        .data
+                        .insert_temp(scroll_state_id, current_fingerprint);
                 });
             },
         );
@@ -547,7 +705,10 @@ fn render_text_with_term_matches(
             .then_with(|| right.1.cmp(&left.1))
             .then_with(|| right.0.end_byte.cmp(&left.0.end_byte))
     });
-    ui.horizontal_wrapped(|ui| {
+    // Virtual history rows have a fixed height, so the preview must stay on
+    // one line. The row clip handles horizontal overflow while preserving the
+    // individual terminology hover targets.
+    ui.horizontal(|ui| {
         ui.spacing_mut().item_spacing.x = 0.0;
         let mut cursor = 0usize;
         for (term_match, primary) in matches {

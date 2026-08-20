@@ -51,8 +51,8 @@ use crate::{
     conversation_context::LogicalTurnRecord,
     language::AdaptiveLanguageRoute,
     pipeline::{
-        NativeInference, NativePipeline, PipelineEvent, RecognizedOutput, TimedUtterance,
-        TranslationOutput, validate_input_chunk_size, validate_input_sample_rate,
+        InferenceFailure, NativeInference, NativePipeline, PipelineEvent, RecognizedOutput,
+        TimedUtterance, TranslationOutput, validate_input_chunk_size, validate_input_sample_rate,
     },
     prompt_context::prompt_context_for_segment,
     session::{SegmentContext, SessionAdapter, WireOutput},
@@ -173,7 +173,7 @@ enum InferenceEvent {
         asr_elapsed: Duration,
         total_elapsed: Duration,
         context: SegmentContext,
-        output: Result<TranslationOutput, String>,
+        output: Result<TranslationOutput, InferenceFailure>,
     },
     StreamEnded {
         generation: PipelineGeneration,
@@ -186,6 +186,7 @@ enum InferenceEvent {
     Error {
         generation: PipelineGeneration,
         message: String,
+        configuration_required: bool,
     },
 }
 
@@ -1244,6 +1245,7 @@ async fn run_inference_worker(
                 .send(InferenceEvent::Error {
                     generation: current_generation,
                     message: message.to_string(),
+                    configuration_required: false,
                 })
                 .await;
             return;
@@ -1296,8 +1298,7 @@ async fn run_inference_worker(
                         &job.text,
                         &job.source_language,
                         &job.target_language,
-                    )
-                {
+                    ) {
                     (new_src.to_string(), new_tgt.to_string())
                 } else {
                     (job.source_language.clone(), job.target_language.clone())
@@ -1318,6 +1319,7 @@ async fn run_inference_worker(
                             .send(InferenceEvent::Error {
                                 generation: job.generation,
                                 message: message.to_string(),
+                                configuration_required: false,
                             })
                             .await
                             .is_err()
@@ -1327,10 +1329,8 @@ async fn run_inference_worker(
                         continue;
                     }
                 };
-                let segments = translation_segment_pairs_for_final_text_with_lang(
-                    &job.text,
-                    &routed_source,
-                );
+                let segments =
+                    translation_segment_pairs_for_final_text_with_lang(&job.text, &routed_source);
                 let mut recognized = RecognizedOutput {
                     source_text: job.text.clone(),
                     segments,
@@ -1362,6 +1362,7 @@ async fn run_inference_worker(
                             .send(InferenceEvent::Error {
                                 generation: job.generation,
                                 message: message.to_string(),
+                                configuration_required: false,
                             })
                             .await
                             .is_err()
@@ -1607,6 +1608,7 @@ async fn run_inference_worker(
                         .send(InferenceEvent::Error {
                             generation: job.generation,
                             message: message.to_string(),
+                            configuration_required: false,
                         })
                         .await;
                     continue;
@@ -1636,6 +1638,7 @@ async fn run_inference_worker(
                     .send(InferenceEvent::Error {
                         generation: job.generation,
                         message: message.to_string(),
+                        configuration_required: false,
                     })
                     .await
                     .is_err()
@@ -1681,11 +1684,12 @@ async fn run_inference_worker(
                 }
                 continue;
             }
-            Err(message) => {
+            Err(failure) => {
                 if events
                     .send(InferenceEvent::Error {
                         generation: job.generation,
-                        message: message.to_string(),
+                        message: failure.message,
+                        configuration_required: failure.configuration_required,
                     })
                     .await
                     .is_err()
@@ -1818,6 +1822,7 @@ async fn run_inference_worker(
                     .send(InferenceEvent::Error {
                         generation: job.generation,
                         message: message.to_string(),
+                        configuration_required: false,
                     })
                     .await
                     .is_err()
@@ -2074,7 +2079,13 @@ async fn handle_inference_event(
             let output = match output {
                 Ok(output) => output,
                 Err(error) if generation.route_epoch == session.route_epoch() => {
-                    send_scoped_error(writer, generation, error).await?;
+                    send_scoped_error(
+                        writer,
+                        generation,
+                        error.message,
+                        error.configuration_required,
+                    )
+                    .await?;
                     return Ok(());
                 }
                 Err(_) => return Ok(()),
@@ -2112,8 +2123,9 @@ async fn handle_inference_event(
         InferenceEvent::Error {
             generation,
             message,
+            configuration_required,
         } if generation.route_epoch == session.route_epoch() => {
-            send_scoped_error(writer, generation, message).await?
+            send_scoped_error(writer, generation, message, configuration_required).await?
         }
         InferenceEvent::Error { .. } => {}
     }
@@ -2244,18 +2256,30 @@ async fn send_error(
     writer: &mpsc::Sender<OutboundMessage>,
     message: String,
 ) -> Result<(), axum::Error> {
-    send_event(writer, None, ServerEvent::Error(ErrorEvent { message })).await
+    send_event(
+        writer,
+        None,
+        ServerEvent::Error(ErrorEvent {
+            message,
+            configuration_required: false,
+        }),
+    )
+    .await
 }
 
 async fn send_scoped_error(
     writer: &mpsc::Sender<OutboundMessage>,
     generation: PipelineGeneration,
     message: String,
+    configuration_required: bool,
 ) -> Result<(), axum::Error> {
     send_event(
         writer,
         Some(generation),
-        ServerEvent::Error(ErrorEvent { message }),
+        ServerEvent::Error(ErrorEvent {
+            message,
+            configuration_required,
+        }),
     )
     .await
 }

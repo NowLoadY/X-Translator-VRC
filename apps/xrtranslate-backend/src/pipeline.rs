@@ -29,7 +29,7 @@ use xrtranslate_engine::{
 };
 use xrtranslate_inference::{
     AsrTranscript, InferenceError, ReqwestClient, TranslationAdapter, TranslationOptions,
-    is_probable_asr_hallucination, is_probable_translation_context_leak,
+    is_probable_asr_hallucination,
 };
 use xrtranslate_prompt::{PromptExecutionTrace, PromptNodeGraph, TranslationPromptContext};
 use xrtranslate_protocol::AudioSource;
@@ -49,6 +49,28 @@ use crate::language::{
 use crate::model_runtime::{NativeAsrAdapter, NativeAsrOptions, NativeProviderPlan};
 
 const SILERO_VAD_MODEL: &str = "models/silero-vad/src/silero_vad/data/silero_vad.onnx";
+
+#[derive(Debug)]
+pub(crate) struct InferenceFailure {
+    pub(crate) message: String,
+    pub(crate) configuration_required: bool,
+}
+
+impl InferenceFailure {
+    fn request(context: &str, error: InferenceError) -> Self {
+        Self {
+            configuration_required: error.requires_provider_configuration(),
+            message: format!("{context}: {error}"),
+        }
+    }
+
+    fn runtime(message: impl Into<String>) -> Self {
+        Self {
+            message: message.into(),
+            configuration_required: false,
+        }
+    }
+}
 /// Largest binary WebSocket message accepted from a microphone client.
 ///
 /// At 16 kHz mono PCM16 this is eight seconds.  Longer audio must arrive in
@@ -932,7 +954,7 @@ impl NativeInference {
         adaptive_route: &mut AdaptiveLanguageRoute,
         prompt_context: Option<String>,
         echo_candidates: &[String],
-    ) -> Result<Option<RecognizedOutput>, String> {
+    ) -> Result<Option<RecognizedOutput>, InferenceFailure> {
         let pcm = samples
             .iter()
             .flat_map(|sample| sample.to_le_bytes())
@@ -941,9 +963,9 @@ impl NativeInference {
         let max_tokens = asr_max_tokens(samples.len()).min(self.asr_max_output_tokens);
         adaptive_route.configure(source_language, target_language);
         if source_language.eq_ignore_ascii_case("auto") && !adaptive_route.is_configured() {
-            return Err(
-                "Automatic input requires two different supported languages in the pair".into(),
-            );
+            return Err(InferenceFailure::runtime(
+                "Automatic input requires two different supported languages in the pair",
+            ));
         }
         let prompt_context = append_prompt_hint(prompt_context, adaptive_route.prompt_hint());
         let Some(auto_transcript) = self
@@ -1045,7 +1067,7 @@ impl NativeInference {
         prompt_context: Option<String>,
         echo_candidates: &[String],
         max_tokens: u32,
-    ) -> Result<Option<AsrTranscript>, String> {
+    ) -> Result<Option<AsrTranscript>, InferenceFailure> {
         let mut transcript = self
             .asr
             .transcribe_pcm16(
@@ -1057,7 +1079,7 @@ impl NativeInference {
                 },
             )
             .await
-            .map_err(|error| format!("ASR request failed: {error}"))?;
+            .map_err(|error| InferenceFailure::request("ASR request failed", error))?;
 
         if !is_probable_asr_hallucination(
             &transcript.text,
@@ -1081,7 +1103,7 @@ impl NativeInference {
                 },
             )
             .await
-            .map_err(|error| format!("ASR context-free retry failed: {error}"))?;
+            .map_err(|error| InferenceFailure::request("ASR context-free retry failed", error))?;
         if is_probable_asr_hallucination(&transcript.text, sample_count, SAMPLE_RATE_HZ, None, &[])
         {
             warn!("suppressing ASR output after context-free retry failed quality checks");
@@ -1099,7 +1121,7 @@ impl NativeInference {
         target_language: &str,
         prompt_graph: PromptNodeGraph,
         prompt_context: TranslationPromptContext,
-    ) -> Result<TranslationOutput, String> {
+    ) -> Result<TranslationOutput, InferenceFailure> {
         let route = translation_route(source_language, target_language);
         if route.source_code == "zh" && is_traditional_chinese(&route.target_code) {
             let mt_started = Instant::now();
@@ -1122,52 +1144,54 @@ impl NativeInference {
             options.prompt_context = prompt_context;
         }
         let mt_started = Instant::now();
-        let had_prompt_context = options.prompt_context.has_reference_context();
-        let mut translated = match self
-            .translation
-            .translate(&segment.translation_text, options.clone())
-            .await
-        {
-            Ok(translated) => translated,
-            Err(error)
-                if options.prompt_context.has_reference_context()
-                    && is_context_window_error(&error) =>
-            {
-                warn!(
-                    %error,
-                    "translation context exceeded the provider window; retrying current segment without optional context"
-                );
-                options.prompt_context = TranslationPromptContext::default();
-                self.translation
-                    .translate(&segment.translation_text, options.clone())
-                    .await
-                    .map_err(|retry| format!("translation context-free retry failed: {retry}"))?
-            }
-            Err(error) => return Err(format!("translation request failed: {error}")),
-        };
-
-        let rendered_reference = options.prompt_context.reference_text_for_quality_checks();
-        if had_prompt_context
-            && is_probable_translation_context_leak(
-                &segment.translation_text,
-                &translated.text,
-                rendered_reference.as_deref(),
-            )
-        {
-            warn!(
-                "translation output copied optional context; retrying current segment without context"
-            );
-            options.prompt_context = TranslationPromptContext::default();
-            translated = self
+        let mut context_window_retried = false;
+        let mut rejected_output_retried = false;
+        let translated = loop {
+            match self
                 .translation
-                .translate(&segment.translation_text, options)
+                .translate(&segment.translation_text, options.clone())
                 .await
-                .map_err(|retry| format!("translation context-leak retry failed: {retry}"))?;
-        }
-
-        if is_probable_translation_context_leak(&segment.translation_text, &translated.text, None) {
-            return Err("translation output failed context-leak quality checks".into());
-        }
+            {
+                Ok(translated) => break translated,
+                Err(error)
+                    if !context_window_retried
+                        && options.prompt_context.has_reference_context()
+                        && is_context_window_error(&error) =>
+                {
+                    warn!(
+                        %error,
+                        "translation context exceeded the provider window; retrying current segment without optional context"
+                    );
+                    context_window_retried = true;
+                    options.prompt_context = TranslationPromptContext::default();
+                }
+                Err(error) if !rejected_output_retried && error.is_rejected_output() => {
+                    warn!(
+                        %error,
+                        "translation output failed prompt-aware quality checks; regenerating current segment once"
+                    );
+                    rejected_output_retried = true;
+                    options.prompt_context = TranslationPromptContext::default();
+                }
+                Err(error) if error.is_rejected_output() => {
+                    warn!(
+                        %error,
+                        "suppressing translation after regenerated output failed prompt-aware quality checks"
+                    );
+                    return Err(InferenceFailure::runtime(format!(
+                        "translation output remained invalid after one regeneration: {error}"
+                    )));
+                }
+                Err(error) => {
+                    let context = if rejected_output_retried || context_window_retried {
+                        "translation retry failed"
+                    } else {
+                        "translation request failed"
+                    };
+                    return Err(InferenceFailure::request(context, error));
+                }
+            }
+        };
 
         let mut final_translated_text = translated.text;
         if is_traditional_chinese(&route.target_code) {

@@ -119,15 +119,6 @@ impl BackendManager {
         !value.is_empty() && configured_llama_server_path(&self.project_root, value).is_file()
     }
 
-    pub fn uses_managed_llama_server_path(&self) -> bool {
-        let value = self.llama_server_path.trim();
-        !value.is_empty()
-            && is_managed_llama_server_path(
-                &self.project_root,
-                &configured_llama_server_path(&self.project_root, value),
-            )
-    }
-
     /// Stores the local llama.cpp executable where the Rust backend already
     /// expects it: `model_manager.llama_server_path` in `config.json`.
     pub fn save_llama_server_path(&mut self) -> Result<(), String> {

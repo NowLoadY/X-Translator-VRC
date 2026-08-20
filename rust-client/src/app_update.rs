@@ -4,9 +4,10 @@
 //! staging run on a worker thread; replacing the running application is handed
 //! to `xrtranslate-updater` so Windows can swap the executable after exit.
 
+use crate::client_settings::UpdateChannel;
 use crossbeam_channel::{Receiver, TryRecvError, unbounded};
 use reqwest::header::{ACCEPT, ACCEPT_ENCODING, HeaderValue};
-use serde::Deserialize;
+use serde::{Deserialize, de::DeserializeOwned};
 use std::{
     fs, io,
     path::{Path, PathBuf},
@@ -18,6 +19,8 @@ use xrtranslate_download::{DownloadClient, DownloadSpec};
 
 const LATEST_RELEASE_URL: &str =
     "https://api.github.com/repos/NowLoadY/XRTranslate/releases/latest";
+const RELEASES_URL: &str = "https://api.github.com/repos/NowLoadY/XRTranslate/releases?per_page=30";
+const RELEASES_PAGE: &str = "https://github.com/NowLoadY/XRTranslate/releases";
 const LATEST_RELEASE_PAGE: &str = "https://github.com/NowLoadY/XRTranslate/releases/latest";
 const RELEASE_DOWNLOAD_BASE: &str = "https://github.com/NowLoadY/XRTranslate/releases/download/";
 const USER_AGENT: &str = concat!("XRTranslate updater/", env!("CARGO_PKG_VERSION"));
@@ -86,11 +89,20 @@ pub struct AppUpdateManager {
     available: Option<ReleaseAsset>,
     prepared: Option<PreparedUpdate>,
     proxy_url: Option<String>,
+    channel: UpdateChannel,
 }
 
 impl AppUpdateManager {
     pub fn set_proxy_url(&mut self, proxy_url: &str) {
         self.proxy_url = (!proxy_url.trim().is_empty()).then(|| proxy_url.trim().to_owned());
+    }
+    pub fn set_channel(&mut self, channel: UpdateChannel) {
+        if self.channel != channel {
+            self.channel = channel;
+            self.state = AppUpdateState::Idle;
+            self.available = None;
+            self.prepared = None;
+        }
     }
     #[must_use]
     pub fn state(&self) -> &AppUpdateState {
@@ -108,10 +120,11 @@ impl AppUpdateManager {
         }
         let (sender, receiver) = unbounded();
         let proxy_url = self.proxy_url.clone();
+        let channel = self.channel;
         thread::Builder::new()
             .name("app-update-checker".into())
             .spawn(move || {
-                let result = run_async(|| check_latest_release(proxy_url.as_deref()));
+                let result = run_async(|| check_latest_release(proxy_url.as_deref(), channel));
                 let _ = sender.send(Event::Checked(result));
             })
             .map_err(|error| format!("Cannot start update checker: {error}"))?;
@@ -251,6 +264,8 @@ impl ReleaseAsset {
 #[derive(Debug, Deserialize)]
 struct GitHubRelease {
     tag_name: String,
+    #[serde(default)]
+    draft: bool,
     assets: Vec<GitHubAsset>,
 }
 
@@ -263,11 +278,27 @@ struct GitHubAsset {
     digest: Option<String>,
 }
 
-async fn check_latest_release(proxy_url: Option<&str>) -> Result<Option<ReleaseAsset>, String> {
+async fn check_latest_release(
+    proxy_url: Option<&str>,
+    channel: UpdateChannel,
+) -> Result<Option<ReleaseAsset>, String> {
     if !cfg!(any(target_os = "windows", target_os = "linux")) {
         return Err("Updates are available for Windows and Linux builds only.".into());
     }
     let client = http_client(proxy_url)?;
+    if channel == UpdateChannel::Beta {
+        return match fetch_releases(&client).await {
+            Ok(releases) => release_asset_from_catalogue(releases, channel),
+            Err(api_error) => fallback_catalogue_asset(&client, channel).await.map_err(
+                |fallback_error| {
+                    format!(
+                        "Cannot check the beta update channel: GitHub API failed ({api_error}); \
+                         release page fallback failed ({fallback_error})."
+                    )
+                },
+            ),
+        };
+    }
     let (latest_tag, latest_version) = match discover_latest_version(&client).await {
         Ok(release) => release,
         Err(page_error) => {
@@ -298,6 +329,84 @@ async fn check_latest_release(proxy_url: Option<&str>) -> Result<Option<ReleaseA
     }
 }
 
+async fn fetch_releases(client: &reqwest::Client) -> Result<Vec<GitHubRelease>, String> {
+    fetch_github_json(client, RELEASES_URL).await
+}
+
+fn release_asset_from_catalogue(
+    releases: Vec<GitHubRelease>,
+    channel: UpdateChannel,
+) -> Result<Option<ReleaseAsset>, String> {
+    let current = parse_version(crate::version::APP_VERSION)?;
+    let selected = releases
+        .into_iter()
+        .filter(|release| !release.draft)
+        .filter_map(|release| {
+            let version = parse_version(&release.tag_name).ok()?;
+            (version > current && (channel == UpdateChannel::Beta || version.is_stable()))
+                .then_some((version, release))
+        })
+        .max_by(|(left, _), (right, _)| left.cmp(right));
+    let Some((version, release)) = selected else {
+        return Ok(None);
+    };
+    let asset = select_release_asset(&release.assets)
+        .ok_or_else(|| format!("No update package is available for {}.", platform_label()))?;
+    Ok(Some(ReleaseAsset {
+        version: version.to_string(),
+        name: asset.name.clone(),
+        download_url: asset.browser_download_url.clone(),
+        size: asset.size,
+        sha256: asset.digest.as_deref().and_then(parse_sha256_digest),
+    }))
+}
+
+async fn fallback_catalogue_asset(
+    client: &reqwest::Client,
+    channel: UpdateChannel,
+) -> Result<Option<ReleaseAsset>, String> {
+    let response = client
+        .get(RELEASES_PAGE)
+        .send()
+        .await
+        .map_err(|error| error.to_string())?
+        .error_for_status()
+        .map_err(|error| error.to_string())?;
+    let tags = release_tags_from_html(&response.text().await.map_err(|error| error.to_string())?);
+    let current = parse_version(crate::version::APP_VERSION)?;
+    let selected = tags
+        .into_iter()
+        .filter_map(|tag| parse_version(&tag).ok().map(|version| (version, tag)))
+        .filter(|(version, _)| {
+            version > &current && (channel == UpdateChannel::Beta || version.is_stable())
+        })
+        .max_by(|(left, _), (right, _)| left.cmp(right));
+    match selected {
+        Some((version, tag)) => fallback_release_asset(client, &tag, &version.to_string())
+            .await
+            .map(Some),
+        None => Ok(None),
+    }
+}
+
+fn release_tags_from_html(html: &str) -> Vec<String> {
+    const MARKER: &str = "/releases/tag/";
+    let mut tags = Vec::new();
+    let mut remaining = html;
+    while let Some(index) = remaining.find(MARKER) {
+        remaining = &remaining[index + MARKER.len()..];
+        let end = remaining
+            .find(['\"', '\'', '<', '?', '#'])
+            .unwrap_or(remaining.len());
+        let tag = &remaining[..end];
+        if !tag.is_empty() && !tags.iter().any(|existing| existing == tag) {
+            tags.push(tag.to_owned());
+        }
+        remaining = &remaining[end..];
+    }
+    tags
+}
+
 async fn discover_latest_version(client: &reqwest::Client) -> Result<(String, String), String> {
     let response = client
         .get(LATEST_RELEASE_PAGE)
@@ -314,8 +423,15 @@ async fn discover_latest_version(client: &reqwest::Client) -> Result<(String, St
 }
 
 async fn fetch_latest_release(client: &reqwest::Client) -> Result<GitHubRelease, String> {
+    fetch_github_json(client, LATEST_RELEASE_URL).await
+}
+
+async fn fetch_github_json<T: DeserializeOwned>(
+    client: &reqwest::Client,
+    url: &str,
+) -> Result<T, String> {
     let response = client
-        .get(LATEST_RELEASE_URL)
+        .get(url)
         .header(ACCEPT, "application/vnd.github+json")
         .header(
             "X-GitHub-Api-Version",
@@ -324,12 +440,32 @@ async fn fetch_latest_release(client: &reqwest::Client) -> Result<GitHubRelease,
         .send()
         .await
         .map_err(|error| error.to_string())?;
+    if !response.status().is_success() {
+        return Err(github_status_error(&response));
+    }
     response
-        .error_for_status()
-        .map_err(|error| error.to_string())?
-        .json::<GitHubRelease>()
+        .json::<T>()
         .await
         .map_err(|error| error.to_string())
+}
+
+fn github_status_error(response: &reqwest::Response) -> String {
+    let status = response.status();
+    let remaining = response
+        .headers()
+        .get("x-ratelimit-remaining")
+        .and_then(|value| value.to_str().ok());
+    let reset = response
+        .headers()
+        .get("x-ratelimit-reset")
+        .and_then(|value| value.to_str().ok());
+    if status == reqwest::StatusCode::FORBIDDEN && remaining == Some("0") {
+        return reset.map_or_else(
+            || "GitHub API rate limit exceeded".into(),
+            |reset| format!("GitHub API rate limit exceeded; reset timestamp: {reset}"),
+        );
+    }
+    format!("HTTP {status}")
 }
 
 fn release_asset_if_newer(release: GitHubRelease) -> Result<Option<ReleaseAsset>, String> {
@@ -608,16 +744,67 @@ fn normalize_version(tag: &str) -> Result<String, String> {
 }
 
 fn version_is_newer(latest: &str, current: &str) -> bool {
-    let latest = version_parts(latest);
-    let current = version_parts(current);
-    latest > current
+    match (parse_version(latest), parse_version(current)) {
+        (Ok(latest), Ok(current)) => latest > current,
+        _ => false,
+    }
 }
 
-fn version_parts(value: &str) -> Vec<u64> {
-    value
-        .split(['.', '-', '+'])
-        .map(|part| part.parse::<u64>().unwrap_or(0))
-        .collect()
+#[derive(Clone, Debug, Eq, Ord, PartialEq, PartialOrd)]
+struct ParsedVersion {
+    core: [u64; 3],
+    beta_rank: u64,
+}
+
+impl ParsedVersion {
+    fn is_stable(&self) -> bool {
+        self.beta_rank == u64::MAX
+    }
+}
+
+impl std::fmt::Display for ParsedVersion {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(
+            formatter,
+            "{}.{}.{}",
+            self.core[0], self.core[1], self.core[2]
+        )?;
+        if !self.is_stable() {
+            write!(formatter, "-beta.{}", self.beta_rank)?;
+        }
+        Ok(())
+    }
+}
+
+fn parse_version(value: &str) -> Result<ParsedVersion, String> {
+    let normalized = value.trim().trim_start_matches(['v', 'V']);
+    let normalized = normalized
+        .split_once('+')
+        .map_or(normalized, |parts| parts.0);
+    let (core, suffix) = normalized.split_once('-').unwrap_or((normalized, ""));
+    let core = core
+        .split('.')
+        .map(str::parse::<u64>)
+        .collect::<Result<Vec<_>, _>>()
+        .map_err(|error| format!("Invalid release version {value:?}: {error}"))?;
+    let [major, minor, patch] = core.as_slice() else {
+        return Err(format!(
+            "Invalid release version {value:?}: expected major.minor.patch"
+        ));
+    };
+    let beta_rank = if suffix.is_empty() {
+        u64::MAX
+    } else {
+        suffix
+            .strip_prefix("beta.")
+            .ok_or_else(|| format!("Unsupported release version {value:?}"))?
+            .parse::<u64>()
+            .map_err(|error| format!("Invalid release version {value:?}: {error}"))?
+    };
+    Ok(ParsedVersion {
+        core: [*major, *minor, *patch],
+        beta_rank,
+    })
 }
 
 fn parse_sha256_digest(value: &str) -> Option<String> {
@@ -742,6 +929,51 @@ mod tests {
         assert!(version_is_newer("0.10.0", "0.2.9"));
         assert!(!version_is_newer("0.2.0", "0.2.0"));
         assert!(!version_is_newer("0.1.9", "0.2.0"));
+        assert!(version_is_newer("0.2.7-beta.2", "0.2.7-beta.1"));
+        assert!(version_is_newer("0.2.7", "0.2.7-beta.3"));
+        assert!(!version_is_newer("0.2.7-beta.1", "0.2.7"));
+    }
+
+    fn release(tag: &str) -> GitHubRelease {
+        GitHubRelease {
+            tag_name: tag.into(),
+            draft: false,
+            assets: vec![GitHubAsset {
+                name: standard_release_asset_name(tag.trim_start_matches('v')),
+                browser_download_url: format!("https://example.invalid/{tag}.zip"),
+                size: 1,
+                digest: None,
+            }],
+        }
+    }
+
+    #[test]
+    fn beta_catalogue_prefers_stable_over_prerelease_of_same_version() {
+        let selected = release_asset_from_catalogue(
+            vec![release("v0.2.8-beta.3"), release("v0.2.8")],
+            UpdateChannel::Beta,
+        )
+        .unwrap()
+        .unwrap();
+        assert_eq!(selected.version, "0.2.8");
+    }
+
+    #[test]
+    fn stable_catalogue_ignores_prereleases() {
+        let selected =
+            release_asset_from_catalogue(vec![release("v99.0.0-beta.1")], UpdateChannel::Stable)
+                .unwrap();
+        assert!(selected.is_none());
+    }
+
+    #[test]
+    fn extracts_and_deduplicates_release_tags_from_html() {
+        let html = r#"
+            <a href="/NowLoadY/XRTranslate/releases/tag/v0.2.8-beta.2">beta</a>
+            <a href="/NowLoadY/XRTranslate/releases/tag/v0.2.8">stable</a>
+            <a href="/NowLoadY/XRTranslate/releases/tag/v0.2.8">duplicate</a>
+        "#;
+        assert_eq!(release_tags_from_html(html), ["v0.2.8-beta.2", "v0.2.8"]);
     }
 
     #[test]

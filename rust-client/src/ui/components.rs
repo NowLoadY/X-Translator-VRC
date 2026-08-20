@@ -601,9 +601,11 @@ pub fn searchable_combobox_with_options<T: PartialEq + Clone>(
             ui.style_mut().visuals.widgets.inactive.bg_stroke = egui::Stroke::NONE;
             ui.style_mut().visuals.widgets.inactive.bg_fill = egui::Color32::TRANSPARENT;
             ui.style_mut().visuals.widgets.hovered.bg_stroke = egui::Stroke::NONE;
-            ui.style_mut().visuals.widgets.hovered.bg_fill = crate::ui::theme::surface_control_hover();
+            ui.style_mut().visuals.widgets.hovered.bg_fill =
+                crate::ui::theme::surface_control_hover();
             ui.style_mut().visuals.widgets.active.bg_stroke = egui::Stroke::NONE;
-            ui.style_mut().visuals.widgets.active.bg_fill = crate::ui::theme::surface_control_active();
+            ui.style_mut().visuals.widgets.active.bg_fill =
+                crate::ui::theme::surface_control_active();
             ui.style_mut().visuals.widgets.open.bg_stroke = egui::Stroke::NONE;
             ui.style_mut().visuals.widgets.open.bg_fill = egui::Color32::TRANSPARENT;
             ui.spacing_mut().button_padding = egui::vec2(4.0, 2.0);
@@ -1185,6 +1187,23 @@ pub fn file_path_input(
     changed
 }
 
+pub fn singleline_input(
+    ui: &mut Ui,
+    value: &mut String,
+    hint: &str,
+    width: f32,
+    secret: bool,
+) -> egui::Response {
+    let mut edit = egui::TextEdit::singleline(value)
+        .hint_text(hint)
+        .desired_width(width)
+        .margin(egui::vec2(10.0, 8.0));
+    if secret {
+        edit = edit.password(true);
+    }
+    ui.add(edit)
+}
+
 pub fn status_badge(ui: &mut Ui, status: &str, is_active: bool, is_error: bool) {
     let (fg_color, dot) = if is_error {
         (Color32::from_rgb(220, 38, 38), "● ")
@@ -1221,7 +1240,7 @@ pub fn sub_sidebar<T: Copy + PartialEq>(
     items: &[SubNavItem<T>],
     language: crate::i18n::UiLanguage,
 ) {
-    let width = 180.0;
+    let width = 150.0;
     let gap = 5.0;
     let item_height = 42.0_f32;
 

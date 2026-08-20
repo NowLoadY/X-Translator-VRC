@@ -158,6 +158,7 @@ struct XRTranslateApp {
     last_error: Option<String>,
     server_url: String,
     download_proxy_url: String,
+    update_channel: client_settings::UpdateChannel,
     source_lang: String,
     target_lang: String,
     denoise_enabled: bool,
@@ -218,6 +219,7 @@ struct SharedSessionState {
     is_translating: bool,
     pending_route_change: Option<(String, String)>,
     latest_prompt_trace: Option<PromptExecutionTrace>,
+    provider_configuration_required: bool,
 }
 
 fn publish_host_output(subscribers: &[Box<dyn HostOutputSubscriber>], event: HostOutputEvent<'_>) {
@@ -233,8 +235,10 @@ impl Default for XRTranslateApp {
         let loopback_devices = audio_system.available_loopback_devices();
         let (event_tx, event_rx) = unbounded();
         let backend_manager = backend::BackendManager::load();
-        let managed_runtime_missing = !backend_manager.llama_server_path_is_valid()
-            && backend_manager.uses_managed_llama_server_path();
+        let service_config = service_config::ServiceConfigEditor::load();
+        let runtime_requirements = service_config.runtime_requirements();
+        let managed_runtime_missing =
+            runtime_requirements.llama_cpp && !backend_manager.llama_server_path_is_valid();
         let mut settings = ClientSettings::load(&backend_manager.project_root());
         settings.sanitize_devices(&devices, &loopback_devices);
 
@@ -250,6 +254,7 @@ impl Default for XRTranslateApp {
         runtime_installer.set_proxy_url(&settings.download_proxy_url);
         let mut app_update_manager = app_update::AppUpdateManager::default();
         app_update_manager.set_proxy_url(&settings.download_proxy_url);
+        app_update_manager.set_channel(settings.update_channel);
 
         let selected_input_config = match settings.capture_source {
             CaptureSource::Microphone => {
@@ -612,8 +617,12 @@ impl Default for XRTranslateApp {
                             state.pending_route_change = Some((source_lang, target_lang));
                         }
                         SessionEvent::TtsAudio(_audio) => {}
-                        SessionEvent::BackendError(error) => {
-                            state.last_error = Some(error);
+                        SessionEvent::BackendError {
+                            message,
+                            configuration_required,
+                        } => {
+                            state.last_error = Some(message);
+                            state.provider_configuration_required |= configuration_required;
                         }
                         SessionEvent::Error(error) => {
                             publish_host_output(&host_output_subscribers, HostOutputEvent::Clear);
@@ -668,7 +677,6 @@ impl Default for XRTranslateApp {
             })
             .expect("failed to spawn session-event-pump thread");
 
-        let service_config = service_config::ServiceConfigEditor::load();
         let prompt_provider = service_config.translation_prompt_target();
         let mut app = Self {
             audio_system,
@@ -698,6 +706,7 @@ impl Default for XRTranslateApp {
             last_error: None,
             server_url: settings.server_url,
             download_proxy_url: settings.download_proxy_url,
+            update_channel: settings.update_channel,
             source_lang: settings.source_lang,
             target_lang: settings.target_lang,
             denoise_enabled: settings.denoise_enabled,
@@ -723,13 +732,7 @@ impl Default for XRTranslateApp {
             ),
             modal_dialog: ui::modal::ModalDialog::default(),
             first_run: settings.first_run || managed_runtime_missing,
-            onboarding_page: if settings.first_run {
-                0
-            } else if managed_runtime_missing {
-                1
-            } else {
-                0
-            },
+            onboarding_page: if settings.first_run { 0 } else { 2 },
             ui_language: settings.ui_language,
             navigation: NavigationState {
                 collapsed: settings.sidebar_collapsed,
@@ -1285,6 +1288,7 @@ impl XRTranslateApp {
             first_run: self.first_run,
             server_url: self.server_url.clone(),
             download_proxy_url: self.download_proxy_url.clone(),
+            update_channel: self.update_channel,
             osc_settings: self.osc_plugin.draft().clone(),
             plugin_preferences: self.plugin_preferences.clone(),
             active_page: self.navigation.page,
@@ -1300,6 +1304,21 @@ impl XRTranslateApp {
     }
 
     pub fn finish_onboarding(&mut self) {
+        if self.service_config.has_unsaved_changes()
+            && self.service_config.save_onboarding_configuration().is_err()
+        {
+            self.onboarding_page = 1;
+            return;
+        }
+        let requirements = self.service_config.runtime_requirements();
+        if requirements.missing_api_key {
+            self.onboarding_page = 1;
+            return;
+        }
+        if requirements.llama_cpp && !self.backend_manager.llama_server_path_is_valid() {
+            self.onboarding_page = 2;
+            return;
+        }
         self.first_run = false;
         self.save_settings();
     }
@@ -1328,6 +1347,13 @@ impl XRTranslateApp {
         self.app_update_manager
             .set_proxy_url(&self.download_proxy_url);
         self.save_settings();
+    }
+
+    pub fn set_update_channel(&mut self, channel: client_settings::UpdateChannel) {
+        self.update_channel = channel;
+        self.app_update_manager.set_channel(channel);
+        self.save_settings();
+        self.check_for_updates();
     }
 
     fn show_available_update(&mut self) {
@@ -1519,6 +1545,16 @@ impl XRTranslateApp {
         }
         self.backend_start_deadline = None;
         self.backend_manager.shutdown();
+        self.model_task_manager.invalidate_discovery();
+        let requirements = self.service_config.runtime_requirements();
+        if requirements.llama_cpp && !self.backend_manager.llama_server_path_is_valid() {
+            if !self.first_run {
+                self.first_run = true;
+                self.onboarding_page = 2;
+            }
+            self.set_connection_status("Ready");
+            return;
+        }
         if resume_translation {
             self.start(ctx);
         } else {
@@ -2293,6 +2329,7 @@ impl XRTranslateApp {
         }
 
         // Copy latest shared state into self for local rendering when main UI is visible
+        let mut open_provider_configuration = false;
         if let Ok(mut state) = self.shared_session_state.lock() {
             self.connection_status = state.connection_status.clone();
             self.partial_text = state.partial_text.clone();
@@ -2324,6 +2361,13 @@ impl XRTranslateApp {
             if let Some(err) = &state.last_error {
                 self.last_error = Some(err.clone());
             }
+            open_provider_configuration =
+                std::mem::take(&mut state.provider_configuration_required);
+        }
+        if open_provider_configuration {
+            self.stop();
+            self.first_run = true;
+            self.onboarding_page = 1;
         }
     }
 }
@@ -2561,6 +2605,7 @@ impl eframe::App for XRTranslateApp {
                                 &snapshot,
                                 &mut self.prompt_studio,
                                 ui,
+                                self.ui_language,
                             );
                             self.apply_prompt_studio_actions(actions);
                         },

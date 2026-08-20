@@ -34,6 +34,15 @@ struct ServiceCategory {
     show_all: bool,
 }
 
+#[derive(Clone)]
+pub(crate) struct OnboardingProviderState {
+    pub selected: String,
+    pub remote: bool,
+    pub choices: Vec<(String, bool)>,
+    pub model: String,
+    pub api_key: String,
+}
+
 /// Editable view of the ASR and translation provider portions of `config.json`.
 /// The original JSON document is retained so unrelated project settings are preserved.
 pub struct ServiceConfigEditor {
@@ -96,6 +105,112 @@ impl ServiceConfigEditor {
             .map(|field| field.value.as_str())
             .unwrap_or("local");
         prompt_target_for_translation_provider(&category.selected_provider, transport)
+    }
+
+    pub fn runtime_requirements(&self) -> xrtranslate_config::RuntimeRequirements {
+        let mut document = self.document.clone();
+        let _ = Self::sync_categories(&mut document, &self.categories);
+        xrtranslate_config::AppConfig::from_value(document)
+            .map(|config| config.runtime_requirements())
+            .unwrap_or_default()
+    }
+
+    pub(crate) const fn has_unsaved_changes(&self) -> bool {
+        self.dirty
+    }
+
+    pub(crate) fn onboarding_provider_state(
+        &self,
+        category_key: &str,
+    ) -> Option<OnboardingProviderState> {
+        let category = self
+            .categories
+            .iter()
+            .find(|category| category.key == category_key)?;
+        let selected = category
+            .providers
+            .iter()
+            .find(|provider| provider.name == category.selected_provider)?;
+        let field = |name: &str| {
+            selected
+                .fields
+                .iter()
+                .find(|field| field.name == name)
+                .map(|field| field.value.clone())
+                .unwrap_or_default()
+        };
+        Some(OnboardingProviderState {
+            selected: selected.name.clone(),
+            remote: provider_is_remote(selected),
+            choices: category
+                .providers
+                .iter()
+                .map(|provider| (provider.name.clone(), provider_is_remote(provider)))
+                .collect(),
+            model: field("model"),
+            api_key: field("api_key"),
+        })
+    }
+
+    pub(crate) fn select_onboarding_provider(&mut self, category_key: &str, provider_name: &str) {
+        if let Some(category) = self
+            .categories
+            .iter_mut()
+            .find(|category| category.key == category_key)
+            && category
+                .providers
+                .iter()
+                .any(|provider| provider.name == provider_name)
+        {
+            category.selected_provider = provider_name.to_owned();
+            self.dirty = true;
+            self.message = None;
+        }
+    }
+
+    pub(crate) fn set_onboarding_remote_fields(
+        &mut self,
+        category_key: &str,
+        model: String,
+        api_key: String,
+    ) {
+        let Some(category) = self
+            .categories
+            .iter_mut()
+            .find(|category| category.key == category_key)
+        else {
+            return;
+        };
+        let Some(provider) = category
+            .providers
+            .iter_mut()
+            .find(|provider| provider.name == category.selected_provider)
+        else {
+            return;
+        };
+        for (name, value) in [("model", model), ("api_key", api_key)] {
+            if let Some(field) = provider.fields.iter_mut().find(|field| field.name == name) {
+                field.value = value;
+            }
+        }
+        self.dirty = true;
+        self.message = None;
+    }
+
+    pub(crate) fn save_onboarding_configuration(&mut self) -> Result<(), String> {
+        let result = self.save();
+        self.message = result.as_ref().err().and_then(|error| {
+            if error.contains(".api_key is required for remote API providers") {
+                None
+            } else {
+                Some(error.clone())
+            }
+        });
+        result
+    }
+
+    pub(crate) fn onboarding_message(&self) -> Option<&str> {
+        self.message.as_deref()
     }
 
     fn make_category(document: &Value, key: &'static str, title: &'static str) -> ServiceCategory {
@@ -312,7 +427,11 @@ impl ServiceConfigEditor {
                                         .fields
                                         .iter()
                                         .filter(|field| {
-                                            provider_field_is_visible(field, model_asset.is_some())
+                                            provider_field_is_visible(
+                                                field,
+                                                &provider_name,
+                                                model_asset.is_some(),
+                                            )
                                         })
                                         .count();
                                     if fields_len == 0 {
@@ -336,6 +455,7 @@ impl ServiceConfigEditor {
                                                 {
                                                     if !provider_field_is_visible(
                                                         field,
+                                                        &provider_name,
                                                         model_asset.is_some(),
                                                     ) {
                                                         continue;
@@ -413,7 +533,13 @@ impl ServiceConfigEditor {
                         let fields_len = self.categories[cat_idx].providers[idx]
                             .fields
                             .iter()
-                            .filter(|field| provider_field_is_visible(field, model_asset.is_some()))
+                            .filter(|field| {
+                                provider_field_is_visible(
+                                    field,
+                                    &provider_name,
+                                    model_asset.is_some(),
+                                )
+                            })
                             .count();
                         if fields_len == 0 {
                             ui.label(
@@ -428,8 +554,11 @@ impl ServiceConfigEditor {
                                 .show(ui, |ui| {
                                     for field in &mut self.categories[cat_idx].providers[idx].fields
                                     {
-                                        if !provider_field_is_visible(field, model_asset.is_some())
-                                        {
+                                        if !provider_field_is_visible(
+                                            field,
+                                            &provider_name,
+                                            model_asset.is_some(),
+                                        ) {
                                             continue;
                                         }
                                         let label = provider_field_label(language, &field.name);
@@ -509,11 +638,27 @@ impl ServiceConfigEditor {
     }
 
     fn save(&mut self) -> Result<(), String> {
-        let root = self
-            .document
+        Self::sync_categories(&mut self.document, &self.categories)?;
+        let parsed = xrtranslate_config::AppConfig::from_value(self.document.clone())
+            .map_err(|error| format!("Invalid configuration: {error}"))?;
+        let route = parsed
+            .native_model_route()
+            .map_err(|error| format!("Invalid model settings: {error}"))?;
+        validate_native_provider_asset(&route.asr, xrtranslate_assets::ModelCapability::Asr)?;
+        validate_native_provider_asset(
+            &route.translation,
+            xrtranslate_assets::ModelCapability::Translation,
+        )?;
+        xrtranslate_config::save_user_config_document(&self.path, &project_root(), &self.document)?;
+        self.dirty = false;
+        Ok(())
+    }
+
+    fn sync_categories(document: &mut Value, categories: &[ServiceCategory]) -> Result<(), String> {
+        let root = document
             .as_object_mut()
             .ok_or("config.json root must be an object")?;
-        for category in &self.categories {
+        for category in categories {
             let section = root
                 .get_mut(category.key)
                 .and_then(Value::as_object_mut)
@@ -536,18 +681,6 @@ impl ServiceConfigEditor {
                 }
             }
         }
-        let parsed = xrtranslate_config::AppConfig::from_value(self.document.clone())
-            .map_err(|error| format!("Invalid configuration: {error}"))?;
-        let route = parsed
-            .native_model_route()
-            .map_err(|error| format!("Invalid model settings: {error}"))?;
-        validate_native_provider_asset(&route.asr, xrtranslate_assets::ModelCapability::Asr)?;
-        validate_native_provider_asset(
-            &route.translation,
-            xrtranslate_assets::ModelCapability::Translation,
-        )?;
-        xrtranslate_config::save_user_config_document(&self.path, &project_root(), &self.document)?;
-        self.dirty = false;
         Ok(())
     }
 
@@ -577,7 +710,7 @@ impl ServiceConfigEditor {
                 "transport": "openai",
                 "url": "https://api.openai.com/v1/chat/completions",
                 "api_key": "",
-                "model": if category_key == "asr" { "gpt-4o-audio-preview" } else { "gpt-4o-mini" },
+                "model": if category_key == "asr" { "gpt-4o-transcribe" } else { "gpt-4o-mini" },
                 "context_window_tokens": 8192,
                 "max_tokens": if category_key == "asr" { 256 } else { 512 },
                 "parallel_slots": 2,
@@ -912,13 +1045,14 @@ fn render_field_input(
                     });
                 changed
             } else {
-                let mut edit = egui::TextEdit::singleline(&mut field.value)
-                    .desired_width(width.min(360.0))
-                    .hint_text(value_hint(field.kind));
-                if field.name == "api_key" {
-                    edit = edit.password(true);
-                }
-                ui.add(edit).changed()
+                crate::ui::components::singleline_input(
+                    ui,
+                    &mut field.value,
+                    value_hint(field.kind),
+                    width.min(360.0),
+                    field.name == "api_key",
+                )
+                .changed()
             }
         }
     }
@@ -931,7 +1065,10 @@ fn provider_field_label(language: crate::i18n::UiLanguage, name: &str) -> String
     )
 }
 
-fn provider_field_is_visible(field: &ConfigField, native_model: bool) -> bool {
+fn provider_field_is_visible(field: &ConfigField, provider_name: &str, native_model: bool) -> bool {
+    if provider_name == "openai" && matches!(field.name.as_str(), "transport" | "url") {
+        return false;
+    }
     provider_field_descriptor(&field.name).map_or(!native_model, |descriptor| {
         descriptor.is_visible(native_model)
     })
@@ -1025,7 +1162,11 @@ fn parse_value(value: &str, kind: JsonFieldKind) -> Result<Value, String> {
 
 #[cfg(test)]
 mod tests {
-    use super::{prompt_target_for_translation_provider, validate_native_provider_asset};
+    use super::{
+        ConfigField, JsonFieldKind, ServiceConfigEditor, prompt_target_for_translation_provider,
+        provider_field_is_visible, validate_native_provider_asset,
+    };
+    use serde_json::Value;
     use xrtranslate_assets::ModelCapability;
     use xrtranslate_config::{LocalModelRuntimeConfig, NativeProviderConfig};
     use xrtranslate_prompt::PromptProviderTarget;
@@ -1079,5 +1220,65 @@ mod tests {
             prompt_target_for_translation_provider("openai-custom", "openai"),
             PromptProviderTarget::OpenAiCompatible
         );
+    }
+
+    #[test]
+    fn official_openai_hides_fixed_connection_fields() {
+        let field = |name: &str| ConfigField {
+            name: name.into(),
+            value: String::new(),
+            kind: JsonFieldKind::String,
+        };
+
+        assert!(!provider_field_is_visible(&field("url"), "openai", false));
+        assert!(!provider_field_is_visible(
+            &field("transport"),
+            "openai",
+            false
+        ));
+        assert!(provider_field_is_visible(
+            &field("api_key"),
+            "openai",
+            false
+        ));
+        assert!(provider_field_is_visible(
+            &field("url"),
+            "openai-compatible",
+            false
+        ));
+    }
+
+    #[test]
+    fn onboarding_provider_drafts_drive_shared_runtime_requirements() {
+        let document: Value = serde_json::from_str(include_str!("../../config.json")).unwrap();
+        let categories = vec![
+            ServiceConfigEditor::make_category(&document, "asr", "ASR / Speech Recognition"),
+            ServiceConfigEditor::make_category(&document, "translation", "Translation"),
+        ];
+        let mut editor = ServiceConfigEditor {
+            path: "config.json".into(),
+            document,
+            categories,
+            dirty: false,
+            message: None,
+        };
+
+        editor.select_onboarding_provider("asr", "openai");
+        assert!(editor.save_onboarding_configuration().is_err());
+        assert_eq!(editor.onboarding_message(), None);
+        editor.set_onboarding_remote_fields("asr", "gpt-4o-transcribe".into(), "asr-key".into());
+        assert_eq!(editor.onboarding_message(), None);
+        editor.select_onboarding_provider("translation", "openai");
+        editor.set_onboarding_remote_fields(
+            "translation",
+            "gpt-4o-mini".into(),
+            "translation-key".into(),
+        );
+
+        assert_eq!(
+            editor.runtime_requirements(),
+            xrtranslate_config::RuntimeRequirements::default()
+        );
+        assert!(editor.has_unsaved_changes());
     }
 }

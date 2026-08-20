@@ -16,8 +16,8 @@ use xrtranslate_config::{
     AppConfig, LocalModelRuntimeConfig, NativeModelRouteConfig, RuntimeLayout,
 };
 use xrtranslate_inference::{
-    AsrTranscript, InferenceError, Qwen3AsrAdapter, Qwen3AsrOptions, ReqwestClient,
-    TranslationAdapter, TranslationProvider,
+    AsrTranscript, InferenceError, OpenAiAsrAdapter, OpenAiAsrOptions, Qwen3AsrAdapter,
+    Qwen3AsrOptions, ReqwestClient, TranslationAdapter, TranslationProvider,
 };
 use xrtranslate_supervisor::{LlamaServerEndpoint, LlamaServerSpec};
 
@@ -46,6 +46,7 @@ pub(crate) struct NativeAsrOptions {
 #[derive(Clone, Debug)]
 pub(crate) enum NativeAsrAdapter {
     Qwen3(Qwen3AsrAdapter<ReqwestClient>),
+    OpenAi(OpenAiAsrAdapter<ReqwestClient>),
 }
 
 impl NativeAsrAdapter {
@@ -60,6 +61,18 @@ impl NativeAsrAdapter {
                     .transcribe_pcm16(
                         pcm,
                         Qwen3AsrOptions {
+                            language: options.language,
+                            prompt_context: options.prompt_context,
+                            max_tokens: options.max_tokens,
+                        },
+                    )
+                    .await
+            }
+            Self::OpenAi(adapter) => {
+                adapter
+                    .transcribe_pcm16(
+                        pcm,
+                        OpenAiAsrOptions {
                             language: options.language,
                             prompt_context: options.prompt_context,
                             max_tokens: options.max_tokens,
@@ -222,19 +235,13 @@ impl NativeProviderPlan {
                 Qwen3AsrAdapter::new(http, self.asr_url(), self.asr_model_alias())
                     .map(NativeAsrAdapter::Qwen3)
             }
-            AsrProfile::OpenAiAudio => {
-                let adapter = if let Some(token) = self.route.asr.api_key.as_deref() {
-                    Qwen3AsrAdapter::with_bearer_token(
-                        http,
-                        self.asr_url(),
-                        self.asr_model_alias(),
-                        token,
-                    )
-                } else {
-                    Qwen3AsrAdapter::new(http, self.asr_url(), self.asr_model_alias())
-                }?;
-                Ok(NativeAsrAdapter::Qwen3(adapter))
-            }
+            AsrProfile::OpenAiAudio => OpenAiAsrAdapter::with_bearer_token(
+                http,
+                self.asr_url(),
+                self.asr_model_alias(),
+                self.route.asr.api_key.as_deref().unwrap_or_default(),
+            )
+            .map(NativeAsrAdapter::OpenAi),
         }
     }
 
@@ -540,8 +547,10 @@ mod tests {
             serde_json::from_str(include_str!("../../../config.json")).unwrap();
         document["asr"]["provider"] = serde_json::Value::from("openai-custom");
         document["translation"]["provider"] = serde_json::Value::from("openai-custom");
-        let asr_remote = document["asr"]["providers"]["openai"].clone();
-        let translation_remote = document["translation"]["providers"]["openai"].clone();
+        let mut asr_remote = document["asr"]["providers"]["openai"].clone();
+        let mut translation_remote = document["translation"]["providers"]["openai"].clone();
+        asr_remote["api_key"] = serde_json::Value::from("test-key");
+        translation_remote["api_key"] = serde_json::Value::from("test-key");
         document["asr"]["providers"]["openai-custom"] = asr_remote;
         document["translation"]["providers"]["openai-custom"] = translation_remote;
         let config = AppConfig::from_value(document).unwrap();
@@ -549,7 +558,7 @@ mod tests {
 
         assert!(!plan.uses_local_runtime());
         assert!(plan.check_assets().is_ok());
-        assert_eq!(plan.asr_model_alias(), "gpt-4o-audio-preview");
+        assert_eq!(plan.asr_model_alias(), "gpt-4o-transcribe");
         assert_eq!(plan.translation_model_alias(), "gpt-4o-mini");
         assert!(plan.managed_server_specs(8101, 8102).unwrap().0.is_none());
         assert!(plan.managed_server_specs(8101, 8102).unwrap().1.is_none());

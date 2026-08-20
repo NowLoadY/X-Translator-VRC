@@ -241,13 +241,14 @@ pub fn render(
     snapshot: &PromptStudioSnapshot,
     controller: &mut PromptStudioController,
     ui: &mut egui::Ui,
+    language: crate::i18n::UiLanguage,
 ) -> Vec<PromptStudioAction> {
     ui.scope(|ui| {
         style::apply(ui);
         let mut actions = Vec::new();
-        render_header(snapshot, controller, ui, &mut actions);
+        render_header(snapshot, controller, ui, language, &mut actions);
         ui.add_space(6.0);
-        canvas::render_graph_editor(snapshot, controller, ui, &mut actions);
+        canvas::render_graph_editor(snapshot, controller, ui, language, &mut actions);
         actions
     })
     .inner
@@ -257,6 +258,7 @@ fn render_header(
     snapshot: &PromptStudioSnapshot,
     controller: &mut PromptStudioController,
     ui: &mut egui::Ui,
+    language: crate::i18n::UiLanguage,
     actions: &mut Vec<PromptStudioAction>,
 ) {
     Frame::new()
@@ -267,27 +269,28 @@ fn render_header(
         .show(ui, |ui| {
             ui.horizontal(|ui| {
                 ui.label(
-                    RichText::new("PROMPT STUDIO")
+                    RichText::new(crate::i18n::tr(language, "PROMPT STUDIO"))
                         .font(egui::FontId::monospace(10.0))
                         .color(style::INK)
                         .strong(),
                 );
                 ui.separator();
                 ui.label(
-                    RichText::new("TRANSLATION GRAPH")
+                    RichText::new(crate::i18n::tr(language, "TRANSLATION GRAPH"))
                         .font(egui::FontId::monospace(10.0))
                         .color(style::MUTED),
                 );
                 ui.add_space(5.0);
                 egui::ComboBox::from_id_salt("prompt_design_select")
                     .width(180.0)
-                    .selected_text(&snapshot.draft.name)
+                    .selected_text(crate::i18n::tr_dynamic(language, &snapshot.draft.name))
                     .show_ui(ui, |ui| {
                         for profile in &snapshot.profiles {
+                            let name = crate::i18n::tr_dynamic(language, &profile.name);
                             let label = if profile.id == snapshot.active_id {
-                                format!("{}  ACTIVE", profile.name)
+                                format!("{}  {}", name, crate::i18n::tr(language, "ACTIVE"))
                             } else {
-                                profile.name.clone()
+                                name.into_owned()
                             };
                             if ui
                                 .selectable_label(profile.id == snapshot.selected_id, label)
@@ -305,7 +308,12 @@ fn render_header(
                             }
                         }
                     });
-                if small_outline_button(ui, "NEW GRAPH", "Create complete provider graph").clicked()
+                if small_outline_button(
+                    ui,
+                    crate::i18n::tr(language, "NEW GRAPH"),
+                    crate::i18n::tr(language, "Create complete provider graph"),
+                )
+                .clicked()
                 {
                     let profile = new_profile();
                     actions.push(PromptStudioAction::CreateProfile(profile.clone()));
@@ -313,7 +321,9 @@ fn render_header(
                 }
                 ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
                     if controller.is_dirty() {
-                        if style::command_button(ui, "SAVE *", true).clicked() {
+                        if style::command_button(ui, crate::i18n::tr(language, "SAVE *"), true)
+                            .clicked()
+                        {
                             if let Some(profile) = controller.draft.clone() {
                                 actions.push(if profile.id == snapshot.active_id {
                                     PromptStudioAction::ActivateProfile(profile)
@@ -324,7 +334,7 @@ fn render_header(
                             }
                         }
                     } else {
-                        status_chip(ui, "SAVED");
+                        status_chip(ui, crate::i18n::tr(language, "SAVED"));
                     }
                 });
             })

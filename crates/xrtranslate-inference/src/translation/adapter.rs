@@ -2,7 +2,10 @@ use crate::{
     AsyncHttpClient, InferenceError, OpenAiCompatibleClient, openai::non_streaming_chat_payload,
 };
 
-use super::{TranslationOptions, TranslationProvider, TranslationResult, profile::registered};
+use super::{
+    TranslationOptions, TranslationProvider, TranslationResult,
+    profile::{registered, translation_output_rejection},
+};
 
 /// Reusable MT adapter for Hy-MT2 GGUF and remote OpenAI-compatible services.
 ///
@@ -63,7 +66,7 @@ impl<C: AsyncHttpClient> TranslationAdapter<C> {
         let prompt = profile.build_prompt(source_text, &options)?;
         let mut payload = non_streaming_chat_payload(
             &self.model,
-            prompt.messages,
+            prompt.messages_json(),
             profile.temperature(),
             options.max_tokens,
         );
@@ -74,6 +77,17 @@ impl<C: AsyncHttpClient> TranslationAdapter<C> {
         if text.is_empty() {
             return Err(InferenceError::EmptyOutput {
                 operation: "translation",
+            });
+        }
+        if let Some(reason) = translation_output_rejection(
+            source_text,
+            &text,
+            &prompt.messages,
+            &options.prompt_context,
+        ) {
+            return Err(InferenceError::RejectedOutput {
+                operation: "translation",
+                reason,
             });
         }
         Ok(TranslationResult {
@@ -197,5 +211,40 @@ mod tests {
         );
         assert_eq!(request.body["model"], "remote-model");
         assert!(request.body.get("authorization").is_none());
+    }
+
+    #[tokio::test]
+    async fn rejects_text_copied_from_the_actual_rendered_prompt() {
+        let http = RecordingHttpClient::default();
+        http.respond_with(HttpResponse {
+            status: 200,
+            body: serde_json::json!({
+                "choices": [{
+                    "message": {
+                        "content": "Translate only the current input. Do not translate, repeat, summarize, or explain the context. Unless explicitly requested otherwise, output only the final translation."
+                    }
+                }]
+            })
+            .to_string(),
+        });
+        let adapter = TranslationAdapter::new(
+            http,
+            "http://127.0.0.1:8002/v1/chat/completions",
+            "hy-mt2",
+            TranslationProvider::Hunyuan,
+        )
+        .unwrap();
+        let mut options = TranslationOptions::new("English", "Chinese");
+        options.prompt_context.terminology_rows = vec!["VRChat,VRChat".into()];
+
+        let error = adapter.translate("hello", options).await.unwrap_err();
+
+        assert!(matches!(
+            error,
+            InferenceError::RejectedOutput {
+                operation: "translation",
+                ..
+            }
+        ));
     }
 }

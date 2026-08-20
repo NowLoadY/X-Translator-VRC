@@ -17,11 +17,18 @@ impl TranslationPromptContext {
     }
 
     pub fn reference_text_for_quality_checks(&self) -> Option<String> {
-        let values = TranslationPromptBlock::builtin_reference_blocks()
+        let values = self.reference_blocks_for_quality_checks();
+        (!values.is_empty()).then(|| values.join("\n\n"))
+    }
+
+    /// Renders each runtime reference block independently so downstream
+    /// quality checks can exclude dynamic values regardless of graph order or
+    /// separators without reconstructing prompt composition.
+    pub fn reference_blocks_for_quality_checks(&self) -> Vec<String> {
+        TranslationPromptBlock::builtin_reference_blocks()
             .iter()
             .filter_map(|block| render_block(block, self))
-            .collect::<Vec<_>>();
-        (!values.is_empty()).then(|| values.join("\n\n"))
+            .collect()
     }
 }
 

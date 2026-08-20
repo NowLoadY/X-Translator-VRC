@@ -24,6 +24,9 @@ use xrtranslate_config::{AppConfig, RuntimeLayout};
 
 const RELEASE_LAYOUT_VERSION: u32 = 3;
 const VAD_RELATIVE_PATH: &str = "models/silero-vad/src/silero_vad/data/silero_vad.onnx";
+const VAD_MODEL_VERSION: &str = "v6.2.1";
+const VAD_MODEL_BYTES: u64 = 2_327_524;
+const VAD_MODEL_SHA256: &str = "1a153a22f4509e292a94e67d6f9b85e8deb25b4988682b7e174c65279d8788e3";
 const SPEAKER_RELATIVE_PATH: &str = "models/3D-Speaker-ERes2NetV2/speaker_embedding.onnx";
 const SPEAKER_MODEL_BYTES: u64 = 71_964_309;
 const SPEAKER_MODEL_SHA256: &str =
@@ -163,6 +166,12 @@ fn main() -> Result<(), Box<dyn Error>> {
     let arguments = Arguments::parse();
     let check = arguments.check;
     let plan = ReleasePlan::from_arguments(arguments)?;
+    verify_file_integrity(
+        "--vad-model",
+        &plan.vad_model,
+        VAD_MODEL_BYTES,
+        VAD_MODEL_SHA256,
+    )?;
     verify_file_integrity(
         "--speaker-model",
         &plan.speaker_model,
@@ -484,7 +493,19 @@ fn release_manifest(
             "directory": runtime_directory,
             "setup_required": "Choose the llama-server executable in the client welcome flow.",
         },
-        "vad_model": VAD_RELATIVE_PATH,
+        "vad_model": {
+            "path": VAD_RELATIVE_PATH,
+            "architecture": "Silero VAD",
+            "format": "ONNX opset 16",
+            "sample_rate_hz": 16_000,
+            "frame_samples": 512,
+            "source": {
+                "repository": "snakers4/silero-vad",
+                "revision": VAD_MODEL_VERSION,
+            },
+            "bytes": VAD_MODEL_BYTES,
+            "sha256": VAD_MODEL_SHA256,
+        },
         "speaker_model": {
             "path": SPEAKER_RELATIVE_PATH,
             "architecture": "ERes2NetV2",
@@ -1107,6 +1128,13 @@ zh,en,fr,pt,es,ja,ru,ko,th,it,de,vi,id,pl,cs,nl
         .unwrap();
         assert_eq!(manifest["python"], false);
         assert_eq!(manifest["runtime"]["included"], false);
+        assert_eq!(manifest["vad_model"]["path"], VAD_RELATIVE_PATH);
+        assert_eq!(
+            manifest["vad_model"]["source"]["revision"],
+            VAD_MODEL_VERSION
+        );
+        assert_eq!(manifest["vad_model"]["bytes"], VAD_MODEL_BYTES);
+        assert_eq!(manifest["vad_model"]["sha256"], VAD_MODEL_SHA256);
         assert_eq!(manifest["speaker_model"]["path"], SPEAKER_RELATIVE_PATH);
         assert_eq!(manifest["denoise_model"]["path"], DENOISE_RELATIVE_PATH);
         assert_eq!(

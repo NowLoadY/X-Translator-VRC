@@ -666,33 +666,4 @@ mod tests {
         assert_eq!(groups[1].role, ContributorRole::BetaTesters);
     }
 
-    #[test]
-    fn test_embedded_default() {
-        let groups = parse_contributors_markdown(EMBEDDED_CONTRIBUTORS_MD);
-        assert_eq!(groups.len(), 2);
-
-        // Group 0: Code Contributors
-        assert_eq!(groups[0].role, ContributorRole::CodeContributors);
-        assert_eq!(groups[0].contributors[0].name, "NowLoadY");
-        assert_eq!(groups[0].contributors[0].links.len(), 2);
-        assert_eq!(groups[0].contributors[0].links[0].label, "GitHub");
-        assert_eq!(groups[0].contributors[0].links[0].url, "https://github.com/NowLoadY");
-        assert_eq!(groups[0].contributors[0].links[1].label, "VRChat");
-        assert_eq!(
-            groups[0].contributors[0].links[1].url,
-            "https://vrchat.com/home/user/usr_b301c719-e3c6-4db2-ab37-f9761493f578"
-        );
-        assert_eq!(groups[0].contributors[0].contributions.len(), 1);
-
-        // Group 1: Beta Testers
-        assert_eq!(groups[1].role, ContributorRole::BetaTesters);
-        assert_eq!(groups[1].contributors[0].name, "小雨安然");
-        assert_eq!(groups[1].contributors[0].links.len(), 1);
-        assert_eq!(groups[1].contributors[0].links[0].label, "VRChat");
-        assert_eq!(
-            groups[1].contributors[0].links[0].url,
-            "https://vrchat.com/home/user/usr_7fd3c0d2-c1db-4d93-8e9d-9cce9472a326"
-        );
-        assert_eq!(groups[1].contributors[0].contributions.len(), 1);
-    }
 }

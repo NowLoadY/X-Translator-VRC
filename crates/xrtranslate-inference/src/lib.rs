@@ -10,6 +10,7 @@
 mod error;
 mod http;
 mod openai;
+mod openai_asr;
 mod qwen3;
 mod translation;
 mod wav;
@@ -17,6 +18,7 @@ mod wav;
 pub use error::{InferenceError, TransportError};
 pub use http::{AsyncHttpClient, HttpRequest, HttpResponse, ReqwestClient};
 pub use openai::{ChatCompletion, OpenAiCompatibleClient};
+pub use openai_asr::{OpenAiAsrAdapter, OpenAiAsrOptions};
 pub use qwen3::{AsrTranscript, Qwen3AsrAdapter, Qwen3AsrOptions, is_probable_asr_hallucination};
 pub use translation::{
     PromptCondition, PromptGraphError, PromptLink, PromptMessage, PromptMessageRole, PromptNode,

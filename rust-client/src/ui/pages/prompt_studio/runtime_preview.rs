@@ -28,6 +28,7 @@ pub(super) fn render(
     node: &PromptNode,
     trace: Option<&PromptExecutionTrace>,
     scale: f32,
+    language: crate::i18n::UiLanguage,
 ) {
     if scale < 0.58 {
         return;
@@ -43,11 +44,17 @@ pub(super) fn render(
 
     let node_trace = trace.and_then(|trace| trace.node(&node.id));
     let status = match (trace, node_trace) {
-        (None, _) => "NO LIVE DATA".to_owned(),
-        (Some(_), None) => "NOT USED".to_owned(),
+        (None, _) => crate::i18n::tr(language, "NO LIVE DATA").to_owned(),
+        (Some(_), None) => crate::i18n::tr(language, "NOT USED").to_owned(),
         (Some(_), Some(node_trace)) => node_trace.selected_input.map_or_else(
-            || "LIVE OUTPUT".to_owned(),
-            |input| format!("LIVE OUTPUT / {}", super::input_socket_label(node, input)),
+            || crate::i18n::tr(language, "LIVE OUTPUT").to_owned(),
+            |input| {
+                format!(
+                    "{} / {}",
+                    crate::i18n::tr(language, "LIVE OUTPUT"),
+                    crate::i18n::tr_dynamic(language, &super::input_socket_label(node, input))
+                )
+            },
         ),
     };
     ui.painter().text(
@@ -78,7 +85,7 @@ pub(super) fn render(
                     let output = node_trace.map_or("", |node| node.output.as_str());
                     let output = if output.is_empty() {
                         match (trace, node_trace) {
-                            (Some(_), Some(_)) => "(empty)",
+                            (Some(_), Some(_)) => crate::i18n::tr(language, "(empty)"),
                             _ => "",
                         }
                     } else {

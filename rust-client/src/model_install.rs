@@ -8,7 +8,7 @@ use crossbeam_channel::{Receiver, TryRecvError, unbounded};
 use std::{path::PathBuf, thread};
 use xrtranslate_assets::{
     DownloadProgress, ModelAssetId, ModelAssetsConfig, ModelCapability, ModelLevel,
-    NativeModelInstaller, ResolvedModelAssets, manifest_for, manifests_for_capability,
+    NativeModelInstaller, ResolvedModelAssets, manifests_for_capability,
 };
 use xrtranslate_config::AppConfig;
 
@@ -96,6 +96,7 @@ pub struct NativeModelTaskManager {
     state: NativeModelTaskState,
     events: Option<Receiver<NativeModelTaskEvent>>,
     proxy_url: Option<String>,
+    rediscover_after_current: bool,
 }
 
 impl Default for NativeModelTaskManager {
@@ -104,6 +105,7 @@ impl Default for NativeModelTaskManager {
             state: NativeModelTaskState::Idle,
             events: None,
             proxy_url: None,
+            rediscover_after_current: false,
         }
     }
 }
@@ -138,7 +140,9 @@ impl NativeModelTaskManager {
     }
 
     pub fn invalidate_discovery(&mut self) {
-        if !self.is_busy() {
+        if self.is_busy() {
+            self.rediscover_after_current = true;
+        } else {
             self.state = NativeModelTaskState::Idle;
             self.events = None;
         }
@@ -238,6 +242,10 @@ impl NativeModelTaskManager {
         }
         if finished {
             self.events = None;
+            if self.rediscover_after_current {
+                self.rediscover_after_current = false;
+                self.state = NativeModelTaskState::Idle;
+            }
         }
     }
 
@@ -489,25 +497,13 @@ fn configured_assets(
         config.model_manager.qwen3_asr_gguf_directory.clone(),
         config.model_manager.hunyuan_mt_gguf_directory.clone(),
     );
-    let mut has_asr = false;
-    let mut has_translation = false;
     for key in config.active_native_model_assets() {
         let id = ModelAssetId::from_config_key(&key).ok_or_else(|| {
             format!("Unknown model_asset in active provider configuration: {key}")
         })?;
-        match manifest_for(id).capability {
-            ModelCapability::Asr => has_asr = true,
-            ModelCapability::Translation => has_translation = true,
-        }
         assets.select_asset(id);
     }
-    if !has_asr {
-        return Err("The active ASR provider has no model package.".into());
-    }
-    if !has_translation {
-        return Err("The active translation provider has no model package.".into());
-    }
-    Ok(assets.resolve(project_root))
+    Ok(assets.resolve_selected(project_root))
 }
 
 fn load_config(project_root: &std::path::Path) -> Result<AppConfig, String> {
@@ -534,6 +530,23 @@ mod tests {
     }
 
     #[test]
+    fn mixed_remote_and_local_routes_require_only_the_local_package() {
+        let mut document: serde_json::Value =
+            serde_json::from_str(include_str!("../../config.json")).unwrap();
+        document["asr"]["provider"] = serde_json::Value::from("openai");
+        document["asr"]["providers"]["openai"]["api_key"] = serde_json::Value::from("test-key");
+        let config = AppConfig::from_value(document).unwrap();
+
+        let assets = configured_assets(&config, std::path::Path::new("project-root")).unwrap();
+        let active = assets
+            .active_assets()
+            .map(|asset| asset.manifest().id)
+            .collect::<Vec<_>>();
+
+        assert_eq!(active, vec![ModelAssetId::HunyuanMtGguf]);
+    }
+
+    #[test]
     fn verified_state_is_scoped_to_the_packages_that_were_hashed() {
         let manager = NativeModelTaskManager {
             state: NativeModelTaskState::Verified {
@@ -541,11 +554,45 @@ mod tests {
             },
             events: None,
             proxy_url: None,
+            rediscover_after_current: false,
         };
 
         assert!(manager.is_model_ready(ModelAssetId::Qwen3AsrGguf));
         assert!(manager.is_model_present(ModelAssetId::Qwen3AsrGguf));
         assert!(!manager.is_model_ready(ModelAssetId::HunyuanMtGguf));
         assert!(!manager.is_model_present(ModelAssetId::HunyuanMtGguf));
+    }
+
+    #[test]
+    fn provider_change_clears_a_stale_discovery_failure() {
+        let mut manager = NativeModelTaskManager::default();
+        manager.state = NativeModelTaskState::Failed("old provider failure".into());
+
+        manager.invalidate_discovery();
+
+        assert!(matches!(manager.state(), NativeModelTaskState::Idle));
+        assert!(manager.needs_discovery());
+    }
+
+    #[test]
+    fn provider_change_discards_a_task_result_that_finishes_late() {
+        let (sender, receiver) = unbounded();
+        let mut manager = NativeModelTaskManager {
+            state: NativeModelTaskState::Discovering,
+            events: Some(receiver),
+            proxy_url: None,
+            rediscover_after_current: false,
+        };
+        manager.invalidate_discovery();
+        sender
+            .send(NativeModelTaskEvent::Finished(
+                NativeModelTaskResult::Failed("old provider failure".into()),
+            ))
+            .unwrap();
+
+        manager.poll();
+
+        assert!(matches!(manager.state(), NativeModelTaskState::Idle));
+        assert!(manager.needs_discovery());
     }
 }
