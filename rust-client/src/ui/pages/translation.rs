@@ -855,6 +855,7 @@ fn render_input_adaptation(
 
 fn render_audio_level(
     ui: &mut egui::Ui,
+    id_source: &'static str,
     level: &std::sync::Arc<std::sync::atomic::AtomicU32>,
     vad_active: &std::sync::Arc<std::sync::atomic::AtomicBool>,
     visible: bool,
@@ -865,7 +866,7 @@ fn render_audio_level(
     let raw_fraction = ((decibels + 60.0) / 60.0).clamp(0.0, 1.0);
     let active = vad_active.load(std::sync::atomic::Ordering::Relaxed);
 
-    components::segmented_audio_meter(ui, raw_fraction, active, visible, updating);
+    components::segmented_audio_meter(ui, id_source, raw_fraction, active, visible, updating);
 }
 
 fn render_capture_device_selector(app: &mut crate::XRTranslateApp, ui: &mut egui::Ui) {
@@ -969,13 +970,17 @@ fn render_capture_device_selector(app: &mut crate::XRTranslateApp, ui: &mut egui
             }
         }
         ui.add_space(8.0);
-        let (level, vad_active) = match app.capture_source {
+        let (id_source, level, vad_active) = match app.capture_source {
             CaptureSource::Microphone | CaptureSource::Both => {
-                (&app.input_level, &app.microphone_vad_active)
+                ("microphone", &app.input_level, &app.microphone_vad_active)
             }
-            CaptureSource::SystemAudio => (&app.loopback_level, &app.loopback_vad_active),
+            CaptureSource::SystemAudio => (
+                "system_audio",
+                &app.loopback_level,
+                &app.loopback_vad_active,
+            ),
         };
-        render_audio_level(ui, level, vad_active, true, app.is_translating);
+        render_audio_level(ui, id_source, level, vad_active, true, app.is_translating);
     });
 
     if app.capture_source == CaptureSource::Both && !app.loopback_devices.is_empty() {
@@ -1016,6 +1021,7 @@ fn render_capture_device_selector(app: &mut crate::XRTranslateApp, ui: &mut egui
             ui.add_space(8.0);
             render_audio_level(
                 ui,
+                "system_audio",
                 &app.loopback_level,
                 &app.loopback_vad_active,
                 true,

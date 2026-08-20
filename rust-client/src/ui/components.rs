@@ -156,6 +156,7 @@ pub fn swap_capsule_button(ui: &mut Ui, enabled: bool) -> egui::Response {
 
 pub fn segmented_audio_meter(
     ui: &mut Ui,
+    id_source: &'static str,
     raw_fraction: f32,
     active: bool,
     visible: bool,
@@ -171,7 +172,7 @@ pub fn segmented_audio_meter(
         const HEIGHT: f32 = 11.0;
         const WIDTH: f32 = 68.0;
 
-        let id = ui.make_persistent_id("audio_waveform_samples");
+        let id = ui.make_persistent_id(("audio_waveform_samples", id_source));
         let mut history = ui.memory(|memory| {
             memory
                 .data
