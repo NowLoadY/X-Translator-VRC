@@ -77,6 +77,12 @@ Supports fast typing and real-time translation through OSC.
   <img src="assets/preview-OSC-type.png" alt="OSC Typing and Real-Time Translation" width="760" />
 </p>
 
+Make every translation sound like you!
+
+<p align="center">
+  <img src="assets/preview-PromptStudio.png" alt="Customize your translation style!" width="760" />
+</p>
+
 ---
 
 ## User Guide
