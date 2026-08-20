@@ -10,8 +10,13 @@ use std::collections::VecDeque;
 use std::error::Error;
 use std::fmt;
 
+pub mod language;
 pub mod text_processing;
 
+pub use language::{
+    Script, auto_route_language_pair, detect_text_language, has_substantial_script_evidence,
+    observed_scripts,
+};
 pub use text_processing::{
     TranslationSegmentPair, collapse_asr_split_words, ends_at_sentence_boundary, is_filler_segment,
     is_split_word_pair, remove_asr_stutters, remove_transcript_overlap, split_translation_segments,

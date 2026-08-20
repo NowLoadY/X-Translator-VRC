@@ -11,6 +11,9 @@ pub(super) const GRID: Color32 = Color32::from_gray(218);
 pub(super) const NODE_TEXT: Color32 = Color32::from_gray(55);
 pub(super) const NODE_MUTED: Color32 = Color32::from_gray(105);
 pub(super) const NODE_BORDER: Color32 = Color32::from_gray(155);
+pub(super) const LINK_SELECTED: Color32 = Color32::from_rgb(64, 132, 228);
+pub(super) const ERROR_BORDER: Color32 = Color32::from_rgb(232, 110, 95);
+pub(super) const ERROR_FILL: Color32 = Color32::from_rgba_unmultiplied_const(253, 242, 240, 200);
 
 pub(super) fn apply(ui: &mut egui::Ui) {
     let style = ui.style_mut();

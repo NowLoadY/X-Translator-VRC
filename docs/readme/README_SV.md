@@ -29,6 +29,7 @@
   <a href="#användarguide">Användarguide</a> •
   <a href="#vanliga-platser">Vanliga platser</a> •
   <a href="#citation">Citation</a> •
+  <a href="#bidragsgivare--contributors">Bidragsgivare</a> •
   <a href="#erkännanden">Erkännanden</a> •
   <a href="#licens">Licens</a>
 </p>
@@ -119,6 +120,12 @@ När båda modellerna körs samtidigt används cirka **4,1 GB** VRAM. Ett grafik
       url={https://arxiv.org/abs/2607.17544},
 }
 ```
+
+---
+
+## Bidragsgivare / Contributors
+
+Ett varmt tack till alla som bidragit med kod och deltagit i betatesterna av XRTranslate. Se [docs/contributors.md](../contributors.md) för en fullständig lista över deltagare, sociala länkar och bidragsdetaljer.
 
 ---
 

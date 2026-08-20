@@ -3,6 +3,8 @@ use serde::{Deserialize, Serialize};
 use crate::PromptNodeGraph;
 use crate::builtin::BUILTIN_ID;
 
+use std::path::Path;
+
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct PromptTemplateProfile {
     pub id: String,
@@ -31,6 +33,27 @@ impl Default for PromptTemplateLibrary {
 }
 
 impl PromptTemplateLibrary {
+    pub const FILE_NAME: &'static str = "prompt-studio.json";
+
+    pub fn load_from_dir(runtime_dir: &Path) -> Self {
+        let path = runtime_dir.join(Self::FILE_NAME);
+        let mut library = std::fs::read_to_string(path)
+            .ok()
+            .and_then(|contents| serde_json::from_str::<Self>(&contents).ok())
+            .unwrap_or_default();
+        library.normalize();
+        library
+    }
+
+    pub fn save_to_dir(&self, runtime_dir: &Path) -> Result<(), String> {
+        let _ = std::fs::create_dir_all(runtime_dir);
+        let path = runtime_dir.join(Self::FILE_NAME);
+        let mut normalized = self.clone();
+        normalized.normalize();
+        let contents = serde_json::to_string_pretty(&normalized).map_err(|e| e.to_string())?;
+        std::fs::write(path, format!("{contents}\n")).map_err(|e| e.to_string())
+    }
+
     pub fn normalize(&mut self) {
         self.profiles
             .retain(|profile| !profile.id.trim().is_empty());
@@ -123,4 +146,36 @@ mod tests {
         let value = serde_json::to_value(PromptTemplateLibrary::default()).unwrap();
         assert!(value["profiles"][0].get("accent").is_none());
     }
+
+    #[test]
+    fn prompt_library_saves_and_loads_from_dedicated_file() {
+        let temp_dir = std::env::temp_dir().join(format!(
+            "xrt_prompt_lib_test_{}",
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        let _ = std::fs::remove_dir_all(&temp_dir);
+
+        let mut library = PromptTemplateLibrary::default();
+        let mut custom = PromptTemplateLibrary::editable_copy_of(
+            &library.profiles[0],
+            "custom-test-profile",
+        );
+        custom.name = "Custom Test Profile".into();
+        library.profiles.push(custom);
+        library.active_id = "custom-test-profile".into();
+
+        library.save_to_dir(&temp_dir).unwrap();
+        assert!(temp_dir.join(PromptTemplateLibrary::FILE_NAME).exists());
+
+        let loaded = PromptTemplateLibrary::load_from_dir(&temp_dir);
+        assert_eq!(loaded.active_id, "custom-test-profile");
+        assert_eq!(loaded.profiles.len(), 2);
+        assert_eq!(loaded.profiles[1].name, "Custom Test Profile");
+
+        let _ = std::fs::remove_dir_all(&temp_dir);
+    }
 }
+

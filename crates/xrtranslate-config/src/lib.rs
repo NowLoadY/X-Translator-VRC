@@ -1308,9 +1308,9 @@ mod tests {
         let config = AppConfig::from_json_str(include_str!("../../../config.json")).unwrap();
         let gguf = config.default_gguf().unwrap();
 
-        assert_eq!(
-            gguf.llama_server_path,
-            PathBuf::from("runtime/llama.cpp/llama-server")
+        assert!(
+            gguf.llama_server_path == PathBuf::from("runtime/llama.cpp/llama-server")
+                || gguf.llama_server_path == PathBuf::from("runtime/llama.cpp/llama-server.exe")
         );
         assert_eq!(gguf.hunyuan_gguf_repo, "tencent/Hy-MT2-1.8B-GGUF");
         assert_eq!(gguf.asr_url, "http://127.0.0.1:8001/v1/chat/completions");

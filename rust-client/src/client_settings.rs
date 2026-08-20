@@ -97,7 +97,7 @@ pub struct ClientSettings {
     pub floating_subtitles_max_count: usize,
     #[serde(default = "default_floating_font_size")]
     pub floating_subtitles_font_size: f64,
-    #[serde(default)]
+    #[serde(skip)]
     pub prompt_library: PromptTemplateLibrary,
 }
 
@@ -166,18 +166,17 @@ impl Default for ClientSettings {
 
 impl ClientSettings {
     pub fn load(project_root: &Path) -> Self {
-        let settings_path = project_root
-            .join("runtime")
-            .join("rust-client-settings.json");
+        let runtime_dir = project_root.join("runtime");
+        let settings_path = runtime_dir.join("rust-client-settings.json");
         let mut settings = std::fs::read_to_string(&settings_path)
             .ok()
             .and_then(|contents| serde_json::from_str::<ClientSettings>(&contents).ok())
             .unwrap_or_default();
+        settings.prompt_library = PromptTemplateLibrary::load_from_dir(&runtime_dir);
         settings.migrate_recognition_settings();
         // Keep lifecycle state authoritative across development and packaged launches.
         settings.apply_app_state(project_root);
         settings.normalize_feature_dependencies();
-        settings.prompt_library.normalize();
         let registry = PluginRegistry::builtin();
         registry.initialize_preferences(&mut settings.plugin_preferences);
         registry.normalize_active_page(&settings.plugin_preferences, &mut settings.active_page);
@@ -300,12 +299,13 @@ impl ClientSettings {
         let _ = std::fs::create_dir_all(&directory);
         let path = directory.join("rust-client-settings.json");
         let mut normalized = self.clone();
-        normalized.prompt_library.normalize();
         let registry = PluginRegistry::builtin();
         registry.initialize_preferences(&mut normalized.plugin_preferences);
         registry.normalize_active_page(&normalized.plugin_preferences, &mut normalized.active_page);
         let contents = serde_json::to_string_pretty(&normalized).map_err(|e| e.to_string())?;
         std::fs::write(&path, format!("{contents}\n")).map_err(|e| e.to_string())?;
+
+        self.prompt_library.save_to_dir(&directory)?;
 
         let app_state_path = directory.join("app_state.json");
         let mut app_state = std::fs::read_to_string(&app_state_path)
@@ -408,6 +408,20 @@ mod tests {
         settings.prompt_library.active_id = "user-profile-1".into();
 
         settings.save(&root).unwrap();
+
+        assert!(root.join("runtime").join(PromptTemplateLibrary::FILE_NAME).exists());
+        let settings_json =
+            std::fs::read_to_string(root.join("runtime/rust-client-settings.json")).unwrap();
+        assert!(!settings_json.contains("prompt_library"));
+        assert!(!settings_json.contains("user-profile-1"));
+
+        let prompt_studio_json = std::fs::read_to_string(
+            root.join("runtime").join(PromptTemplateLibrary::FILE_NAME),
+        )
+        .unwrap();
+        assert!(prompt_studio_json.contains("user-profile-1"));
+        assert!(prompt_studio_json.contains("My saved project"));
+
         let loaded = ClientSettings::load(&root);
         let loaded_profile = loaded
             .prompt_library

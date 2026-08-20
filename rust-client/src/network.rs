@@ -150,6 +150,11 @@ enum SessionCommand {
     UpdatePromptTemplate {
         graph: PromptNodeGraph,
     },
+    TranslateText {
+        text: String,
+        source_lang: Option<String>,
+        target_lang: Option<String>,
+    },
     Pause,
     Resume,
     Finish,
@@ -252,6 +257,23 @@ impl SessionHandle {
         let _ = self
             .command_tx
             .try_send(SessionCommand::UpdatePromptTemplate { graph });
+    }
+
+    /// Submits a direct text turn to the standard translation pipeline.
+    pub fn translate_text(
+        &self,
+        text: impl Into<String>,
+        source_lang: Option<String>,
+        target_lang: Option<String>,
+    ) {
+        if self.stop_requested.load(Ordering::Acquire) {
+            return;
+        }
+        let _ = self.command_tx.try_send(SessionCommand::TranslateText {
+            text: text.into(),
+            source_lang,
+            target_lang,
+        });
     }
 
     /// Reconfigure the backend audio stream after replacing the local capture
@@ -663,6 +685,22 @@ where
                 json!({
                     "action": "set_prompt_graph",
                     "prompt_graph": graph,
+                }),
+            )
+            .await
+        }
+        SessionCommand::TranslateText {
+            text,
+            source_lang,
+            target_lang,
+        } => {
+            send_json(
+                write,
+                json!({
+                    "action": "translate_text",
+                    "text": text,
+                    "source_lang": source_lang,
+                    "target_lang": target_lang,
                 }),
             )
             .await

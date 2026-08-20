@@ -514,8 +514,8 @@ mod tests {
         fs::create_dir_all(&source).unwrap();
         fs::create_dir_all(target.join("runtime")).unwrap();
         fs::write(
-            target.join("runtime/rust-client-settings.json"),
-            br#"{"prompt_library":{"active_id":"user-profile-1","profiles":[{"id":"user-profile-1","name":"My saved project"}]}}"#,
+            target.join("runtime/prompt-studio.json"),
+            br#"{"active_id":"user-profile-1","profiles":[{"id":"user-profile-1","name":"My saved project"}]}"#,
         )
         .unwrap();
         fs::write(source.join("rust-client.exe"), b"new client").unwrap();
@@ -524,7 +524,7 @@ mod tests {
         replace_entries(&source, &target, &source_entries, &backup).unwrap();
 
         let settings =
-            fs::read_to_string(target.join("runtime/rust-client-settings.json")).unwrap();
+            fs::read_to_string(target.join("runtime/prompt-studio.json")).unwrap();
         assert!(settings.contains("user-profile-1"));
         assert!(settings.contains("My saved project"));
 

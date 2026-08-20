@@ -29,6 +29,7 @@
   <a href="#사용-가이드">사용 가이드</a> •
   <a href="#주요-파일-및-경로">주요 파일 및 경로</a> •
   <a href="#citation">Citation</a> •
+  <a href="#기여자--contributors">기여자</a> •
   <a href="#감사의-글">감사의 글</a> •
   <a href="#라이선스">라이선스</a>
 </p>
@@ -119,6 +120,12 @@ OSC를 통한 빠른 타이핑 입력 및 실시간 번역 전송을 지원합�
       url={https://arxiv.org/abs/2607.17544},
 }
 ```
+
+---
+
+## 기여자 / Contributors
+
+XRTranslate 개발에 기여해주신 코드 기여자 및 베타 테스터 여러분께 진심으로 감사드립니다. 전체 기여자 명단, 소셜 링크 및 기여 내역은 [docs/contributors.md](../contributors.md)에서 확인하실 수 있습니다.
 
 ---
 

@@ -18,16 +18,25 @@ const NODE_HEADER_HEIGHT: f32 = 28.0;
 const SOCKET_RADIUS: f32 = 5.0;
 const GRAPH_ACCENT: Color32 = style::GRAPH_ACCENT;
 
+#[derive(Clone, Debug, PartialEq, Eq, Hash)]
+pub struct PromptLinkKey {
+    pub from: String,
+    pub to: String,
+    pub input: u8,
+}
+
 #[derive(Clone, Debug)]
 pub struct PromptStudioController {
     selected_id: String,
     draft: Option<PromptTemplateProfile>,
     dirty: bool,
     wire_from: Option<String>,
+    wire_from_input: Option<(String, u8)>,
     pan: Vec2,
     zoom: f32,
     fit_pending: bool,
     selected_nodes: HashSet<String>,
+    selected_links: HashSet<PromptLinkKey>,
     drag_node: Option<String>,
     drag_origins: HashMap<String, [f32; 2]>,
     box_select_start: Option<Pos2>,
@@ -51,10 +60,12 @@ impl PromptStudioController {
             draft: None,
             dirty: false,
             wire_from: None,
+            wire_from_input: None,
             pan: Vec2::ZERO,
             zoom: 1.0,
             fit_pending: true,
             selected_nodes: HashSet::new(),
+            selected_links: HashSet::new(),
             drag_node: None,
             drag_origins: HashMap::new(),
             box_select_start: None,
@@ -97,6 +108,9 @@ impl PromptStudioController {
             self.dirty = false;
             self.fit_pending = true;
             self.selected_nodes.clear();
+            self.selected_links.clear();
+            self.wire_from = None;
+            self.wire_from_input = None;
             self.box_select_start = None;
             self.box_select_current = None;
         }
@@ -120,7 +134,9 @@ impl PromptStudioController {
             .find(|profile| profile.id == self.selected_id)
             .cloned();
         self.wire_from = None;
+        self.wire_from_input = None;
         self.selected_nodes.clear();
+        self.selected_links.clear();
         self.box_select_start = None;
         self.box_select_current = None;
         self.fit_pending = true;
@@ -131,7 +147,10 @@ impl PromptStudioController {
         self.draft = Some(profile);
         self.dirty = true;
         self.fit_pending = true;
+        self.wire_from = None;
+        self.wire_from_input = None;
         self.selected_nodes.clear();
+        self.selected_links.clear();
         self.box_select_start = None;
         self.box_select_current = None;
     }
@@ -149,6 +168,7 @@ impl PromptStudioController {
     }
 
     fn finish_wire(&mut self) -> Option<String> {
+        self.wire_from_input = None;
         self.wire_from.take()
     }
 
@@ -186,7 +206,9 @@ impl PromptStudioController {
         }
         self.active_provider = target;
         self.selected_nodes.clear();
+        self.selected_links.clear();
         self.wire_from = None;
+        self.wire_from_input = None;
         self.box_select_start = None;
         self.box_select_current = None;
         self.fit_pending = true;

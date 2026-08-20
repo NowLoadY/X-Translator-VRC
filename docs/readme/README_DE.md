@@ -29,6 +29,7 @@
   <a href="#benutzerhandbuch">Benutzerhandbuch</a> •
   <a href="#wichtige-pfade">Wichtige Pfade</a> •
   <a href="#citation">Citation</a> •
+  <a href="#mitwirkende--contributors">Mitwirkende</a> •
   <a href="#danksagung">Danksagung</a> •
   <a href="#lizenz">Lizenz</a>
 </p>
@@ -119,6 +120,12 @@ Wenn beide Modelle gleichzeitig ausgeführt werden, belegen sie etwa **4,1 GB** 
       url={https://arxiv.org/abs/2607.17544},
 }
 ```
+
+---
+
+## Mitwirkende / Contributors
+
+Ein herzlicher Dank geht an alle Code-Mitwirkenden und Beta-Tester, die an der Entwicklung und dem Testen von XRTranslate mitgewirkt haben. Die vollständige Liste der Mitwirkenden, Social-Links und Beitragsdetails finden Sie in [docs/contributors.md](../contributors.md).
 
 ---
 

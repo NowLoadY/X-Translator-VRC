@@ -99,115 +99,250 @@ pub fn render_bottom_input_bar(
     plugin: &mut super::super::OscPlugin,
     ui: &mut egui::Ui,
     language: crate::i18n::UiLanguage,
+    actions: &mut Vec<super::OscUiAction>,
 ) {
     let is_enabled = plugin.draft().enabled;
     let mut submit = false;
     let has_text = !plugin.draft_input().trim().is_empty();
+    let translate_mode = plugin.translate_input();
 
-    card(ui, |ui| {
-        let mut request_focus_back = false;
-        let mut text_edit_response = None;
+    let container_id = ui.make_persistent_id("osc_bottom_chatbox_container");
 
-        ui.horizontal(|ui| {
-            let send_btn_width = 76.0;
-            let spacing = 8.0;
-            let input_frame_width = (ui.available_width() - send_btn_width - spacing).max(120.0);
-            let input_content_width = (input_frame_width - 28.0).max(72.0);
+    if crate::languages_conflict(
+        &plugin.draft().typing_source_lang,
+        &plugin.draft().typing_target_lang,
+    ) {
+        plugin.draft_mut().typing_target_lang =
+            if crate::languages_conflict(&plugin.draft().typing_source_lang, "zh") {
+                "en".to_string()
+            } else {
+                "zh".to_string()
+            };
+    }
 
-            egui::Frame::new()
-                .fill(egui::Color32::from_rgb(248, 250, 252))
-                .stroke(egui::Stroke::new(
-                    1.0,
-                    egui::Color32::from_rgb(226, 232, 240),
-                ))
-                .corner_radius(egui::CornerRadius::same(14))
-                .inner_margin(egui::Margin::symmetric(14, 8))
-                .show(ui, |ui| {
-                    ui.set_width(input_content_width);
-                    ui.horizontal(|ui| {
-                        let text_frame = egui::Frame::new()
-                            .fill(egui::Color32::TRANSPARENT)
-                            .stroke(egui::Stroke::NONE)
-                            .corner_radius(egui::CornerRadius::ZERO)
-                            .inner_margin(egui::Margin::ZERO);
+    egui::Frame::new()
+        .fill(egui::Color32::TRANSPARENT)
+        .stroke(egui::Stroke::new(1.0, crate::ui::theme::border()))
+        .corner_radius(egui::CornerRadius::same(10))
+        .inner_margin(egui::Margin::symmetric(12, 6))
+        .show(ui, |ui| {
+            ui.with_layout(
+                egui::Layout::right_to_left(egui::Align::Center),
+                |ui| {
+                    let spacing = 4.0;
 
-                        let clear_width = if has_text { 32.0 } else { 0.0 };
-                        let edit_width = (input_content_width - clear_width - 8.0).max(50.0);
+                    let send_btn = if is_enabled && has_text {
+                        let resp = ui.add(
+                            egui::Button::new(
+                                egui::RichText::new(crate::i18n::tr(language, "Send"))
+                                    .color(egui::Color32::WHITE)
+                                    .size(12.0)
+                                    .strong(),
+                            )
+                            .fill(egui::Color32::from_rgb(37, 99, 235))
+                            .corner_radius(egui::CornerRadius::same(6))
+                            .min_size(egui::vec2(52.0, 24.0)),
+                        );
+                        if resp.hovered() {
+                            ui.ctx().set_cursor_icon(egui::CursorIcon::PointingHand);
+                        }
+                        resp
+                    } else {
+                        ui.add_enabled(
+                            false,
+                            egui::Button::new(
+                                egui::RichText::new(crate::i18n::tr(language, "Send"))
+                                    .color(crate::ui::theme::text_weak())
+                                    .size(12.0),
+                            )
+                            .frame(false)
+                            .min_size(egui::vec2(44.0, 24.0)),
+                        )
+                    };
+                    if send_btn.clicked() {
+                        submit = true;
+                    }
 
-                        let edit_resp = ui.add_enabled(
-                            is_enabled,
-                            egui::TextEdit::singleline(plugin.draft_input_mut())
-                                .id_salt("osc_bottom_chatbox_input")
-                                .hint_text(crate::i18n::tr(
-                                    language,
-                                    "Type a message to Chatbox (Press Enter to send)...",
-                                ))
-                                .frame(text_frame)
-                                .margin(egui::Margin::ZERO)
-                                .desired_width(edit_width),
+                    if translate_mode {
+                        ui.add_space(spacing);
+
+                        let target_label = crate::language_label(language, &plugin.draft().typing_target_lang);
+                        let target_options: Vec<(String, String)> = crate::LANGUAGE_OPTIONS
+                            .iter()
+                            .filter(|(code, _)| !crate::languages_conflict(code, &plugin.draft().typing_source_lang))
+                            .map(|(code, label)| ((*code).to_string(), crate::i18n::tr(language, label).to_string()))
+                            .collect();
+                        crate::ui::components::searchable_combobox_frameless(
+                            ui,
+                            container_id.with("typing_target_lang"),
+                            target_label,
+                            &mut plugin.draft_mut().typing_target_lang,
+                            &target_options,
+                            Some(68.0),
                         );
 
-                        if edit_resp.lost_focus() && ui.input(|i| i.key_pressed(egui::Key::Enter)) {
-                            if has_text {
-                                submit = true;
+                        ui.add_space(1.0);
+
+                        let swap_btn = ui.add_enabled(
+                            is_enabled,
+                            egui::Button::new(
+                                egui::RichText::new("↔")
+                                    .size(12.0)
+                                    .color(crate::ui::theme::text_weak())
+                                    .strong(),
+                            )
+                            .frame(false)
+                            .min_size(egui::vec2(16.0, 22.0)),
+                        );
+                        if swap_btn.hovered() && is_enabled {
+                            ui.ctx().set_cursor_icon(egui::CursorIcon::PointingHand);
+                        }
+                        if swap_btn.clicked() {
+                            let old_source = plugin.draft().typing_source_lang.clone();
+                            let old_target = plugin.draft().typing_target_lang.clone();
+                            plugin.draft_mut().typing_source_lang = old_target;
+                            plugin.draft_mut().typing_target_lang = old_source;
+                        }
+
+                        ui.add_space(1.0);
+
+                        let source_label = crate::language_label(language, &plugin.draft().typing_source_lang);
+                        let source_options: Vec<(String, String)> = crate::LANGUAGE_OPTIONS
+                            .iter()
+                            .map(|(code, label)| ((*code).to_string(), crate::i18n::tr(language, label).to_string()))
+                            .collect();
+                        crate::ui::components::searchable_combobox_frameless(
+                            ui,
+                            container_id.with("typing_source_lang"),
+                            source_label,
+                            &mut plugin.draft_mut().typing_source_lang,
+                            &source_options,
+                            Some(68.0),
+                        );
+
+                        ui.add_space(spacing);
+                        ui.label(
+                            egui::RichText::new("|")
+                                .size(11.0)
+                                .color(crate::ui::theme::border()),
+                        );
+                    }
+
+                    ui.add_space(spacing);
+
+                    let mode_text = if translate_mode {
+                        egui::RichText::new(format!("🌐 {}", crate::i18n::tr(language, "Translate")))
+                            .color(egui::Color32::from_rgb(37, 99, 235))
+                            .size(12.0)
+                            .strong()
+                    } else {
+                        egui::RichText::new(format!("⌨️ {}", crate::i18n::tr(language, "Direct")))
+                            .color(crate::ui::theme::text_weak())
+                            .size(12.0)
+                    };
+                    let mode_btn = ui.add_enabled(
+                        is_enabled,
+                        egui::Button::new(mode_text).frame(false),
+                    );
+                    if mode_btn.hovered() && is_enabled {
+                        ui.ctx().set_cursor_icon(egui::CursorIcon::PointingHand);
+                    }
+                    if mode_btn.clicked() {
+                        plugin.set_translate_input(!translate_mode);
+                    }
+
+                    ui.add_space(spacing);
+                    ui.label(
+                        egui::RichText::new("|")
+                            .size(11.0)
+                            .color(crate::ui::theme::border()),
+                    );
+                    ui.add_space(spacing);
+
+                    let hint_text = if !is_enabled {
+                        crate::i18n::tr(language, "OSC is disabled")
+                    } else if translate_mode {
+                        crate::i18n::tr(
+                            language,
+                            "Type a message to Translate & Send (Press Enter)...",
+                        )
+                    } else {
+                        crate::i18n::tr(
+                            language,
+                            "Type a message to Chatbox (Press Enter to send)...",
+                        )
+                    };
+
+                    let text_frame = egui::Frame::new()
+                        .fill(egui::Color32::TRANSPARENT)
+                        .stroke(egui::Stroke::NONE)
+                        .corner_radius(egui::CornerRadius::ZERO)
+                        .inner_margin(egui::Margin::symmetric(0, 2));
+
+                    let edit_resp = ui.add_enabled(
+                        is_enabled,
+                        egui::TextEdit::singleline(plugin.draft_input_mut())
+                            .id_salt("osc_bottom_chatbox_input")
+                            .hint_text(
+                                egui::RichText::new(hint_text)
+                                    .size(13.0)
+                                    .color(crate::ui::theme::text_weak()),
+                            )
+                            .text_color(crate::ui::theme::text_strong())
+                            .font(egui::FontId::proportional(13.5))
+                            .frame(text_frame)
+                            .margin(egui::Margin::symmetric(0, 2))
+                            .desired_width(ui.available_width()),
+                    );
+
+                    if edit_resp.changed() && translate_mode {
+                        let text = plugin.draft_input();
+                        let current_src = &plugin.draft().typing_source_lang;
+                        let current_tgt = &plugin.draft().typing_target_lang;
+                        if let Some((new_src, new_tgt)) =
+                            xrtranslate_engine::auto_route_language_pair(text, current_src, current_tgt)
+                        {
+                            if new_src != current_src || new_tgt != current_tgt {
+                                plugin.draft_mut().typing_source_lang = new_src.to_string();
+                                plugin.draft_mut().typing_target_lang = new_tgt.to_string();
                             }
-                            request_focus_back = true;
                         }
+                    }
 
+                    if edit_resp.lost_focus() && ui.input(|i| i.key_pressed(egui::Key::Enter)) {
                         if has_text {
-                            ui.with_layout(
-                                egui::Layout::right_to_left(egui::Align::Center),
-                                |ui| {
-                                    let clear_btn = egui::Frame::new()
-                                        .fill(egui::Color32::from_rgb(226, 232, 240))
-                                        .corner_radius(egui::CornerRadius::same(10))
-                                        .inner_margin(egui::Margin::symmetric(6, 2))
-                                        .show(ui, |ui| {
-                                            ui.label(
-                                                egui::RichText::new("×")
-                                                    .color(egui::Color32::from_rgb(100, 116, 139))
-                                                    .size(12.0)
-                                                    .strong(),
-                                            )
-                                        })
-                                        .response
-                                        .interact(egui::Sense::click());
-                                    if clear_btn.clicked() {
-                                        plugin.draft_input_mut().clear();
-                                        request_focus_back = true;
-                                    }
-                                },
-                            );
+                            submit = true;
                         }
-
-                        text_edit_response = Some(edit_resp);
-                    });
-                });
-
-            ui.add_space(spacing);
-
-            let send_btn = crate::ui::components::primary_button_enabled(
-                ui,
-                crate::i18n::tr(language, "Send"),
-                is_enabled && has_text,
+                        edit_resp.request_focus();
+                    }
+                },
             );
-            if send_btn.clicked() {
-                submit = true;
-                request_focus_back = true;
-            }
         });
 
-        if let Some(resp) = text_edit_response {
-            if request_focus_back {
-                resp.request_focus();
-            }
-        }
+    if submit && is_enabled && has_text {
+        let text = plugin.draft_input().trim().to_string();
+        if plugin.translate_input() {
+            let current_src = &plugin.draft().typing_source_lang;
+            let current_tgt = &plugin.draft().typing_target_lang;
+            let (final_src, final_tgt) = if let Some((new_src, new_tgt)) =
+                xrtranslate_engine::auto_route_language_pair(&text, current_src, current_tgt)
+            {
+                (new_src.to_string(), new_tgt.to_string())
+            } else {
+                (current_src.clone(), current_tgt.clone())
+            };
+            plugin.draft_mut().typing_source_lang = final_src.clone();
+            plugin.draft_mut().typing_target_lang = final_tgt.clone();
 
-        if submit && is_enabled && has_text {
-            let text = plugin.draft_input().trim().to_string();
+            actions.push(super::OscUiAction::TranslateInput {
+                text,
+                source_lang: final_src,
+                target_lang: final_tgt,
+            });
+        } else {
             plugin.send_manual_message(&text);
-            plugin.draft_input_mut().clear();
-            ui.ctx().request_repaint();
         }
-    });
+        plugin.draft_input_mut().clear();
+        ui.ctx().request_repaint();
+    }
 }

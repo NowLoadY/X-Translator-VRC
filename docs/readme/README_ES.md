@@ -29,6 +29,7 @@
   <a href="#guía-de-usuario">Guía de usuario</a> •
   <a href="#ubicaciones-comunes">Ubicaciones comunes</a> •
   <a href="#citation">Citation</a> •
+  <a href="#colaboradores--contributors">Colaboradores</a> •
   <a href="#agradecimientos">Agradecimientos</a> •
   <a href="#licencia">Licencia</a>
 </p>
@@ -119,6 +120,12 @@ La ejecución conjunta de ambos modelos utiliza aproximadamente **4,1 GB** de VR
       url={https://arxiv.org/abs/2607.17544},
 }
 ```
+
+---
+
+## Colaboradores / Contributors
+
+Agradecemos sinceramente a todos los desarrolladores que han contribuido con código y a los evaluadores beta que han participado en las pruebas de XRTranslate. Puede consultar la lista completa de colaboradores, enlaces sociales y detalles de sus contribuciones en [docs/contributors.md](../contributors.md).
 
 ---
 

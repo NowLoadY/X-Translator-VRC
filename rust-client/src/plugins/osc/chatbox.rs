@@ -124,26 +124,26 @@ fn render_entries<'a>(
     let mut sources = Vec::new();
     let mut targets = Vec::new();
     for entry in entries {
-        let source = entry.source.trim();
-        let target = entry.translated.trim();
+        let source = sanitize_chatbox_segment(&entry.source);
+        let target = sanitize_chatbox_segment(&entry.translated);
         let speaker = settings
             .show_speaker_number
             .then(|| compact_speaker_label(&entry.speaker_id))
             .flatten();
 
         if !source.is_empty() && !target.is_empty() && source != target {
-            sources.push(with_speaker(source, speaker.as_deref()));
-            targets.push(target.to_string());
+            sources.push(with_speaker(&source, speaker.as_deref()));
+            targets.push(target);
         } else if let Some(text) = (!target.is_empty())
             .then_some(target)
             .or_else(|| (!source.is_empty()).then_some(source))
         {
             match settings.format_mode {
                 OscFormatMode::BilingualTargetFirst => {
-                    targets.push(with_speaker(text, speaker.as_deref()));
+                    targets.push(with_speaker(&text, speaker.as_deref()));
                 }
                 OscFormatMode::BilingualSourceFirst | OscFormatMode::Inline => {
-                    sources.push(with_speaker(text, speaker.as_deref()));
+                    sources.push(with_speaker(&text, speaker.as_deref()));
                 }
                 OscFormatMode::TargetOnly => unreachable!(),
             }
@@ -159,10 +159,10 @@ fn render_entries<'a>(
         OscFormatMode::TargetOnly => unreachable!(),
     };
     [first, second]
-        .into_iter()
-        .filter(|text| !text.is_empty())
-        .collect::<Vec<_>>()
-        .join(separator)
+    .into_iter()
+    .filter(|text| !text.is_empty())
+    .collect::<Vec<_>>()
+    .join(separator)
 }
 
 fn with_speaker(text: &str, speaker: Option<&str>) -> String {
@@ -178,42 +178,42 @@ fn compose_chatbox(prefix: &str, content: &str, suffix: &str) -> String {
 }
 
 pub(super) fn render_entry(entry: &HistoryMessage, settings: &OscSettings) -> String {
-    let source = entry.source.trim();
-    let translated = entry.translated.trim();
+    let source = sanitize_chatbox_segment(&entry.source);
+    let translated = sanitize_chatbox_segment(&entry.translated);
 
     let core_text = match settings.format_mode {
         OscFormatMode::TargetOnly => {
             if !translated.is_empty() {
-                translated.to_string()
+                translated
             } else {
-                source.to_string()
+                source
             }
         }
         OscFormatMode::BilingualTargetFirst => {
             if !source.is_empty() && !translated.is_empty() && source != translated {
                 format!("{}\n{}", translated, source)
             } else if !translated.is_empty() {
-                translated.to_string()
+                translated
             } else {
-                source.to_string()
+                source
             }
         }
         OscFormatMode::Inline => {
             if !source.is_empty() && !translated.is_empty() && source != translated {
                 format!("{} | {}", source, translated)
             } else if !translated.is_empty() {
-                translated.to_string()
+                translated
             } else {
-                source.to_string()
+                source
             }
         }
         OscFormatMode::BilingualSourceFirst => {
             if !source.is_empty() && !translated.is_empty() && source != translated {
                 format!("{}\n{}", source, translated)
             } else if !translated.is_empty() {
-                translated.to_string()
+                translated
             } else {
-                source.to_string()
+                source
             }
         }
     };
@@ -229,6 +229,64 @@ pub(super) fn render_entry(entry: &HistoryMessage, settings: &OscSettings) -> St
     } else {
         core_text
     }
+}
+
+/// Sanitizes a text segment for informal chatbox display:
+/// 1. Removes all fullwidth / halfwidth Chinese periods (`。`, `｡`), replacing intra-sentence periods with spaces if needed.
+/// 2. Strips trailing punctuation symbols that do not appear in informal chat typing (e.g. periods, commas, semicolons, colons across scripts).
+/// 3. Preserves expressive emotion punctuation (e.g. `?`, `!`, `~`, `？`, `！`, `～`).
+pub(super) fn sanitize_chatbox_segment(text: &str) -> String {
+    let trimmed = text.trim();
+    if trimmed.is_empty() {
+        return String::new();
+    }
+
+    let mut cleaned = String::with_capacity(trimmed.len());
+    let mut prev_is_space = false;
+    let chars: Vec<char> = trimmed.chars().collect();
+
+    for (i, &c) in chars.iter().enumerate() {
+        if c == '。' || c == '｡' {
+            let has_prev = i > 0 && !chars[i - 1].is_whitespace();
+            let has_next = i + 1 < chars.len() && !chars[i + 1].is_whitespace();
+            if has_prev && has_next && !prev_is_space {
+                cleaned.push(' ');
+                prev_is_space = true;
+            }
+        } else {
+            prev_is_space = c.is_whitespace();
+            cleaned.push(c);
+        }
+    }
+
+    strip_trailing_chat_punctuation(&cleaned)
+}
+
+pub(super) fn strip_trailing_chat_punctuation(text: &str) -> String {
+    let trimmed = text.trim();
+    let trimmed_end = trimmed.trim_end_matches(|c: char| {
+        matches!(
+            c,
+            '.' | '。'
+                | '｡'
+                | ',' | '，'
+                | '、' | '､'
+                | ';' | '；'
+                | ':' | '：'
+                | '۔' // Arabic Full Stop
+                | '։' // Armenian Full Stop
+                | '՝' // Armenian Comma
+                | '।' // Devanagari Danda
+                | '॥' // Devanagari Double Danda
+                | '።' // Ethiopic Full Stop
+                | '၊' // Myanmar Comma
+                | '။' // Myanmar Full Stop
+                | '᠃' // Mongolian Full Stop
+                | '᠂' // Mongolian Comma
+                | '༌' | '།' | '༎' // Tibetan
+        ) || c.is_whitespace()
+    });
+    trimmed_end.to_string()
 }
 
 fn fit_single_entry(
@@ -438,5 +496,52 @@ mod tests {
 
         entry.speaker_id = "speaker-unknown".into();
         assert_eq!(render_entry(&entry, &settings), "[S?] hello");
+    }
+
+    #[test]
+    fn removes_chinese_periods_and_trailing_non_chat_punctuation() {
+        // Chinese period removal
+        assert_eq!(sanitize_chatbox_segment("好的。"), "好的");
+        assert_eq!(sanitize_chatbox_segment("好的。我知道了。"), "好的 我知道了");
+        assert_eq!(sanitize_chatbox_segment("好的，我知道了。"), "好的，我知道了");
+        assert_eq!(sanitize_chatbox_segment("好的。 我知道了。"), "好的 我知道了");
+        assert_eq!(sanitize_chatbox_segment("こんにちは｡"), "こんにちは");
+
+        // Western period removal
+        assert_eq!(sanitize_chatbox_segment("Hello."), "Hello");
+        assert_eq!(sanitize_chatbox_segment("I am coming home."), "I am coming home");
+        assert_eq!(sanitize_chatbox_segment("Wait..."), "Wait");
+
+        // Trailing commas, semicolons, colons
+        assert_eq!(sanitize_chatbox_segment("你好，"), "你好");
+        assert_eq!(sanitize_chatbox_segment("Hello, "), "Hello");
+        assert_eq!(sanitize_chatbox_segment("First;"), "First");
+        assert_eq!(sanitize_chatbox_segment("Title:"), "Title");
+
+        // Preserves expressive chat punctuation
+        assert_eq!(sanitize_chatbox_segment("真的吗？"), "真的吗？");
+        assert_eq!(sanitize_chatbox_segment("Really?"), "Really?");
+        assert_eq!(sanitize_chatbox_segment("太棒了！"), "太棒了！");
+        assert_eq!(sanitize_chatbox_segment("Awesome!"), "Awesome!");
+        assert_eq!(sanitize_chatbox_segment("好的~"), "好的~");
+
+        // Multi-script full stops (Devanagari, Arabic, Armenian, Ethiopic, Myanmar, Tibetan)
+        assert_eq!(sanitize_chatbox_segment("नमस्ते।"), "नमस्ते");
+        assert_eq!(sanitize_chatbox_segment("مرحبا۔"), "مرحبا");
+        assert_eq!(sanitize_chatbox_segment("Բարև։"), "Բարև");
+        assert_eq!(sanitize_chatbox_segment("ሰላም።"), "ሰላም");
+        assert_eq!(sanitize_chatbox_segment("မင်္ဂလာပါ။"), "မင်္ဂလာပါ");
+    }
+
+    #[test]
+    fn render_entry_cleans_translation_segments_before_output() {
+        let mut entry = history_message(Instant::now(), "I am going to sleep.");
+        entry.translated = "我要去睡觉了。".into();
+        let settings = OscSettings::default();
+
+        assert_eq!(
+            render_entry(&entry, &settings),
+            "I am going to sleep\n我要去睡觉了"
+        );
     }
 }

@@ -29,6 +29,7 @@
   <a href="#user-guide">User Guide</a> •
   <a href="#common-locations">Common Locations</a> •
   <a href="#citation">Citation</a> •
+  <a href="#contributors">Contributors</a> •
   <a href="#acknowledgements">Acknowledgements</a> •
   <a href="#license">License</a>
 </p>
@@ -121,6 +122,12 @@ Running both models together uses about **4.1 GB** of VRAM. An 8 GB or larger GP
       url={https://arxiv.org/abs/2607.17544},
 }
 ```
+
+---
+
+## Contributors
+
+Special thanks to all code contributors and beta testers who helped build and test XRTranslate. See [docs/contributors.md](docs/contributors.md) for the full list of participants, their social links, and contribution details.
 
 ---
 

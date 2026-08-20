@@ -33,7 +33,7 @@ use tokio::{
 };
 use tracing::{info, warn};
 use xrtranslate_config::AppConfig;
-use xrtranslate_engine::RouteEpoch;
+use xrtranslate_engine::{RouteEpoch, translation_segment_pairs_for_final_text_with_lang};
 use xrtranslate_inference::{AsyncHttpClient, HttpRequest, ReqwestClient};
 use xrtranslate_prompt::PromptNodeGraph;
 use xrtranslate_protocol::{
@@ -130,8 +130,21 @@ struct UtteranceJob {
     enqueued_at: Instant,
 }
 
+struct TextJob {
+    text: String,
+    generation: PipelineGeneration,
+    turn_id: String,
+    topic_turn_id: String,
+    source_language: String,
+    target_language: String,
+    speaker_id: Option<String>,
+    workload: InferenceWorkload,
+    enqueued_at: Instant,
+}
+
 enum InferenceJob {
     Utterance(UtteranceJob),
+    Text(TextJob),
     StreamEnded {
         generation: PipelineGeneration,
         turn_id: String,
@@ -695,6 +708,40 @@ async fn serve_session(socket: WebSocket, state: BackendState) {
                             }
                             info!(%session_id, ?feature, enabled, "session feature configured");
                         }
+                        Ok(ClientControl::Action(ActionControl::TranslateText {
+                            text,
+                            source_lang,
+                            target_lang,
+                            stream_id: _,
+                        })) => {
+                            let trimmed = text.trim();
+                            if !trimmed.is_empty() && input_state != SessionInputState::Draining {
+                                let Some(sender) = job_sender.as_ref() else { break };
+                                let source_language = source_lang
+                                    .filter(|s| !s.trim().is_empty())
+                                    .unwrap_or_else(|| session.source_lang().to_string());
+                                let target_language = target_lang
+                                    .filter(|t| !t.trim().is_empty())
+                                    .unwrap_or_else(|| session.target_lang().to_string());
+                                let turn_id = format!("text-{}", next_utterance_sequence);
+                                next_utterance_sequence = next_utterance_sequence.wrapping_add(1);
+                                let topic_turn_id = turn_id.clone();
+                                let job = TextJob {
+                                    text: trimmed.to_string(),
+                                    generation,
+                                    turn_id,
+                                    topic_turn_id,
+                                    source_language,
+                                    target_language,
+                                    speaker_id: None,
+                                    workload,
+                                    enqueued_at: Instant::now(),
+                                };
+                                if sender.send(InferenceJob::Text(job)).await.is_err() {
+                                    break;
+                                }
+                            }
+                        }
                         Ok(ClientControl::Event(EventControl::TurnStarted { turn_id })) => {
                             session.set_turn_id(turn_id);
                         }
@@ -1228,6 +1275,257 @@ async fn run_inference_worker(
         };
         let job = match job {
             InferenceJob::Utterance(job) => job,
+            InferenceJob::Text(job) => {
+                if let Some(pending) = pending_translation.take() {
+                    let Ok(batch) = pending.await else { break };
+                    if !send_inference_batch(&events, batch).await {
+                        break;
+                    }
+                }
+                if *generation.borrow() != job.generation {
+                    continue;
+                }
+                let job_queue_elapsed = job.enqueued_at.elapsed();
+                let (asr_tokens, translation_tokens) = inference.prompt_context_token_budgets();
+                let context_budgets = ContextBudgets {
+                    asr_tokens,
+                    translation_tokens,
+                };
+                let (routed_source, routed_target) = if let Some((new_src, new_tgt)) =
+                    xrtranslate_engine::auto_route_language_pair(
+                        &job.text,
+                        &job.source_language,
+                        &job.target_language,
+                    )
+                {
+                    (new_src.to_string(), new_tgt.to_string())
+                } else {
+                    (job.source_language.clone(), job.target_language.clone())
+                };
+                adaptive_route.configure(&routed_source, &routed_target);
+                let active_target_language = adaptive_route.active_targets(&routed_target);
+                let asr_context = match corpus_session
+                    .prepare_asr(&PrepareAsrRequest {
+                        source_language: routed_source.clone(),
+                        target_language: active_target_language,
+                        budgets: context_budgets,
+                    })
+                    .await
+                {
+                    Ok(prompt) => prompt,
+                    Err(message) => {
+                        if events
+                            .send(InferenceEvent::Error {
+                                generation: job.generation,
+                                message: message.to_string(),
+                            })
+                            .await
+                            .is_err()
+                        {
+                            break;
+                        }
+                        continue;
+                    }
+                };
+                let segments = translation_segment_pairs_for_final_text_with_lang(
+                    &job.text,
+                    &routed_source,
+                );
+                let mut recognized = RecognizedOutput {
+                    source_text: job.text.clone(),
+                    segments,
+                    source_language: routed_source,
+                    target_language: routed_target,
+                    asr_elapsed: Duration::ZERO,
+                    route_switched: None,
+                };
+                let translation_context = match corpus_session
+                    .prepare_translation(&PrepareTranslationRequest {
+                        asr_context_id: asr_context.context_id,
+                        turn_id: Some(job.topic_turn_id.clone()),
+                        speaker_id: job.speaker_id.clone().unwrap_or_default(),
+                        source_language: recognized.source_language.clone(),
+                        target_language: recognized.target_language.clone(),
+                        recognized_text: recognized.source_text.clone(),
+                        segments: recognized
+                            .segments
+                            .iter()
+                            .map(|segment| segment.translation_text.clone())
+                            .collect(),
+                        budgets: context_budgets,
+                    })
+                    .await
+                {
+                    Ok(context) => context,
+                    Err(message) => {
+                        if events
+                            .send(InferenceEvent::Error {
+                                generation: job.generation,
+                                message: message.to_string(),
+                            })
+                            .await
+                            .is_err()
+                        {
+                            break;
+                        }
+                        continue;
+                    }
+                };
+                let source_rewrite = rewrite_recognition_terms(
+                    &recognized.source_text,
+                    &translation_context.source_corrections,
+                );
+                if source_rewrite.corrected_text != recognized.source_text {
+                    recognized.apply_source_correction(source_rewrite.corrected_text.clone());
+                }
+                for (segment, context) in recognized
+                    .segments
+                    .iter_mut()
+                    .zip(&translation_context.segments)
+                {
+                    let rewrite = rewrite_recognition_terms(
+                        &segment.translation_text,
+                        &context.source_corrections,
+                    );
+                    segment.translation_text = rewrite.corrected_text;
+                    segment.source_text.clone_from(&segment.translation_text);
+                }
+                let asr_elapsed = Duration::ZERO;
+                let source_language = recognized.source_language.clone();
+                let target_language = recognized.target_language.clone();
+                let segments = recognized.segments.clone();
+                let segment_contexts = segment_contexts(
+                    &segments,
+                    &translation_context.segments,
+                    job.turn_id.clone(),
+                    job.speaker_id.clone().unwrap_or_default(),
+                    StreamWindowContext {
+                        start_ms: 0.0,
+                        end_ms: 0.0,
+                        revisable: false,
+                        overlap_ratio: 0.0,
+                        boundary: SegmentBoundary::InputBoundary,
+                    },
+                );
+                if events
+                    .send(InferenceEvent::Recognized {
+                        generation: job.generation,
+                        recognized,
+                        segments: segment_contexts.clone(),
+                    })
+                    .await
+                    .is_err()
+                {
+                    break;
+                }
+                let translation_generation = generation.clone();
+                let event_generation = job.generation;
+                let workload = job.workload;
+                let turn_started_at = job.enqueued_at;
+                let queue_elapsed = job_queue_elapsed;
+                let context_id = translation_context.context_id;
+                let corpus_session = corpus_session.clone();
+                let inference = inference.clone();
+                let scheduler = scheduler.clone();
+                let logical_turn_id = job.topic_turn_id.clone();
+                let history_speaker_id = job.speaker_id.unwrap_or_default();
+                let history_source_language = source_language.clone();
+                let history_target_language = target_language.clone();
+                let prompt_graph_for_turn = Arc::clone(&prompt_graph);
+                let turn_id_for_end = job.turn_id.clone();
+                pending_translation = Some(tokio::spawn(async move {
+                    let translations = futures_util::stream::iter(
+                        segments
+                            .into_iter()
+                            .zip(segment_contexts)
+                            .zip(translation_context.segments),
+                    )
+                    .map(|((segment, segment_context), corpus_context)| {
+                        let inference = inference.clone();
+                        let scheduler = scheduler.clone();
+                        let source_language = source_language.clone();
+                        let target_language = target_language.clone();
+                        let source_for_terms = segment.translation_text.clone();
+                        let prompt_terms = corpus_context.prompt_terms.clone();
+                        let prompt_graph = Arc::clone(&prompt_graph_for_turn);
+                        async move {
+                            let _permit = scheduler.acquire_translation(workload).await;
+                            let prompt_graph = prompt_graph.read().await.clone();
+                            let prompt_context = prompt_context_for_segment(
+                                &source_language,
+                                &target_language,
+                                &corpus_context,
+                            );
+                            let output = inference
+                                .translate_segment(
+                                    &segment,
+                                    &source_language,
+                                    &target_language,
+                                    prompt_graph,
+                                    prompt_context,
+                                )
+                                .await;
+                            (segment_context, source_for_terms, prompt_terms, output)
+                        }
+                    })
+                    .buffered(TRANSLATION_CONCURRENCY_PER_SESSION);
+                    tokio::pin!(translations);
+                    let mut batch = Vec::new();
+                    let mut completed_pairs = Vec::new();
+                    let mut cancelled = false;
+                    while let Some((segment_context, source_for_terms, prompt_terms, mut output)) =
+                        translations.next().await
+                    {
+                        if *translation_generation.borrow() != event_generation {
+                            cancelled = true;
+                            break;
+                        }
+                        if let Ok(translated) = &mut output {
+                            let rewrite = rewrite_translation_terms(
+                                &source_for_terms,
+                                &translated.translated_text,
+                                &translated.target_language,
+                                &prompt_terms,
+                            );
+                            translated.translated_text = rewrite.translated_text;
+                            translated.term_matches = rewrite.term_matches;
+                            completed_pairs.push((
+                                translated.source_text.clone(),
+                                translated.translated_text.clone(),
+                            ));
+                        }
+                        batch.push(InferenceEvent::Translation {
+                            generation: event_generation,
+                            queue_elapsed,
+                            asr_elapsed,
+                            total_elapsed: turn_started_at.elapsed(),
+                            context: segment_context,
+                            output,
+                        });
+                    }
+                    if !cancelled
+                        && let Some(request) = (LogicalTurnRecord {
+                            context_id,
+                            turn_id: logical_turn_id,
+                            speaker_id: history_speaker_id,
+                            source_language: &history_source_language,
+                            target_language: &history_target_language,
+                            completed_pairs: &completed_pairs,
+                        })
+                        .into_request()
+                    {
+                        if let Err(message) = corpus_session.record_translation(&request).await {
+                            warn!(%message, "could not record XR Corpus translation context");
+                        }
+                    }
+                    batch.push(InferenceEvent::StreamEnded {
+                        generation: event_generation,
+                        turn_id: turn_id_for_end,
+                    });
+                    batch
+                }));
+                continue;
+            }
             InferenceJob::StreamEnded {
                 generation: event_generation,
                 turn_id,

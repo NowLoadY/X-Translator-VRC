@@ -167,6 +167,18 @@ pub enum ActionControl {
     SetPromptGraph { prompt_graph: PromptNodeGraph },
     /// Enables or disables a session feature.
     ToggleFeature { feature: Feature, enabled: bool },
+    /// Submits a direct text turn for standard translation processing (segmenting,
+    /// XR Corpus terminology matching & context retrieval, prompt graph execution,
+    /// translation model inference, terminology post-rewriting, and history commit).
+    TranslateText {
+        text: String,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        source_lang: Option<String>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        target_lang: Option<String>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        stream_id: Option<u64>,
+    },
 }
 
 /// Event-discriminated client controls.
@@ -523,6 +535,38 @@ mod tests {
         assert_eq!(
             serde_json::to_string(&control).unwrap(),
             r#"{"action":"toggle_feature","feature":"speaker_recognition","enabled":true}"#
+        );
+    }
+
+    #[test]
+    fn translate_text_action_has_stable_wire_shape() {
+        let control = ClientControl::Action(ActionControl::TranslateText {
+            text: "Hello world".into(),
+            source_lang: Some("en".into()),
+            target_lang: Some("zh".into()),
+            stream_id: Some(42),
+        });
+        let json = serde_json::to_string(&control).unwrap();
+        assert_eq!(
+            json,
+            r#"{"action":"translate_text","text":"Hello world","source_lang":"en","target_lang":"zh","stream_id":42}"#
+        );
+        assert_eq!(
+            serde_json::from_str::<ClientControl>(&json).unwrap(),
+            control
+        );
+
+        let minimal = ClientControl::Action(ActionControl::TranslateText {
+            text: "Hello".into(),
+            source_lang: None,
+            target_lang: None,
+            stream_id: None,
+        });
+        let min_json = serde_json::to_string(&minimal).unwrap();
+        assert_eq!(min_json, r#"{"action":"translate_text","text":"Hello"}"#);
+        assert_eq!(
+            serde_json::from_str::<ClientControl>(&min_json).unwrap(),
+            minimal
         );
     }
 

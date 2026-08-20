@@ -12,13 +12,18 @@ pub struct OscPageContext<'a> {
     pub mute_gate_enabled: bool,
 }
 
-#[derive(Debug)]
+#[derive(Debug, PartialEq, Eq)]
 pub enum OscUiAction {
     ClearHostHistory,
     SetMuteGateEnabled(bool),
     SetSpeakerNumberVisible(bool),
     SaveSettings,
     SettingsApplied(Result<(), String>),
+    TranslateInput {
+        text: String,
+        source_lang: String,
+        target_lang: String,
+    },
 }
 
 pub fn render(
@@ -75,7 +80,7 @@ pub fn render(
 
     ui.add_space(10.0);
 
-    canvas::render_bottom_input_bar(plugin, ui, context.language);
+    canvas::render_bottom_input_bar(plugin, ui, context.language, &mut actions);
 
     actions
 }

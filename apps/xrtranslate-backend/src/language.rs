@@ -1,19 +1,9 @@
-//! Compact, stateful language routing for bidirectional automatic sessions.
-
 use std::collections::VecDeque;
+
+pub(crate) use xrtranslate_engine::language::Script;
 
 const RECENT_OBSERVATIONS_LIMIT: usize = 5;
 const SWITCH_CANDIDATE_THRESHOLD: usize = 2;
-
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
-pub(crate) enum Script {
-    Latin,
-    Han,
-    Japanese,
-    Cyrillic,
-    Hangul,
-    Thai,
-}
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 struct LanguageSpec {
@@ -370,7 +360,7 @@ impl AdaptiveLanguageRoute {
 }
 
 fn script_evidence(language: SupportedLanguage, text: &str) -> Evidence {
-    let observed = observed_scripts(text);
+    let observed = xrtranslate_engine::observed_scripts(text);
     if observed.is_empty() {
         return Evidence::Unknown;
     }
@@ -392,86 +382,7 @@ fn script_evidence(language: SupportedLanguage, text: &str) -> Evidence {
 }
 
 fn has_substantial_language_evidence(language: SupportedLanguage, text: &str) -> bool {
-    let trimmed = text.trim();
-    if trimmed.is_empty() {
-        return false;
-    }
-    match language.0.script {
-        Script::Latin => {
-            let words: Vec<&str> = trimmed
-                .split_whitespace()
-                .filter(|w| w.chars().any(|c| c.is_ascii_alphabetic()))
-                .collect();
-            if words.is_empty() {
-                return false;
-            }
-            let total_alpha: usize = trimmed.chars().filter(|c| c.is_ascii_alphabetic()).count();
-            if total_alpha < 3 {
-                return false;
-            }
-            if words.len() == 1 {
-                let word = words[0];
-                let is_all_upper_or_digit = word.chars().all(|c| {
-                    c.is_ascii_uppercase() || c.is_ascii_digit() || !c.is_ascii_alphanumeric()
-                });
-                if is_all_upper_or_digit && word.len() <= 3 {
-                    return false;
-                }
-            }
-            true
-        }
-        Script::Han => {
-            let has_han = trimmed
-                .chars()
-                .any(|c| ('\u{3400}'..='\u{9fff}').contains(&c));
-            let has_kana = trimmed
-                .chars()
-                .any(|c| ('\u{3040}'..='\u{31ff}').contains(&c));
-            has_han && !has_kana
-        }
-        Script::Japanese => trimmed.chars().any(|c| {
-            ('\u{3040}'..='\u{31ff}').contains(&c) || ('\u{3400}'..='\u{9fff}').contains(&c)
-        }),
-        Script::Hangul => trimmed.chars().any(|c| {
-            ('\u{1100}'..='\u{11ff}').contains(&c) || ('\u{ac00}'..='\u{d7af}').contains(&c)
-        }),
-        Script::Cyrillic => trimmed
-            .chars()
-            .any(|c| ('\u{0400}'..='\u{04ff}').contains(&c)),
-        Script::Thai => trimmed
-            .chars()
-            .any(|c| ('\u{0e00}'..='\u{0e7f}').contains(&c)),
-    }
-}
-
-fn observed_scripts(text: &str) -> Vec<Script> {
-    let mut scripts = Vec::with_capacity(2);
-    for character in text.chars() {
-        let script =
-            if character.is_ascii_alphabetic() || ('\u{00c0}'..='\u{024f}').contains(&character) {
-                Some(Script::Latin)
-            } else if ('\u{3040}'..='\u{31ff}').contains(&character) {
-                Some(Script::Japanese)
-            } else if ('\u{3400}'..='\u{9fff}').contains(&character) {
-                Some(Script::Han)
-            } else if ('\u{0400}'..='\u{04ff}').contains(&character) {
-                Some(Script::Cyrillic)
-            } else if ('\u{1100}'..='\u{11ff}').contains(&character)
-                || ('\u{ac00}'..='\u{d7af}').contains(&character)
-            {
-                Some(Script::Hangul)
-            } else if ('\u{0e00}'..='\u{0e7f}').contains(&character) {
-                Some(Script::Thai)
-            } else {
-                None
-            };
-        if let Some(script) = script
-            && !scripts.contains(&script)
-        {
-            scripts.push(script);
-        }
-    }
-    scripts
+    xrtranslate_engine::has_substantial_script_evidence(language.0.script, text)
 }
 
 #[cfg(test)]

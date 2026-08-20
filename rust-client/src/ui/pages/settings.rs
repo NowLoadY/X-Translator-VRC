@@ -109,7 +109,7 @@ fn render_general_appearance_section(app: &mut crate::XRTranslateApp, ui: &mut e
                 ))
                 .desired_width(300.0),
         );
-        if response.lost_focus() && response.changed() {
+        if response.lost_focus() || response.changed() {
             app.set_download_proxy_url(app.download_proxy_url.clone());
         }
         ui.add_space(4.0);
@@ -152,7 +152,104 @@ fn render_general_appearance_section(app: &mut crate::XRTranslateApp, ui: &mut e
         });
         ui.add_space(14.0);
         render_update_controls(app, ui);
+
+        let groups = crate::contributors::load_contributors_cached(&app.project_root());
+        if !groups.is_empty() {
+            ui.add_space(14.0);
+            components::wavy_divider(ui, crate::ui::theme::border());
+            ui.add_space(12.0);
+
+            for group in groups {
+                let section_title = match &group.role {
+                    crate::contributors::ContributorRole::CodeContributors => {
+                        crate::i18n::tr(app.ui_language, "Code Contributors")
+                    }
+                    crate::contributors::ContributorRole::BetaTesters => {
+                        crate::i18n::tr(app.ui_language, "Beta Testers")
+                    }
+                    crate::contributors::ContributorRole::Other(title) => title.as_str(),
+                };
+
+                ui.label(
+                    egui::RichText::new(section_title)
+                        .color(crate::ui::theme::text_strong())
+                        .size(13.5)
+                        .strong(),
+                );
+                ui.add_space(6.0);
+
+                for contributor in &group.contributors {
+                    ui.vertical(|ui| {
+                        ui.horizontal_wrapped(|ui| {
+                            ui.label(
+                                egui::RichText::new(&contributor.name)
+                                    .color(crate::ui::theme::text_strong())
+                                    .strong(),
+                            );
+                            if !contributor.links.is_empty() {
+                                ui.add_space(4.0);
+                                for link in &contributor.links {
+                                    render_social_link_chip(ui, &link.label, &link.url);
+                                    ui.add_space(3.0);
+                                }
+                            }
+                            if contributor.contributions.len() == 1 {
+                                ui.add_space(4.0);
+                                ui.label(
+                                    egui::RichText::new(format!("— {}", contributor.contributions[0]))
+                                        .size(12.0)
+                                        .color(crate::ui::theme::text_weak()),
+                                );
+                            }
+                        });
+                        if contributor.contributions.len() > 1 {
+                            ui.add_space(2.0);
+                            for item in &contributor.contributions {
+                                ui.horizontal(|ui| {
+                                    ui.add_space(8.0);
+                                    ui.label(
+                                        egui::RichText::new("•")
+                                            .size(11.0)
+                                            .color(crate::ui::theme::primary_dark()),
+                                    );
+                                    ui.label(
+                                        egui::RichText::new(item)
+                                            .size(12.0)
+                                            .color(crate::ui::theme::text_weak()),
+                                    );
+                                });
+                            }
+                        }
+                    });
+                    ui.add_space(5.0);
+                }
+                ui.add_space(6.0);
+            }
+        }
     });
+}
+
+fn render_social_link_chip(ui: &mut egui::Ui, label: &str, url: &str) {
+    let is_external = url.starts_with("http://") || url.starts_with("https://");
+    let display_text = if is_external {
+        format!("{label} ↗")
+    } else {
+        label.to_string()
+    };
+
+    egui::Frame::new()
+        .fill(crate::ui::theme::surface_control())
+        .stroke(egui::Stroke::new(1.0, crate::ui::theme::border()))
+        .corner_radius(egui::CornerRadius::same(6))
+        .inner_margin(egui::Margin::symmetric(6, 2))
+        .show(ui, |ui| {
+            ui.hyperlink_to(
+                egui::RichText::new(display_text)
+                    .size(11.5)
+                    .color(crate::ui::theme::primary_dark()),
+                url,
+            );
+        });
 }
 
 fn render_update_controls(app: &mut crate::XRTranslateApp, ui: &mut egui::Ui) {
@@ -222,6 +319,10 @@ fn render_update_controls(app: &mut crate::XRTranslateApp, ui: &mut egui::Ui) {
     ui.add_space(10.0);
     ui.horizontal(|ui| {
         let busy = app.app_update_manager.is_busy();
+        let is_actionable = matches!(
+            &state,
+            AppUpdateState::Ready(_) | AppUpdateState::Available(_)
+        );
         let primary_label = match &state {
             AppUpdateState::Ready(_) => "Install and Restart",
             AppUpdateState::Available(_) => "Download Update",
@@ -233,7 +334,13 @@ fn render_update_controls(app: &mut crate::XRTranslateApp, ui: &mut egui::Ui) {
             AppUpdateState::Idle => "Check for Updates",
         };
 
-        if components::primary_button_enabled(ui, primary_label, !busy).clicked() {
+        let btn_clicked = if is_actionable {
+            components::primary_button_enabled(ui, primary_label, !busy).clicked()
+        } else {
+            components::animated_button_enabled(ui, primary_label, !busy).clicked()
+        };
+
+        if btn_clicked {
             match &state {
                 AppUpdateState::Ready(_) => app.install_update_and_restart(),
                 AppUpdateState::Available(_) => app.download_update(),

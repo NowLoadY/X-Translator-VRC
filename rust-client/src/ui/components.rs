@@ -502,37 +502,37 @@ pub fn primary_button_enabled_with_id(
         0.08,
     );
 
-    let rest_fill = theme::primary();
-    let hover_fill = theme::primary_dark();
+    let rest_fill = Color32::from_rgb(37, 99, 235);
+    let hover_fill = Color32::from_rgb(59, 130, 246);
     let active_fill = Color32::from_rgb(29, 78, 216);
 
-    let fill = if enabled {
+    let (fill, stroke, text_color) = if enabled {
         let base =
             crate::ui::animation::AnimationSystem::lerp_color(rest_fill, hover_fill, hover_factor);
-        crate::ui::animation::AnimationSystem::lerp_color(base, active_fill, active_factor)
+        let current_fill =
+            crate::ui::animation::AnimationSystem::lerp_color(base, active_fill, active_factor);
+        (current_fill, Stroke::NONE, Color32::WHITE)
     } else {
-        Color32::from_rgb(219, 234, 254)
-    };
-
-    let text_color = if enabled {
-        Color32::WHITE
-    } else {
-        Color32::from_rgb(147, 197, 253)
+        (
+            theme::surface_control(),
+            Stroke::new(1.0, theme::border()),
+            crate::ui::theme::text_weak(),
+        )
     };
 
     let resp = ui
         .add_enabled_ui(enabled, |ui| {
             Frame::new()
                 .fill(fill)
-                .stroke(Stroke::new(1.0, theme::border_strong()))
+                .stroke(stroke)
                 .corner_radius(CornerRadius::same(8))
-                .inner_margin(Margin::symmetric(14, 7))
+                .inner_margin(Margin::symmetric(14, 6))
                 .shadow(egui::Shadow::NONE)
                 .show(ui, |ui| {
                     ui.label(
                         egui::RichText::new(text)
                             .color(text_color)
-                            .size(13.5)
+                            .size(13.0)
                             .strong(),
                     );
                 })
@@ -559,13 +559,68 @@ pub fn searchable_combobox<T: PartialEq + Clone>(
     selected: &mut T,
     options: &[(T, String)],
 ) -> bool {
+    searchable_combobox_with_width(ui, id, selected_text, selected, options, None)
+}
+
+pub fn searchable_combobox_with_width<T: PartialEq + Clone>(
+    ui: &mut Ui,
+    id: impl std::hash::Hash + std::fmt::Debug,
+    selected_text: impl Into<String>,
+    selected: &mut T,
+    options: &[(T, String)],
+    width: Option<f32>,
+) -> bool {
+    searchable_combobox_with_options(ui, id, selected_text, selected, options, width, true)
+}
+
+pub fn searchable_combobox_frameless<T: PartialEq + Clone>(
+    ui: &mut Ui,
+    id: impl std::hash::Hash + std::fmt::Debug,
+    selected_text: impl Into<String>,
+    selected: &mut T,
+    options: &[(T, String)],
+    width: Option<f32>,
+) -> bool {
+    searchable_combobox_with_options(ui, id, selected_text, selected, options, width, false)
+}
+
+pub fn searchable_combobox_with_options<T: PartialEq + Clone>(
+    ui: &mut Ui,
+    id: impl std::hash::Hash + std::fmt::Debug,
+    selected_text: impl Into<String>,
+    selected: &mut T,
+    options: &[(T, String)],
+    width: Option<f32>,
+    frame: bool,
+) -> bool {
     let mut changed = false;
     let search_id = ui.make_persistent_id(&id).with("combo_search");
 
-    egui::ComboBox::from_id_salt(&id)
-        .selected_text(selected_text.into())
-        .close_behavior(egui::PopupCloseBehavior::CloseOnClickOutside)
-        .show_ui(ui, |ui| {
+    ui.scope(|ui| {
+        if !frame {
+            ui.style_mut().visuals.widgets.inactive.bg_stroke = egui::Stroke::NONE;
+            ui.style_mut().visuals.widgets.inactive.bg_fill = egui::Color32::TRANSPARENT;
+            ui.style_mut().visuals.widgets.hovered.bg_stroke = egui::Stroke::NONE;
+            ui.style_mut().visuals.widgets.hovered.bg_fill = crate::ui::theme::surface_control_hover();
+            ui.style_mut().visuals.widgets.active.bg_stroke = egui::Stroke::NONE;
+            ui.style_mut().visuals.widgets.active.bg_fill = crate::ui::theme::surface_control_active();
+            ui.style_mut().visuals.widgets.open.bg_stroke = egui::Stroke::NONE;
+            ui.style_mut().visuals.widgets.open.bg_fill = egui::Color32::TRANSPARENT;
+            ui.spacing_mut().button_padding = egui::vec2(4.0, 2.0);
+        }
+
+        let mut combo = egui::ComboBox::from_id_salt(&id)
+            .selected_text(
+                egui::RichText::new(selected_text.into())
+                    .size(12.0)
+                    .color(crate::ui::theme::text_strong()),
+            )
+            .close_behavior(egui::PopupCloseBehavior::CloseOnClickOutside);
+        if let Some(w) = width {
+            combo = combo.width(w);
+        }
+
+        combo.show_ui(ui, |ui| {
             let is_more_than_3 = options.len() > 3;
 
             let mut search_query = if is_more_than_3 {
@@ -618,6 +673,7 @@ pub fn searchable_combobox<T: PartialEq + Clone>(
                 ui.add_space(4.0);
             }
         });
+    });
 
     changed
 }

@@ -29,6 +29,7 @@
   <a href="#利用ガイド">利用ガイド</a> •
   <a href="#主要なファイルとパス">主要なファイルとパス</a> •
   <a href="#citation">Citation</a> •
+  <a href="#貢献者--contributors">貢献者</a> •
   <a href="#謝辞">謝辞</a> •
   <a href="#ライセンス">ライセンス</a>
 </p>
@@ -119,6 +120,12 @@ OSC を介した高速タイピング入力とリアルタイム翻訳送信に�
       url={https://arxiv.org/abs/2607.17544},
 }
 ```
+
+---
+
+## 貢献者 / Contributors
+
+XRTranslate の開発へのコード貢献およびベータテストにご参加いただいた皆様に深く感謝いたします。完全な貢献者一覧、ソーシャルリンク、および貢献内容については [docs/contributors.md](../contributors.md) をご覧ください。
 
 ---
 

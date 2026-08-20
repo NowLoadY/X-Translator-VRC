@@ -1,4 +1,4 @@
-use std::collections::{BTreeMap, HashMap, HashSet};
+use std::collections::{HashMap, HashSet};
 use std::fmt::{Display, Formatter};
 
 use serde::{Deserialize, Serialize};
@@ -153,7 +153,7 @@ pub struct PromptGraphError {
 }
 
 impl PromptGraphError {
-    pub(crate) fn new(message: impl Into<String>) -> Self {
+    pub fn new(message: impl Into<String>) -> Self {
         Self {
             message: message.into(),
         }
@@ -488,22 +488,66 @@ impl PromptNodeGraph {
             }
         }
 
-        let mut shared = nodes_by_layer(&self.nodes, &layers, PromptNodePage::Shared);
-        let mut shared_bottoms = HashMap::new();
-        for (layer, ids) in &mut shared {
-            ids.sort();
-            let bottom = position_column(&mut self.nodes, *layer, ids, 40.0);
-            shared_bottoms.insert(*layer, bottom);
-        }
+        let max_layer = layers.values().copied().max().unwrap_or(0);
 
-        // Provider pages are mutually exclusive canvas views, so their nodes can
-        // reuse the same vertical space after any Shared nodes in that column.
-        for page in [PromptNodePage::OpenAiCompatible, PromptNodePage::Hunyuan] {
-            let mut grouped = nodes_by_layer(&self.nodes, &layers, page);
-            for (layer, ids) in &mut grouped {
-                ids.sort();
-                let y = shared_bottoms.get(layer).copied().unwrap_or(40.0);
-                position_column(&mut self.nodes, *layer, ids, y);
+        for layer in 0..=max_layer {
+            let mut shared_ids = self
+                .nodes
+                .iter()
+                .filter(|node| node.page == PromptNodePage::Shared && layers.get(&node.id) == Some(&layer))
+                .map(|node| node.id.clone())
+                .collect::<Vec<_>>();
+
+            // If layer == 0 (input layer), sort semantically so language variables are on top and context blocks are on bottom
+            if layer == 0 {
+                shared_ids.sort_by_key(|id| {
+                    self.nodes
+                        .iter()
+                        .find(|n| n.id == *id)
+                        .map(node_semantic_rank)
+                        .unwrap_or((99, id.clone()))
+                });
+                position_column(&mut self.nodes, layer, &shared_ids, 40.0);
+                continue;
+            }
+
+            // For layer >= 1: partition shared nodes by barycenter into top shared (< 500.0) and bottom shared (>= 500.0)
+            let mut top_shared = Vec::new();
+            let mut bottom_shared = Vec::new();
+            for id in shared_ids {
+                let bary = compute_node_barycenter(&id, &self.nodes, &self.links).unwrap_or(0.0);
+                if bary < 500.0 {
+                    top_shared.push(id);
+                } else {
+                    bottom_shared.push(id);
+                }
+            }
+            sort_layer_nodes(&mut top_shared, layer, &self.nodes, &self.links);
+            sort_layer_nodes(&mut bottom_shared, layer, &self.nodes, &self.links);
+
+            let top_bottom = position_column(&mut self.nodes, layer, &top_shared, 40.0);
+
+            // Provider nodes on each page (OpenAiCompatible, Hunyuan)
+            let mut max_provider_bottom = top_bottom;
+            for page in [PromptNodePage::OpenAiCompatible, PromptNodePage::Hunyuan] {
+                let mut provider_ids = self
+                    .nodes
+                    .iter()
+                    .filter(|node| node.page == page && layers.get(&node.id) == Some(&layer))
+                    .map(|node| node.id.clone())
+                    .collect::<Vec<_>>();
+                if provider_ids.is_empty() {
+                    continue;
+                }
+                sort_layer_nodes(&mut provider_ids, layer, &self.nodes, &self.links);
+                let prov_bottom = position_column(&mut self.nodes, layer, &provider_ids, top_bottom);
+                if prov_bottom > max_provider_bottom {
+                    max_provider_bottom = prov_bottom;
+                }
+            }
+
+            if !bottom_shared.is_empty() {
+                position_column(&mut self.nodes, layer, &bottom_shared, max_provider_bottom);
             }
         }
         self.layout_version = Self::CURRENT_LAYOUT_VERSION;
@@ -631,26 +675,91 @@ pub(crate) fn default_node_label(kind: &PromptNodeKind) -> String {
     }
 }
 
-fn nodes_by_layer(
+fn node_semantic_rank(node: &PromptNode) -> (usize, String) {
+    let category = match &node.kind {
+        PromptNodeKind::Variable { variable } => match variable {
+            PromptVariable::SourceLanguage => 0,
+            PromptVariable::TargetLanguage => 1,
+            PromptVariable::CurrentInput => 2,
+        },
+        PromptNodeKind::Input { block } => match block {
+            TranslationPromptBlock::LanguageOrder => 3,
+            TranslationPromptBlock::RecentTurns { .. } => 4,
+            TranslationPromptBlock::SurroundingSource => 5,
+            TranslationPromptBlock::Terminology => 6,
+            TranslationPromptBlock::PreviousRevision => 7,
+            TranslationPromptBlock::CustomText { .. } => 8,
+        },
+        PromptNodeKind::Compose { text }
+            if text.contains("Reference handling rules") || text.contains("POLICY") =>
+        {
+            9
+        }
+        PromptNodeKind::Compose { .. } => 10,
+        PromptNodeKind::Switch { .. } => 11,
+        PromptNodeKind::Request { .. } => 12,
+    };
+    (category, node.id.clone())
+}
+
+fn compute_node_barycenter(
+    node_id: &str,
     nodes: &[PromptNode],
-    layers: &HashMap<String, usize>,
-    page: PromptNodePage,
-) -> BTreeMap<usize, Vec<String>> {
-    let mut grouped = BTreeMap::new();
-    for node in nodes.iter().filter(|node| node.page == page) {
-        grouped
-            .entry(layers.get(&node.id).copied().unwrap_or_default())
-            .or_insert_with(Vec::new)
-            .push(node.id.clone());
+    links: &[PromptLink],
+) -> Option<f32> {
+    let mut sum_y = 0.0;
+    let mut count = 0.0;
+    for link in links {
+        if link.to == node_id {
+            if let Some(from_node) = nodes.iter().find(|n| n.id == link.from) {
+                sum_y += from_node.position[1];
+                count += 1.0;
+            }
+        }
     }
-    grouped
+    if count > 0.0 {
+        Some(sum_y / count)
+    } else {
+        None
+    }
+}
+
+fn sort_layer_nodes(
+    ids: &mut [String],
+    layer: usize,
+    nodes: &[PromptNode],
+    links: &[PromptLink],
+) {
+    if layer == 0 {
+        ids.sort_by_key(|id| {
+            nodes
+                .iter()
+                .find(|n| n.id == *id)
+                .map(node_semantic_rank)
+                .unwrap_or((99, id.clone()))
+        });
+    } else {
+        ids.sort_by(|a, b| {
+            let bary_a = compute_node_barycenter(a, nodes, links);
+            let bary_b = compute_node_barycenter(b, nodes, links);
+            match (bary_a, bary_b) {
+                (Some(va), Some(vb)) => va
+                    .partial_cmp(&vb)
+                    .unwrap_or(std::cmp::Ordering::Equal)
+                    .then_with(|| a.cmp(b)),
+                (Some(_), None) => std::cmp::Ordering::Less,
+                (None, Some(_)) => std::cmp::Ordering::Greater,
+                (None, None) => a.cmp(b),
+            }
+        });
+    }
 }
 
 fn position_column(nodes: &mut [PromptNode], layer: usize, ids: &[String], mut y: f32) -> f32 {
     for id in ids {
         if let Some(node) = nodes.iter_mut().find(|node| node.id == *id) {
-            node.position = [48.0 + layer as f32 * 600.0, y];
-            y += node.layout_height() + 32.0;
+            node.position = [48.0 + layer as f32 * 680.0, y];
+            y += node.layout_height() + 36.0;
         }
     }
     y
@@ -714,7 +823,7 @@ mod tests {
         let PromptNodeKind::Compose { text } = &mut changed
             .nodes
             .iter_mut()
-            .find(|node| node.id == "reference-handling-rules")
+            .find(|node| node.id == "reference-explicit-rules")
             .unwrap()
             .kind
         else {
@@ -786,13 +895,39 @@ mod tests {
         let mut graph = PromptNodeGraph::builtin_default();
         graph.links.push(PromptLink {
             from: "current-input".into(),
-            to: "reference-handling-rules".into(),
-            input: 0,
+            to: "reference-explicit-rules".into(),
+            input: 2,
         });
 
         assert_eq!(
             graph.validate_for_activation().unwrap_err().to_string(),
             "prompt link uses an invalid socket"
         );
+    }
+
+    #[test]
+    fn auto_layout_orders_layers_by_barycenter_without_line_crossings() {
+        let mut graph = PromptNodeGraph::empty();
+        // Top variable
+        let top_var = graph.add_variable(PromptNodePage::Shared, PromptVariable::SourceLanguage, [0.0, 0.0]);
+        // Bottom variable
+        let btm_var = graph.add_variable(PromptNodePage::Shared, PromptVariable::CurrentInput, [0.0, 0.0]);
+
+        // Target nodes in Layer 1: intentionally add bottom target first, then top target
+        let btm_target = graph.add_compose(PromptNodePage::Shared, "Btm: {0}".into(), [0.0, 0.0]);
+        let top_target = graph.add_compose(PromptNodePage::Shared, "Top: {0}".into(), [0.0, 0.0]);
+
+        // Connect top_var -> top_target, and btm_var -> btm_target
+        assert!(graph.connect(&top_var, &top_target, 0));
+        assert!(graph.connect(&btm_var, &btm_target, 0));
+
+        // Perform auto_layout
+        graph.auto_layout();
+
+        let top_target_node = graph.nodes.iter().find(|n| n.id == top_target).unwrap();
+        let btm_target_node = graph.nodes.iter().find(|n| n.id == btm_target).unwrap();
+
+        // Top target must be placed above bottom target (smaller Y) to prevent edge crossing
+        assert!(top_target_node.position[1] < btm_target_node.position[1]);
     }
 }

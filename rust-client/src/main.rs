@@ -14,6 +14,7 @@ mod audio;
 mod backend;
 mod child_process;
 mod client_settings;
+pub(crate) mod contributors;
 mod feature_access;
 mod history;
 mod i18n;
@@ -80,7 +81,7 @@ pub const LANGUAGE_OPTIONS: &[(&str, &str)] = &[
 /// network/model path from turning old audio into ever-growing live latency.
 const LIVE_AUDIO_QUEUE_CAPACITY: usize = 64;
 
-fn language_label(ui_language: UiLanguage, code: &str) -> &'static str {
+pub(crate) fn language_label(ui_language: UiLanguage, code: &str) -> &'static str {
     if code == "auto" {
         return i18n::tr(ui_language, "Auto (bidirectional)");
     }
@@ -992,6 +993,11 @@ impl XRTranslateApp {
                     Ok(()) => self.last_error = None,
                     Err(error) => self.last_error = Some(error),
                 },
+                OscUiAction::TranslateInput {
+                    text,
+                    source_lang,
+                    target_lang,
+                } => self.translate_text(&text, Some(source_lang), Some(target_lang)),
             }
         }
     }
@@ -2124,6 +2130,29 @@ impl XRTranslateApp {
             state.pending_recognition_windows.clear();
         }
         self.osc_plugin.clear_chatbox();
+    }
+
+    pub(crate) fn translate_text(
+        &mut self,
+        text: &str,
+        source_lang: Option<String>,
+        target_lang: Option<String>,
+    ) {
+        let trimmed = text.trim();
+        if trimmed.is_empty() {
+            return;
+        }
+        if self.is_translating && !self.sessions.is_empty() {
+            self.sessions[0].translate_text(trimmed, source_lang, target_lang);
+        } else {
+            self.last_error = Some(
+                i18n::tr(
+                    self.ui_language,
+                    "Translation session is not active. Please start translation first.",
+                )
+                .to_string(),
+            );
+        }
     }
 
     pub(crate) fn pause_active_meeting(&mut self) {

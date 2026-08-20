@@ -105,13 +105,15 @@ pub fn render_onboarding_fullscreen(app: &mut crate::XRTranslateApp, ui: &mut eg
     }
     let requirement = onboarding_requirement(app);
     let can_advance = requirement.is_none();
+    let viewport_focused = ui.input(|input| input.viewport().focused.unwrap_or(true));
 
     egui::Panel::bottom("onboarding_bottom_nav")
+        .show_separator_line(false)
         .frame(
             Frame::new()
-                .fill(Color32::from_rgb(244, 248, 255))
+                .fill(theme::content_backdrop(viewport_focused))
                 .inner_margin(Margin::symmetric(36, 14))
-                .stroke(Stroke::new(1.0, Color32::from_rgb(226, 232, 240))),
+                .stroke(Stroke::NONE),
         )
         .show(ui, |ui| {
             ui.horizontal(|ui| {
@@ -158,8 +160,9 @@ pub fn render_onboarding_fullscreen(app: &mut crate::XRTranslateApp, ui: &mut eg
     egui::CentralPanel::default()
         .frame(
             Frame::new()
-                .fill(Color32::from_rgb(244, 248, 255))
-                .inner_margin(Margin::symmetric(36, 20)),
+                .fill(theme::content_backdrop(viewport_focused))
+                .inner_margin(Margin::symmetric(36, 20))
+                .stroke(Stroke::NONE),
         )
         .show(ui, |ui| {
             ui.vertical(|ui| {
@@ -183,6 +186,18 @@ pub fn render_onboarding_fullscreen(app: &mut crate::XRTranslateApp, ui: &mut eg
                         );
                     });
                     ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
+                        ui.label(
+                            RichText::new(format!(
+                                "{} {}/{}",
+                                crate::i18n::tr(app.ui_language, "Step"),
+                                app.onboarding_page + 1,
+                                total_pages
+                            ))
+                            .size(13.0)
+                            .color(theme::text_strong())
+                            .strong(),
+                        );
+                        ui.add_space(12.0);
                         let language_changed = components::language_selector(
                             ui,
                             "onboarding_ui_language",
@@ -192,17 +207,21 @@ pub fn render_onboarding_fullscreen(app: &mut crate::XRTranslateApp, ui: &mut eg
                             app.set_ui_language(app.ui_language);
                         }
                         ui.add_space(10.0);
-                        components::status_badge(
-                            ui,
-                            &format!(
-                                "{} {}/{}",
-                                crate::i18n::tr(app.ui_language, "Step"),
-                                app.onboarding_page + 1,
-                                total_pages
-                            ),
-                            true,
-                            false,
+                        let response = ui.add(
+                            egui::TextEdit::singleline(&mut app.download_proxy_url)
+                                .hint_text(crate::i18n::tr(
+                                    app.ui_language,
+                                    "Proxy, e.g. http://127.0.0.1:7890",
+                                ))
+                                .desired_width(200.0),
                         );
+                        if response.lost_focus() || response.changed() {
+                            app.set_download_proxy_url(app.download_proxy_url.clone());
+                        }
+                        response.on_hover_text(crate::i18n::tr(
+                            app.ui_language,
+                            "Download proxy: used only for updates and downloads. Leave empty when your VPN uses global mode.",
+                        ));
                     });
                 });
 
@@ -213,20 +232,26 @@ pub fn render_onboarding_fullscreen(app: &mut crate::XRTranslateApp, ui: &mut eg
                 ui.add_space(14.0);
 
                 Frame::new()
-                    .fill(Color32::WHITE)
-                    .corner_radius(CornerRadius::same(20))
-                    .inner_margin(Margin::symmetric(28, 24))
-                    .stroke(Stroke::new(1.0, Color32::from_rgb(219, 230, 246)))
+                    .fill(Color32::TRANSPARENT)
+                    .inner_margin(Margin::symmetric(8, 12))
+                    .stroke(Stroke::NONE)
                     .show(ui, |ui| {
                         ui.set_height(ui.available_height());
                         ui.set_width(ui.available_width());
                         egui::ScrollArea::vertical()
                             .id_salt("onboarding_content_scroll")
                             .auto_shrink([false, false])
-                            .show(ui, |ui| match app.onboarding_page {
-                                0 => render_onboarding_welcome(app.ui_language, ui),
-                                1 => render_onboarding_runtime(app, ui),
-                                _ => render_onboarding_models(app, ui),
+                            .show(ui, |ui| {
+                                let cur = app.onboarding_page;
+                                crate::ui::animation::AnimationSystem::render_animated_page(
+                                    ui,
+                                    cur,
+                                    |ui| match cur {
+                                        0 => render_onboarding_welcome(app.ui_language, ui),
+                                        1 => render_onboarding_runtime(app, ui),
+                                        _ => render_onboarding_models(app, ui),
+                                    },
+                                );
                             });
                     });
             });
@@ -291,7 +316,7 @@ fn render_onboarding_steps(
                 )
             };
 
-            let check_mark = if complete { "✓ " } else { "" };
+            let step_label = format!("{}  {}", index + 1, crate::i18n::tr(language, step));
 
             Frame::new()
                 .fill(fill)
@@ -300,19 +325,10 @@ fn render_onboarding_steps(
                 .inner_margin(Margin::symmetric(14, 7))
                 .show(ui, |ui| {
                     ui.label(
-                        RichText::new(format!(
-                            "{}{}{}",
-                            check_mark,
-                            if !complete {
-                                format!("{}  ", index + 1)
-                            } else {
-                                "".to_string()
-                            },
-                            crate::i18n::tr(language, step)
-                        ))
-                        .size(12.5)
-                        .color(text)
-                        .strong(),
+                        RichText::new(step_label)
+                            .size(12.5)
+                            .color(text)
+                            .strong(),
                     );
                 });
 
@@ -363,7 +379,7 @@ fn onboarding_feature_card(
         .fill(tint)
         .corner_radius(CornerRadius::same(10))
         .inner_margin(Margin::same(20))
-        .stroke(Stroke::new(1.0, Color32::from_black_alpha(12)))
+        .stroke(Stroke::new(1.0, theme::border()))
         .show(ui, |ui| {
             ui.set_width(ui.available_width());
             ui.set_min_height(82.0);
@@ -390,21 +406,21 @@ fn render_onboarding_welcome(language: crate::i18n::UiLanguage, ui: &mut egui::U
             &mut columns[0],
             "01",
             "Audio Input",
-            Color32::from_rgb(239, 246, 255),
+            Color32::from_rgba_unmultiplied(239, 246, 255, 120),
             language,
         );
         onboarding_feature_card(
             &mut columns[1],
             "02",
             "Recognition & Translation",
-            Color32::from_rgb(240, 253, 250),
+            Color32::from_rgba_unmultiplied(240, 253, 250, 120),
             language,
         );
         onboarding_feature_card(
             &mut columns[2],
             "03",
             "VRChat OSC",
-            Color32::from_rgb(255, 247, 237),
+            Color32::from_rgba_unmultiplied(255, 247, 237, 120),
             language,
         );
     });
@@ -560,108 +576,23 @@ fn render_onboarding_runtime(app: &mut crate::XRTranslateApp, ui: &mut egui::Ui)
 
     ui.add_space(14.0);
 
-    // Option B: Manual Setup Card
+    // Option B: Manual Setup / Existing llama-server
     Frame::new()
-        .fill(Color32::from_rgb(248, 250, 252))
-        .corner_radius(CornerRadius::same(16))
+        .fill(Color32::from_rgba_unmultiplied(248, 250, 252, 160))
+        .corner_radius(CornerRadius::same(12))
         .inner_margin(Margin::same(18))
-        .stroke(Stroke::new(1.0, Color32::from_rgb(226, 232, 240)))
+        .stroke(Stroke::new(1.0, theme::border()))
         .show(ui, |ui| {
             ui.label(
-                RichText::new(crate::i18n::tr(language, "Option B: Install Manually"))
-                    .size(14.5)
-                    .color(theme::text_strong())
-                    .strong(),
-            );
-            ui.add_space(6.0);
-            ui.label(
                 RichText::new(crate::i18n::tr(
                     language,
-                    "If automatic download fails or you prefer using an existing llama.cpp build:",
+                    "Option B: Choose Existing llama-server.exe / Manual Setup",
                 ))
-                .size(12.0)
-                .color(theme::text_weak()),
-            );
-
-            ui.add_space(12.0);
-
-            // Step 1: Download
-            ui.label(
-                RichText::new(crate::i18n::tr(
-                    language,
-                    "1. Download the right package manually",
-                ))
-                .size(13.0)
+                .size(14.5)
                 .color(theme::text_strong())
                 .strong(),
             );
-            ui.add_space(4.0);
-            ui.label(
-                RichText::new(crate::i18n::tr(
-                    language,
-                    "NVIDIA graphics: download the matching llama-...-bin-win-cuda-...-x64.zip and cudart-llama-bin-win-cuda-...-x64.zip from the same release and CUDA version.",
-                ))
-                .size(12.0)
-                .color(theme::text_normal()),
-            );
-            ui.add_space(4.0);
-            ui.label(
-                RichText::new(crate::i18n::tr(
-                    language,
-                    "CPU only: download llama-...-bin-win-cpu-x64.zip.",
-                ))
-                .size(12.0)
-                .color(theme::text_normal()),
-            );
-            ui.add_space(8.0);
-            match crate::runtime_install::configured_release_page(&app.project_root()) {
-                Ok(release_page) => {
-                    ui.hyperlink_to(
-                        crate::i18n::tr(language, "Open llama.cpp downloads"),
-                        release_page,
-                    );
-                }
-                Err(error) => {
-                    ui.label(RichText::new(error).size(11.0).color(Color32::from_rgb(220, 38, 38)));
-                }
-            }
-
-            ui.add_space(12.0);
-
-            // Step 2: Extract & keep together
-            ui.label(
-                RichText::new(crate::i18n::tr(language, "2. Keep the runtime together"))
-                    .size(13.0)
-                    .color(theme::text_strong())
-                    .strong(),
-            );
-            ui.add_space(4.0);
-            ui.label(
-                RichText::new(crate::i18n::tr(
-                    language,
-                    "Extract every file into one folder, for example D:\\llama.cpp. With NVIDIA, llama-server.exe and cudart64_*.dll must stay in that same folder.",
-                ))
-                .size(12.0)
-                .color(theme::text_normal()),
-            );
-        });
-
-    ui.add_space(14.0);
-
-    // Selected Path Executable Card
-    Frame::new()
-        .fill(Color32::WHITE)
-        .corner_radius(CornerRadius::same(16))
-        .inner_margin(Margin::same(18))
-        .stroke(Stroke::new(1.0, Color32::from_rgb(219, 230, 246)))
-        .show(ui, |ui| {
-            ui.label(
-                RichText::new(crate::i18n::tr(language, "Select llama-server.exe"))
-                    .size(14.0)
-                    .color(theme::text_strong())
-                    .strong(),
-            );
-            ui.add_space(8.0);
+            ui.add_space(10.0);
             ui.horizontal(|ui| {
                 let path_changed = components::file_path_input(
                     ui,
@@ -680,13 +611,52 @@ fn render_onboarding_runtime(app: &mut crate::XRTranslateApp, ui: &mut egui::Ui)
                 }
             });
             if let Some(error) = &app.last_error {
-                ui.add_space(8.0);
+                ui.add_space(6.0);
                 ui.label(
                     RichText::new(error)
                         .size(12.0)
                         .color(Color32::from_rgb(220, 38, 38)),
                 );
             }
+            ui.add_space(8.0);
+            ui.collapsing(
+                crate::i18n::tr(language, "Manual download & packaging guide"),
+                |ui| {
+                    ui.add_space(4.0);
+                    ui.label(
+                        RichText::new(crate::i18n::tr(
+                            language,
+                            "NVIDIA graphics: download matching llama-...-bin-win-cuda-...-x64.zip and cudart-llama-bin-win-cuda-...-x64.zip from release.",
+                        ))
+                        .size(12.0)
+                        .color(theme::text_normal()),
+                    );
+                    ui.label(
+                        RichText::new(crate::i18n::tr(
+                            language,
+                            "CPU only: download llama-...-bin-win-cpu-x64.zip.",
+                        ))
+                        .size(12.0)
+                        .color(theme::text_normal()),
+                    );
+                    ui.add_space(4.0);
+                    if let Ok(release_page) = crate::runtime_install::configured_release_page(&app.project_root()) {
+                        ui.hyperlink_to(
+                            crate::i18n::tr(language, "Open llama.cpp downloads"),
+                            release_page,
+                        );
+                    }
+                    ui.add_space(4.0);
+                    ui.label(
+                        RichText::new(crate::i18n::tr(
+                            language,
+                            "Extract all files into one folder (e.g. D:\\llama.cpp) with llama-server.exe and DLLs together.",
+                        ))
+                        .size(12.0)
+                        .color(theme::text_normal()),
+                    );
+                },
+            );
         });
 }
 
@@ -942,7 +912,7 @@ pub fn render_sidebar(
     let icon_tr = include_image!("../../resources/icons/translation.svg");
     let icon_settings = include_image!("../../resources/icons/settings.svg");
     let icon_guide = include_image!("../../resources/icons/guide.svg");
-    let icon_prompt = include_image!("../../resources/icons/guide.svg");
+    let icon_prompt = include_image!("../../resources/icons/prompt-studio.svg");
     let icon_expand = include_image!("../../resources/icons/chevron-right.svg");
     let icon_collapse = include_image!("../../resources/icons/chevron-left.svg");
 

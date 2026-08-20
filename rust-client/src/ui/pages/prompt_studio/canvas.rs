@@ -78,16 +78,89 @@ fn request_summary(message_count: usize) -> String {
     format!("{message_count} {noun} · ONE API REQUEST")
 }
 
-fn input_socket_tooltip(graph: &PromptNodeGraph, node: &PromptNode, input: u8) -> String {
+#[derive(Clone, Debug, Default)]
+struct GraphErrorTarget {
+    node_id: Option<String>,
+    input_index: Option<u8>,
+}
+
+fn parse_validation_error_target(
+    error: Option<&xrtranslate_prompt::PromptGraphError>,
+) -> GraphErrorTarget {
+    let Some(err) = error else {
+        return GraphErrorTarget::default();
+    };
+    let msg = err.to_string();
+    if let Some(rest) = msg.strip_prefix("node ") {
+        if let Some((node_id, after_node)) = rest.split_once(" input ") {
+            if let Some((input_str, _)) = after_node.split_once(" is not connected") {
+                if let Ok(idx) = input_str.parse::<u8>() {
+                    return GraphErrorTarget {
+                        node_id: Some(node_id.trim().to_string()),
+                        input_index: Some(idx),
+                    };
+                }
+            }
+        }
+    }
+    if let Some(rest) = msg.strip_prefix("compose node ") {
+        if let Some((node_id, _)) = rest.split_once(':') {
+            return GraphErrorTarget {
+                node_id: Some(node_id.trim().to_string()),
+                input_index: None,
+            };
+        }
+    }
+    if let Some(rest) = msg.strip_prefix("provider request ") {
+        let node_id = rest.split_whitespace().next().unwrap_or_default();
+        if !node_id.is_empty() {
+            return GraphErrorTarget {
+                node_id: Some(node_id.trim().to_string()),
+                input_index: None,
+            };
+        }
+    }
+    GraphErrorTarget::default()
+}
+
+fn remove_compose_placeholder(text: &mut String, input: u8) {
+    let target = format!("{{{input}}}");
+    *text = text.replace(&format!("\n\n{target}"), "");
+    *text = text.replace(&format!("\n{target}"), "");
+    *text = text.replace(&target, "");
+    *text = text.trim_end().to_string();
+}
+
+fn input_socket_tooltip(
+    graph: &PromptNodeGraph,
+    node: &PromptNode,
+    input: u8,
+    error_target: &GraphErrorTarget,
+) -> String {
     let socket = input_socket_label(node, input);
+    let is_error = error_target.node_id.as_deref() == Some(node.id.as_str())
+        && error_target.input_index == Some(input);
+    if is_error {
+        return format!("{socket} · UNCONNECTED (Required by prompt template)");
+    }
     graph
         .links
         .iter()
         .find(|link| link.to == node.id && link.input == input)
         .and_then(|link| graph.nodes.iter().find(|source| source.id == link.from))
         .map_or_else(
-            || format!("{socket} · Not connected"),
-            |source| format!("{socket} · {}", node_display_label(source)),
+            || match &node.kind {
+                PromptNodeKind::Compose { text } if text.contains(&format!("{{{input}}}")) => {
+                    format!("{socket} · Unconnected placeholder in text (Right-click to remove {{{input}}})")
+                }
+                _ => format!("{socket} · Not connected (Drag to connect)"),
+            },
+            |source| {
+                format!(
+                    "{socket} · Connected to {}\n(Drag to pull off · Right-click to disconnect)",
+                    node_display_label(source)
+                )
+            },
         )
 }
 
@@ -108,6 +181,7 @@ pub(super) fn render_graph_editor(
                 && trace.graph_fingerprint == draft.graph.fingerprint()
         });
     let validation_error = draft.graph.validate_for_activation().err();
+    let error_target = parse_validation_error_target(validation_error.as_ref());
     let editable = !draft.read_only;
     ui.horizontal(|ui| {
         ui.label(
@@ -190,7 +264,7 @@ pub(super) fn render_graph_editor(
         ui.label(
             RichText::new(format!("INVALID GRAPH / {error}"))
                 .font(egui::FontId::monospace(10.0))
-                .color(Color32::from_rgb(232, 135, 119)),
+                .color(style::ERROR_BORDER),
         );
     }
     ui.add_space(4.0);
@@ -204,16 +278,53 @@ pub(super) fn render_graph_editor(
             let canvas_height = ui.available_height().max(1.0);
             let (canvas, response) = ui.allocate_exact_size(
                 Vec2::new(ui.available_width(), canvas_height),
-                Sense::drag(),
+                Sense::click_and_drag(),
             );
             controller.canvas_size = canvas.size();
-            if editable && response.secondary_clicked() {
-                controller.add_node_center = response.interact_pointer_pos().map(|pointer| {
-                    let position = (pointer - canvas.min - controller.pan) / controller.zoom;
-                    [position.x, position.y]
+
+            let pointer_over_node_or_link = response.interact_pointer_pos().is_some_and(|pointer| {
+                let over_node = draft
+                    .graph
+                    .nodes
+                    .iter()
+                    .filter(|node| controller.node_is_visible(node))
+                    .any(|node| {
+                        graph_rect(canvas, controller, node.position, node_size(node))
+                            .contains(pointer)
+                    });
+                let over_link = draft.graph.links.iter().any(|link| {
+                    let endpoints_visible = draft
+                        .graph
+                        .nodes
+                        .iter()
+                        .filter(|node| node.id == link.from || node.id == link.to)
+                        .all(|node| controller.node_is_visible(node));
+                    if !endpoints_visible {
+                        return false;
+                    }
+                    if let Some((from, to)) = link_points(canvas, controller, &draft.graph, link) {
+                        distance_to_curve(pointer, bezier_points(from, to)) <= 12.0
+                    } else {
+                        false
+                    }
                 });
+                over_node || over_link
+            });
+
+            let is_pulling_wire = controller.wire_from.is_some() || controller.wire_from_input.is_some();
+
+            if editable && response.secondary_clicked() {
+                if is_pulling_wire {
+                    controller.wire_from = None;
+                    controller.wire_from_input = None;
+                } else if !pointer_over_node_or_link {
+                    controller.add_node_center = response.interact_pointer_pos().map(|pointer| {
+                        let position = (pointer - canvas.min - controller.pan) / controller.zoom;
+                        [position.x, position.y]
+                    });
+                }
             }
-            if editable {
+            if editable && !pointer_over_node_or_link && !is_pulling_wire {
                 let preferred_center = controller.add_node_center;
                 response.context_menu(|ui| {
                     render_node_menu(&mut draft, controller, ui, preferred_center);
@@ -224,10 +335,13 @@ pub(super) fn render_graph_editor(
                 controller.fit_pending = false;
             }
             let mut canvas_ui = canvas_viewport(ui, canvas);
-            if response.dragged_by(egui::PointerButton::Middle) {
+            let space_held = canvas_ui.input(|input| input.key_down(egui::Key::Space));
+            if response.dragged_by(egui::PointerButton::Middle)
+                || (space_held && response.dragged_by(egui::PointerButton::Primary))
+            {
                 controller.pan += canvas_ui.input(|input| input.pointer.delta());
             }
-            if editable && response.drag_started_by(egui::PointerButton::Primary) {
+            if editable && !space_held && response.drag_started_by(egui::PointerButton::Primary) {
                 if let Some(pointer) = response.interact_pointer_pos() {
                     let over_node = draft
                         .graph
@@ -238,9 +352,28 @@ pub(super) fn render_graph_editor(
                             graph_rect(canvas, controller, node.position, node_size(node))
                                 .contains(pointer)
                         });
-                    if !over_node {
+                    let over_link = draft.graph.links.iter().any(|link| {
+                        let endpoints_visible = draft
+                            .graph
+                            .nodes
+                            .iter()
+                            .filter(|node| node.id == link.from || node.id == link.to)
+                            .all(|node| controller.node_is_visible(node));
+                        if !endpoints_visible {
+                            return false;
+                        }
+                        if let Some((from, to)) =
+                            link_points(canvas, controller, &draft.graph, link)
+                        {
+                            distance_to_curve(pointer, bezier_points(from, to)) <= 12.0
+                        } else {
+                            false
+                        }
+                    });
+                    if !over_node && !over_link {
                         if !canvas_ui.input(|input| input.modifiers.shift || input.modifiers.ctrl) {
                             controller.selected_nodes.clear();
+                            controller.selected_links.clear();
                         }
                         controller.box_select_start = Some(pointer);
                         controller.box_select_current = Some(pointer);
@@ -277,8 +410,13 @@ pub(super) fn render_graph_editor(
                 }
             }
             if response.clicked_by(egui::PointerButton::Primary) {
-                controller.selected_nodes.clear();
-                controller.wire_from = None;
+                if is_pulling_wire {
+                    controller.wire_from = None;
+                    controller.wire_from_input = None;
+                } else if !pointer_over_node_or_link {
+                    controller.selected_nodes.clear();
+                    controller.selected_links.clear();
+                }
             }
             if response.hovered() {
                 let scroll = canvas_ui.input(|input| input.smooth_scroll_delta.y);
@@ -309,18 +447,31 @@ pub(super) fn render_graph_editor(
                     input.key_pressed(egui::Key::Delete) || input.key_pressed(egui::Key::Backspace)
                 })
             {
+                let mut modified = false;
                 let selected = controller.selected_nodes.drain().collect::<Vec<_>>();
                 for id in &selected {
                     draft.graph.remove_node(&id);
+                    modified = true;
                 }
-                if !selected.is_empty() {
+                let selected_links = controller.selected_links.drain().collect::<Vec<_>>();
+                for link_key in &selected_links {
+                    draft.graph.links.retain(|link| {
+                        !(link.from == link_key.from
+                            && link.to == link_key.to
+                            && link.input == link_key.input)
+                    });
+                    modified = true;
+                }
+                if modified {
                     controller.mark_dirty();
                 }
             }
             if canvas_ui.input(|input| input.key_pressed(egui::Key::Escape)) {
                 controller.wire_from = None;
+                controller.wire_from_input = None;
                 controller.box_select_start = None;
                 controller.box_select_current = None;
+                controller.selected_links.clear();
             }
             draw_canvas_background(&mut canvas_ui, canvas, controller);
             render_links(&mut canvas_ui, canvas, &mut draft, controller, editable);
@@ -331,9 +482,11 @@ pub(super) fn render_graph_editor(
                 controller,
                 editable,
                 runtime_trace.as_ref(),
+                &error_target,
             );
             render_wire_preview(&mut canvas_ui, canvas, &draft, controller);
             render_selection_box(&mut canvas_ui, controller);
+            render_canvas_navigation_hint(&canvas_ui, canvas);
         });
     controller.draft = Some(draft);
 }
@@ -511,6 +664,63 @@ fn render_links(
 ) {
     let links = profile.graph.links.clone();
     let mut remove_link = None;
+
+    // Find the single closest visible link to the pointer within 12px
+    let hovered_link_idx = ui.ctx().pointer_hover_pos().and_then(|pointer| {
+        let mut closest = None;
+        let mut min_dist = 12.0;
+
+        for (index, link) in links.iter().enumerate() {
+            let endpoints_visible = profile
+                .graph
+                .nodes
+                .iter()
+                .filter(|node| node.id == link.from || node.id == link.to)
+                .all(|node| controller.node_is_visible(node));
+            if !endpoints_visible {
+                continue;
+            }
+            let Some((from, to)) = link_points(canvas, controller, &profile.graph, link) else {
+                continue;
+            };
+            let points = bezier_points(from, to);
+            let dist = distance_to_curve(pointer, points);
+            if dist < min_dist {
+                min_dist = dist;
+                closest = Some(index);
+            }
+        }
+        closest
+    });
+
+    if editable {
+        if let Some(idx) = hovered_link_idx {
+            let link = &links[idx];
+            let link_key = PromptLinkKey {
+                from: link.from.clone(),
+                to: link.to.clone(),
+                input: link.input,
+            };
+
+            if ui.input(|i| i.pointer.primary_clicked()) {
+                let extend = ui.input(|i| i.modifiers.shift || i.modifiers.ctrl);
+                if extend {
+                    if !controller.selected_links.insert(link_key.clone()) {
+                        controller.selected_links.remove(&link_key);
+                    }
+                } else {
+                    controller.selected_nodes.clear();
+                    controller.selected_links.clear();
+                    controller.selected_links.insert(link_key);
+                }
+            }
+
+            if ui.input(|i| i.pointer.secondary_clicked()) {
+                remove_link = Some(idx);
+            }
+        }
+    }
+
     for (index, link) in links.iter().enumerate() {
         let endpoints_visible = profile
             .graph
@@ -525,30 +735,14 @@ fn render_links(
             continue;
         };
         let points = bezier_points(from, to);
-        let bounds = points
-            .iter()
-            .fold(Rect::from_min_max(points[0], points[0]), |rect, point| {
-                Rect::from_min_max(
-                    Pos2::new(rect.left().min(point.x), rect.top().min(point.y)),
-                    Pos2::new(rect.right().max(point.x), rect.bottom().max(point.y)),
-                )
-            });
-        let hit = ui.interact(
-            bounds.expand(8.0),
-            ui.make_persistent_id(("prompt_link", index)),
-            if editable {
-                Sense::click()
-            } else {
-                Sense::hover()
-            },
-        );
-        let pointer_near = ui
-            .ctx()
-            .pointer_hover_pos()
-            .is_some_and(|pointer| pointer_near_curve(pointer, points, 9.0));
-        if editable && pointer_near && hit.secondary_clicked() {
-            remove_link = Some(index);
-        }
+        let link_key = PromptLinkKey {
+            from: link.from.clone(),
+            to: link.to.clone(),
+            input: link.input,
+        };
+        let is_selected = controller.selected_links.contains(&link_key);
+        let is_hovered = hovered_link_idx == Some(index);
+
         let source_color = profile
             .graph
             .nodes
@@ -556,27 +750,55 @@ fn render_links(
             .find(|node| node.id == link.from)
             .map(|node| node_palette(&node.kind).connector)
             .unwrap_or(GRAPH_ACCENT);
-        let wire_color = if pointer_near {
-            style::GRAPH_ACCENT
+
+        let (wire_color, stroke_width) = if is_selected {
+            (style::LINK_SELECTED, 3.2)
+        } else if is_hovered {
+            (style::GRAPH_ACCENT, 2.6)
         } else {
-            Color32::from_rgba_unmultiplied(
-                source_color.r(),
-                source_color.g(),
-                source_color.b(),
-                178,
+            (
+                Color32::from_rgba_unmultiplied(
+                    source_color.r(),
+                    source_color.g(),
+                    source_color.b(),
+                    178,
+                ),
+                1.6,
             )
         };
+
         ui.painter().add(egui::Shape::CubicBezier(
             egui::epaint::CubicBezierShape::from_points_stroke(
                 points,
                 false,
                 Color32::TRANSPARENT,
-                Stroke::new(if pointer_near { 2.6 } else { 1.6 }, wire_color),
+                Stroke::new(stroke_width, wire_color),
             ),
         ));
     }
+
+    if hovered_link_idx.is_some() {
+        if let Some(pointer) = ui.ctx().pointer_hover_pos() {
+            ui.interact(
+                Rect::from_center_size(pointer, Vec2::splat(16.0)),
+                ui.make_persistent_id("hovered_link_tooltip"),
+                Sense::hover(),
+            )
+            .on_hover_text(if editable {
+                "Click to select · Press Del to delete · Right-click to disconnect"
+            } else {
+                "Connection wire"
+            });
+        }
+    }
+
     if let Some(index) = remove_link {
-        profile.graph.links.remove(index);
+        let removed = profile.graph.links.remove(index);
+        controller.selected_links.remove(&PromptLinkKey {
+            from: removed.from,
+            to: removed.to,
+            input: removed.input,
+        });
         controller.mark_dirty();
     }
 }
@@ -588,6 +810,7 @@ fn render_nodes(
     controller: &mut PromptStudioController,
     editable: bool,
     runtime_trace: Option<&PromptExecutionTrace>,
+    error_target: &GraphErrorTarget,
 ) {
     let nodes = profile
         .graph
@@ -632,34 +855,32 @@ fn render_nodes(
                 }
             } else {
                 controller.selected_nodes.clear();
+                controller.selected_links.clear();
                 controller.selected_nodes.insert(node.id.clone());
             }
         }
         if editable && response.drag_started() {
             if !controller.selected_nodes.contains(&node.id) {
                 controller.selected_nodes.clear();
+                controller.selected_links.clear();
                 controller.selected_nodes.insert(node.id.clone());
             }
             controller.drag_node = Some(node.id.clone());
-            controller.drag_origins = profile
-                .graph
-                .nodes
-                .iter()
-                .filter(|candidate| controller.selected_nodes.contains(&candidate.id))
-                .map(|candidate| (candidate.id.clone(), candidate.position))
-                .collect();
         }
         if editable
             && response.dragged()
             && controller.drag_node.as_deref() == Some(node.id.as_str())
         {
             let delta = response.drag_delta() / controller.zoom;
-            for target in &mut profile.graph.nodes {
-                if let Some(origin) = controller.drag_origins.get(&target.id) {
-                    target.position = [origin[0] + delta.x, origin[1] + delta.y];
+            if delta.length_sq() > f32::EPSILON {
+                for target in &mut profile.graph.nodes {
+                    if controller.selected_nodes.contains(&target.id) {
+                        target.position[0] += delta.x;
+                        target.position[1] += delta.y;
+                    }
                 }
+                controller.mark_dirty();
             }
-            controller.mark_dirty();
         }
         if editable
             && response.drag_stopped()
@@ -700,8 +921,17 @@ fn render_nodes(
             editable,
             selected,
             runtime_trace,
+            error_target,
         );
-        render_node_sockets(ui, rect, &node, profile, controller, editable);
+        render_node_sockets(
+            ui,
+            rect,
+            &node,
+            profile,
+            controller,
+            editable,
+            error_target,
+        );
     }
     if let Some(id) = remove_id {
         profile.graph.remove_node(&id);
@@ -719,30 +949,37 @@ fn draw_node(
     editable: bool,
     selected: bool,
     runtime_trace: Option<&PromptExecutionTrace>,
+    error_target: &GraphErrorTarget,
 ) {
     let scale = node_scale(rect, node);
     let header_height = NODE_HEADER_HEIGHT * scale;
     let palette = node_palette(&node.kind);
     let title = node_display_label(node);
+    let is_error = error_target.node_id.as_deref() == Some(node.id.as_str());
+
     ui.painter()
         .rect_filled(rect, CornerRadius::same(2), palette.fill);
+    let (border_stroke, border_color) = if selected {
+        (2.0, GRAPH_ACCENT)
+    } else if is_error {
+        (2.0, style::ERROR_BORDER)
+    } else {
+        (1.0, style::NODE_BORDER)
+    };
     ui.painter().rect_stroke(
         rect,
         CornerRadius::same(2),
-        Stroke::new(
-            if selected { 2.0 } else { 1.0 },
-            if selected {
-                GRAPH_ACCENT
-            } else {
-                style::NODE_BORDER
-            },
-        ),
+        Stroke::new(border_stroke, border_color),
         egui::epaint::StrokeKind::Inside,
     );
     ui.painter().rect_filled(
         Rect::from_min_size(rect.min, Vec2::new(rect.width(), header_height)),
         CornerRadius::same(2),
-        palette.header,
+        if is_error {
+            style::ERROR_FILL
+        } else {
+            palette.header
+        },
     );
     let show_kind = scale >= 0.72;
     let kind_tag = node_kind_tag(&profile.graph, node);
@@ -795,7 +1032,11 @@ fn draw_node(
             egui::Align2::LEFT_TOP,
             truncate_preview(&title, title_chars),
             egui::FontId::monospace(title_font_size),
-            style::NODE_TEXT,
+            if is_error {
+                style::ERROR_BORDER
+            } else {
+                style::NODE_TEXT
+            },
         );
     }
     if show_kind {
@@ -999,6 +1240,7 @@ fn render_node_sockets(
     profile: &mut PromptTemplateProfile,
     controller: &mut PromptStudioController,
     editable: bool,
+    error_target: &GraphErrorTarget,
 ) {
     let scale = node_scale(rect, node);
     if !matches!(node.kind, PromptNodeKind::Request { .. }) {
@@ -1007,13 +1249,21 @@ fn render_node_sockets(
             Rect::from_center_size(output, Vec2::splat(22.0)),
             ui.make_persistent_id(("prompt_output_socket", &node.id)),
             if editable {
-                Sense::click()
+                Sense::click_and_drag()
             } else {
                 Sense::hover()
             },
         );
         if editable && (output_response.clicked() || output_response.drag_started()) {
             controller.wire_from = Some(node.id.clone());
+            controller.wire_from_input = None;
+        }
+        if editable && (output_response.clicked() || output_response.drag_stopped()) {
+            if let Some((target_id, target_input)) = controller.wire_from_input.take() {
+                if profile.graph.connect(&node.id, &target_id, target_input) {
+                    controller.mark_dirty();
+                }
+            }
         }
         ui.painter().circle_filled(
             output,
@@ -1030,41 +1280,113 @@ fn render_node_sockets(
     if !inputs.is_empty() {
         for input in inputs {
             let position = socket_position(&profile.graph, rect, node, true, input);
+            let connected_link = profile
+                .graph
+                .links
+                .iter()
+                .find(|link| link.to == node.id && link.input == input)
+                .cloned();
+            let is_error_socket = error_target.node_id.as_deref() == Some(node.id.as_str())
+                && error_target.input_index == Some(input);
+
             let input_response = ui
                 .interact(
                     Rect::from_center_size(position, Vec2::splat(22.0)),
                     ui.make_persistent_id(("prompt_input_socket", &node.id, input)),
                     if editable {
-                        Sense::click()
+                        Sense::click_and_drag()
                     } else {
                         Sense::hover()
                     },
                 )
-                .on_hover_text(input_socket_tooltip(&profile.graph, node, input));
-            if editable && (input_response.clicked() || input_response.drag_stopped()) {
-                if let Some(from) = controller.finish_wire() {
-                    if profile.graph.connect(&from, &node.id, input) {
+                .on_hover_text(input_socket_tooltip(
+                    &profile.graph,
+                    node,
+                    input,
+                    error_target,
+                ));
+
+            if editable {
+                if controller.wire_from.is_some() {
+                    if input_response.clicked() || input_response.drag_stopped() {
+                        if let Some(from) = controller.finish_wire() {
+                            if profile.graph.connect(&from, &node.id, input) {
+                                controller.mark_dirty();
+                            }
+                        }
+                    }
+                } else if let Some(link) = connected_link.as_ref() {
+                    if input_response.drag_started() {
+                        let from_id = link.from.clone();
+                        profile
+                            .graph
+                            .links
+                            .retain(|l| !(l.to == node.id && l.input == input));
+                        controller.wire_from = Some(from_id);
                         controller.mark_dirty();
+                    } else if input_response.secondary_clicked() {
+                        profile
+                            .graph
+                            .links
+                            .retain(|l| !(l.to == node.id && l.input == input));
+                        controller.mark_dirty();
+                    }
+                } else {
+                    if input_response.drag_started() {
+                        controller.wire_from_input = Some((node.id.clone(), input));
+                    } else if input_response.secondary_clicked() {
+                        if let Some(actual) =
+                            profile.graph.nodes.iter_mut().find(|actual| actual.id == node.id)
+                        {
+                            if let PromptNodeKind::Compose { text } = &mut actual.kind {
+                                remove_compose_placeholder(text, input);
+                                profile.graph.layout_version = 0;
+                                controller.mark_dirty();
+                            }
+                        }
                     }
                 }
             }
+
+            let socket_color = if is_error_socket {
+                style::ERROR_BORDER
+            } else if connected_link.is_some() {
+                style::NODE_TEXT
+            } else {
+                style::NODE_MUTED
+            };
+
             ui.painter().circle_filled(
                 position,
                 (SOCKET_RADIUS * scale).max(2.5),
-                style::NODE_MUTED,
+                socket_color,
             );
+
+            if is_error_socket {
+                ui.painter().circle_stroke(
+                    position,
+                    (SOCKET_RADIUS * scale + 3.0).max(5.0),
+                    Stroke::new(1.5, style::ERROR_BORDER),
+                );
+            }
+
             if matches!(
                 node.kind,
                 PromptNodeKind::Compose { .. }
                     | PromptNodeKind::Switch { .. }
                     | PromptNodeKind::Request { .. }
             ) {
+                let label_color = if is_error_socket {
+                    style::ERROR_BORDER
+                } else {
+                    style::NODE_TEXT
+                };
                 ui.painter().text(
                     Pos2::new(position.x + 12.0 * scale, position.y - 6.0 * scale),
                     egui::Align2::LEFT_TOP,
                     input_socket_label(node, input),
                     egui::FontId::monospace((9.0 * scale).max(6.5)),
-                    style::NODE_TEXT,
+                    label_color,
                 );
             }
         }
@@ -1077,33 +1399,57 @@ fn render_wire_preview(
     profile: &PromptTemplateProfile,
     controller: &PromptStudioController,
 ) {
-    let Some(from_id) = controller.wire_from.as_deref() else {
-        return;
-    };
-    let Some(node) = profile.graph.nodes.iter().find(|node| node.id == from_id) else {
-        return;
-    };
-    let from = socket_position(
-        &profile.graph,
-        graph_rect(canvas, controller, node.position, node_size(node)),
-        node,
-        false,
-        0,
-    );
-    let to = ui
-        .ctx()
-        .pointer_hover_pos()
-        .map(|position| position.clamp(canvas.min, canvas.max))
-        .unwrap_or_else(|| Pos2::new(from.x + 100.0, from.y));
-    let points = bezier_points(from, to);
-    ui.painter().add(egui::Shape::CubicBezier(
-        egui::epaint::CubicBezierShape::from_points_stroke(
-            points,
+    if let Some(from_id) = controller.wire_from.as_deref() {
+        let Some(node) = profile.graph.nodes.iter().find(|node| node.id == from_id) else {
+            return;
+        };
+        let from = socket_position(
+            &profile.graph,
+            graph_rect(canvas, controller, node.position, node_size(node)),
+            node,
             false,
-            Color32::TRANSPARENT,
-            Stroke::new(2.0, GRAPH_ACCENT),
-        ),
-    ));
+            0,
+        );
+        let to = ui
+            .ctx()
+            .pointer_hover_pos()
+            .map(|position| position.clamp(canvas.min, canvas.max))
+            .unwrap_or_else(|| Pos2::new(from.x + 100.0, from.y));
+        let points = bezier_points(from, to);
+        ui.painter().add(egui::Shape::CubicBezier(
+            egui::epaint::CubicBezierShape::from_points_stroke(
+                points,
+                false,
+                Color32::TRANSPARENT,
+                Stroke::new(2.0, style::LINK_SELECTED),
+            ),
+        ));
+    } else if let Some((to_id, to_input)) = controller.wire_from_input.as_ref() {
+        let Some(node) = profile.graph.nodes.iter().find(|node| node.id == *to_id) else {
+            return;
+        };
+        let to = socket_position(
+            &profile.graph,
+            graph_rect(canvas, controller, node.position, node_size(node)),
+            node,
+            true,
+            *to_input,
+        );
+        let from = ui
+            .ctx()
+            .pointer_hover_pos()
+            .map(|position| position.clamp(canvas.min, canvas.max))
+            .unwrap_or_else(|| Pos2::new(to.x - 100.0, to.y));
+        let points = bezier_points(from, to);
+        ui.painter().add(egui::Shape::CubicBezier(
+            egui::epaint::CubicBezierShape::from_points_stroke(
+                points,
+                false,
+                Color32::TRANSPARENT,
+                Stroke::new(2.0, style::LINK_SELECTED),
+            ),
+        ));
+    }
 }
 
 fn link_points(
@@ -1149,6 +1495,34 @@ fn render_selection_box(ui: &egui::Ui, controller: &PromptStudioController) {
         Stroke::new(1.0, GRAPH_ACCENT),
         egui::epaint::StrokeKind::Inside,
     );
+}
+
+fn render_canvas_navigation_hint(ui: &egui::Ui, canvas: Rect) {
+    let font_id = egui::FontId::monospace(9.5);
+    let text_color = Color32::BLACK;
+
+    let items = [
+        ("NAVIGATE", "Space + Left Drag / Middle Drag to pan · Mouse Wheel to zoom"),
+        ("SELECT", "Left Drag on canvas to box select · Shift + Click to multi-select"),
+        ("CONNECT", "Drag socket to connect / unplug · Click empty space to cancel wire"),
+        ("ACTIONS", "Del / Backspace to delete · Right-Click socket to disconnect"),
+    ];
+
+    let line_height = 16.0;
+    let base_y = canvas.bottom() - 12.0;
+    let right_x = canvas.right() - 16.0;
+
+    for (index, (tag, detail)) in items.iter().rev().enumerate() {
+        let y = base_y - index as f32 * line_height;
+        let line_text = format!("{tag} · {detail}");
+        ui.painter().text(
+            Pos2::new(right_x, y),
+            egui::Align2::RIGHT_BOTTOM,
+            line_text,
+            font_id.clone(),
+            text_color,
+        );
+    }
 }
 
 fn rect_between(first: Pos2, second: Pos2) -> Rect {
@@ -1298,16 +1672,18 @@ fn cubic_point(points: [Pos2; 4], t: f32) -> Pos2 {
     a.lerp(b, t).lerp(b.lerp(c, t), t)
 }
 
-fn pointer_near_curve(pointer: Pos2, points: [Pos2; 4], threshold: f32) -> bool {
+fn distance_to_curve(pointer: Pos2, points: [Pos2; 4]) -> f32 {
+    let mut min_dist = f32::INFINITY;
     let mut previous = points[0];
-    for step in 1..=24 {
-        let next = cubic_point(points, step as f32 / 24.0);
-        if distance_to_segment(pointer, previous, next) <= threshold {
-            return true;
+    for step in 1..=32 {
+        let next = cubic_point(points, step as f32 / 32.0);
+        let dist = distance_to_segment(pointer, previous, next);
+        if dist < min_dist {
+            min_dist = dist;
         }
         previous = next;
     }
-    false
+    min_dist
 }
 
 fn distance_to_segment(point: Pos2, start: Pos2, end: Pos2) -> f32 {
@@ -1370,5 +1746,81 @@ mod tests {
             assert!(canvas.contains(rect.min));
             assert!(canvas.contains(rect.max));
         }
+    }
+
+    #[test]
+    fn parse_validation_error_locates_unconnected_node_and_input() {
+        let err = xrtranslate_prompt::PromptGraphError::new(
+            "node hunyuan-explicit-instruction input 2 is not connected",
+        );
+        let target = parse_validation_error_target(Some(&err));
+        assert_eq!(
+            target.node_id.as_deref(),
+            Some("hunyuan-explicit-instruction")
+        );
+        assert_eq!(target.input_index, Some(2));
+    }
+
+    #[test]
+    fn remove_compose_placeholder_cleans_unused_slots() {
+        let mut text = String::from("Translate: {0}\n\n{1}\n\n{2}");
+        remove_compose_placeholder(&mut text, 2);
+        assert_eq!(text, "Translate: {0}\n\n{1}");
+
+        remove_compose_placeholder(&mut text, 1);
+        assert_eq!(text, "Translate: {0}");
+    }
+
+    #[test]
+    fn test_distance_to_curve_accuracy() {
+        let points = bezier_points(Pos2::new(0.0, 100.0), Pos2::new(200.0, 100.0));
+        // Point right on the horizontal middle
+        let dist_on_line = distance_to_curve(Pos2::new(100.0, 100.0), points);
+        assert!(dist_on_line < 1.0);
+
+        // Point 10px above the line
+        let dist_above = distance_to_curve(Pos2::new(100.0, 90.0), points);
+        assert!((dist_above - 10.0).abs() < 1.5);
+
+        // Point far away
+        let dist_far = distance_to_curve(Pos2::new(100.0, 200.0), points);
+        assert!(dist_far > 50.0);
+    }
+
+    #[test]
+    fn test_node_position_delta_accumulates_and_snaps() {
+        let mut graph = PromptNodeGraph::empty();
+        let id = graph.add_variable(
+            PromptNodePage::OpenAiCompatible,
+            PromptVariable::CurrentInput,
+            [100.0, 100.0],
+        );
+        let mut controller = PromptStudioController::default();
+        controller.selected_nodes.insert(id.clone());
+
+        // Simulate 3 frames of dragging
+        for _ in 0..3 {
+            let delta = Vec2::new(10.0, 5.0);
+            for target in &mut graph.nodes {
+                if controller.selected_nodes.contains(&target.id) {
+                    target.position[0] += delta.x;
+                    target.position[1] += delta.y;
+                }
+            }
+        }
+
+        let node = graph.nodes.iter().find(|n| n.id == id).unwrap();
+        assert_eq!(node.position, [130.0, 115.0]);
+
+        // Snap to 16px grid
+        for target in &mut graph.nodes {
+            if controller.selected_nodes.contains(&target.id) {
+                target.position[0] = (target.position[0] / 16.0).round() * 16.0;
+                target.position[1] = (target.position[1] / 16.0).round() * 16.0;
+            }
+        }
+
+        let node = graph.nodes.iter().find(|n| n.id == id).unwrap();
+        assert_eq!(node.position, [128.0, 112.0]);
     }
 }

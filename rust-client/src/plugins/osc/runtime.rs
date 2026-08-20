@@ -1,4 +1,6 @@
-use super::chatbox::{HistoryMessage, ManualMessage, build_chatbox_text, render_entry};
+use super::chatbox::{
+    HistoryMessage, ManualMessage, build_chatbox_text, render_entry, sanitize_chatbox_segment,
+};
 use crossbeam_channel::{Receiver, Sender, bounded, unbounded};
 use parking_lot::Mutex;
 use rosc::{OscBundle, OscMessage, OscPacket, OscType, decoder, encoder};
@@ -151,6 +153,14 @@ impl BannerConfig {
     }
 }
 
+fn default_typing_source_lang() -> String {
+    "zh".to_string()
+}
+
+fn default_typing_target_lang() -> String {
+    "en".to_string()
+}
+
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 pub struct OscSettings {
     pub enabled: bool,
@@ -165,6 +175,10 @@ pub struct OscSettings {
     #[serde(default)]
     pub message_separator: OscMessageSeparator,
     pub show_speaker_number: bool,
+    #[serde(default = "default_typing_source_lang")]
+    pub typing_source_lang: String,
+    #[serde(default = "default_typing_target_lang")]
+    pub typing_target_lang: String,
 }
 
 impl Default for OscSettings {
@@ -181,6 +195,8 @@ impl Default for OscSettings {
             format_mode: OscFormatMode::BilingualSourceFirst,
             message_separator: OscMessageSeparator::default(),
             show_speaker_number: false,
+            typing_source_lang: default_typing_source_lang(),
+            typing_target_lang: default_typing_target_lang(),
         }
     }
 }
@@ -324,8 +340,8 @@ impl OscHandle {
     ) {
         let _ = self.tx.send(Command::Message {
             stream_id,
-            source: source.trim().into(),
-            translated: translated.trim().into(),
+            source: sanitize_chatbox_segment(source),
+            translated: sanitize_chatbox_segment(translated),
             speaker_id: speaker_id.trim().into(),
             ongoing,
             ttl: None,
@@ -360,8 +376,8 @@ impl OscHandle {
     ) {
         let _ = self.tx.send(Command::RollStream {
             stream_id,
-            source: source.trim().into(),
-            translated: translated.trim().into(),
+            source: sanitize_chatbox_segment(source),
+            translated: sanitize_chatbox_segment(translated),
             speaker_id: speaker_id.trim().into(),
         });
     }

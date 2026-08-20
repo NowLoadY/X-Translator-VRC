@@ -29,6 +29,7 @@
   <a href="#使用指南">使用指南</a> •
   <a href="#常用位置">常用位置</a> •
   <a href="#citation">Citation</a> •
+  <a href="#contributors--参与者">参与者</a> •
   <a href="#acknowledgements">致谢</a> •
   <a href="#license">许可证</a>
 </p>
@@ -119,6 +120,12 @@ OSC 字幕可以逐条显示，也可以合并排列。
       url={https://arxiv.org/abs/2607.17544},
 }
 ```
+
+---
+
+## Contributors / 参与者
+
+衷心感谢为 XRTranslate 贡献代码与参与测试的全体成员。完整参与者名单、社交主页及贡献详情请参见 [docs/contributors.md](../contributors.md)。
 
 ---
 

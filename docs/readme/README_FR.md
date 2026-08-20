@@ -29,6 +29,7 @@
   <a href="#guide-dutilisation">Guide d'utilisation</a> •
   <a href="#emplacements-courants">Emplacements courants</a> •
   <a href="#citation">Citation</a> •
+  <a href="#contributeurs--contributors">Contributeurs</a> •
   <a href="#remerciements">Remerciements</a> •
   <a href="#licence">Licence</a>
 </p>
@@ -119,6 +120,12 @@ L'exécution simultanée des deux modèles utilise environ **4,1 Go** de VRAM. U
       url={https://arxiv.org/abs/2607.17544},
 }
 ```
+
+---
+
+## Contributeurs / Contributors
+
+Nous remercions chaleureusement tous les contributeurs de code et testeurs bêta qui ont participé au développement et aux tests de XRTranslate. Retrouvez la liste complète des participants, leurs liens sociaux et le détail de leurs contributions dans [docs/contributors.md](../contributors.md).
 
 ---
 

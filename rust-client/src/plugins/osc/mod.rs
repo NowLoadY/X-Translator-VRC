@@ -49,6 +49,7 @@ pub struct OscPlugin {
     manager: OscManager,
     draft: OscSettings,
     draft_input: String,
+    translate_input: bool,
     host_enabled: bool,
 }
 
@@ -59,6 +60,7 @@ impl OscPlugin {
             manager,
             draft,
             draft_input: String::new(),
+            translate_input: true,
             host_enabled,
         }
     }
@@ -81,6 +83,14 @@ impl OscPlugin {
 
     pub fn draft_input_mut(&mut self) -> &mut String {
         &mut self.draft_input
+    }
+
+    pub fn translate_input(&self) -> bool {
+        self.translate_input
+    }
+
+    pub fn set_translate_input(&mut self, enabled: bool) {
+        self.translate_input = enabled;
     }
 
     pub fn send_manual_message(&mut self, text: &str) {
@@ -156,5 +166,27 @@ mod tests {
         plugin.activate().unwrap();
         plugin.deactivate().unwrap();
         assert!(plugin.draft().enabled);
+    }
+
+    #[test]
+    fn translate_input_defaults_to_true_and_can_be_toggled() {
+        let mut plugin = OscPlugin::new(OscSettings::default(), true);
+        assert!(plugin.translate_input());
+        plugin.set_translate_input(false);
+        assert!(!plugin.translate_input());
+        plugin.set_translate_input(true);
+        assert!(plugin.translate_input());
+    }
+
+    #[test]
+    fn typing_language_direction_defaults_to_zh_to_en_and_can_be_changed() {
+        let mut plugin = OscPlugin::new(OscSettings::default(), true);
+        assert_eq!(plugin.draft().typing_source_lang, "zh");
+        assert_eq!(plugin.draft().typing_target_lang, "en");
+
+        plugin.draft_mut().typing_source_lang = "ja".into();
+        plugin.draft_mut().typing_target_lang = "zh".into();
+        assert_eq!(plugin.draft().typing_source_lang, "ja");
+        assert_eq!(plugin.draft().typing_target_lang, "zh");
     }
 }
