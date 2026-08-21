@@ -33,6 +33,24 @@ if ([string]::IsNullOrWhiteSpace($env:RUST_LOG)) {
 $env:XRTRANSLATE_BACKEND_CONSOLE_LOG = '1'
 
 $buildArguments = @('build', '--manifest-path', $workspaceManifestPath, '--package', 'xrtranslate-backend')
+$runtimeMarker = Join-Path $projectRoot 'runtime\native-runtime.json'
+if (Test-Path -LiteralPath $runtimeMarker -PathType Leaf) {
+    try {
+        $runtimeSelection = Get-Content -LiteralPath $runtimeMarker -Raw | ConvertFrom-Json
+        if (-not [string]::IsNullOrWhiteSpace($runtimeSelection.onnx_core_library)) {
+            $managedCore = $runtimeSelection.onnx_core_library
+            if (-not [System.IO.Path]::IsPathRooted($managedCore)) {
+                $managedCore = Join-Path $projectRoot $managedCore
+            }
+            if (Test-Path -LiteralPath $managedCore -PathType Leaf) {
+                $buildArguments += @('--features', 'managed-ort')
+                Write-Host "Using managed ONNX Runtime core: $managedCore"
+            }
+        }
+    } catch {
+        Write-Warning "Ignoring invalid managed runtime marker: $($_.Exception.Message)"
+    }
+}
 if ($Release) {
     $buildArguments += '--release'
 }

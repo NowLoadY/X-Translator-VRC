@@ -13,6 +13,8 @@ mod openai;
 mod openai_asr;
 mod qwen3;
 mod translation;
+mod tts;
+mod tts_onnx;
 mod wav;
 
 pub use error::{InferenceError, TransportError};
@@ -26,5 +28,10 @@ pub use translation::{
     PromptTemplateProfile, PromptTurn, PromptVariable, SurroundingSource, TranslationAdapter,
     TranslationOptions, TranslationPromptBlock, TranslationPromptContext, TranslationProvider,
     TranslationResult, build_translation_messages, is_probable_translation_context_leak,
+};
+pub use tts::SynthesizedPcm;
+pub use tts_onnx::{
+    Audio8ExecutionDevice, Audio8OnnxAdapter, Audio8SynthesisOptions, initialize_onnx_runtime,
+    preload_onnx_cuda_libraries,
 };
 pub use wav::{PCM16_MONO_16KHZ_FORMAT, pcm16_mono_16khz_to_wav};

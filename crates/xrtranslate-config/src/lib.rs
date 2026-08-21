@@ -27,16 +27,104 @@ pub type ProviderConfigs = Map<String, Value>;
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct RuntimeLayout {
     project_root: PathBuf,
+    runtime_root: PathBuf,
+}
+
+/// Persisted host selection consumed before the native backend is spawned.
+/// Paths are stored relative to the project root so a packaged installation
+/// remains movable and no process needs to mutate the system `PATH`.
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+pub struct NativeRuntimeSelection {
+    pub schema_version: u32,
+    /// Effective ONNX backend retained for schema-v1 consumers.
+    pub backend: NativeRuntimeBackend,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub llama_cpp_backend: Option<NativeRuntimeBackend>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub onnx_backend: Option<NativeRuntimeBackend>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub cuda_version: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub provider_dir: Option<PathBuf>,
+    /// ONNX Runtime core selected for this process. CUDA markers point to the
+    /// core from the same official archive as their execution providers;
+    /// CPU markers point to the compact core shipped with the application.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub onnx_core_library: Option<PathBuf>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub cuda_bin_dir: Option<PathBuf>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub cudnn_bin_dir: Option<PathBuf>,
+    /// Exact preload order for CUDA dependency libraries. ONNX provider DLLs
+    /// are loaded by the colocated ONNX Runtime core and must not be preloaded
+    /// directly.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub preload_libraries: Vec<PathBuf>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub fallback_reason: Option<String>,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum NativeRuntimeBackend {
+    Cpu,
+    Cuda,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct ResolvedNativeRuntimeSelection {
+    pub backend: NativeRuntimeBackend,
+    pub llama_cpp_backend: Option<NativeRuntimeBackend>,
+    pub onnx_backend: Option<NativeRuntimeBackend>,
+    pub cuda_version: Option<String>,
+    pub provider_dir: Option<PathBuf>,
+    pub onnx_core_library: Option<PathBuf>,
+    pub cuda_bin_dir: Option<PathBuf>,
+    pub cudnn_bin_dir: Option<PathBuf>,
+    pub preload_libraries: Vec<PathBuf>,
+    pub fallback_reason: Option<String>,
 }
 
 impl RuntimeLayout {
+    pub const DEFAULT_RUNTIME_DIRECTORY: &'static str = "runtime";
     pub const LLAMA_CPP_DIRECTORY: &'static str = "runtime/llama.cpp";
+    pub const CUDA_RUNTIME_DIRECTORY: &'static str = "runtime/cuda";
+    pub const ONNX_RUNTIME_DIRECTORY: &'static str = "runtime/onnxruntime";
+    pub const ONNX_CPU_RUNTIME_DIRECTORY: &'static str = "runtime/onnxruntime/cpu";
+    pub const ONNX_CORE_LIBRARY: &'static str = "onnxruntime.dll";
+    pub const NATIVE_RUNTIME_SELECTION_FILE: &'static str = "runtime/native-runtime.json";
 
     #[must_use]
     pub fn for_project_root(project_root: impl AsRef<Path>) -> Self {
+        Self::new(project_root, None::<&Path>)
+    }
+
+    #[must_use]
+    pub fn new(
+        project_root: impl AsRef<Path>,
+        runtime_directory: Option<impl AsRef<Path>>,
+    ) -> Self {
+        let project_root = project_root.as_ref().to_path_buf();
+        let runtime_root = match runtime_directory {
+            Some(dir) => {
+                let dir = dir.as_ref();
+                if dir.is_absolute() {
+                    dir.to_path_buf()
+                } else {
+                    project_root.join(dir)
+                }
+            }
+            None => project_root.join(Self::DEFAULT_RUNTIME_DIRECTORY),
+        };
         Self {
-            project_root: project_root.as_ref().to_path_buf(),
+            project_root,
+            runtime_root,
         }
+    }
+
+    #[must_use]
+    pub fn for_config(project_root: impl AsRef<Path>, config: &ModelManagerConfig) -> Self {
+        Self::new(project_root, config.runtime_directory.as_deref())
     }
 
     #[must_use]
@@ -45,8 +133,68 @@ impl RuntimeLayout {
     }
 
     #[must_use]
+    pub fn runtime_root(&self) -> &Path {
+        &self.runtime_root
+    }
+
+    #[must_use]
     pub fn llama_cpp_directory(&self) -> PathBuf {
-        self.project_root.join(Self::LLAMA_CPP_DIRECTORY)
+        self.runtime_root.join("llama.cpp")
+    }
+
+    #[must_use]
+    pub fn cuda_runtime_directory(&self, cuda_version: &str) -> PathBuf {
+        self.runtime_root
+            .join("cuda")
+            .join(cuda_version)
+    }
+
+    #[must_use]
+    pub fn onnx_runtime_directory(&self, cuda_version: &str) -> PathBuf {
+        self.runtime_root
+            .join("onnxruntime")
+            .join(format!("cuda-{cuda_version}"))
+    }
+
+    #[must_use]
+    pub fn onnx_cpu_runtime_directory(&self) -> PathBuf {
+        self.runtime_root.join("onnxruntime").join("cpu")
+    }
+
+    #[must_use]
+    pub fn onnx_cpu_core_library(&self) -> PathBuf {
+        self.onnx_cpu_runtime_directory()
+            .join(Self::ONNX_CORE_LIBRARY)
+    }
+
+    #[must_use]
+    pub fn native_runtime_selection_file(&self) -> PathBuf {
+        self.runtime_root.join("native-runtime.json")
+    }
+
+    #[must_use]
+    pub fn resolve_native_runtime_selection(
+        &self,
+        selection: &NativeRuntimeSelection,
+    ) -> ResolvedNativeRuntimeSelection {
+        let resolve =
+            |path: &Option<PathBuf>| path.as_ref().map(|path| self.resolve_configured_path(path));
+        ResolvedNativeRuntimeSelection {
+            backend: selection.backend,
+            llama_cpp_backend: selection.llama_cpp_backend,
+            onnx_backend: selection.onnx_backend,
+            cuda_version: selection.cuda_version.clone(),
+            provider_dir: resolve(&selection.provider_dir),
+            onnx_core_library: resolve(&selection.onnx_core_library),
+            cuda_bin_dir: resolve(&selection.cuda_bin_dir),
+            cudnn_bin_dir: resolve(&selection.cudnn_bin_dir),
+            preload_libraries: selection
+                .preload_libraries
+                .iter()
+                .map(|path| self.resolve_configured_path(path))
+                .collect(),
+            fallback_reason: selection.fallback_reason.clone(),
+        }
     }
 
     /// Resolves a config path against the config/project root while preserving
@@ -238,6 +386,12 @@ pub struct AppConfig {
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
 pub struct RuntimeRequirements {
     pub llama_cpp: bool,
+    /// The selected TTS provider uses the in-process ONNX runtime. CUDA is an
+    /// optional host acceleration for this requirement; CPU remains valid.
+    pub onnx_tts: bool,
+    /// The selected ONNX TTS device allows CUDA. `device = "cpu"` keeps this
+    /// false so the host does not probe or download NVIDIA runtime assets.
+    pub onnx_cuda: bool,
     pub missing_api_key: bool,
 }
 
@@ -255,6 +409,9 @@ impl AppConfig {
             let Some(selected) = section.get("provider").and_then(Value::as_str) else {
                 continue;
             };
+            if selected == "none" {
+                continue;
+            }
             let Some(provider) = section
                 .get("providers")
                 .and_then(Value::as_object)
@@ -271,10 +428,23 @@ impl AppConfig {
                         .is_none_or(|key| key.trim().is_empty());
                 }
                 Some("local") | None => requirements.llama_cpp = true,
+                Some("onnx") => {
+                    requirements.onnx_tts = true;
+                    requirements.onnx_cuda |= provider
+                        .get("device")
+                        .and_then(Value::as_str)
+                        .is_none_or(|device| device != "cpu");
+                }
                 Some(_) => {}
             }
         }
         requirements
+    }
+
+    /// Returns the resolved runtime layout for this configuration.
+    #[must_use]
+    pub fn runtime_layout(&self, project_root: impl AsRef<Path>) -> RuntimeLayout {
+        RuntimeLayout::for_config(project_root, &self.model_manager)
     }
 
     /// Reads and validates JSON syntax from `path`.
@@ -335,12 +505,6 @@ impl AppConfig {
     /// fields.
     pub fn native_model_route(&self) -> Result<NativeModelRouteConfig, DefaultGgufValidationError> {
         let mut issues = Vec::new();
-        if self.tts.provider.trim() != "none" {
-            issues.push(format!(
-                "tts.provider must be \"none\" for the default native route until that TTS provider is migrated (found {:?})",
-                self.tts.provider
-            ));
-        }
         let asr = active_native_provider(
             &self.asr.provider,
             &self.asr.providers,
@@ -397,13 +561,6 @@ impl AppConfig {
                 self.translation.provider
             ));
         }
-        if self.tts.provider.trim() != "none" {
-            issues.push(format!(
-                "tts.provider must be \"none\" for the default native route until that TTS provider is migrated (found {:?})",
-                self.tts.provider
-            ));
-        }
-
         let llama_server_path = required_non_empty(
             &self.model_manager.llama_server_path,
             "model_manager.llama_server_path",
@@ -479,6 +636,7 @@ impl AppConfig {
         for (provider, providers) in [
             (&self.asr.provider, &self.asr.providers),
             (&self.translation.provider, &self.translation.providers),
+            (&self.tts.provider, &self.tts.providers),
         ] {
             let Some(model_asset) = providers
                 .get(provider.trim())
@@ -874,6 +1032,15 @@ pub struct ModelManagerConfig {
     /// change instead of a client-code change.
     #[serde(default)]
     pub llama_cpp: LlamaCppRuntimeConfig,
+    /// Optional CUDA execution-provider archives for in-process ONNX models.
+    /// CPU inference uses the compact core supplied by the native release and
+    /// requires no end-user download.
+    #[serde(default)]
+    pub onnxruntime: OnnxRuntimeConfig,
+    /// Optional runtime root, resolved relative to `config.json` by the native
+    /// backend and desktop client.
+    #[serde(default, alias = "runtime_root")]
+    pub runtime_directory: Option<PathBuf>,
     /// Optional models root, resolved relative to `config.json` by the native
     /// backend and desktop client.  Keeping this here prevents each frontend
     /// from inventing a different model search path.
@@ -898,6 +1065,39 @@ pub struct LlamaCppRuntimeConfig {
     /// Exact archive names and URLs available to the automatic installer.
     #[serde(default)]
     pub downloads: Vec<LlamaCppDownload>,
+}
+
+/// A fixed ONNX Runtime release and its downloadable CUDA providers.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct OnnxRuntimeConfig {
+    #[serde(default)]
+    pub release: String,
+    #[serde(default)]
+    pub downloads: Vec<OnnxRuntimeDownload>,
+}
+
+/// One CUDA execution-provider archive. Only the declared files are retained
+/// after extraction, so SDK headers, import libraries, PDBs and TensorRT
+/// providers never enter the managed runtime directory.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct OnnxRuntimeDownload {
+    pub name: String,
+    pub url: String,
+    #[serde(default)]
+    pub archive_format: LlamaCppArchiveFormat,
+    #[serde(default)]
+    pub bytes: u64,
+    #[serde(default)]
+    pub sha256: String,
+    #[serde(default)]
+    pub target: String,
+    #[serde(default)]
+    pub cuda_version: String,
+    /// Directory inside the archive that contains `required_files`.
+    #[serde(default)]
+    pub archive_directory: String,
+    #[serde(default)]
+    pub required_files: Vec<String>,
 }
 
 /// One llama.cpp archive available from the configured release.
@@ -958,6 +1158,8 @@ impl Default for ModelManagerConfig {
             hunyuan_gguf_repo: default_hunyuan_gguf_repo(),
             llama_server_path: default_llama_server_path(),
             llama_cpp: LlamaCppRuntimeConfig::default(),
+            onnxruntime: OnnxRuntimeConfig::default(),
+            runtime_directory: None,
             models_directory: None,
             qwen3_asr_gguf_directory: None,
             hunyuan_mt_gguf_directory: None,
@@ -1307,6 +1509,42 @@ mod tests {
     }
 
     #[test]
+    fn runtime_layout_with_custom_directory_resolves_all_subdirs() {
+        let root = PathBuf::from("/tmp/xrtranslate-release");
+        let layout = RuntimeLayout::new(&root, Some("custom_runtime"));
+        assert_eq!(
+            layout.runtime_root(),
+            Path::new("/tmp/xrtranslate-release/custom_runtime")
+        );
+        assert_eq!(
+            layout.llama_cpp_directory(),
+            PathBuf::from("/tmp/xrtranslate-release/custom_runtime/llama.cpp")
+        );
+        assert_eq!(
+            layout.cuda_runtime_directory("13.3"),
+            PathBuf::from("/tmp/xrtranslate-release/custom_runtime/cuda/13.3")
+        );
+        assert_eq!(
+            layout.onnx_runtime_directory("13"),
+            PathBuf::from("/tmp/xrtranslate-release/custom_runtime/onnxruntime/cuda-13")
+        );
+        assert_eq!(
+            layout.native_runtime_selection_file(),
+            PathBuf::from("/tmp/xrtranslate-release/custom_runtime/native-runtime.json")
+        );
+
+        let external_layout = RuntimeLayout::new(&root, Some("/mnt/ai/runtime"));
+        assert_eq!(
+            external_layout.runtime_root(),
+            Path::new("/mnt/ai/runtime")
+        );
+        assert_eq!(
+            external_layout.llama_cpp_directory(),
+            PathBuf::from("/mnt/ai/runtime/llama.cpp")
+        );
+    }
+
+    #[test]
     fn root_config_is_read_with_optional_sections_preserved() {
         let config = AppConfig::from_json_str(include_str!("../../../config.json")).unwrap();
 
@@ -1342,6 +1580,8 @@ mod tests {
         assert_eq!(config.tts.provider, "none");
         assert_eq!(config.model_manager.llama_cpp.release, "b10333");
         assert_eq!(config.model_manager.llama_cpp.downloads.len(), 6);
+        assert_eq!(config.model_manager.onnxruntime.release, "1.28.0");
+        assert_eq!(config.model_manager.onnxruntime.downloads.len(), 2);
         assert_eq!(
             config.model_manager.llama_cpp.downloads[0].name,
             "llama-b10333-bin-win-cpu-x64.zip"
@@ -1504,6 +1744,73 @@ mod tests {
     }
 
     #[test]
+    fn onnx_tts_does_not_imply_llama_cpp() {
+        let mut document: Value =
+            serde_json::from_str(include_str!("../../../config.json")).unwrap();
+        document["asr"]["provider"] = Value::from("openai");
+        document["asr"]["providers"]["openai"]["api_key"] = Value::from("asr-key");
+        document["translation"]["provider"] = Value::from("openai");
+        document["translation"]["providers"]["openai"]["api_key"] = Value::from("translation-key");
+        document["tts"]["provider"] = Value::from("audio8");
+
+        let requirements = AppConfig::from_value(document)
+            .unwrap()
+            .runtime_requirements();
+
+        assert!(!requirements.llama_cpp);
+        assert!(requirements.onnx_tts);
+        assert!(requirements.onnx_cuda);
+        assert!(!requirements.missing_api_key);
+    }
+
+    #[test]
+    fn explicit_cpu_tts_does_not_request_cuda_assets() {
+        let mut document: Value =
+            serde_json::from_str(include_str!("../../../config.json")).unwrap();
+        document["tts"]["provider"] = Value::from("audio8");
+        document["tts"]["providers"]["audio8"]["device"] = Value::from("cpu");
+        let requirements = AppConfig::from_value(document)
+            .unwrap()
+            .runtime_requirements();
+        assert!(requirements.onnx_tts);
+        assert!(!requirements.onnx_cuda);
+    }
+
+    #[test]
+    fn native_runtime_paths_resolve_from_a_movable_marker() {
+        let layout = RuntimeLayout::for_project_root("release-root");
+        let marker = NativeRuntimeSelection {
+            schema_version: 1,
+            backend: NativeRuntimeBackend::Cuda,
+            llama_cpp_backend: Some(NativeRuntimeBackend::Cuda),
+            onnx_backend: Some(NativeRuntimeBackend::Cuda),
+            cuda_version: Some("13.3".into()),
+            provider_dir: Some(PathBuf::from("runtime/onnxruntime/cuda-13")),
+            onnx_core_library: Some(PathBuf::from("runtime/onnxruntime/cuda-13/onnxruntime.dll")),
+            cuda_bin_dir: Some(PathBuf::from("runtime/cuda/13.3")),
+            cudnn_bin_dir: None,
+            preload_libraries: vec![PathBuf::from("runtime/cuda/13.3/cudart64_13.dll")],
+            fallback_reason: None,
+        };
+
+        let resolved = layout.resolve_native_runtime_selection(&marker);
+        assert_eq!(
+            resolved.provider_dir.as_deref(),
+            Some(Path::new("release-root/runtime/onnxruntime/cuda-13"))
+        );
+        assert_eq!(
+            resolved.onnx_core_library.as_deref(),
+            Some(Path::new(
+                "release-root/runtime/onnxruntime/cuda-13/onnxruntime.dll"
+            ))
+        );
+        assert_eq!(
+            resolved.preload_libraries[0],
+            PathBuf::from("release-root/runtime/cuda/13.3/cudart64_13.dll")
+        );
+    }
+
+    #[test]
     fn local_provider_selection_can_be_saved_before_llama_cpp_is_installed() {
         let mut document: Value =
             serde_json::from_str(include_str!("../../../config.json")).unwrap();
@@ -1625,7 +1932,6 @@ mod tests {
         let message = error.to_string();
         assert!(message.contains("asr.provider must be \"qwen3-gguf\""));
         assert!(message.contains("translation.provider must be \"hunyuan\""));
-        assert!(message.contains("tts.provider must be \"none\""));
         assert!(message.contains("model_manager.llama_server_path must be a non-empty string"));
         assert!(message.contains("asr.providers.qwen3-gguf.url is missing"));
         assert!(message.contains("translation.providers.hunyuan.url is missing"));

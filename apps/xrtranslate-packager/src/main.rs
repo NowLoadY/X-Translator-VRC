@@ -36,6 +36,18 @@ const DENOISE_MODEL_BYTES: u64 = 535_638;
 const DENOISE_MODEL_SHA256: &str =
     "e77603ac0c23dac3227dd2d7135b3a585cbee2679048aecfa886657d3ae1b534";
 const INTERNAL_BIN_DIRECTORY: &str = "bin";
+const ONNX_CPU_CORE_RELATIVE_PATH: &str = "runtime/onnxruntime/cpu/onnxruntime.dll";
+const ONNX_CPU_CORE_BYTES: u64 = 16_277_856;
+const ONNX_CPU_CORE_SHA256: &str =
+    "2462fe2d64ce063babefda3d9b1998380ffa74e99acf5d24d520ee67daa9e0f1";
+const ONNX_LICENSE_RELATIVE_PATH: &str = "licenses/onnxruntime/LICENSE";
+const ONNX_LICENSE_BYTES: u64 = 1_094;
+const ONNX_LICENSE_SHA256: &str =
+    "c250d6278f0b47a6439fb7592b08b58a55eb9f535aa49a1db63211c3f982b674";
+const ONNX_NOTICES_RELATIVE_PATH: &str = "licenses/onnxruntime/ThirdPartyNotices.txt";
+const ONNX_NOTICES_BYTES: u64 = 331_175;
+const ONNX_NOTICES_SHA256: &str =
+    "fb0af774b4d7cffc5b9d046f2aaeade2f37df2f80abf8033c95dfffcc77a8866";
 const CORPORA_RELEASE_ROOT: &str = "corpora";
 const CORPORA_CONFIG_ROOT: &str = "corpora/v1";
 
@@ -79,6 +91,14 @@ struct Arguments {
     /// GTCRN-Light v3 speech enhancement ONNX file bundled in every release.
     #[arg(long)]
     denoise_model: Option<PathBuf>,
+    /// Verified ONNX Runtime 1.28 core used by CPU-only hosts and as the
+    /// universal fallback. GPU providers remain managed downloads.
+    #[arg(long)]
+    onnx_runtime_cpu: PathBuf,
+    #[arg(long)]
+    onnx_runtime_license: PathBuf,
+    #[arg(long)]
+    onnx_runtime_notices: PathBuf,
     /// Destination release directory. It must not already exist.
     #[arg(long)]
     output: PathBuf,
@@ -155,6 +175,9 @@ struct ReleasePlan {
     vad_model: PathBuf,
     speaker_model: PathBuf,
     denoise_model: PathBuf,
+    onnx_runtime_cpu: PathBuf,
+    onnx_runtime_license: PathBuf,
+    onnx_runtime_notices: PathBuf,
     output: PathBuf,
     include_models: bool,
     assets: ResolvedModelAssets,
@@ -183,6 +206,24 @@ fn main() -> Result<(), Box<dyn Error>> {
         &plan.denoise_model,
         DENOISE_MODEL_BYTES,
         DENOISE_MODEL_SHA256,
+    )?;
+    verify_file_integrity(
+        "--onnx-runtime-cpu",
+        &plan.onnx_runtime_cpu,
+        ONNX_CPU_CORE_BYTES,
+        ONNX_CPU_CORE_SHA256,
+    )?;
+    verify_file_integrity(
+        "--onnx-runtime-license",
+        &plan.onnx_runtime_license,
+        ONNX_LICENSE_BYTES,
+        ONNX_LICENSE_SHA256,
+    )?;
+    verify_file_integrity(
+        "--onnx-runtime-notices",
+        &plan.onnx_runtime_notices,
+        ONNX_NOTICES_BYTES,
+        ONNX_NOTICES_SHA256,
     )?;
     if plan.output.exists() {
         return Err(PackageError::InvalidInput(format!(
@@ -228,6 +269,9 @@ impl ReleasePlan {
         require_regular_file("--corpus-bin", &arguments.corpus_bin)?;
         require_regular_file("--installer-bin", &arguments.installer_bin)?;
         require_regular_file("--updater-bin", &arguments.updater_bin)?;
+        require_regular_file("--onnx-runtime-cpu", &arguments.onnx_runtime_cpu)?;
+        require_regular_file("--onnx-runtime-license", &arguments.onnx_runtime_license)?;
+        require_regular_file("--onnx-runtime-notices", &arguments.onnx_runtime_notices)?;
         require_regular_file("--config", &arguments.config)?;
         require_directory("--resources-dir", &arguments.resources_dir)?;
         require_directory("--corpora-dir", &arguments.corpora_dir)?;
@@ -297,6 +341,9 @@ impl ReleasePlan {
             vad_model,
             speaker_model,
             denoise_model,
+            onnx_runtime_cpu: arguments.onnx_runtime_cpu,
+            onnx_runtime_license: arguments.onnx_runtime_license,
+            onnx_runtime_notices: arguments.onnx_runtime_notices,
             output: arguments.output,
             include_models: arguments.include_models,
             assets,
@@ -360,6 +407,18 @@ fn package(plan: &ReleasePlan) -> Result<PathBuf, PackageError> {
         copy_file_to(&plan.vad_model, &staging.join(VAD_RELATIVE_PATH))?;
         copy_file_to(&plan.speaker_model, &staging.join(SPEAKER_RELATIVE_PATH))?;
         copy_file_to(&plan.denoise_model, &staging.join(DENOISE_RELATIVE_PATH))?;
+        copy_file_to(
+            &plan.onnx_runtime_cpu,
+            &staging.join(ONNX_CPU_CORE_RELATIVE_PATH),
+        )?;
+        copy_file_to(
+            &plan.onnx_runtime_license,
+            &staging.join(ONNX_LICENSE_RELATIVE_PATH),
+        )?;
+        copy_file_to(
+            &plan.onnx_runtime_notices,
+            &staging.join(ONNX_NOTICES_RELATIVE_PATH),
+        )?;
         fs::write(staging.join("config.json"), &plan.packaged_config).map_err(|source| {
             PackageError::Io {
                 context: format!("cannot write staged config in {}", staging.display()),
@@ -420,7 +479,9 @@ fn rewrite_config(config_path: &Path) -> Result<String, PackageError> {
             PackageError::InvalidInput("config.model_manager must be a JSON object".into())
         })?;
     manager.insert("llama_server_path".into(), Value::String(String::new()));
+    manager.insert("runtime_directory".into(), Value::String("runtime".into()));
     manager.insert("models_directory".into(), Value::String("models".into()));
+    manager.remove("runtime_root");
     manager.remove("qwen3_asr_gguf_directory");
     manager.remove("hunyuan_mt_gguf_directory");
     let speaker = root_object
@@ -489,9 +550,26 @@ fn release_manifest(
             "updater": format!("{INTERNAL_BIN_DIRECTORY}/{}", native_binary_name("xrtranslate-updater", updater).unwrap_or_else(|_| "xrtranslate-updater".into())),
         },
         "runtime": {
-            "included": false,
+            "included": true,
             "directory": runtime_directory,
             "setup_required": "Choose the llama-server executable in the client welcome flow.",
+            "onnx_cuda": {
+                "included": false,
+                "selection_marker": RuntimeLayout::NATIVE_RUNTIME_SELECTION_FILE,
+                "provider_directory": RuntimeLayout::ONNX_RUNTIME_DIRECTORY,
+                "cuda_directory": RuntimeLayout::CUDA_RUNTIME_DIRECTORY,
+                "delivery": "managed-download"
+            },
+            "onnx_cpu": {
+                "included": true,
+                "path": ONNX_CPU_CORE_RELATIVE_PATH,
+                "release": "1.28.0",
+                "bytes": ONNX_CPU_CORE_BYTES,
+                "sha256": ONNX_CPU_CORE_SHA256,
+                "source_archive": "onnxruntime-win-x64-gpu_cuda13-1.28.0.zip",
+                "license": ONNX_LICENSE_RELATIVE_PATH,
+                "third_party_notices": ONNX_NOTICES_RELATIVE_PATH
+            }
         },
         "vad_model": {
             "path": VAD_RELATIVE_PATH,
@@ -953,6 +1031,7 @@ mod tests {
 
         let rewritten: Value = serde_json::from_str(&rewrite_config(&config).unwrap()).unwrap();
         assert_eq!(rewritten["model_manager"]["llama_server_path"], "");
+        assert_eq!(rewritten["model_manager"]["runtime_directory"], "runtime");
         assert_eq!(rewritten["model_manager"]["models_directory"], "models");
         assert_eq!(rewritten["speaker"]["enabled"], true);
         assert_eq!(rewritten["speaker"]["model_path"], SPEAKER_RELATIVE_PATH);
@@ -999,6 +1078,9 @@ mod tests {
         let vad = source.join("silero_vad.onnx");
         let speaker = source.join("speaker_embedding.onnx");
         let denoise = source.join("gtcrn_simple.onnx");
+        let onnx_runtime_cpu = source.join("onnxruntime.dll");
+        let onnx_runtime_license = source.join("onnxruntime-LICENSE");
+        let onnx_runtime_notices = source.join("onnxruntime-ThirdPartyNotices.txt");
         let config = source.join("config.json");
         let license = source.join("LICENSE");
         write(&client, b"client");
@@ -1049,6 +1131,9 @@ zh,en,fr,pt,es,ja,ru,ko,th,it,de,vi,id,pl,cs,nl
         write(&vad, b"onnx");
         write(&speaker, b"onnx");
         write(&denoise, b"onnx");
+        write(&onnx_runtime_cpu, b"onnx runtime");
+        write(&onnx_runtime_license, b"onnx license");
+        write(&onnx_runtime_notices, b"onnx notices");
         write(&config, br#"{"model_manager":{"llama_server_path":"old"}}"#);
         write(&license, b"AGPL-3.0-only");
 
@@ -1065,6 +1150,9 @@ zh,en,fr,pt,es,ja,ru,ko,th,it,de,vi,id,pl,cs,nl
             vad_model: Some(vad),
             speaker_model: Some(speaker),
             denoise_model: Some(denoise),
+            onnx_runtime_cpu,
+            onnx_runtime_license,
+            onnx_runtime_notices,
             output: output.clone(),
             include_models: false,
             check: false,
@@ -1116,6 +1204,9 @@ zh,en,fr,pt,es,ja,ru,ko,th,it,de,vi,id,pl,cs,nl
         assert!(output.join(VAD_RELATIVE_PATH).is_file());
         assert!(output.join(SPEAKER_RELATIVE_PATH).is_file());
         assert!(output.join(DENOISE_RELATIVE_PATH).is_file());
+        assert!(output.join(ONNX_CPU_CORE_RELATIVE_PATH).is_file());
+        assert!(output.join(ONNX_LICENSE_RELATIVE_PATH).is_file());
+        assert!(output.join(ONNX_NOTICES_RELATIVE_PATH).is_file());
         assert!(output.join("release-manifest.json").is_file());
         assert!(!output.join("runtime/llama.cpp").exists());
         assert!(!output.join("backend").exists());
@@ -1127,7 +1218,16 @@ zh,en,fr,pt,es,ja,ru,ko,th,it,de,vi,id,pl,cs,nl
         )
         .unwrap();
         assert_eq!(manifest["python"], false);
-        assert_eq!(manifest["runtime"]["included"], false);
+        assert_eq!(manifest["runtime"]["included"], true);
+        assert_eq!(
+            manifest["runtime"]["onnx_cpu"]["path"],
+            ONNX_CPU_CORE_RELATIVE_PATH
+        );
+        assert_eq!(manifest["runtime"]["onnx_cuda"]["included"], false);
+        assert_eq!(
+            manifest["runtime"]["onnx_cuda"]["selection_marker"],
+            RuntimeLayout::NATIVE_RUNTIME_SELECTION_FILE
+        );
         assert_eq!(manifest["vad_model"]["path"], VAD_RELATIVE_PATH);
         assert_eq!(
             manifest["vad_model"]["source"]["revision"],

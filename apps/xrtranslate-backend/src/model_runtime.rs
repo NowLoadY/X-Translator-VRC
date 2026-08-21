@@ -4,6 +4,7 @@
 //! session pipeline consume this plan without branching on model names.
 
 use std::{
+    ffi::OsString,
     net::{IpAddr, Ipv4Addr},
     path::Path,
 };
@@ -13,7 +14,8 @@ use xrtranslate_assets::{
     ResolvedModelAssets,
 };
 use xrtranslate_config::{
-    AppConfig, LocalModelRuntimeConfig, NativeModelRouteConfig, RuntimeLayout,
+    AppConfig, LocalModelRuntimeConfig, NativeModelRouteConfig, NativeRuntimeSelection,
+    ResolvedNativeRuntimeSelection, RuntimeLayout,
 };
 use xrtranslate_inference::{
     AsrTranscript, InferenceError, OpenAiAsrAdapter, OpenAiAsrOptions, Qwen3AsrAdapter,
@@ -91,6 +93,7 @@ pub(crate) struct NativeProviderPlan {
     asr_profile: AsrProfile,
     translation_profile: TranslationProfile,
     translation_supports_reference_context: bool,
+    native_runtime: Option<ResolvedNativeRuntimeSelection>,
 }
 
 impl NativeProviderPlan {
@@ -98,8 +101,9 @@ impl NativeProviderPlan {
         let mut route = config
             .native_model_route()
             .map_err(|error| error.to_string())?;
-        route.llama_server_path = RuntimeLayout::for_project_root(project_root)
-            .resolve_configured_path(&route.llama_server_path);
+        let runtime_layout = config.runtime_layout(project_root);
+        route.llama_server_path = runtime_layout.resolve_configured_path(&route.llama_server_path);
+        let native_runtime = load_native_runtime_selection(&runtime_layout)?;
         let asr_profile = AsrProfile::registered(&route.asr.provider, &route.asr.transport)
             .ok_or_else(|| format!("unsupported ASR provider {:?}", route.asr.provider))?;
         let translation_profile = TranslationProfile::registered(
@@ -147,6 +151,7 @@ impl NativeProviderPlan {
             asr_profile,
             translation_profile,
             translation_supports_reference_context,
+            native_runtime,
         })
     }
 
@@ -190,6 +195,10 @@ impl NativeProviderPlan {
 
     pub(crate) fn llama_server_path(&self) -> &Path {
         &self.route.llama_server_path
+    }
+
+    pub(crate) fn audio8_tts_model_directory(&self) -> &Path {
+        &self.assets.audio8_tts.directory()
     }
 
     pub(crate) fn asr_runtime(&self) -> LocalModelRuntimeConfig {
@@ -292,6 +301,7 @@ impl NativeProviderPlan {
             )
             .with_endpoint(bind(asr_port));
             apply_model_runtime(&mut spec, self.asr_runtime())?;
+            apply_managed_runtime_environment(&mut spec, self.native_runtime.as_ref())?;
             Some(spec)
         } else {
             None
@@ -304,12 +314,55 @@ impl NativeProviderPlan {
             )
             .with_endpoint(bind(translation_port));
             apply_model_runtime(&mut spec, self.translation_runtime())?;
+            apply_managed_runtime_environment(&mut spec, self.native_runtime.as_ref())?;
             Some(spec)
         } else {
             None
         };
         Ok((asr, translation))
     }
+}
+
+fn load_native_runtime_selection(
+    layout: &RuntimeLayout,
+) -> Result<Option<ResolvedNativeRuntimeSelection>, String> {
+    let path = layout.native_runtime_selection_file();
+    if !path.is_file() {
+        return Ok(None);
+    }
+    let selection: NativeRuntimeSelection = serde_json::from_slice(
+        &std::fs::read(&path)
+            .map_err(|error| format!("cannot read {}: {error}", path.display()))?,
+    )
+    .map_err(|error| format!("invalid {}: {error}", path.display()))?;
+    if selection.schema_version != 1 {
+        return Err(format!(
+            "unsupported native runtime marker schema {} in {}",
+            selection.schema_version,
+            path.display()
+        ));
+    }
+    Ok(Some(layout.resolve_native_runtime_selection(&selection)))
+}
+
+fn apply_managed_runtime_environment(
+    spec: &mut LlamaServerSpec,
+    runtime: Option<&ResolvedNativeRuntimeSelection>,
+) -> Result<(), String> {
+    let Some(runtime) = runtime else {
+        return Ok(());
+    };
+    let Some(cuda_directory) = runtime.cuda_bin_dir.as_ref() else {
+        return Ok(());
+    };
+    let mut paths = vec![cuda_directory.clone()];
+    if let Some(existing) = std::env::var_os("PATH") {
+        paths.extend(std::env::split_paths(&existing));
+    }
+    let joined = std::env::join_paths(paths)
+        .map_err(|error| format!("cannot build managed CUDA PATH: {error}"))?;
+    spec.environment.push((OsString::from("PATH"), joined));
+    Ok(())
 }
 
 fn model_file(
@@ -418,6 +471,34 @@ fn apply_model_runtime(
 mod tests {
     use super::*;
     use std::path::PathBuf;
+
+    #[test]
+    fn managed_cuda_directory_is_injected_only_into_llama_child_path() {
+        let cuda = std::env::temp_dir().join("xrtranslate-managed-cuda");
+        let runtime = ResolvedNativeRuntimeSelection {
+            backend: xrtranslate_config::NativeRuntimeBackend::Cuda,
+            llama_cpp_backend: Some(xrtranslate_config::NativeRuntimeBackend::Cuda),
+            onnx_backend: None,
+            cuda_version: Some("13.3".into()),
+            provider_dir: None,
+            onnx_core_library: None,
+            cuda_bin_dir: Some(cuda.clone()),
+            cudnn_bin_dir: None,
+            preload_libraries: Vec::new(),
+            fallback_reason: None,
+        };
+        let mut spec = LlamaServerSpec::hunyuan_mt_gguf("llama-server", "model.gguf");
+
+        apply_managed_runtime_environment(&mut spec, Some(&runtime)).unwrap();
+
+        let path = spec
+            .environment
+            .iter()
+            .find(|(name, _)| name == "PATH")
+            .map(|(_, value)| value)
+            .unwrap();
+        assert_eq!(std::env::split_paths(path).next().as_ref(), Some(&cuda));
+    }
 
     #[test]
     fn big_translation_level_selects_the_7b_model_for_backend_launch() {
@@ -574,6 +655,7 @@ mod tests {
                 ModelCapability::Translation => {
                     TranslationProfile::registered(manifest.provider, "local").is_some()
                 }
+                ModelCapability::Tts => manifest.provider == "audio8",
             };
             assert!(
                 registered,

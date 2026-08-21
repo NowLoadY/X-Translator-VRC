@@ -100,4 +100,61 @@ impl AnimationSystem {
         })
         .inner
     }
+
+    /// Renders a directional page-flip / slide transition for multi-step wizards.
+    /// Pages moving forward (next) glide smoothly in from the right; pages moving backward (back) glide in from the left.
+    pub fn render_page_flip_transition<R>(
+        ui: &mut egui::Ui,
+        page_index: usize,
+        add_contents: impl FnOnce(&mut egui::Ui) -> R,
+    ) -> R {
+        let current_time = ui.ctx().input(|i| i.time);
+        let global_id = Id::new("onboarding_page_flip_transition_state");
+
+        let (direction, start_time) = ui.ctx().memory_mut(|m| {
+            let state = m.data.get_temp_mut_or_insert_with(global_id, || {
+                (page_index, current_time, 0.0f32)
+            });
+            if state.0 != page_index {
+                let dir = if page_index > state.0 { 1.0f32 } else { -1.0f32 };
+                state.0 = page_index;
+                state.1 = current_time;
+                state.2 = dir;
+            }
+            (state.2, state.1)
+        });
+
+        let elapsed = (current_time - start_time) as f32;
+        let duration = 0.28; // 280ms page flip slide
+        let raw_t = (elapsed / duration).clamp(0.0, 1.0);
+
+        if raw_t < 1.0 {
+            ui.ctx().request_repaint();
+        }
+
+        let eased = Self::ease_out_cubic(raw_t);
+        let x_offset = (1.0 - eased) * (direction * 42.0);
+        let opacity = (eased * 1.15).clamp(0.0, 1.0);
+        let left_padding = if x_offset > 0.0 { x_offset } else { 0.0 };
+        let right_padding = if x_offset < 0.0 { -x_offset } else { 0.0 };
+
+        ui.horizontal(|ui| {
+            if left_padding > 0.1 {
+                ui.add_space(left_padding);
+            }
+            ui.vertical(|ui| {
+                if right_padding > 0.1 {
+                    ui.set_width((ui.available_width() - right_padding).max(100.0));
+                } else {
+                    ui.set_width(ui.available_width());
+                }
+                if opacity < 0.999 {
+                    ui.set_opacity(opacity);
+                }
+                add_contents(ui)
+            })
+            .inner
+        })
+        .inner
+    }
 }

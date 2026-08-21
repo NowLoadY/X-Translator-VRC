@@ -6,6 +6,10 @@ license = "MIT"
 repository = "https://github.com/NowLoadY/XRTranslate"
 description = "Stateful Silero VAD inference and deterministic PCM endpointing"
 
+[features]
+default = []
+managed-ort = ["ort/load-dynamic"]
+
 [dependencies]
-ndarray = "0.16"
-ort = { version = "=2.0.0-rc.10", features = ["ndarray"] }
+ndarray = "0.17"
+ort = { version = "=2.0.0-rc.13", default-features = false, features = ["std", "ndarray", "tracing", "download-binaries", "tls-native", "api-27"] }

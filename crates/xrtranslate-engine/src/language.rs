@@ -18,25 +18,24 @@ pub enum Script {
 pub fn observed_scripts(text: &str) -> Vec<Script> {
     let mut scripts = Vec::with_capacity(2);
     for character in text.chars() {
-        let script = if character.is_ascii_alphabetic()
-            || ('\u{00c0}'..='\u{024f}').contains(&character)
-        {
-            Some(Script::Latin)
-        } else if ('\u{3040}'..='\u{31ff}').contains(&character) {
-            Some(Script::Japanese)
-        } else if ('\u{3400}'..='\u{9fff}').contains(&character) {
-            Some(Script::Han)
-        } else if ('\u{0400}'..='\u{04ff}').contains(&character) {
-            Some(Script::Cyrillic)
-        } else if ('\u{1100}'..='\u{11ff}').contains(&character)
-            || ('\u{ac00}'..='\u{d7af}').contains(&character)
-        {
-            Some(Script::Hangul)
-        } else if ('\u{0e00}'..='\u{0e7f}').contains(&character) {
-            Some(Script::Thai)
-        } else {
-            None
-        };
+        let script =
+            if character.is_ascii_alphabetic() || ('\u{00c0}'..='\u{024f}').contains(&character) {
+                Some(Script::Latin)
+            } else if ('\u{3040}'..='\u{31ff}').contains(&character) {
+                Some(Script::Japanese)
+            } else if ('\u{3400}'..='\u{9fff}').contains(&character) {
+                Some(Script::Han)
+            } else if ('\u{0400}'..='\u{04ff}').contains(&character) {
+                Some(Script::Cyrillic)
+            } else if ('\u{1100}'..='\u{11ff}').contains(&character)
+                || ('\u{ac00}'..='\u{d7af}').contains(&character)
+            {
+                Some(Script::Hangul)
+            } else if ('\u{0e00}'..='\u{0e7f}').contains(&character) {
+                Some(Script::Thai)
+            } else {
+                None
+            };
         if let Some(script) = script {
             if !scripts.contains(&script) {
                 scripts.push(script);
@@ -108,7 +107,10 @@ pub fn detect_text_language(text: &str) -> Option<&'static str> {
     }
 
     // Check for Kana first because Japanese texts often contain Kanji (Han) characters.
-    if trimmed.chars().any(|c| ('\u{3040}'..='\u{31ff}').contains(&c)) {
+    if trimmed
+        .chars()
+        .any(|c| ('\u{3040}'..='\u{31ff}').contains(&c))
+    {
         return Some("ja");
     }
 
@@ -253,10 +255,7 @@ mod tests {
         );
 
         // When typing Chinese on a zh -> en pair, no change is needed
-        assert_eq!(
-            auto_route_language_pair("你好世界", "zh", "en"),
-            None
-        );
+        assert_eq!(auto_route_language_pair("你好世界", "zh", "en"), None);
 
         // When typing Japanese on a zh -> en pair, routes ja -> en
         assert_eq!(

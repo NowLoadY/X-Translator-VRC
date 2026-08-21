@@ -291,8 +291,10 @@ impl GtcrnDenoiser {
         intra_threads: usize,
     ) -> Result<Self, DenoiseError> {
         let session = Session::builder()?
-            .with_intra_threads(intra_threads.max(1))?
-            .with_inter_threads(1)?
+            .with_intra_threads(intra_threads.max(1))
+            .map_err(|error| DenoiseError::Ort(ort::Error::new(error.to_string())))?
+            .with_inter_threads(1)
+            .map_err(|error| DenoiseError::Ort(ort::Error::new(error.to_string())))?
             .commit_from_file(model_path)?;
 
         Ok(Self {

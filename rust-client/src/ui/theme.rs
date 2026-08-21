@@ -110,12 +110,12 @@ pub fn surface_control_active() -> Color32 {
 }
 
 pub fn sidebar(focused: bool) -> Color32 {
-    let alpha = if focused { 184 } else { 142 };
+    let alpha = if focused { 174 } else { 132 };
     Color32::from_rgba_unmultiplied(255, 255, 255, alpha)
 }
 
 pub fn content_backdrop(focused: bool) -> Color32 {
-    let alpha = if focused { 182 } else { 126 };
+    let alpha = if focused { 172 } else { 116 };
     Color32::from_rgba_unmultiplied(255, 255, 255, alpha)
 }
 

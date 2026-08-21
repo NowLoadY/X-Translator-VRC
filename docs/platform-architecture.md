@@ -17,6 +17,26 @@ start inference, or choose storage locations.
   and (when relevant) `cuda_version`.
   Adding Linux assets is a configuration/catalogue change, not a second
   downloader or inference pipeline.
+- CUDA runtime selection is shared by llama.cpp and in-process ONNX providers.
+  The installer downloads one matching CUDA redistributable, installs it under
+  `runtime/cuda/<version>`, and atomically publishes
+  `runtime/native-runtime.json`. The marker contains resolved provider/CUDA
+  directories and an exact library preload order; backend processes consume
+  that contract without modifying the system `PATH` or guessing DLL names.
+- The native-runtime marker records `llama_cpp_backend` and `onnx_backend`
+  independently. Its project-relative `onnx_core_library`, `provider_dir`,
+  `cuda_bin_dir`, and `preload_libraries` are resolved through `RuntimeLayout`.
+  Packaged backends dynamically load the selected core before any ONNX API.
+  CUDA dependencies are preloaded in the declared order; the core then loads
+  its colocated `onnxruntime_providers_shared` and
+  `onnxruntime_providers_cuda`. Provider DLLs must never be preloaded directly
+  or combined with a core from another archive.
+- CPU-only hosts use the compact ONNX core included in the native application
+  package and download no ONNX execution-provider runtime. A compatible
+  NVIDIA host selects the newest declared CUDA package supported by its driver;
+  CUDA 12 and CUDA 13 providers remain separate immutable assets. If no complete
+  compatible GPU bundle exists, planning succeeds with the CPU backend and an
+  actionable fallback reason instead of mixing incompatible runtime files.
 - `rust-client/src/runtime_install.rs` performs one generic workflow: select
   assets for the current target, download with `xrtranslate-download`, verify,
   extract, and persist the resulting executable path. It must not inspect

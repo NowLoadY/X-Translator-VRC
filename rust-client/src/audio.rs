@@ -3,7 +3,7 @@ use cpal::traits::{DeviceTrait, HostTrait, StreamTrait};
 use cpal::{Sample, Stream};
 use crossbeam_channel::{Receiver, Sender, bounded};
 use parking_lot::Mutex;
-use rubato::{Fft, FixedSync, Resampler};
+use rubato::{Fft, FixedSync, Indexing, Resampler};
 use std::collections::VecDeque;
 use std::sync::{
     Arc,
@@ -41,25 +41,44 @@ pub struct AudioSystem {
 pub struct TtsPlayerHandle {
     queue: Arc<Mutex<VecDeque<f32>>>,
     sample_rate: u32,
+    source_sample_rate: u32,
 }
 
 impl TtsPlayerHandle {
-    pub fn play_pcm(&self, pcm: &[u8]) {
+    pub fn play_pcm(&self, pcm: &[u8]) -> Result<(), String> {
         if pcm.len() < 2 {
-            return;
+            return Ok(());
         }
         let samples = pcm
             .chunks_exact(2)
             .map(|bytes| i16::from_le_bytes([bytes[0], bytes[1]]) as f32 / 32768.0)
             .collect::<Vec<_>>();
-        let samples = resample_mono_linear(samples, 48_000, self.sample_rate);
-        self.queue.lock().extend(samples);
+        let samples = resample_mono(samples, self.source_sample_rate, self.sample_rate)?;
+        let output_samples = samples.len();
+        let mut queue = self.queue.lock();
+        queue.extend(samples);
+        let queued_samples = queue.len();
+        drop(queue);
+        log::info!(
+            "Queued TTS audio for playback: input_bytes={}, output_samples={}, queued_samples={}, source_rate={}, output_rate={}",
+            pcm.len(),
+            output_samples,
+            queued_samples,
+            self.source_sample_rate,
+            self.sample_rate
+        );
+        Ok(())
+    }
+
+    pub fn is_playing(&self) -> bool {
+        !self.queue.lock().is_empty()
     }
 }
 
 struct TtsPlayer {
     queue: Arc<Mutex<VecDeque<f32>>>,
     sample_rate: u32,
+    device_id: String,
     _stream: Stream,
 }
 
@@ -134,6 +153,25 @@ impl AudioSystem {
         devices
     }
 
+    /// Lists render endpoints. Virtual microphone cables appear here as an
+    /// output endpoint and can therefore receive game-bound synthesized audio.
+    pub fn available_output_devices(&self) -> Vec<InputDevice> {
+        self.host
+            .output_devices()
+            .map(|devices| {
+                devices
+                    .filter_map(|device| match (device.id(), device.description()) {
+                        (Ok(id), Ok(description)) => Some(InputDevice {
+                            id: id.to_string(),
+                            name: description.name().to_owned(),
+                        }),
+                        _ => None,
+                    })
+                    .collect()
+            })
+            .unwrap_or_default()
+    }
+
     /// Read the current default capture format for the selected device.
     pub fn input_config(&self, device_id: &str) -> Result<InputConfigInfo, String> {
         let device = if device_id.is_empty() {
@@ -173,15 +211,20 @@ impl AudioSystem {
     }
 
     /// Get a handle to the TTS player that can be safely sent to other threads.
-    pub fn tts_handle(&mut self) -> Option<TtsPlayerHandle> {
-        if let Err(e) = self.ensure_tts_player() {
-            log::error!("Failed to initialize TTS player: {}", e);
-            return None;
-        }
-        self.tts_player.as_ref().map(|p| TtsPlayerHandle {
-            queue: Arc::clone(&p.queue),
-            sample_rate: p.sample_rate,
-        })
+    pub fn tts_handle(
+        &mut self,
+        source_sample_rate: u32,
+        device_id: &str,
+    ) -> Result<TtsPlayerHandle, String> {
+        self.ensure_tts_player(device_id)?;
+        self.tts_player
+            .as_ref()
+            .map(|p| TtsPlayerHandle {
+                queue: Arc::clone(&p.queue),
+                sample_rate: p.sample_rate,
+                source_sample_rate,
+            })
+            .ok_or_else(|| "TTS output stream was not initialized".into())
     }
 
     /// Start capturing from a device by name.
@@ -387,22 +430,36 @@ impl AudioSystem {
         self.active_captures.push(capture);
     }
 
-    fn ensure_tts_player(&mut self) -> Result<(), String> {
-        if self.tts_player.is_some() {
+    fn ensure_tts_player(&mut self, device_id: &str) -> Result<(), String> {
+        if self
+            .tts_player
+            .as_ref()
+            .is_some_and(|player| player.device_id == device_id)
+        {
             return Ok(());
         }
-        let device = self
-            .host
-            .default_output_device()
-            .ok_or("No default audio output device available for TTS playback")?;
+        self.tts_player = None;
+        let device = if device_id.is_empty() {
+            self.host
+                .default_output_device()
+                .ok_or("No default audio output device available for TTS playback")?
+        } else {
+            let parsed_id = device_id
+                .parse()
+                .map_err(|error| format!("Invalid TTS output ID '{device_id}': {error}"))?;
+            self.host
+                .device_by_id(&parsed_id)
+                .ok_or_else(|| format!("TTS output '{device_id}' is no longer available"))?
+        };
         let config = device
             .default_output_config()
             .map_err(|error| format!("Cannot read TTS output format: {error}"))?;
         let sample_rate = config.sample_rate();
         let channels = config.channels() as usize;
+        let sample_format = config.sample_format();
         let queue = Arc::new(Mutex::new(VecDeque::new()));
         let stream_config: cpal::StreamConfig = config.into();
-        let stream = match config.sample_format() {
+        let stream = match sample_format {
             cpal::SampleFormat::F32 => {
                 build_tts_output_stream::<f32>(&device, stream_config, channels, Arc::clone(&queue))
             }
@@ -450,9 +507,17 @@ impl AudioSystem {
         stream
             .play()
             .map_err(|error| format!("Cannot start TTS output stream: {error}"))?;
+        log::info!(
+            "TTS output stream started: device_id={:?}, sample_rate={}, channels={}, sample_format={}",
+            device_id,
+            sample_rate,
+            channels,
+            sample_format
+        );
         self.tts_player = Some(TtsPlayer {
             queue,
             sample_rate,
+            device_id: device_id.to_owned(),
             _stream: stream,
         });
         Ok(())
@@ -487,20 +552,62 @@ where
         .map_err(|error| format!("Cannot create TTS output stream: {error}"))
 }
 
-fn resample_mono_linear(samples: Vec<f32>, source_rate: u32, target_rate: u32) -> Vec<f32> {
+fn resample_mono(
+    samples: Vec<f32>,
+    source_rate: u32,
+    target_rate: u32,
+) -> Result<Vec<f32>, String> {
     if source_rate == target_rate || samples.len() < 2 {
-        return samples;
+        return Ok(samples);
     }
-    let output_len = samples.len() * target_rate as usize / source_rate as usize;
-    (0..output_len)
-        .map(|index| {
-            let position = index as f64 * source_rate as f64 / target_rate as f64;
-            let lower = position.floor() as usize;
-            let upper = (lower + 1).min(samples.len() - 1);
-            let fraction = (position - lower as f64) as f32;
-            samples[lower] + (samples[upper] - samples[lower]) * fraction
-        })
-        .collect()
+    let expected =
+        ((samples.len() as u64 * u64::from(target_rate)).div_ceil(u64::from(source_rate))) as usize;
+    let mut resampler = Fft::<f32>::new(
+        source_rate as usize,
+        target_rate as usize,
+        1024,
+        1,
+        FixedSync::Input,
+    )
+    .map_err(|error| format!("Cannot initialize TTS resampler: {error}"))?;
+    let mut output = Vec::with_capacity(expected);
+    let mut offset = 0;
+    let mut trim_remaining = resampler.output_delay();
+    while output.len() < expected {
+        let required = resampler.input_frames_next();
+        let valid = samples.len().saturating_sub(offset).min(required);
+        let mut input = if valid == 0 {
+            vec![0.0; required]
+        } else {
+            samples[offset..offset + valid].to_vec()
+        };
+        input.resize(required, 0.0);
+        offset += valid;
+        let input = InterleavedSlice::new(&input, 1, required)
+            .map_err(|error| format!("Invalid TTS resampler input: {error}"))?;
+        let capacity = resampler.output_frames_max();
+        let mut chunk = vec![0.0; capacity];
+        let mut output_adapter = InterleavedSlice::new_mut(&mut chunk, 1, capacity)
+            .map_err(|error| format!("Invalid TTS resampler output: {error}"))?;
+        let indexing = Indexing {
+            partial_len: (valid < required).then_some(valid),
+            ..Indexing::default()
+        };
+        let before = output.len();
+        let (_, written) = resampler
+            .process_into_buffer(&input, &mut output_adapter, Some(&indexing))
+            .map_err(|error| format!("TTS resampling failed: {error}"))?;
+        chunk.truncate(written);
+        let trim = trim_remaining.min(chunk.len());
+        chunk.drain(..trim);
+        trim_remaining -= trim;
+        chunk.truncate(expected - output.len());
+        output.extend(chunk);
+        if valid == 0 && output.len() == before {
+            return Err("TTS resampler could not flush its delayed output".into());
+        }
+    }
+    Ok(output)
 }
 
 #[cfg(windows)]
@@ -803,4 +910,20 @@ fn take_loopback_mono(pending: &mut VecDeque<u8>, frames: usize) -> Vec<f32> {
         mono.push((left + right) * 0.5);
     }
     mono
+}
+
+#[cfg(test)]
+mod tests {
+    use super::resample_mono;
+
+    #[test]
+    fn tts_resampling_preserves_duration_and_signal() {
+        let source = (0..4_410)
+            .map(|frame| ((frame as f32 / 44_100.0) * 440.0 * std::f32::consts::TAU).sin())
+            .collect();
+        let output = resample_mono(source, 44_100, 48_000).unwrap();
+        assert_eq!(output.len(), 4_800);
+        assert!(output.iter().all(|sample| sample.is_finite()));
+        assert!(output.iter().any(|sample| sample.abs() > 0.5));
+    }
 }

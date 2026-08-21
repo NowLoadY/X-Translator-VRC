@@ -159,10 +159,10 @@ fn render_entries<'a>(
         OscFormatMode::TargetOnly => unreachable!(),
     };
     [first, second]
-    .into_iter()
-    .filter(|text| !text.is_empty())
-    .collect::<Vec<_>>()
-    .join(separator)
+        .into_iter()
+        .filter(|text| !text.is_empty())
+        .collect::<Vec<_>>()
+        .join(separator)
 }
 
 fn with_speaker(text: &str, speaker: Option<&str>) -> String {
@@ -502,14 +502,26 @@ mod tests {
     fn removes_chinese_periods_and_trailing_non_chat_punctuation() {
         // Chinese period removal
         assert_eq!(sanitize_chatbox_segment("好的。"), "好的");
-        assert_eq!(sanitize_chatbox_segment("好的。我知道了。"), "好的 我知道了");
-        assert_eq!(sanitize_chatbox_segment("好的，我知道了。"), "好的，我知道了");
-        assert_eq!(sanitize_chatbox_segment("好的。 我知道了。"), "好的 我知道了");
+        assert_eq!(
+            sanitize_chatbox_segment("好的。我知道了。"),
+            "好的 我知道了"
+        );
+        assert_eq!(
+            sanitize_chatbox_segment("好的，我知道了。"),
+            "好的，我知道了"
+        );
+        assert_eq!(
+            sanitize_chatbox_segment("好的。 我知道了。"),
+            "好的 我知道了"
+        );
         assert_eq!(sanitize_chatbox_segment("こんにちは｡"), "こんにちは");
 
         // Western period removal
         assert_eq!(sanitize_chatbox_segment("Hello."), "Hello");
-        assert_eq!(sanitize_chatbox_segment("I am coming home."), "I am coming home");
+        assert_eq!(
+            sanitize_chatbox_segment("I am coming home."),
+            "I am coming home"
+        );
         assert_eq!(sanitize_chatbox_segment("Wait..."), "Wait");
 
         // Trailing commas, semicolons, colons

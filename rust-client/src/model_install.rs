@@ -28,13 +28,9 @@ pub enum NativeModelTaskState {
         downloaded_bytes: u64,
         total_bytes: u64,
     },
-    Verifying,
     Installed {
         asset_id: ModelAssetId,
         directory: PathBuf,
-    },
-    Verified {
-        ready: Vec<ModelAssetId>,
     },
     Failed(String),
 }
@@ -53,10 +49,7 @@ pub struct NativeModelPackage {
 impl NativeModelTaskState {
     #[must_use]
     pub const fn is_busy(&self) -> bool {
-        matches!(
-            self,
-            Self::Discovering | Self::Installing { .. } | Self::Verifying
-        )
+        matches!(self, Self::Discovering | Self::Installing { .. })
     }
 }
 
@@ -64,7 +57,6 @@ impl NativeModelTaskState {
 enum NativeModelTask {
     Discover,
     Install(ModelAssetId),
-    Verify,
 }
 
 #[derive(Debug)]
@@ -82,9 +74,6 @@ enum NativeModelTaskResult {
     Installed {
         asset_id: ModelAssetId,
         directory: PathBuf,
-    },
-    Verified {
-        ready: Vec<ModelAssetId>,
     },
     Failed(String),
 }
@@ -128,10 +117,6 @@ impl NativeModelTaskManager {
         self.start(project_root, NativeModelTask::Install(asset_id))
     }
 
-    pub fn verify(&mut self, project_root: PathBuf) -> Result<(), String> {
-        self.start(project_root, NativeModelTask::Verify)
-    }
-
     /// Starts a one-time, background presence scan for the configured model
     /// packages. It never downloads or hashes; explicit verification remains
     /// available as a separate action.
@@ -167,7 +152,6 @@ impl NativeModelTaskManager {
                 },
                 requested,
             ) => *installed == requested,
-            (NativeModelTaskState::Verified { ready }, requested) => ready.contains(&requested),
             _ => false,
         }
     }
@@ -188,7 +172,6 @@ impl NativeModelTaskManager {
                 },
                 requested,
             ) => *installed == requested,
-            (NativeModelTaskState::Verified { ready }, requested) => ready.contains(&requested),
             _ => false,
         }
     }
@@ -222,9 +205,6 @@ impl NativeModelTaskManager {
                             asset_id,
                             directory,
                         },
-                        NativeModelTaskResult::Verified { ready } => {
-                            NativeModelTaskState::Verified { ready }
-                        }
                         NativeModelTaskResult::Failed(error) => NativeModelTaskState::Failed(error),
                     };
                     finished = true;
@@ -268,7 +248,6 @@ impl NativeModelTaskManager {
                 downloaded_bytes: 0,
                 total_bytes: 0,
             },
-            NativeModelTask::Verify => NativeModelTaskState::Verifying,
         };
         self.events = Some(event_rx);
         Ok(())
@@ -286,7 +265,6 @@ fn run_task(
         NativeModelTask::Install(asset_id) => {
             install_model(project_root, asset_id, &event_tx, proxy_url.as_deref())
         }
-        NativeModelTask::Verify => verify_models(project_root),
     };
     let _ = event_tx.send(NativeModelTaskEvent::Finished(result));
 }
@@ -343,31 +321,6 @@ fn install_model(
     }
 }
 
-fn verify_models(project_root: PathBuf) -> NativeModelTaskResult {
-    match load_assets(&project_root) {
-        Ok(assets) => {
-            let preflight = assets.verify_integrity();
-            if preflight.is_ready() {
-                NativeModelTaskResult::Verified {
-                    ready: assets
-                        .active_assets()
-                        .map(|asset| asset.manifest().id)
-                        .collect(),
-                }
-            } else {
-                NativeModelTaskResult::Failed(
-                    preflight
-                        .diagnostics()
-                        .iter()
-                        .map(|diagnostic| format!("- {diagnostic}"))
-                        .collect::<Vec<_>>()
-                        .join("\n"),
-                )
-            }
-        }
-        Err(error) => NativeModelTaskResult::Failed(error),
-    }
-}
 
 fn load_assets(project_root: &std::path::Path) -> Result<ResolvedModelAssets, String> {
     let config = load_config(project_root)?;
@@ -456,6 +409,7 @@ pub fn set_model_level(
     let section_name = match capability {
         ModelCapability::Asr => "asr",
         ModelCapability::Translation => "translation",
+        ModelCapability::Tts => "tts",
     };
     let section = document
         .get_mut(section_name)
@@ -547,9 +501,10 @@ mod tests {
     }
 
     #[test]
-    fn verified_state_is_scoped_to_the_packages_that_were_hashed() {
+    fn detected_state_is_scoped_to_the_packages_that_were_discovered() {
         let manager = NativeModelTaskManager {
-            state: NativeModelTaskState::Verified {
+            state: NativeModelTaskState::Detected {
+                present: vec![ModelAssetId::Qwen3AsrGguf],
                 ready: vec![ModelAssetId::Qwen3AsrGguf],
             },
             events: None,

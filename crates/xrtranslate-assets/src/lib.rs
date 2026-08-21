@@ -11,9 +11,9 @@ mod preflight;
 mod resolve;
 
 pub use catalog::{
-    DEFAULT_GGUF_MANIFEST, HUNYUAN_MT_7B_GGUF, HUNYUAN_MT_GGUF, ModelAssetId, ModelAssetManifest,
-    ModelCapability, ModelFileRole, ModelLevel, ModelSource, QWEN3_ASR_GGUF, RequiredModelFile,
-    manifest_for, manifests_for_capability,
+    AUDIO8_TTS_ONNX_FP16, DEFAULT_GGUF_MANIFEST, HUNYUAN_MT_7B_GGUF, HUNYUAN_MT_GGUF, ModelAssetId,
+    ModelAssetManifest, ModelCapability, ModelFileRole, ModelFileSource, ModelLevel, ModelSource,
+    QWEN3_ASR_GGUF, RequiredModelFile, manifest_for, manifests_for_capability,
 };
 pub use install::{AtomicInstallError, DownloadProgress, ModelDownloadError, NativeModelInstaller};
 pub use preflight::{

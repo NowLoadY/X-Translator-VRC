@@ -159,10 +159,8 @@ mod tests {
         let _ = std::fs::remove_dir_all(&temp_dir);
 
         let mut library = PromptTemplateLibrary::default();
-        let mut custom = PromptTemplateLibrary::editable_copy_of(
-            &library.profiles[0],
-            "custom-test-profile",
-        );
+        let mut custom =
+            PromptTemplateLibrary::editable_copy_of(&library.profiles[0], "custom-test-profile");
         custom.name = "Custom Test Profile".into();
         library.profiles.push(custom);
         library.active_id = "custom-test-profile".into();
@@ -178,4 +176,3 @@ mod tests {
         let _ = std::fs::remove_dir_all(&temp_dir);
     }
 }
-

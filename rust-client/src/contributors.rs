@@ -189,9 +189,12 @@ fn handle_sub_bullet(line: &str, contributor: &mut Contributor) {
     }
 
     let (links, spans) = extract_markdown_links_with_spans(trimmed);
-    let is_pure_link = !links.is_empty() && spans.len() == 1 && spans[0].0 == 0 && spans[0].1 == trimmed.len();
+    let is_pure_link =
+        !links.is_empty() && spans.len() == 1 && spans[0].0 == 0 && spans[0].1 == trimmed.len();
 
-    if is_pure_link || (trimmed.to_lowercase().starts_with("links:") || trimmed.starts_with("社交链接:")) {
+    if is_pure_link
+        || (trimmed.to_lowercase().starts_with("links:") || trimmed.starts_with("社交链接:"))
+    {
         for link in links {
             if contributor.links.len() < 2 {
                 contributor.links.push(link);
@@ -206,18 +209,17 @@ fn handle_sub_bullet(line: &str, contributor: &mut Contributor) {
 }
 
 fn parse_table_row(row: &str) -> Option<Contributor> {
-    let cells: Vec<&str> = row
-        .trim_matches('|')
-        .split('|')
-        .map(|c| c.trim())
-        .collect();
+    let cells: Vec<&str> = row.trim_matches('|').split('|').map(|c| c.trim()).collect();
 
     if cells.len() < 2 {
         return None;
     }
 
     // Skip markdown table header separators like | :--- | :--- |
-    if cells.iter().all(|c| c.chars().all(|ch| ch == '-' || ch == ':' || ch == ' ')) {
+    if cells
+        .iter()
+        .all(|c| c.chars().all(|ch| ch == '-' || ch == ':' || ch == ' '))
+    {
         return None;
     }
 
@@ -236,7 +238,10 @@ fn parse_table_row(row: &str) -> Option<Contributor> {
             links = extracted_links;
         } else {
             // Split by <br>, <br/>, <br />, or semicolons
-            let cell_content = cell.replace("<br/>", "\n").replace("<br />", "\n").replace("<br>", "\n");
+            let cell_content = cell
+                .replace("<br/>", "\n")
+                .replace("<br />", "\n")
+                .replace("<br>", "\n");
             for part in cell_content.lines() {
                 for item in split_contributions(part) {
                     if !item.is_empty() {
@@ -297,7 +302,9 @@ fn parse_contributor_line(line: &str) -> Option<Contributor> {
         if !paren_desc.is_empty() {
             inline_contributions.extend(split_contributions(&paren_desc));
         }
-    } else if desc_raw.trim().is_empty() && (name_raw.contains(" - ") || name_raw.contains(" — ") || name_raw.contains(" – ")) {
+    } else if desc_raw.trim().is_empty()
+        && (name_raw.contains(" - ") || name_raw.contains(" — ") || name_raw.contains(" – "))
+    {
         // e.g. Name — Desc (with no links)
         let sep = if name_raw.contains(" — ") {
             " — "
@@ -498,7 +505,8 @@ fn extract_markdown_links_with_spans(text: &str) -> (Vec<SocialLink>, Vec<(usize
                         }
                     }
 
-                    let end_pos = start_bracket + 1 + relative_end_bracket + 1 + 1 + relative_end_paren + 1;
+                    let end_pos =
+                        start_bracket + 1 + relative_end_bracket + 1 + 1 + relative_end_paren + 1;
                     spans.push((start_bracket, end_pos));
 
                     if !label.trim().is_empty() && !url.is_empty() {
@@ -588,8 +596,14 @@ mod tests {
         assert_eq!(groups[0].contributors[0].name, "NowLoadY");
         assert_eq!(groups[0].contributors[0].links.len(), 1);
         assert_eq!(groups[0].contributors[0].contributions.len(), 2);
-        assert_eq!(groups[0].contributors[0].contributions[0], "Project Creator & Core Architecture");
-        assert_eq!(groups[0].contributors[0].contributions[1], "Prompt Studio Workflow");
+        assert_eq!(
+            groups[0].contributors[0].contributions[0],
+            "Project Creator & Core Architecture"
+        );
+        assert_eq!(
+            groups[0].contributors[0].contributions[1],
+            "Prompt Studio Workflow"
+        );
 
         assert_eq!(groups[0].contributors[1].name, "ContributorA");
         assert_eq!(groups[0].contributors[1].links.len(), 2);
@@ -627,8 +641,14 @@ mod tests {
         assert_eq!(groups[0].contributors[0].name, "NowLoadY");
         assert_eq!(groups[0].contributors[0].links.len(), 1);
         assert_eq!(groups[0].contributors[0].contributions.len(), 2);
-        assert_eq!(groups[0].contributors[0].contributions[0], "项目发起人与核心架构");
-        assert_eq!(groups[0].contributors[0].contributions[1], "Prompt Studio 节点流");
+        assert_eq!(
+            groups[0].contributors[0].contributions[0],
+            "项目发起人与核心架构"
+        );
+        assert_eq!(
+            groups[0].contributors[0].contributions[1],
+            "Prompt Studio 节点流"
+        );
 
         assert_eq!(groups[0].contributors[1].name, "DevA");
         assert_eq!(groups[0].contributors[1].links.len(), 2);
@@ -665,5 +685,4 @@ mod tests {
         assert_eq!(groups[0].role, ContributorRole::CodeContributors);
         assert_eq!(groups[1].role, ContributorRole::BetaTesters);
     }
-
 }

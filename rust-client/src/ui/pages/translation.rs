@@ -472,17 +472,141 @@ pub fn render(app: &mut crate::XRTranslateApp, ui: &mut egui::Ui) {
 
             ui.add_space(8.0);
             ui.horizontal_wrapped(|ui| {
+                let tts_configured = app.service_config.tts_is_configured();
                 let mut tts_enabled = app.tts_enabled;
-                if components::feature_checkbox(
-                    ui,
-                    crate::feature_access::Feature::TtsPlayback,
-                    app.ui_language,
-                    &mut tts_enabled,
-                    crate::i18n::tr(app.ui_language, "TTS"),
-                )
-                .changed()
-                {
-                    app.set_tts_enabled(tts_enabled);
+                let tts_response = ui.add_enabled_ui(tts_configured, |ui| {
+                    if components::feature_checkbox(
+                        ui,
+                        crate::feature_access::Feature::TtsPlayback,
+                        app.ui_language,
+                        &mut tts_enabled,
+                        crate::i18n::tr(app.ui_language, "TTS"),
+                    )
+                    .changed()
+                    {
+                        app.set_tts_enabled(tts_enabled);
+                    }
+                });
+                if !tts_configured {
+                    tts_response.response.on_disabled_hover_text(crate::i18n::tr(
+                        app.ui_language,
+                        "Configure a TTS provider in Settings to enable TTS playback.",
+                    ));
+                }
+
+                ui.add_space(8.0);
+                ui.label(
+                    egui::RichText::new(crate::i18n::tr(app.ui_language, "TTS output:"))
+                        .color(crate::ui::theme::text_normal()),
+                );
+                let current_output = app
+                    .tts_output_devices
+                    .iter()
+                    .find(|device| device.id == app.selected_tts_output_device_id)
+                    .map(|device| device.name.clone())
+                    .unwrap_or_else(|| crate::i18n::tr(app.ui_language, "Default speaker").into());
+                let mut output_options = vec![(
+                    String::new(),
+                    crate::i18n::tr(app.ui_language, "Default speaker").to_owned(),
+                )];
+                output_options.extend(
+                    app.tts_output_devices
+                        .iter()
+                        .map(|device| (device.id.clone(), device.name.clone())),
+                );
+                let output_selector = ui.add_enabled_ui(tts_configured && !app.is_translating, |ui| {
+                    if components::searchable_combobox(
+                        ui,
+                        "tts_output_device_selector",
+                        &current_output,
+                        &mut app.selected_tts_output_device_id,
+                        &output_options,
+                    ) {
+                        app.audio_system.clear_tts_playback();
+                        app.save_settings();
+                    }
+                });
+                if app.is_translating {
+                    output_selector.response.on_hover_text(crate::i18n::tr(
+                        app.ui_language,
+                        "Stop translation to change the TTS output device.",
+                    ));
+                }
+
+                for source in app.capture_source.routes() {
+                    ui.add_space(8.0);
+                    let status = app.voice_clone_state(*source).cloned();
+                    let busy = status.as_ref().is_some_and(|status| {
+                        matches!(
+                            status.state,
+                            xrtranslate_protocol::VoiceClonePhase::Collecting
+                                | xrtranslate_protocol::VoiceClonePhase::Registering
+                        )
+                    });
+                    let label = match status.as_ref().map(|status| status.state) {
+                        Some(xrtranslate_protocol::VoiceClonePhase::Collecting) => status
+                            .as_ref()
+                            .map(|status| {
+                                format!(
+                                    "{} {:.1}/{:.1}s",
+                                    crate::i18n::tr(app.ui_language, "Collecting voice…"),
+                                    status.collected_seconds,
+                                    status.required_seconds
+                                )
+                            })
+                            .unwrap(),
+                        Some(xrtranslate_protocol::VoiceClonePhase::Registering) => {
+                            crate::i18n::tr(app.ui_language, "Creating voice…").into()
+                        }
+                        _ => match source {
+                            CaptureSource::Microphone => {
+                                crate::i18n::tr(app.ui_language, "Clone microphone voice").into()
+                            }
+                            CaptureSource::SystemAudio => {
+                                crate::i18n::tr(app.ui_language, "Clone system voice").into()
+                            }
+                            CaptureSource::Both => unreachable!(),
+                        },
+                    };
+                    let response = components::animated_button_enabled(
+                        ui,
+                        &label,
+                        app.is_translating && !busy && tts_configured,
+                    );
+                    let clicked = response.clicked();
+                    if let Some(message) =
+                        status.as_ref().and_then(|status| status.message.as_deref())
+                    {
+                        response.on_hover_text(message);
+                    } else if !tts_configured {
+                        response.on_disabled_hover_text(crate::i18n::tr(
+                            app.ui_language,
+                            "Configure a TTS provider in Settings to enable voice cloning.",
+                        ));
+                    }
+                    if clicked {
+                        app.begin_voice_clone(*source);
+                    }
+                    if status.as_ref().is_some_and(|status| {
+                        status.state == xrtranslate_protocol::VoiceClonePhase::Ready
+                    }) {
+                        ui.label(
+                            egui::RichText::new("✓").color(egui::Color32::from_rgb(5, 150, 105)),
+                        );
+                    } else if let Some(message) = status.as_ref().and_then(|status| {
+                        (status.state == xrtranslate_protocol::VoiceClonePhase::Failed)
+                            .then_some(status.message.as_deref())
+                            .flatten()
+                    }) {
+                        ui.label(
+                            egui::RichText::new(crate::i18n::tr(
+                                app.ui_language,
+                                "Voice cloning failed",
+                            ))
+                            .color(egui::Color32::from_rgb(220, 38, 38)),
+                        )
+                        .on_hover_text(message);
+                    }
                 }
 
                 ui.add_space(12.0);

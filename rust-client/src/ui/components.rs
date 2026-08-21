@@ -1159,13 +1159,11 @@ fn decorate_unavailable(
     }
 }
 
-pub fn file_path_input(
+pub fn directory_path_input(
     ui: &mut Ui,
     value: &mut String,
     hint: &str,
     browse_label: &str,
-    filter_name: &str,
-    extensions: &[&str],
     input_width: f32,
 ) -> bool {
     let mut changed = ui
@@ -1178,9 +1176,7 @@ pub fn file_path_input(
         .changed();
 
     if animated_button(ui, browse_label).clicked()
-        && let Some(path) = rfd::FileDialog::new()
-            .add_filter(filter_name, extensions)
-            .pick_file()
+        && let Some(path) = rfd::FileDialog::new().pick_folder()
     {
         *value = path.display().to_string();
         changed = true;
@@ -1657,4 +1653,207 @@ pub fn reset_button(ui: &mut Ui, id_salt: &str) -> egui::Response {
         ui.ctx().set_cursor_icon(egui::CursorIcon::PointingHand);
     }
     resp
+}
+
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+pub enum RuntimeUiAction {
+    #[default]
+    None,
+    Install,
+    Retry,
+}
+
+pub fn render_runtime_task_state(
+    ui: &mut egui::Ui,
+    language: crate::i18n::UiLanguage,
+    state: &crate::runtime_install::RuntimeInstallState,
+    extracting_text: &'static str,
+    installed_text: &'static str,
+) -> Option<std::path::PathBuf> {
+    use crate::runtime_install::RuntimeInstallState;
+
+    match state {
+        RuntimeInstallState::Idle | RuntimeInstallState::Ready => None,
+        RuntimeInstallState::Detecting => {
+            ui.add_space(6.0);
+            ui.label(
+                egui::RichText::new(crate::i18n::tr(
+                    language,
+                    "Detecting the recommended runtime...",
+                ))
+                .size(12.0)
+                .color(theme::text_weak()),
+            );
+            None
+        }
+        RuntimeInstallState::Downloading {
+            asset,
+            downloaded,
+            total,
+        } => {
+            ui.add_space(6.0);
+            ui.label(egui::RichText::new(asset).size(11.0).color(theme::text_weak()));
+            if *total > 0 {
+                ui.add(
+                    egui::ProgressBar::new(
+                        (*downloaded as f64 / *total as f64).clamp(0.0, 1.0) as f32,
+                    )
+                    .text(format!(
+                        "{} / {}",
+                        format_file_size(*downloaded),
+                        format_file_size(*total),
+                    )),
+                );
+            }
+            None
+        }
+        RuntimeInstallState::Extracting => {
+            ui.add_space(6.0);
+            ui.label(
+                egui::RichText::new(crate::i18n::tr(language, extracting_text))
+                    .size(12.0)
+                    .color(theme::text_weak()),
+            );
+            None
+        }
+        RuntimeInstallState::Installed(path) => {
+            ui.add_space(6.0);
+            ui.label(
+                egui::RichText::new(crate::i18n::tr(language, installed_text))
+                    .size(12.0)
+                    .color(Color32::from_rgb(5, 150, 105)),
+            );
+            Some(path.clone())
+        }
+        RuntimeInstallState::Failed(error) => {
+            ui.add_space(6.0);
+            ui.label(
+                egui::RichText::new(error)
+                    .size(12.0)
+                    .color(Color32::from_rgb(220, 38, 38)),
+            );
+            None
+        }
+    }
+}
+
+pub fn render_tts_runtime_status(
+    ui: &mut egui::Ui,
+    language: crate::i18n::UiLanguage,
+    installer: &crate::runtime_install::RuntimeInstaller,
+    requirements: xrtranslate_config::RuntimeRequirements,
+    live_backend: Option<&str>,
+    live_cuda_version: Option<&str>,
+) -> RuntimeUiAction {
+    use crate::runtime_install::RuntimeInstallState;
+
+    let state = installer.state().clone();
+    let download_size = installer.download_size_bytes();
+    let actual = live_backend.is_some();
+    let backend_name = live_backend
+        .map(|backend| backend.to_ascii_uppercase())
+        .unwrap_or_else(|| installer.backend_label().unwrap_or_default().to_owned());
+    let cuda_version = live_cuda_version.or_else(|| installer.cuda_version_label());
+    let backend = cuda_version.map_or(backend_name.clone(), |version| {
+        format!("{backend_name} {version}")
+    });
+    let plan_is_ready = installer.plan_is_ready();
+    let mut action = RuntimeUiAction::None;
+    Frame::new()
+        .fill(Color32::from_rgb(240, 253, 250))
+        .corner_radius(CornerRadius::same(12))
+        .inner_margin(Margin::same(14))
+        .stroke(Stroke::new(1.0, Color32::from_rgb(167, 243, 208)))
+        .show(ui, |ui| {
+            ui.horizontal(|ui| {
+                ui.label(
+                    egui::RichText::new(crate::i18n::tr(language, "TTS acceleration"))
+                        .size(13.0)
+                        .color(theme::text_strong())
+                        .strong(),
+                );
+                if !backend.is_empty() {
+                    ui.label(
+                        egui::RichText::new(format!(
+                            "{} · {backend}",
+                            crate::i18n::tr(language, if actual { "Active" } else { "Planned" })
+                        ))
+                        .size(11.5)
+                        .color(Color32::from_rgb(4, 120, 87)),
+                    );
+                }
+            });
+            if installer.is_busy() && !installer.plan_matches(requirements) {
+                ui.add_space(6.0);
+                ui.label(
+                    egui::RichText::new(crate::i18n::tr(
+                        language,
+                        "The runtime plan will update after the current installation finishes.",
+                    ))
+                    .size(11.5)
+                    .color(Color32::from_rgb(180, 83, 9)),
+                );
+            }
+            if let Some(reason) = installer.fallback_reason() {
+                ui.add_space(6.0);
+                ui.label(
+                    egui::RichText::new(reason)
+                        .size(11.5)
+                        .color(Color32::from_rgb(180, 83, 9)),
+                );
+            }
+
+            match &state {
+                RuntimeInstallState::Ready if plan_is_ready => {
+                    ui.add_space(6.0);
+                    ui.label(
+                        egui::RichText::new(crate::i18n::tr(
+                            language,
+                            "Ready — no additional runtime download is required.",
+                        ))
+                        .size(12.0)
+                        .color(Color32::from_rgb(5, 150, 105)),
+                    );
+                }
+                RuntimeInstallState::Ready => {
+                    let label = download_size.map_or_else(
+                        || crate::i18n::tr(language, "Preparing download…").to_owned(),
+                        |bytes| {
+                            format!(
+                                "{} {} · {}",
+                                crate::i18n::tr(language, "Download"),
+                                backend,
+                                format_file_size(bytes)
+                            )
+                        },
+                    );
+                    ui.add_space(8.0);
+                    if primary_button_enabled(
+                        ui,
+                        &label,
+                        download_size.is_some() && !installer.is_busy(),
+                    )
+                    .clicked()
+                    {
+                        action = RuntimeUiAction::Install;
+                    }
+                }
+                RuntimeInstallState::Failed(_) => {
+                    ui.add_space(8.0);
+                    if animated_button(ui, crate::i18n::tr(language, "Retry")).clicked() {
+                        action = RuntimeUiAction::Retry;
+                    }
+                }
+                _ => {}
+            }
+
+            render_runtime_task_state(
+                ui,
+                language,
+                &state,
+                "Extracting native runtime...",
+                "TTS acceleration is installed and ready.",
+            );
+        });
+    action
 }

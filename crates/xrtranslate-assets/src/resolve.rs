@@ -103,6 +103,9 @@ impl ModelAssetsConfig {
             .selected_asset(ModelCapability::Translation)
             .or(self.hunyuan_mt_asset)
             .unwrap_or(ModelAssetId::HunyuanMtGguf);
+        let audio8_id = self
+            .selected_asset(ModelCapability::Tts)
+            .unwrap_or(ModelAssetId::Audio8TtsOnnxFp16);
 
         let catalog = DEFAULT_GGUF_MANIFEST
             .iter()
@@ -126,6 +129,7 @@ impl ModelAssetsConfig {
 
         let qwen3_asr = catalog_asset(&catalog, qwen3_id).clone();
         let hunyuan_mt = catalog_asset(&catalog, hunyuan_id).clone();
+        let audio8_tts = catalog_asset(&catalog, audio8_id).clone();
         let active_asset_ids = if include_default_assets && self.active_assets.is_empty() {
             vec![qwen3_id, hunyuan_id]
         } else {
@@ -136,6 +140,7 @@ impl ModelAssetsConfig {
             models_directory,
             qwen3_asr,
             hunyuan_mt,
+            audio8_tts,
             active_asset_ids,
             catalog,
         }
@@ -175,6 +180,8 @@ pub struct ResolvedModelAssets {
     pub qwen3_asr: ResolvedModelAsset,
     /// Active translation package. Prefer [`Self::active_asset`] in new code.
     pub hunyuan_mt: ResolvedModelAsset,
+    /// Active TTS package. Prefer [`Self::active_asset`] in new code.
+    pub audio8_tts: ResolvedModelAsset,
     active_asset_ids: Vec<ModelAssetId>,
     catalog: Vec<ResolvedModelAsset>,
 }
@@ -223,6 +230,7 @@ impl ResolvedModelAssets {
         match capability {
             ModelCapability::Asr => &self.qwen3_asr,
             ModelCapability::Translation => &self.hunyuan_mt,
+            ModelCapability::Tts => &self.audio8_tts,
         }
     }
 

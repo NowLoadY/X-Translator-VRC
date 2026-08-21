@@ -2,7 +2,7 @@ use std::collections::VecDeque;
 
 use xrtranslate_engine::{
     EngineConfig, Language, LanguageRoute, OutboundPayload, ProtocolEvent, RouteEpoch,
-    SessionEngine,
+    SessionEngine, TtsEpoch,
 };
 use xrtranslate_prompt::PromptExecutionTrace;
 use xrtranslate_protocol::{
@@ -90,6 +90,33 @@ impl SessionAdapter {
 
     pub(crate) fn set_tts_enabled(&mut self, enabled: bool) {
         self.engine.set_tts_enabled(enabled);
+    }
+
+    pub(crate) const fn tts_enabled(&self) -> bool {
+        self.engine.tts_enabled()
+    }
+
+    pub(crate) const fn tts_epoch(&self) -> TtsEpoch {
+        self.engine.tts_epoch()
+    }
+
+    pub(crate) fn submit_tts_audio(
+        &mut self,
+        route_epoch: RouteEpoch,
+        tts_epoch: TtsEpoch,
+        pcm: Vec<u8>,
+    ) -> Result<bool, String> {
+        if route_epoch != self.engine.route_epoch() || tts_epoch != self.engine.tts_epoch() {
+            return Ok(false);
+        }
+        self.engine
+            .submit(ProtocolEvent::TtsAudio {
+                route_epoch,
+                tts_epoch,
+                pcm,
+            })
+            .map(|_| true)
+            .map_err(|error| error.to_string())
     }
 
     pub(crate) fn set_turn_id(&mut self, turn_id: String) {

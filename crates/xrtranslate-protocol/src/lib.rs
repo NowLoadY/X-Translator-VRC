@@ -179,6 +179,8 @@ pub enum ActionControl {
         #[serde(default, skip_serializing_if = "Option::is_none")]
         stream_id: Option<u64>,
     },
+    /// Arms one bounded voice-cloning capture for this audio session.
+    BeginVoiceClone,
 }
 
 /// Event-discriminated client controls.
@@ -257,6 +259,7 @@ pub enum ServerEvent {
     RecognitionStreamEnded(RecognitionStreamEnded),
     PipelineDrained(PipelineDrained),
     TtsFinished(TtsFinished),
+    VoiceCloneState(VoiceCloneState),
     RouteChanged(RouteChanged),
     Error(ErrorEvent),
 }
@@ -289,6 +292,13 @@ pub struct SessionReady {
     pub session_id: String,
     pub source_lang: String,
     pub target_lang: String,
+    /// Actual TTS execution provider after backend warm-up. Older backends and
+    /// sessions without TTS omit this diagnostic.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub tts_backend: Option<String>,
+    /// Managed CUDA ABI used by the active TTS provider, when applicable.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub tts_cuda_version: Option<String>,
 }
 
 /// An incremental or completed ASR result.
@@ -425,6 +435,25 @@ pub struct TtsFinished {
     pub text: String,
 }
 
+/// Progress for the explicitly armed, single-use voice-cloning buffer.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct VoiceCloneState {
+    pub state: VoiceClonePhase,
+    pub collected_seconds: f32,
+    pub required_seconds: f32,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub message: Option<String>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum VoiceClonePhase {
+    Collecting,
+    Registering,
+    Ready,
+    Failed,
+}
+
 /// A recoverable backend error for the current session.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct ErrorEvent {
@@ -443,6 +472,37 @@ pub struct RouteChanged {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn legacy_session_ready_defaults_tts_runtime_diagnostics() {
+        let event: ServerEvent = serde_json::from_str(
+            r#"{"action":"session_ready","data":{"session_id":"s1","source_lang":"en","target_lang":"zh"}}"#,
+        )
+        .unwrap();
+        assert!(matches!(
+            event,
+            ServerEvent::SessionReady(SessionReady {
+                tts_backend: None,
+                tts_cuda_version: None,
+                ..
+            })
+        ));
+    }
+
+    #[test]
+    fn session_ready_reports_actual_cuda_runtime() {
+        let event = ServerEvent::SessionReady(SessionReady {
+            session_id: "s1".into(),
+            source_lang: "en".into(),
+            target_lang: "zh".into(),
+            tts_backend: Some("cuda".into()),
+            tts_cuda_version: Some("13.3".into()),
+        });
+        let json = serde_json::to_string(&event).unwrap();
+        assert!(json.contains(r#""tts_backend":"cuda""#));
+        assert!(json.contains(r#""tts_cuda_version":"13.3""#));
+        assert_eq!(serde_json::from_str::<ServerEvent>(&json).unwrap(), event);
+    }
 
     #[test]
     fn legacy_error_event_defaults_to_no_configuration_redirect() {
@@ -552,6 +612,22 @@ mod tests {
             serde_json::to_string(&control).unwrap(),
             r#"{"action":"toggle_feature","feature":"speaker_recognition","enabled":true}"#
         );
+    }
+
+    #[test]
+    fn voice_clone_controls_and_progress_have_stable_wire_shapes() {
+        assert_eq!(
+            serde_json::to_string(&ClientControl::Action(ActionControl::BeginVoiceClone)).unwrap(),
+            r#"{"action":"begin_voice_clone"}"#
+        );
+        let event = ServerEvent::VoiceCloneState(VoiceCloneState {
+            state: VoiceClonePhase::Collecting,
+            collected_seconds: 0.25,
+            required_seconds: 0.5,
+            message: None,
+        });
+        let json = serde_json::to_string(&event).unwrap();
+        assert_eq!(serde_json::from_str::<ServerEvent>(&json).unwrap(), event);
     }
 
     #[test]

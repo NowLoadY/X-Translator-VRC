@@ -63,6 +63,8 @@ pub struct ClientSettings {
     pub selected_device_id: String,
     #[serde(default)]
     pub selected_loopback_device_id: String,
+    #[serde(default)]
+    pub selected_tts_output_device_id: String,
     #[serde(default = "default_background_noise")]
     pub background_noise: f32,
     #[serde(default = "default_pause_tolerance")]
@@ -148,6 +150,7 @@ impl Default for ClientSettings {
             capture_source: CaptureSource::Microphone,
             selected_device_id: String::new(),
             selected_loopback_device_id: String::new(),
+            selected_tts_output_device_id: String::new(),
             background_noise: default_background_noise(),
             pause_tolerance: default_pause_tolerance(),
             continuous_recognition: false,
@@ -376,7 +379,7 @@ mod tests {
         assert_eq!(loaded.capture_source, CaptureSource::SystemAudio);
         assert_eq!(loaded.selected_device_id, "mic-1");
         assert_eq!(loaded.selected_loopback_device_id, "loopback-1");
-        assert!(!loaded.tts_enabled);
+        assert!(loaded.tts_enabled);
         assert_eq!(loaded.source_lang, "en");
         assert_eq!(loaded.download_proxy_url, "socks5://127.0.0.1:1080");
         assert_eq!(loaded.update_channel, UpdateChannel::Beta);
@@ -476,7 +479,7 @@ mod tests {
     }
 
     #[test]
-    fn unavailable_feature_preferences_are_disabled_on_load() {
+    fn available_tts_preference_is_preserved_on_load() {
         let root = std::env::temp_dir().join("xrtranslate_test_feature_access");
         let _ = std::fs::remove_dir_all(&root);
         let settings = ClientSettings {
@@ -485,7 +488,7 @@ mod tests {
         };
         settings.save(&root).unwrap();
 
-        assert!(!ClientSettings::load(&root).tts_enabled);
+        assert!(ClientSettings::load(&root).tts_enabled);
         let _ = std::fs::remove_dir_all(root);
     }
 

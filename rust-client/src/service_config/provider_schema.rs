@@ -36,7 +36,7 @@ impl ProviderFieldDescriptor {
     }
 }
 
-const DEVICE_OPTIONS: &[&str] = &["cuda", "cpu", "mps", "auto"];
+const DEVICE_OPTIONS: &[&str] = &["auto", "cuda", "cpu"];
 
 const PROVIDER_FIELDS: &[ProviderFieldDescriptor] = &[
     ProviderFieldDescriptor {
@@ -46,6 +46,28 @@ const PROVIDER_FIELDS: &[ProviderFieldDescriptor] = &[
             "local uses the managed llama.cpp model; openai uses an OpenAI-compatible HTTP API.",
         ),
         editor: ProviderFieldEditor::Options(&["local", "openai"]),
+        visibility: ProviderFieldVisibility::Default,
+    },
+    ProviderFieldDescriptor {
+        name: "sample_rate",
+        label: "Output sample rate",
+        help: Some("PCM sample rate returned by the TTS provider."),
+        editor: ProviderFieldEditor::UnsignedRange {
+            minimum: 8_000,
+            maximum: 96_000,
+            speed: 100.0,
+        },
+        visibility: ProviderFieldVisibility::Default,
+    },
+    ProviderFieldDescriptor {
+        name: "max_input_chars",
+        label: "Characters per request",
+        help: Some("Long translations are split at sentence boundaries before synthesis."),
+        editor: ProviderFieldEditor::UnsignedRange {
+            minimum: 32,
+            maximum: 500,
+            speed: 1.0,
+        },
         visibility: ProviderFieldVisibility::Default,
     },
     ProviderFieldDescriptor {
@@ -143,8 +165,10 @@ const PROVIDER_FIELDS: &[ProviderFieldDescriptor] = &[
     },
     ProviderFieldDescriptor {
         name: "device",
-        label: "device",
-        help: None,
+        label: "Device",
+        help: Some(
+            "Auto uses the matching CUDA runtime when available and falls back to CPU otherwise.",
+        ),
         editor: ProviderFieldEditor::Options(DEVICE_OPTIONS),
         visibility: ProviderFieldVisibility::Default,
     },
@@ -198,6 +222,20 @@ mod tests {
                 maximum: 32_768,
                 speed: 128.0,
             }
+        );
+    }
+
+    #[test]
+    fn device_editor_exposes_only_supported_tts_backends() {
+        assert_eq!(
+            provider_field_descriptor("device").unwrap().editor,
+            ProviderFieldEditor::Options(&["auto", "cuda", "cpu"])
+        );
+        assert_eq!(
+            provider_field_descriptor("device").unwrap().help,
+            Some(
+                "Auto uses the matching CUDA runtime when available and falls back to CPU otherwise."
+            )
         );
     }
 }

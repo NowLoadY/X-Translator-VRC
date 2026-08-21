@@ -6,10 +6,11 @@ use std::{
 };
 
 use crate::{
-    AtomicInstallError, DEFAULT_GGUF_MANIFEST, HUNYUAN_MT_GGUF, ModelAssetDiagnostic, ModelAssetId,
-    ModelAssetManifest, ModelAssetProblem, ModelAssetsConfig, ModelCapability, ModelFileRole,
-    ModelLevel, ModelSource, QWEN3_ASR_GGUF, RequiredModelFile, ResolvedModelAsset,
-    ResolvedModelAssets, install::install_verified_directory, manifest_for, preflight::sha256_file,
+    AUDIO8_TTS_ONNX_FP16, AtomicInstallError, DEFAULT_GGUF_MANIFEST, HUNYUAN_MT_GGUF,
+    ModelAssetDiagnostic, ModelAssetId, ModelAssetManifest, ModelAssetProblem, ModelAssetsConfig,
+    ModelCapability, ModelFileRole, ModelLevel, ModelSource, QWEN3_ASR_GGUF, RequiredModelFile,
+    ResolvedModelAsset, ResolvedModelAssets, install::install_verified_directory, manifest_for,
+    preflight::sha256_file,
 };
 
 static NEXT_TEMP_ID: AtomicUsize = AtomicUsize::new(0);
@@ -29,7 +30,7 @@ fn temporary_project_root() -> PathBuf {
 
 #[test]
 fn static_manifest_declares_the_default_gguf_route() {
-    assert_eq!(DEFAULT_GGUF_MANIFEST.len(), 3);
+    assert_eq!(DEFAULT_GGUF_MANIFEST.len(), 4);
     assert_eq!(QWEN3_ASR_GGUF.required_files.len(), 2);
     assert_eq!(HUNYUAN_MT_GGUF.required_files.len(), 1);
     assert_eq!(
@@ -46,12 +47,24 @@ fn static_manifest_declares_the_default_gguf_route() {
             .hugging_face_resolve_url("Qwen3-ASR-1.7B.Q4_K_M.gguf"),
         "https://huggingface.co/mradermacher/Qwen3-ASR-1.7B-GGUF/resolve/cc946c78d3804752f7ba1bc42720c0f7aaf3d1ad/Qwen3-ASR-1.7B.Q4_K_M.gguf"
     );
+    assert_eq!(
+        AUDIO8_TTS_ONNX_FP16
+            .source
+            .hugging_face_resolve_url("slow_ar_fp16.onnx"),
+        "https://huggingface.co/OpenVoiceOS/phoonnx-audio8-tts/resolve/6e4de996325cebb25df81efd6b0adc08792cd21f/slow_ar_fp16.onnx"
+    );
+    assert_eq!(
+        AUDIO8_TTS_ONNX_FP16
+            .source
+            .hugging_face_resolve_url("runtime_manifest.json"),
+        "https://huggingface.co/Audio8/Audio8-TTS-Preview-0.6B-ONNX-INT4/resolve/818569c6b832118ad68d61bbd873abe250fcd68a/runtime_manifest.json"
+    );
     for manifest in DEFAULT_GGUF_MANIFEST {
         assert!(
-            manifest
-                .required_files
-                .iter()
-                .any(|file| file.role == ModelFileRole::Weights),
+            manifest.required_files.iter().any(|file| matches!(
+                file.role,
+                ModelFileRole::Weights | ModelFileRole::SlowArGraph
+            )),
             "{} must declare model weights",
             manifest.id
         );
@@ -277,6 +290,7 @@ fn explicit_integrity_verification_accepts_matching_files_and_reports_hash_tampe
             repository: "fixture/repository",
             revision: "0000000000000000000000000000000000000000",
             include_patterns: &["fixture.gguf"],
+            file_overrides: &[],
         },
     }));
     let asset = ResolvedModelAsset::new(manifest, directory);
@@ -322,6 +336,7 @@ fn verified_staging_directory_is_promoted_without_overwriting_an_install() {
             repository: "fixture/repository",
             revision: "0000000000000000000000000000000000000000",
             include_patterns: &["fixture.gguf"],
+            file_overrides: &[],
         },
     }));
     let target = ResolvedModelAsset::new(manifest, root.join("models").join("fixture"));

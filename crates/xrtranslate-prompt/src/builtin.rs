@@ -368,8 +368,7 @@ After current input: speaker-01 en / After it."
     }
 
     fn auto_reference_rules_rendered(target: &str) -> String {
-        AUTO_REFERENCE_CONTEXT_INSTRUCTION
-            .replace("{0}", target)
+        AUTO_REFERENCE_CONTEXT_INSTRUCTION.replace("{0}", target)
     }
 
     #[test]
@@ -823,8 +822,12 @@ After current input: speaker-01 en / After it."
         match &explicit_rules.kind {
             PromptNodeKind::Compose { text } => {
                 assert!(text.contains("100% natural, idiomatic {1}"));
-                assert!(text.contains("Discord, QQ, WeChat, gaming chats, and everyday conversations"));
-                assert!(text.contains("Unless explicitly requested otherwise, output only the final {1} translation."));
+                assert!(
+                    text.contains("Discord, QQ, WeChat, gaming chats, and everyday conversations")
+                );
+                assert!(text.contains(
+                    "Unless explicitly requested otherwise, output only the final {1} translation."
+                ));
                 assert_eq!(text, EXPLICIT_REFERENCE_CONTEXT_INSTRUCTION);
             }
             _ => panic!("reference-explicit-rules must be a Compose node"),
@@ -837,9 +840,15 @@ After current input: speaker-01 en / After it."
             .unwrap();
         match &auto_rules.kind {
             PromptNodeKind::Compose { text } => {
-                assert!(text.contains("into the other language among {0} into 100% natural, idiomatic expression."));
-                assert!(text.contains("Discord, QQ, WeChat, gaming chats, and everyday conversations"));
-                assert!(text.contains("Unless explicitly requested otherwise, output only the final translation."));
+                assert!(text.contains(
+                    "into the other language among {0} into 100% natural, idiomatic expression."
+                ));
+                assert!(
+                    text.contains("Discord, QQ, WeChat, gaming chats, and everyday conversations")
+                );
+                assert!(text.contains(
+                    "Unless explicitly requested otherwise, output only the final translation."
+                ));
                 assert_eq!(text, AUTO_REFERENCE_CONTEXT_INSTRUCTION);
             }
             _ => panic!("reference-auto-rules must be a Compose node"),
@@ -873,4 +882,3 @@ After current input: speaker-01 en / After it."
         assert!(auto_rendered.messages[0].content.contains("Translate only the current input. Do not translate, repeat, summarize, or explain the context. Unless explicitly requested otherwise, output only the final translation."));
     }
 }
-

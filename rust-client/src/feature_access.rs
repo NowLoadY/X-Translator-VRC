@@ -30,20 +30,10 @@ impl FeatureAccess {
             unavailable_reason: None,
         }
     }
-
-    const fn unavailable(reason: &'static str) -> Self {
-        Self {
-            available: false,
-            unavailable_reason: Some(reason),
-        }
-    }
 }
 
 const FEATURE_ACCESS: &[(Feature, FeatureAccess)] = &[
-    (
-        Feature::TtsPlayback,
-        FeatureAccess::unavailable("TTS is not available"),
-    ),
+    (Feature::TtsPlayback, FeatureAccess::available()),
     (Feature::FloatingSubtitles, FeatureAccess::available()),
     (Feature::OscChatbox, FeatureAccess::available()),
     (Feature::SpeakerNumbers, FeatureAccess::available()),
@@ -93,7 +83,7 @@ mod tests {
     }
 
     #[test]
-    fn native_tts_stays_inaccessible_until_a_provider_exists() {
-        assert!(!is_available(Feature::TtsPlayback));
+    fn native_tts_is_available_with_the_audio8_provider() {
+        assert!(is_available(Feature::TtsPlayback));
     }
 }

@@ -21,6 +21,7 @@ mod i18n;
 pub(crate) mod media_import;
 mod model_install;
 mod network;
+mod onboarding;
 mod overlay_ipc;
 mod overlay_manager;
 #[cfg(windows)]
@@ -137,6 +138,8 @@ struct XRTranslateApp {
     selected_device_id: String,
     loopback_devices: Vec<InputDevice>,
     selected_loopback_device_id: String,
+    tts_output_devices: Vec<InputDevice>,
+    selected_tts_output_device_id: String,
     capture_source: CaptureSource,
     microphone_recognition: RecognitionSettings,
     loopback_recognition: RecognitionSettings,
@@ -163,6 +166,10 @@ struct XRTranslateApp {
     target_lang: String,
     denoise_enabled: bool,
     tts_enabled: bool,
+    microphone_clone_state: Option<xrtranslate_protocol::VoiceCloneState>,
+    loopback_clone_state: Option<xrtranslate_protocol::VoiceCloneState>,
+    tts_runtime_backend: Option<String>,
+    tts_runtime_cuda_version: Option<String>,
     osc_plugin: OscPlugin,
     meeting_plugin: MeetingPlugin,
     player_plugin: plugins::player::VideoPlayerPlugin,
@@ -220,6 +227,10 @@ struct SharedSessionState {
     pending_route_change: Option<(String, String)>,
     latest_prompt_trace: Option<PromptExecutionTrace>,
     provider_configuration_required: bool,
+    microphone_clone_state: Option<xrtranslate_protocol::VoiceCloneState>,
+    loopback_clone_state: Option<xrtranslate_protocol::VoiceCloneState>,
+    tts_runtime_backend: Option<String>,
+    tts_runtime_cuda_version: Option<String>,
 }
 
 fn publish_host_output(subscribers: &[Box<dyn HostOutputSubscriber>], event: HostOutputEvent<'_>) {
@@ -233,12 +244,10 @@ impl Default for XRTranslateApp {
         let audio_system = AudioSystem::new();
         let devices = audio_system.available_devices();
         let loopback_devices = audio_system.available_loopback_devices();
+        let tts_output_devices = audio_system.available_output_devices();
         let (event_tx, event_rx) = unbounded();
         let backend_manager = backend::BackendManager::load();
         let service_config = service_config::ServiceConfigEditor::load();
-        let runtime_requirements = service_config.runtime_requirements();
-        let managed_runtime_missing =
-            runtime_requirements.llama_cpp && !backend_manager.llama_server_path_is_valid();
         let mut settings = ClientSettings::load(&backend_manager.project_root());
         settings.sanitize_devices(&devices, &loopback_devices);
 
@@ -307,6 +316,8 @@ impl Default for XRTranslateApp {
                         SessionEvent::Connected => {
                             state.connection_status = "Connected - listening".into();
                             state.is_translating = true;
+                            state.tts_runtime_backend = None;
+                            state.tts_runtime_cuda_version = None;
                         }
                         SessionEvent::Disconnected(reason) => {
                             publish_host_output(&host_output_subscribers, HostOutputEvent::Clear);
@@ -319,6 +330,8 @@ impl Default for XRTranslateApp {
                                 entry.live = false;
                             }
                             state.pending_recognition_windows.clear();
+                            state.tts_runtime_backend = None;
+                            state.tts_runtime_cuda_version = None;
                             microphone_vad_active_clone.store(false, Ordering::Relaxed);
                             loopback_vad_active_clone.store(false, Ordering::Relaxed);
                         }
@@ -616,7 +629,21 @@ impl Default for XRTranslateApp {
                         } => {
                             state.pending_route_change = Some((source_lang, target_lang));
                         }
+                        SessionEvent::TtsRuntime {
+                            backend,
+                            cuda_version,
+                        } => {
+                            state.tts_runtime_backend = Some(backend);
+                            state.tts_runtime_cuda_version = cuda_version;
+                        }
                         SessionEvent::TtsAudio(_audio) => {}
+                        SessionEvent::VoiceCloneState { source, status } => match source {
+                            CaptureSource::Microphone => {
+                                state.microphone_clone_state = Some(status)
+                            }
+                            CaptureSource::SystemAudio => state.loopback_clone_state = Some(status),
+                            CaptureSource::Both => {}
+                        },
                         SessionEvent::BackendError {
                             message,
                             configuration_required,
@@ -678,6 +705,14 @@ impl Default for XRTranslateApp {
             .expect("failed to spawn session-event-pump thread");
 
         let prompt_provider = service_config.translation_prompt_target();
+        let (first_run, onboarding_page) = onboarding::resolve_startup_onboarding_state(
+            settings.first_run,
+            &backend_manager.project_root(),
+            &service_config,
+            &backend_manager,
+            &model_task_manager,
+            &runtime_installer,
+        );
         let mut app = Self {
             audio_system,
             devices,
@@ -685,6 +720,8 @@ impl Default for XRTranslateApp {
             selected_device_id: settings.selected_device_id,
             loopback_devices,
             selected_loopback_device_id: settings.selected_loopback_device_id,
+            tts_output_devices,
+            selected_tts_output_device_id: settings.selected_tts_output_device_id,
             capture_source: settings.capture_source,
             microphone_recognition: settings.microphone_recognition,
             loopback_recognition: settings.loopback_recognition,
@@ -710,7 +747,11 @@ impl Default for XRTranslateApp {
             source_lang: settings.source_lang,
             target_lang: settings.target_lang,
             denoise_enabled: settings.denoise_enabled,
-            tts_enabled: settings.tts_enabled,
+            tts_enabled: settings.tts_enabled && service_config.tts_is_configured(),
+            microphone_clone_state: None,
+            loopback_clone_state: None,
+            tts_runtime_backend: None,
+            tts_runtime_cuda_version: None,
             osc_plugin,
             meeting_plugin,
             player_plugin,
@@ -731,8 +772,8 @@ impl Default for XRTranslateApp {
                 prompt_provider,
             ),
             modal_dialog: ui::modal::ModalDialog::default(),
-            first_run: settings.first_run || managed_runtime_missing,
-            onboarding_page: if settings.first_run { 0 } else { 2 },
+            first_run,
+            onboarding_page,
             ui_language: settings.ui_language,
             navigation: NavigationState {
                 collapsed: settings.sidebar_collapsed,
@@ -789,6 +830,22 @@ impl XRTranslateApp {
         let host_tts = plugin.is_none_or(|binding| binding.host_tts);
         let external_audio_gate = plugin.is_none_or(|binding| binding.external_audio_gate);
         let finish_when_audio_ends = plugin.is_some_and(|binding| binding.finish_when_audio_ends);
+        let tts = if host_tts
+            && crate::feature_access::is_available(crate::feature_access::Feature::TtsPlayback)
+        {
+            match self.audio_system.tts_handle(
+                self.service_config.tts_sample_rate(),
+                &self.selected_tts_output_device_id,
+            ) {
+                Ok(handle) => Some(handle),
+                Err(error) => {
+                    self.last_error = Some(format!("TTS output is unavailable: {error}"));
+                    None
+                }
+            }
+        } else {
+            None
+        };
 
         SessionConfig {
             server_url: self.server_url.clone(),
@@ -803,12 +860,7 @@ impl XRTranslateApp {
                 ExternalAudioGate::default()
             },
             publish_to_host_outputs,
-            tts: (host_tts
-                && crate::feature_access::is_available(
-                    crate::feature_access::Feature::TtsPlayback,
-                ))
-            .then(|| self.audio_system.tts_handle())
-            .flatten(),
+            tts,
             egui_ctx: ctx,
             vad_threshold,
             vad_silence_ms: pause_tolerance_to_ms(recognition.pause_tolerance),
@@ -1274,6 +1326,7 @@ impl XRTranslateApp {
             capture_source: self.capture_source,
             selected_device_id: self.selected_device_id.clone(),
             selected_loopback_device_id: self.selected_loopback_device_id.clone(),
+            selected_tts_output_device_id: self.selected_tts_output_device_id.clone(),
             background_noise: self.microphone_recognition.background_noise,
             pause_tolerance: self.microphone_recognition.pause_tolerance,
             continuous_recognition: self.microphone_recognition.continuous_recognition,
@@ -1310,13 +1363,13 @@ impl XRTranslateApp {
             self.onboarding_page = 1;
             return;
         }
-        let requirements = self.service_config.runtime_requirements();
-        if requirements.missing_api_key {
-            self.onboarding_page = 1;
-            return;
-        }
-        if requirements.llama_cpp && !self.backend_manager.llama_server_path_is_valid() {
-            self.onboarding_page = 2;
+        if onboarding::has_unmet_prerequisites(
+            &self.project_root(),
+            &self.service_config,
+            &self.backend_manager,
+            &self.model_task_manager,
+            &self.runtime_installer,
+        ) {
             return;
         }
         self.first_run = false;
@@ -1539,6 +1592,10 @@ impl XRTranslateApp {
         }
         self.prompt_studio
             .sync_provider(self.service_config.translation_prompt_target());
+        if !self.service_config.tts_is_configured() {
+            self.tts_enabled = false;
+            self.audio_system.clear_tts_playback();
+        }
         let resume_translation = self.is_translating;
         if resume_translation {
             self.stop();
@@ -1547,10 +1604,18 @@ impl XRTranslateApp {
         self.backend_manager.shutdown();
         self.model_task_manager.invalidate_discovery();
         let requirements = self.service_config.runtime_requirements();
+        if !self.runtime_installer.is_busy()
+            && !self.runtime_installer.plan_matches(requirements)
+            && let Err(error) = self
+                .runtime_installer
+                .prepare_for(self.project_root(), requirements)
+        {
+            self.last_error = Some(error);
+        }
         if requirements.llama_cpp && !self.backend_manager.llama_server_path_is_valid() {
             if !self.first_run {
                 self.first_run = true;
-                self.onboarding_page = 2;
+                self.onboarding_page = 3;
             }
             self.set_connection_status("Ready");
             return;
@@ -1563,6 +1628,15 @@ impl XRTranslateApp {
     }
 
     fn start_session(&mut self, ctx: Option<eframe::egui::Context>) {
+        // A new WebSocket session must not inherit a stale visual state. The
+        // backend will immediately re-announce any encoded voice retained by
+        // its shared TTS adapter after audio-source configuration.
+        self.microphone_clone_state = None;
+        self.loopback_clone_state = None;
+        if let Ok(mut state) = self.shared_session_state.lock() {
+            state.microphone_clone_state = None;
+            state.loopback_clone_state = None;
+        }
         let routes = self.capture_source.routes();
         let plugin_session = self.active_plugin_session();
         let publish_to_host_outputs = plugin_session
@@ -2077,6 +2151,12 @@ impl XRTranslateApp {
     }
 
     fn set_tts_enabled(&mut self, enabled: bool) {
+        if enabled && !self.service_config.tts_is_configured() {
+            self.tts_enabled = false;
+            self.last_error =
+                Some("Configure a TTS provider in Settings before enabling TTS.".into());
+            return;
+        }
         self.tts_enabled = enabled
             && crate::feature_access::is_available(crate::feature_access::Feature::TtsPlayback);
         self.save_settings();
@@ -2085,6 +2165,32 @@ impl XRTranslateApp {
         }
         for session in &self.sessions {
             session.set_tts_enabled(self.tts_enabled);
+        }
+    }
+
+    fn begin_voice_clone(&mut self, source: CaptureSource) {
+        if let Some(index) = self
+            .capture_source
+            .routes()
+            .iter()
+            .position(|route| *route == source)
+            && let Some(session) = self.sessions.get(index)
+        {
+            session.begin_voice_clone();
+        } else {
+            self.last_error =
+                Some("Start translation on this audio source before cloning its voice.".into());
+        }
+    }
+
+    fn voice_clone_state(
+        &self,
+        source: CaptureSource,
+    ) -> Option<&xrtranslate_protocol::VoiceCloneState> {
+        match source {
+            CaptureSource::Microphone => self.microphone_clone_state.as_ref(),
+            CaptureSource::SystemAudio => self.loopback_clone_state.as_ref(),
+            CaptureSource::Both => None,
         }
     }
 
@@ -2335,6 +2441,10 @@ impl XRTranslateApp {
             self.partial_text = state.partial_text.clone();
             self.recognition_history = state.recognition_history.clone();
             self.translations = state.translations.clone();
+            self.microphone_clone_state = state.microphone_clone_state.clone();
+            self.loopback_clone_state = state.loopback_clone_state.clone();
+            self.tts_runtime_backend = state.tts_runtime_backend.clone();
+            self.tts_runtime_cuda_version = state.tts_runtime_cuda_version.clone();
             self.prompt_studio
                 .set_runtime_trace(state.latest_prompt_trace.clone());
             let was_translating = self.is_translating;
@@ -2478,6 +2588,19 @@ impl eframe::App for XRTranslateApp {
     fn ui(&mut self, ui: &mut egui::Ui, _frame: &mut eframe::Frame) {
         self.model_task_manager.poll();
         self.runtime_installer.poll();
+        let runtime_requirements = self.service_config.runtime_requirements();
+        if !self.runtime_installer.is_busy()
+            && !self.runtime_installer.plan_matches(runtime_requirements)
+            && !matches!(
+                self.runtime_installer.state(),
+                runtime_install::RuntimeInstallState::Failed(_)
+            )
+            && let Err(error) = self
+                .runtime_installer
+                .prepare_for(self.project_root(), runtime_requirements)
+        {
+            self.last_error = Some(error);
+        }
         self.app_update_manager.poll();
         self.player_plugin
             .controller

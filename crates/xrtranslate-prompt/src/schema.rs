@@ -494,7 +494,9 @@ impl PromptNodeGraph {
             let mut shared_ids = self
                 .nodes
                 .iter()
-                .filter(|node| node.page == PromptNodePage::Shared && layers.get(&node.id) == Some(&layer))
+                .filter(|node| {
+                    node.page == PromptNodePage::Shared && layers.get(&node.id) == Some(&layer)
+                })
                 .map(|node| node.id.clone())
                 .collect::<Vec<_>>();
 
@@ -540,7 +542,8 @@ impl PromptNodeGraph {
                     continue;
                 }
                 sort_layer_nodes(&mut provider_ids, layer, &self.nodes, &self.links);
-                let prov_bottom = position_column(&mut self.nodes, layer, &provider_ids, top_bottom);
+                let prov_bottom =
+                    position_column(&mut self.nodes, layer, &provider_ids, top_bottom);
                 if prov_bottom > max_provider_bottom {
                     max_provider_bottom = prov_bottom;
                 }
@@ -724,12 +727,7 @@ fn compute_node_barycenter(
     }
 }
 
-fn sort_layer_nodes(
-    ids: &mut [String],
-    layer: usize,
-    nodes: &[PromptNode],
-    links: &[PromptLink],
-) {
+fn sort_layer_nodes(ids: &mut [String], layer: usize, nodes: &[PromptNode], links: &[PromptLink]) {
     if layer == 0 {
         ids.sort_by_key(|id| {
             nodes
@@ -909,9 +907,17 @@ mod tests {
     fn auto_layout_orders_layers_by_barycenter_without_line_crossings() {
         let mut graph = PromptNodeGraph::empty();
         // Top variable
-        let top_var = graph.add_variable(PromptNodePage::Shared, PromptVariable::SourceLanguage, [0.0, 0.0]);
+        let top_var = graph.add_variable(
+            PromptNodePage::Shared,
+            PromptVariable::SourceLanguage,
+            [0.0, 0.0],
+        );
         // Bottom variable
-        let btm_var = graph.add_variable(PromptNodePage::Shared, PromptVariable::CurrentInput, [0.0, 0.0]);
+        let btm_var = graph.add_variable(
+            PromptNodePage::Shared,
+            PromptVariable::CurrentInput,
+            [0.0, 0.0],
+        );
 
         // Target nodes in Layer 1: intentionally add bottom target first, then top target
         let btm_target = graph.add_compose(PromptNodePage::Shared, "Btm: {0}".into(), [0.0, 0.0]);

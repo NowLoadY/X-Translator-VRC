@@ -6,6 +6,15 @@ license.workspace = true
 repository.workspace = true
 description = "Native high-performance backend for XRTranslate."
 
+[features]
+default = []
+managed-ort = [
+    "xrtranslate-inference/managed-ort",
+    "xrtranslate-denoise/managed-ort",
+    "xrtranslate-speaker/managed-ort",
+    "xrtranslate-vad/managed-ort",
+]
+
 [dependencies]
 axum = { version = "0.8.8", features = ["ws"] }
 clap = { version = "4.5.58", features = ["derive"] }

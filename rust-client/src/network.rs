@@ -114,7 +114,15 @@ pub enum SessionEvent {
         source_lang: String,
         target_lang: String,
     },
+    TtsRuntime {
+        backend: String,
+        cuda_version: Option<String>,
+    },
     TtsAudio(Vec<u8>),
+    VoiceCloneState {
+        source: CaptureSource,
+        status: xrtranslate_protocol::VoiceCloneState,
+    },
     BackendError {
         message: String,
         configuration_required: bool,
@@ -150,6 +158,7 @@ enum SessionCommand {
         target_lang: String,
     },
     SetTtsEnabled(bool),
+    BeginVoiceClone,
     UpdatePromptTemplate {
         graph: PromptNodeGraph,
     },
@@ -254,6 +263,10 @@ impl SessionHandle {
         let _ = self
             .command_tx
             .try_send(SessionCommand::SetTtsEnabled(enabled));
+    }
+
+    pub fn begin_voice_clone(&self) {
+        let _ = self.command_tx.try_send(SessionCommand::BeginVoiceClone);
     }
 
     pub fn update_prompt_template(&self, graph: PromptNodeGraph) {
@@ -583,6 +596,14 @@ async fn run_session(
                 if paused.load(Ordering::Acquire) || finish_sent {
                     continue;
                 }
+                // System loopback would otherwise feed synthesized speech
+                // straight back into ASR. Microphone capture remains live so
+                // headphones and virtual-microphone routing still work.
+                if audio_source == CaptureSource::SystemAudio
+                    && tts_handle.as_ref().is_some_and(|tts| tts.is_playing())
+                {
+                    continue;
+                }
                 if external_audio_gate.blocks_audio() {
                     continue;
                 }
@@ -624,7 +645,12 @@ async fn run_session(
                     }
                     Some(Ok(Message::Binary(audio))) => {
                         if let Some(tts) = &tts_handle {
-                            tts.play_pcm(&audio);
+                            if let Err(error) = tts.play_pcm(&audio) {
+                                let _ = event_tx.send(SessionEvent::BackendError {
+                                    message: format!("TTS playback failed: {error}"),
+                                    configuration_required: false,
+                                });
+                            }
                         }
                         let _ = event_tx.send(SessionEvent::TtsAudio(audio.to_vec()));
                     }
@@ -681,6 +707,9 @@ where
                 }),
             )
             .await
+        }
+        SessionCommand::BeginVoiceClone => {
+            send_json(write, json!({"action": "begin_voice_clone"})).await
         }
         SessionCommand::UpdatePromptTemplate { graph } => {
             send_json(
@@ -805,6 +834,18 @@ fn forward_server_event(
     match payload.get("action").and_then(Value::as_str) {
         Some("session_ready") => {
             let _ = event_tx.send(SessionEvent::Status("Connected — listening".into()));
+            if let Some(backend) = data
+                .and_then(|data| data.get("tts_backend"))
+                .and_then(Value::as_str)
+            {
+                let _ = event_tx.send(SessionEvent::TtsRuntime {
+                    backend: backend.to_owned(),
+                    cuda_version: data
+                        .and_then(|data| data.get("tts_cuda_version"))
+                        .and_then(Value::as_str)
+                        .map(str::to_owned),
+                });
+            }
         }
         Some("vad_activity") => {
             let active = data
@@ -1006,6 +1047,16 @@ fn forward_server_event(
                 }
             }
         }
+        Some("voice_clone_state") => {
+            if let Some(data) = data
+                && let Ok(status) = serde_json::from_value(Value::Object(data.clone()))
+            {
+                let _ = event_tx.send(SessionEvent::VoiceCloneState {
+                    source: audio_source,
+                    status,
+                });
+            }
+        }
         Some("error") => {
             let _ = event_tx.send(SessionEvent::BackendError {
                 message: data
@@ -1092,6 +1143,29 @@ mod tests {
                 text,
                 turn_id,
             } if kind == "partial" && text == "hello" && turn_id == "turn-1"
+        ));
+    }
+
+    #[test]
+    fn session_ready_forwards_actual_tts_runtime() {
+        let (sender, receiver) = crossbeam_channel::unbounded();
+        forward_server_event(
+            &sender,
+            r#"{"action":"session_ready","data":{"session_id":"s1","source_lang":"en","target_lang":"zh","tts_backend":"cuda","tts_cuda_version":"13.3"}}"#,
+            0,
+            false,
+            true,
+            CaptureSource::Microphone,
+        );
+
+        assert!(matches!(
+            receiver.try_recv().unwrap(),
+            SessionEvent::Status(_)
+        ));
+        assert!(matches!(
+            receiver.try_recv().unwrap(),
+            SessionEvent::TtsRuntime { backend, cuda_version }
+                if backend == "cuda" && cuda_version.as_deref() == Some("13.3")
         ));
     }
 

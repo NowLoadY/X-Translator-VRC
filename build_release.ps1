@@ -4,6 +4,8 @@ param(
     [string]$Output,
     # Add the verified Qwen3-ASR and Hy-MT2 GGUF packages for an offline release.
     [switch]$IncludeModels,
+    # Verified ONNX Runtime 1.28 core DLL. GPU providers are downloaded later.
+    [string]$OnnxRuntimeCpu,
     # Validate all release inputs without writing a release directory.
     [switch]$ValidateOnly
 )
@@ -17,6 +19,22 @@ $speakerModel = Join-Path $projectRoot 'models\3D-Speaker-ERes2NetV2\speaker_emb
 $denoiseModel = Join-Path $projectRoot 'models\gtcrn\gtcrn_simple.onnx'
 $corporaDirectory = Join-Path $projectRoot 'XR-Corpus\corpora'
 $cargoPath = Join-Path $env:USERPROFILE '.cargo\bin\cargo.exe'
+
+if ([string]::IsNullOrWhiteSpace($OnnxRuntimeCpu)) {
+    throw 'Pass -OnnxRuntimeCpu <onnxruntime.dll>. Expected ORT 1.28.0 CUDA13 archive core: 16,277,856 bytes, SHA-256 2462fe2d64ce063babefda3d9b1998380ffa74e99acf5d24d520ee67daa9e0f1. This compact CPU-capable core is the only inference runtime bundled in the release.'
+}
+$OnnxRuntimeCpu = [System.IO.Path]::GetFullPath($OnnxRuntimeCpu)
+if (-not (Test-Path -LiteralPath $OnnxRuntimeCpu -PathType Leaf)) {
+    throw "ONNX Runtime CPU core was not found: $OnnxRuntimeCpu"
+}
+$onnxRuntimePackageRoot = Split-Path (Split-Path $OnnxRuntimeCpu -Parent) -Parent
+$onnxRuntimeLicense = Join-Path $onnxRuntimePackageRoot 'LICENSE'
+$onnxRuntimeNotices = Join-Path $onnxRuntimePackageRoot 'ThirdPartyNotices.txt'
+foreach ($path in @($onnxRuntimeLicense, $onnxRuntimeNotices)) {
+    if (-not (Test-Path -LiteralPath $path -PathType Leaf)) {
+        throw "The ONNX Runtime core must come from an extracted official package with LICENSE and ThirdPartyNotices.txt: missing $path"
+    }
+}
 
 if (-not (Test-Path -LiteralPath $workspaceManifest)) {
     throw "Rust workspace manifest was not found: $workspaceManifest"
@@ -70,7 +88,7 @@ $buildArguments = @(
     '--package', 'xrtranslate-installer',
     '--package', 'xrtranslate-updater',
     '--package', 'xrtranslate-packager',
-    '--features', 'rust-client/mpv'
+    '--features', 'rust-client/mpv,xrtranslate-backend/managed-ort'
 )
 
 Write-Host 'Building native release binaries...'
@@ -97,6 +115,9 @@ $packageArguments = @(
     '--vad-model', $vadModel,
     '--speaker-model', $speakerModel,
     '--denoise-model', $denoiseModel,
+    '--onnx-runtime-cpu', $OnnxRuntimeCpu,
+    '--onnx-runtime-license', $onnxRuntimeLicense,
+    '--onnx-runtime-notices', $onnxRuntimeNotices,
     '--output', $Output
 )
 if ($IncludeModels) {

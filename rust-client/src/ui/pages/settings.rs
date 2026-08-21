@@ -63,10 +63,15 @@ pub fn render(app: &mut crate::XRTranslateApp, ui: &mut egui::Ui) {
                             }
                             SettingsSection::ServiceProviders => {
                                 let project_root = app.project_root();
+                                let live_tts_backend = app.tts_runtime_backend.clone();
+                                let live_tts_cuda_version = app.tts_runtime_cuda_version.clone();
                                 let apply = app.service_config.render(
                                     ui,
                                     &mut app.backend_manager,
                                     &mut app.model_task_manager,
+                                    &mut app.runtime_installer,
+                                    live_tts_backend.as_deref(),
+                                    live_tts_cuda_version.as_deref(),
                                     &project_root,
                                     app.ui_language,
                                 );
@@ -377,18 +382,16 @@ fn render_update_controls(app: &mut crate::XRTranslateApp, ui: &mut egui::Ui) {
 fn render_server_section(app: &mut crate::XRTranslateApp, ui: &mut egui::Ui) {
     section(ui, crate::i18n::tr(app.ui_language, "Backend"), |ui| {
         ui.horizontal(|ui| {
-            ui.label("llama-server:");
-            let path_changed = components::file_path_input(
+            ui.label(format!("{}:", crate::i18n::tr(app.ui_language, "Runtime Directory")));
+            let dir_changed = components::directory_path_input(
                 ui,
-                &mut app.backend_manager.llama_server_path,
-                crate::i18n::tr(app.ui_language, "Choose llama-server.exe"),
+                &mut app.backend_manager.runtime_directory,
+                crate::i18n::tr(app.ui_language, "Choose runtime directory"),
                 crate::i18n::tr(app.ui_language, "Browse…"),
-                "llama-server",
-                &["exe"],
                 (ui.available_width() - 170.0).max(160.0),
             );
-            if path_changed && app.backend_manager.llama_server_path_is_valid() {
-                match app.backend_manager.save_llama_server_path() {
+            if dir_changed {
+                match app.backend_manager.save_runtime_directory() {
                     Ok(()) => app.last_error = None,
                     Err(error) => app.last_error = Some(error),
                 }

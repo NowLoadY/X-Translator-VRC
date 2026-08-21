@@ -43,7 +43,7 @@ pub(crate) struct OnboardingProviderState {
     pub api_key: String,
 }
 
-/// Editable view of the ASR and translation provider portions of `config.json`.
+/// Editable view of the ASR, translation, and TTS provider portions of `config.json`.
 /// The original JSON document is retained so unrelated project settings are preserved.
 pub struct ServiceConfigEditor {
     path: PathBuf,
@@ -75,6 +75,7 @@ impl ServiceConfigEditor {
         self.categories = [
             ("asr", "ASR / Speech Recognition"),
             ("translation", "Translation"),
+            ("tts", "Text to Speech"),
         ]
         .into_iter()
         .map(|(key, title)| Self::make_category(&self.document, key, title))
@@ -113,6 +114,31 @@ impl ServiceConfigEditor {
         xrtranslate_config::AppConfig::from_value(document)
             .map(|config| config.runtime_requirements())
             .unwrap_or_default()
+    }
+
+    pub(crate) fn tts_sample_rate(&self) -> u32 {
+        self.document
+            .get("tts")
+            .and_then(Value::as_object)
+            .and_then(|section| {
+                let selected = section.get("provider")?.as_str()?;
+                section
+                    .get("providers")?
+                    .get(selected)?
+                    .get("sample_rate")?
+                    .as_u64()
+            })
+            .and_then(|rate| u32::try_from(rate).ok())
+            .unwrap_or(44_100)
+    }
+
+    pub(crate) fn tts_is_configured(&self) -> bool {
+        self.document
+            .get("tts")
+            .and_then(Value::as_object)
+            .and_then(|section| section.get("provider"))
+            .and_then(Value::as_str)
+            .is_some_and(|provider| provider != "none" && !provider.trim().is_empty())
     }
 
     pub(crate) const fn has_unsaved_changes(&self) -> bool {
@@ -263,6 +289,9 @@ impl ServiceConfigEditor {
         ui: &mut eframe::egui::Ui,
         backend: &mut crate::backend::BackendManager,
         model_tasks: &mut crate::model_install::NativeModelTaskManager,
+        runtime_installer: &mut crate::runtime_install::RuntimeInstaller,
+        live_tts_backend: Option<&str>,
+        live_tts_cuda_version: Option<&str>,
         project_root: &std::path::Path,
         language: crate::i18n::UiLanguage,
     ) -> bool {
@@ -283,7 +312,9 @@ impl ServiceConfigEditor {
             self.message = Some(error);
         }
 
+        let runtime_requirements = self.runtime_requirements();
         let mut apply_runtime_config = false;
+        let mut runtime_action = crate::ui::RuntimeUiAction::None;
         for cat_idx in 0..self.categories.len() {
             let category_title = crate::i18n::tr(language, self.categories[cat_idx].title);
             let category_key = self.categories[cat_idx].key;
@@ -590,8 +621,37 @@ impl ServiceConfigEditor {
                         }
                     }
                 }
+                if category_key == "tts" && active_name == "audio8" && !self.dirty {
+                    ui.add_space(12.0);
+                    runtime_action = crate::ui::render_tts_runtime_status(
+                        ui,
+                        language,
+                        runtime_installer,
+                        runtime_requirements,
+                        live_tts_backend,
+                        live_tts_cuda_version,
+                    );
+                }
             });
             ui.add_space(12.0);
+        }
+
+        match runtime_action {
+            crate::ui::RuntimeUiAction::None => {}
+            crate::ui::RuntimeUiAction::Install => {
+                if let Err(error) =
+                    runtime_installer.install_recommended(project_root.to_path_buf())
+                {
+                    self.message = Some(error);
+                }
+            }
+            crate::ui::RuntimeUiAction::Retry => {
+                if let Err(error) =
+                    runtime_installer.prepare_for(project_root.to_path_buf(), runtime_requirements)
+                {
+                    self.message = Some(error);
+                }
+            }
         }
 
         // Action Toolbar
@@ -1069,6 +1129,21 @@ fn provider_field_is_visible(field: &ConfigField, provider_name: &str, native_mo
     if provider_name == "openai" && matches!(field.name.as_str(), "transport" | "url") {
         return false;
     }
+    if provider_name == "audio8"
+        && matches!(
+            field.name.as_str(),
+            "device"
+                | "sample_rate"
+                | "max_input_chars"
+                | "clone_min_seconds"
+                | "clone_max_seconds"
+        )
+    {
+        return true;
+    }
+    if provider_name == "audio8" && matches!(field.name.as_str(), "transport" | "url" | "model") {
+        return false;
+    }
     provider_field_descriptor(&field.name).map_or(!native_model, |descriptor| {
         descriptor.is_visible(native_model)
     })
@@ -1086,6 +1161,7 @@ fn model_capability_for_category(
     match category_key {
         "asr" => Some(xrtranslate_assets::ModelCapability::Asr),
         "translation" => Some(xrtranslate_assets::ModelCapability::Translation),
+        "tts" => Some(xrtranslate_assets::ModelCapability::Tts),
         _ => None,
     }
 }

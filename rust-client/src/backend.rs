@@ -3,7 +3,7 @@ use std::{
     fs,
     io::{Read, Seek, SeekFrom, Write},
     net::{TcpStream, ToSocketAddrs},
-    path::PathBuf,
+    path::{Path, PathBuf},
     process::{Child, Command, Stdio},
     sync::mpsc,
     thread::{self, JoinHandle},
@@ -47,6 +47,7 @@ impl BackendStartupStage {
 
 pub struct BackendManager {
     project_root: PathBuf,
+    pub runtime_directory: String,
     pub llama_server_path: String,
     log_policy: BackendLogPolicy,
     corpus_log_policy: BackendLogPolicy,
@@ -62,11 +63,16 @@ impl BackendManager {
     pub fn load() -> Self {
         let project_root = project_root();
         let config = load_project_config(&project_root).ok();
+        let configured_runtime_dir = config
+            .as_ref()
+            .and_then(|config| config.model_manager.runtime_directory.clone());
+        let layout = RuntimeLayout::new(&project_root, configured_runtime_dir.as_deref());
+        let runtime_directory = layout.runtime_root().display().to_string();
         let configured_path = config
             .as_ref()
             .map(|config| config.model_manager.llama_server_path.clone())
             .unwrap_or_default();
-        let llama_server_path = preferred_llama_server_path(&project_root, &configured_path);
+        let llama_server_path = preferred_llama_server_path(&layout, &configured_path);
         let log_policy = BackendLogPolicy::new(
             &project_root,
             config
@@ -85,6 +91,7 @@ impl BackendManager {
         );
         let manager = Self {
             project_root,
+            runtime_directory,
             llama_server_path,
             log_policy,
             corpus_log_policy,
@@ -100,7 +107,8 @@ impl BackendManager {
             && let Err(error) = Self::write_llama_server_path(
                 &manager.project_root,
                 &config_path_value(
-                    &RuntimeLayout::for_project_root(&manager.project_root)
+                    &manager
+                        .runtime_layout()
                         .config_path_for(std::path::Path::new(&manager.llama_server_path)),
                 ),
             )
@@ -110,13 +118,86 @@ impl BackendManager {
         manager
     }
 
+    pub fn runtime_layout(&self) -> RuntimeLayout {
+        let requested = self.runtime_directory.trim();
+        let dir = if requested.is_empty() {
+            None
+        } else {
+            Some(Path::new(requested))
+        };
+        RuntimeLayout::new(&self.project_root, dir)
+    }
+
     pub fn project_root(&self) -> PathBuf {
         self.project_root.clone()
     }
 
     pub fn llama_server_path_is_valid(&self) -> bool {
         let value = self.llama_server_path.trim();
-        !value.is_empty() && configured_llama_server_path(&self.project_root, value).is_file()
+        !value.is_empty() && configured_llama_server_path(&self.runtime_layout(), value).is_file()
+    }
+
+    pub fn save_runtime_directory(&mut self) -> Result<(), String> {
+        let requested = self.runtime_directory.trim();
+        let value = if requested.is_empty() {
+            None
+        } else {
+            let path = Path::new(requested);
+            let canonical = if path.is_absolute() {
+                if let Ok(rel) = path.strip_prefix(&self.project_root) {
+                    rel.display().to_string()
+                } else {
+                    path.display().to_string()
+                }
+            } else {
+                path.display().to_string()
+            };
+            Some(canonical)
+        };
+        Self::write_runtime_directory(&self.project_root, value.as_deref())?;
+        let layout = self.runtime_layout();
+        self.runtime_directory = layout.runtime_root().display().to_string();
+        if self.llama_server_path.trim().is_empty()
+            || is_managed_llama_server_path(&layout, Path::new(&self.llama_server_path))
+        {
+            let candidate = layout.managed_llama_server(format!(
+                "llama-server{}",
+                std::env::consts::EXE_SUFFIX
+            ));
+            self.llama_server_path = candidate.display().to_string();
+        }
+        Ok(())
+    }
+
+    pub fn write_runtime_directory(
+        project_root: &std::path::Path,
+        value: Option<&str>,
+    ) -> Result<(), String> {
+        let config_path = project_root.join("config.json");
+        let mut document =
+            xrtranslate_config::load_user_config_document(&config_path, project_root)
+                .map_err(|error| format!("Cannot read {}: {error}", config_path.display()))?;
+        let root = document
+            .as_object_mut()
+            .ok_or("config.json root must be an object")?;
+        let model_manager = root
+            .entry("model_manager")
+            .or_insert_with(|| Value::Object(serde_json::Map::new()))
+            .as_object_mut()
+            .ok_or("config.json model_manager must be an object")?;
+        match value {
+            Some(v) if !v.trim().is_empty() => {
+                model_manager.insert(
+                    "runtime_directory".into(),
+                    Value::String(v.trim().replace('\\', "/")),
+                );
+            }
+            _ => {
+                model_manager.remove("runtime_directory");
+                model_manager.remove("runtime_root");
+            }
+        }
+        xrtranslate_config::save_user_config_document(&config_path, project_root, &document)
     }
 
     /// Stores the local llama.cpp executable where the Rust backend already
@@ -126,28 +207,29 @@ impl BackendManager {
         if requested.is_empty() {
             return Err("llama-server path is empty".into());
         }
-        let path = configured_llama_server_path(&self.project_root, requested);
-        let persisted = Self::persist_llama_server_path(&self.project_root, &path)?;
+        let layout = self.runtime_layout();
+        let path = configured_llama_server_path(&layout, requested);
+        let persisted = Self::persist_llama_server_path_with_layout(&layout, &path)?;
         self.llama_server_path = persisted.display().to_string();
         Ok(())
     }
 
-    /// Adopts an executable installed by the automatic runtime worker. The
-    /// worker has already persisted it, so this only synchronizes live UI
-    /// state with the durable configuration.
-    pub fn adopt_installed_llama_server_path(&mut self, path: &std::path::Path) {
-        self.llama_server_path = absolute_from_project_root(&self.project_root, path.into())
-            .display()
-            .to_string();
-    }
 
     pub(crate) fn persist_llama_server_path(
         project_root: &std::path::Path,
         path: &std::path::Path,
     ) -> Result<PathBuf, String> {
-        let path = absolute_from_project_root(project_root, path.into());
+        let layout = RuntimeLayout::for_project_root(project_root);
+        Self::persist_llama_server_path_with_layout(&layout, path)
+    }
+
+    pub(crate) fn persist_llama_server_path_with_layout(
+        layout: &RuntimeLayout,
+        path: &std::path::Path,
+    ) -> Result<PathBuf, String> {
+        let path = absolute_from_project_root(layout.project_root(), path.into());
         if !path.is_file() {
-            if is_managed_llama_server_path(project_root, &path) {
+            if is_managed_llama_server_path(layout, &path) {
                 return Err(format!(
                     "llama.cpp runtime is not installed. Open the Welcome Page and download the recommended runtime first. Expected executable: {}",
                     path.display()
@@ -159,9 +241,9 @@ impl BackendManager {
             ));
         }
         let value = config_path_value(
-            &RuntimeLayout::for_project_root(project_root).config_path_for(&path),
+            &layout.config_path_for(&path),
         );
-        Self::write_llama_server_path(project_root, &value)?;
+        Self::write_llama_server_path(layout.project_root(), &value)?;
         Ok(path)
     }
 
@@ -316,11 +398,13 @@ impl BackendManager {
         let capability = match category {
             "asr" => ModelCapability::Asr,
             "translation" => ModelCapability::Translation,
+            "tts" => ModelCapability::Tts,
             _ => return Err(format!("Unknown model category: {category}")),
         };
         let providers = match capability {
             ModelCapability::Asr => &config.asr.providers,
             ModelCapability::Translation => &config.translation.providers,
+            ModelCapability::Tts => &config.tts.providers,
         };
         let model_asset = providers
             .get(provider)
@@ -807,10 +891,10 @@ fn config_path_value(path: &std::path::Path) -> String {
     }
 }
 
-fn preferred_llama_server_path(project_root: &std::path::Path, configured: &str) -> String {
+fn preferred_llama_server_path(layout: &RuntimeLayout, configured: &str) -> String {
     let configured = configured.trim();
     if !configured.is_empty() {
-        let candidate = configured_llama_server_path(project_root, configured);
+        let candidate = configured_llama_server_path(layout, configured);
         if candidate.is_file() {
             return candidate.display().to_string();
         }
@@ -818,12 +902,12 @@ fn preferred_llama_server_path(project_root: &std::path::Path, configured: &str)
         // Keep the normalized managed path visible to the installer and the
         // error UI when the runtime has not been downloaded yet. External
         // stale paths retain their original value for manual repair.
-        if is_managed_llama_server_path(project_root, &candidate) {
+        if is_managed_llama_server_path(layout, &candidate) {
             return candidate.display().to_string();
         }
     }
 
-    let installed = RuntimeLayout::for_project_root(project_root)
+    let installed = layout
         .managed_llama_server(format!("llama-server{}", std::env::consts::EXE_SUFFIX));
     let installed = std::path::absolute(&installed).unwrap_or(installed);
     if installed.is_file() {
@@ -833,8 +917,7 @@ fn preferred_llama_server_path(project_root: &std::path::Path, configured: &str)
     }
 }
 
-fn configured_llama_server_path(project_root: &std::path::Path, configured: &str) -> PathBuf {
-    let layout = RuntimeLayout::for_project_root(project_root);
+fn configured_llama_server_path(layout: &RuntimeLayout, configured: &str) -> PathBuf {
     let configured_path = PathBuf::from(configured);
     let mut candidate = layout.resolve_configured_path(&configured_path);
 
@@ -850,8 +933,7 @@ fn configured_llama_server_path(project_root: &std::path::Path, configured: &str
     std::path::absolute(&candidate).unwrap_or(candidate)
 }
 
-fn is_managed_llama_server_path(project_root: &std::path::Path, path: &std::path::Path) -> bool {
-    let layout = RuntimeLayout::for_project_root(project_root);
+fn is_managed_llama_server_path(layout: &RuntimeLayout, path: &std::path::Path) -> bool {
     let is_supported_name = path.file_stem().is_some_and(|name| name == "llama-server")
         && match path.extension().and_then(|extension| extension.to_str()) {
             None => true,
@@ -975,16 +1057,10 @@ impl Drop for KillOnCloseJob {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::sync::atomic::{AtomicU64, Ordering};
-
-    static NEXT_TEMP: AtomicU64 = AtomicU64::new(0);
 
     fn temp_root(label: &str) -> PathBuf {
-        let root = std::env::temp_dir().join(format!(
-            "xrtranslate-backend-{label}-{}-{}",
-            std::process::id(),
-            NEXT_TEMP.fetch_add(1, Ordering::Relaxed)
-        ));
+        let root = std::env::temp_dir().join(format!("xrtranslate-test-backend-{label}"));
+        let _ = std::fs::remove_dir_all(&root);
         std::fs::create_dir_all(&root).unwrap();
         root
     }
@@ -1003,11 +1079,12 @@ mod tests {
     fn relative_configured_runtime_is_resolved_from_project_root() {
         let root = temp_root("relative");
         let server = create_server(&root);
+        let layout = RuntimeLayout::for_project_root(&root);
         let configured = format!(
             "runtime/llama.cpp/llama-server{}",
             std::env::consts::EXE_SUFFIX
         );
-        let selected = preferred_llama_server_path(&root, &configured);
+        let selected = preferred_llama_server_path(&layout, &configured);
         assert_eq!(PathBuf::from(selected), server);
         std::fs::remove_dir_all(root).unwrap();
     }
@@ -1017,7 +1094,8 @@ mod tests {
     fn extensionless_managed_runtime_is_resolved_to_windows_executable() {
         let root = temp_root("extensionless-windows");
         let server = create_server(&root);
-        let selected = preferred_llama_server_path(&root, "runtime/llama.cpp/llama-server");
+        let layout = RuntimeLayout::for_project_root(&root);
+        let selected = preferred_llama_server_path(&layout, "runtime/llama.cpp/llama-server");
         assert_eq!(PathBuf::from(selected), server);
         std::fs::remove_dir_all(root).unwrap();
     }
@@ -1026,15 +1104,34 @@ mod tests {
     fn standard_runtime_is_recovered_when_config_is_empty_or_stale() {
         let root = temp_root("recover");
         let server = create_server(&root);
+        let layout = RuntimeLayout::for_project_root(&root);
         assert_eq!(
-            PathBuf::from(preferred_llama_server_path(&root, "")),
+            PathBuf::from(preferred_llama_server_path(&layout, "")),
             server
         );
         assert_eq!(
             PathBuf::from(preferred_llama_server_path(
-                &root,
+                &layout,
                 "C:/missing/llama-server.exe"
             )),
+            server
+        );
+        std::fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn custom_runtime_directory_is_used_by_preferred_llama_server() {
+        let root = temp_root("custom-runtime-dir");
+        let custom_runtime = root.join("custom_ai_runtime");
+        let server = custom_runtime
+            .join("llama.cpp")
+            .join(format!("llama-server{}", std::env::consts::EXE_SUFFIX));
+        std::fs::create_dir_all(server.parent().unwrap()).unwrap();
+        std::fs::write(&server, b"test").unwrap();
+
+        let layout = RuntimeLayout::new(&root, Some("custom_ai_runtime"));
+        assert_eq!(
+            PathBuf::from(preferred_llama_server_path(&layout, "")),
             server
         );
         std::fs::remove_dir_all(root).unwrap();
