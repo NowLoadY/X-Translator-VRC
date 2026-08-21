@@ -18,6 +18,105 @@ pub struct PromptTemplateProfile {
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct PromptGraphProjectFile {
+    #[serde(rename = "$schema_guide", default = "default_schema_guide")]
+    pub schema_guide: String,
+    pub name: String,
+    #[serde(default)]
+    pub description: String,
+    pub graph: PromptNodeGraph,
+}
+
+fn default_schema_guide() -> String {
+    "X-Translator Prompt Studio Graph Project Guide for AI / Humans:\n\
+    1. NODES (nodes: Array):\n\
+       - Variable Node: {'type': 'variable', 'variable': 'current_input' | 'source_language' | 'target_language'}\n\
+         * 'current_input': Real-time speech transcript sentence to be translated.\n\
+         * 'source_language': Source language name (e.g. 'English', 'Japanese').\n\
+         * 'target_language': Target language name (e.g. 'Chinese').\n\
+       - Input / Data Block (IMPORTANT: built-in blocks ALREADY include descriptive markdown headers):\n\
+         * 'terminology': Renders '## Terminology\\n\\n<matched glossary rows>'\n\
+         * 'recent_turns': Renders '## Recent Bilingual History\\n\\n<source/target dialogue turns>'\n\
+         * 'language_order': Renders '## Language Order\\n\\n<order list>'\n\
+         * 'previous_revision': Renders '## Previous Revision of Current Speech\\n\\n<revision>'\n\
+         * 'surrounding_source': Renders '## Current Utterance Context (context only; do not translate)\\n\\n<lines>'\n\
+         * 'custom_text': Renders '## Custom Reference Text\\n\\n<custom user text>'\n\
+         * NOTE FOR AI DESIGNERS: Because each data block outputs its own '## Header', DO NOT add extra duplicate headers in Compose templates (e.g. write '{0}', not 'Terminology:\\n{0}').\n\
+       - Compose Node: {'type': 'compose', 'text': 'Prompt template text with {0}, {1}, etc.'}\n\
+         * Placeholders {0}, {1}, {2}... interpolate outputs from incoming links with input: 0, input: 1, etc.\n\
+       - Switch Node: {'type': 'switch', 'condition': 'has_reference_context' | 'source_is_auto'}\n\
+         * Evaluates condition at runtime: routes input: 0 (False branch) or input: 1 (True branch).\n\
+       - Request Node: {'type': 'request', 'target': 'open_ai_compatible' | 'hunyuan', 'roles': ['system', 'user']}\n\
+         * Final output sink sent to translation LLM. For OpenAI: input 0 = System, input 1 = User. For Hunyuan: input 0 = User.\n\
+    2. LINKS (links: Array):\n\
+       - {'from': '<source_node_id>', 'to': '<target_node_id>', 'input': <target_slot_index_integer>}\n\
+    3. PROVIDER PAGES:\n\
+       - Each node belongs to 'page': 'open_ai_compatible' or 'page': 'hunyuan'. Both provider graphs are 100% independent DAG pipelines."
+        .into()
+}
+
+impl PromptTemplateProfile {
+    pub fn export_project_json(&self) -> Result<String, String> {
+        let project = PromptGraphProjectFile {
+            schema_guide: default_schema_guide(),
+            name: self.name.clone(),
+            description: self.description.clone(),
+            graph: self.graph.clone(),
+        };
+        serde_json::to_string_pretty(&project).map_err(|e| e.to_string())
+    }
+
+    pub fn import_project_json(
+        content: &str,
+        new_id: impl Into<String>,
+    ) -> Result<PromptTemplateProfile, String> {
+        let (name, description, mut graph) =
+            if let Ok(project) = serde_json::from_str::<PromptGraphProjectFile>(content) {
+                (project.name, project.description, project.graph)
+            } else if let Ok(profile) = serde_json::from_str::<PromptTemplateProfile>(content) {
+                (profile.name, profile.description, profile.graph)
+            } else if let Ok(raw_graph) = serde_json::from_str::<PromptNodeGraph>(content) {
+                ("Imported Graph".to_string(), String::new(), raw_graph)
+            } else {
+                return Err(
+                    "Failed to parse prompt graph JSON. Please ensure it follows the Prompt Graph schema."
+                        .into(),
+                );
+            };
+
+        if graph.nodes.is_empty() {
+            return Err("Imported prompt graph contains no nodes.".into());
+        }
+
+        for node in &mut graph.nodes {
+            if node.label.trim().is_empty() {
+                node.label = crate::schema::default_node_label(&node.kind);
+            }
+        }
+
+        graph.schema_version = PromptNodeGraph::CURRENT_SCHEMA_VERSION;
+        migrate_shared_nodes(&mut graph);
+        graph.auto_layout();
+
+        if let Err(err) = graph.validate_for_activation() {
+            return Err(format!("Invalid graph structure: {err}"));
+        }
+
+        Ok(PromptTemplateProfile {
+            id: new_id.into(),
+            name: if name.trim().is_empty() {
+                "Imported Graph".into()
+            } else {
+                name
+            },
+            description,
+            graph,
+            read_only: false,
+        })
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct PromptTemplateLibrary {
     pub active_id: String,
     pub profiles: Vec<PromptTemplateProfile>,
@@ -66,6 +165,8 @@ impl PromptTemplateLibrary {
                 || profile.graph.nodes.is_empty()
             {
                 profile.graph = PromptNodeGraph::builtin_default();
+            } else {
+                migrate_shared_nodes(&mut profile.graph);
             }
             profile.read_only = false;
         }
@@ -128,6 +229,88 @@ fn builtin_default_profile() -> PromptTemplateProfile {
     }
 }
 
+fn migrate_shared_nodes(graph: &mut PromptNodeGraph) {
+    use crate::{PromptLink, PromptNodePage};
+    if !graph
+        .nodes
+        .iter()
+        .any(|node| node.page == PromptNodePage::Shared)
+    {
+        return;
+    }
+
+    let mut new_nodes = Vec::new();
+    let mut new_links = Vec::new();
+
+    for node in &graph.nodes {
+        if node.page == PromptNodePage::Shared {
+            let mut openai_node = node.clone();
+            openai_node.id = format!("openai-{}", node.id);
+            openai_node.page = PromptNodePage::OpenAiCompatible;
+            new_nodes.push(openai_node);
+
+            let mut hunyuan_node = node.clone();
+            hunyuan_node.id = format!("hunyuan-{}", node.id);
+            hunyuan_node.page = PromptNodePage::Hunyuan;
+            new_nodes.push(hunyuan_node);
+        } else {
+            new_nodes.push(node.clone());
+        }
+    }
+
+    for link in &graph.links {
+        let from_node = graph.nodes.iter().find(|n| n.id == link.from);
+        let to_node = graph.nodes.iter().find(|n| n.id == link.to);
+        let from_shared = from_node.is_some_and(|n| n.page == PromptNodePage::Shared);
+        let to_shared = to_node.is_some_and(|n| n.page == PromptNodePage::Shared);
+
+        if from_shared && to_shared {
+            new_links.push(PromptLink {
+                from: format!("openai-{}", link.from),
+                to: format!("openai-{}", link.to),
+                input: link.input,
+            });
+            new_links.push(PromptLink {
+                from: format!("hunyuan-{}", link.from),
+                to: format!("hunyuan-{}", link.to),
+                input: link.input,
+            });
+        } else if from_shared {
+            let target_page = to_node
+                .map(|n| n.page)
+                .unwrap_or(PromptNodePage::OpenAiCompatible);
+            let prefix = match target_page {
+                PromptNodePage::Hunyuan => "hunyuan",
+                _ => "openai",
+            };
+            new_links.push(PromptLink {
+                from: format!("{prefix}-{}", link.from),
+                to: link.to.clone(),
+                input: link.input,
+            });
+        } else if to_shared {
+            let source_page = from_node
+                .map(|n| n.page)
+                .unwrap_or(PromptNodePage::OpenAiCompatible);
+            let prefix = match source_page {
+                PromptNodePage::Hunyuan => "hunyuan",
+                _ => "openai",
+            };
+            new_links.push(PromptLink {
+                from: link.from.clone(),
+                to: format!("{prefix}-{}", link.to),
+                input: link.input,
+            });
+        } else {
+            new_links.push(link.clone());
+        }
+    }
+
+    graph.nodes = new_nodes;
+    graph.links = new_links;
+    graph.auto_layout();
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -174,5 +357,29 @@ mod tests {
         assert_eq!(loaded.profiles[1].name, "Custom Test Profile");
 
         let _ = std::fs::remove_dir_all(&temp_dir);
+    }
+
+    #[test]
+    fn export_and_import_project_json_round_trips_cleanly() {
+        let profile = builtin_default_profile();
+        let exported = profile.export_project_json().unwrap();
+
+        assert!(exported.contains("\"$schema_guide\":"));
+        assert!(exported.contains("\"name\": \"Built-in Default\""));
+        assert!(exported.contains("\"openai-request\""));
+        assert!(exported.contains("\"hunyuan-request\""));
+
+        let imported = PromptTemplateProfile::import_project_json(&exported, "imported-test-id").unwrap();
+        assert_eq!(imported.id, "imported-test-id");
+        assert_eq!(imported.name, "Built-in Default");
+        assert!(!imported.read_only);
+        assert_eq!(imported.graph.nodes.len(), profile.graph.nodes.len());
+        assert_eq!(imported.graph.links.len(), profile.graph.links.len());
+    }
+
+    #[test]
+    fn import_project_json_rejects_empty_or_malformed_input() {
+        assert!(PromptTemplateProfile::import_project_json("{}", "test-id").is_err());
+        assert!(PromptTemplateProfile::import_project_json("not json", "test-id").is_err());
     }
 }

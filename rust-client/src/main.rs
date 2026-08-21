@@ -943,6 +943,43 @@ impl XRTranslateApp {
                 PromptStudioAction::SaveProfile(profile) => {
                     self.commit_prompt_profile(profile);
                 }
+                PromptStudioAction::ExportProfile(profile) => {
+                    let clean_name = sanitize_graph_file_name(&profile.name);
+                    let default_name = format!("{clean_name}.json");
+                    if let Some(path) = rfd::FileDialog::new()
+                        .add_filter("Prompt Graph (*.json)", &["json"])
+                        .set_file_name(&default_name)
+                        .save_file()
+                    {
+                        if let Ok(json) = profile.export_project_json() {
+                            let _ = std::fs::write(&path, json);
+                        }
+                    }
+                }
+                PromptStudioAction::ImportProfile => {
+                    if let Some(path) = rfd::FileDialog::new()
+                        .add_filter("Prompt Graph (*.json)", &["json"])
+                        .pick_file()
+                    {
+                        if let Ok(content) = std::fs::read_to_string(&path) {
+                            let new_id = format!("custom-import-{}", uuid::Uuid::new_v4());
+                            if let Ok(mut imported) = xrtranslate_prompt::PromptTemplateProfile::import_project_json(&content, new_id) {
+                                if imported.name == "Imported Graph" || imported.name.trim().is_empty() {
+                                    if let Some(stem) = path.file_stem().and_then(|s| s.to_str()) {
+                                        let clean_stem = stem.trim();
+                                        if !clean_stem.is_empty() {
+                                            imported.name = clean_stem.to_string();
+                                        }
+                                    }
+                                }
+                                let id = imported.id.clone();
+                                self.commit_prompt_profile(imported);
+                                self.prompt_studio.select_profile(id, &self.prompt_library);
+                                self.save_settings();
+                            }
+                        }
+                    }
+                }
             }
         }
     }
@@ -2493,6 +2530,22 @@ fn sanitize_export_name(name: &str) -> String {
     let trimmed = sanitized.trim().trim_end_matches('.');
     if trimmed.is_empty() {
         "meeting".into()
+    } else {
+        trimmed.into()
+    }
+}
+
+fn sanitize_graph_file_name(name: &str) -> String {
+    let sanitized = name
+        .chars()
+        .map(|character| match character {
+            '<' | '>' | ':' | '"' | '/' | '\\' | '|' | '?' | '*' => '_',
+            character => character,
+        })
+        .collect::<String>();
+    let trimmed = sanitized.trim().trim_end_matches('.');
+    if trimmed.is_empty() {
+        "prompt-graph".into()
     } else {
         trimmed.into()
     }

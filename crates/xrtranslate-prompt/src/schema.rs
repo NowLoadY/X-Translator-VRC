@@ -269,21 +269,32 @@ impl PromptNodeGraph {
     }
 
     pub fn connect(&mut self, from: &str, to: &str, input: u8) -> bool {
-        let pages_match = self
-            .nodes
-            .iter()
-            .find(|node| node.id == from)
-            .zip(self.nodes.iter().find(|node| node.id == to))
-            .is_some_and(|(source, target)| pages_can_connect(source.page, target.page));
         if from == to
             || !self.nodes.iter().any(|node| node.id == from)
             || !self.nodes.iter().any(|node| node.id == to)
-            || !pages_match
             || !self.accepts_input(to, input)
             || self.reaches(to, from)
         {
             return false;
         }
+
+        let from_page = self
+            .nodes
+            .iter()
+            .find(|node| node.id == from)
+            .map(|n| n.page)
+            .unwrap_or_default();
+        let to_page = self
+            .nodes
+            .iter()
+            .find(|node| node.id == to)
+            .map(|n| n.page)
+            .unwrap_or_default();
+
+        if !pages_can_connect(from_page, to_page) {
+            return false;
+        }
+
         if let Some(PromptNode {
             kind: PromptNodeKind::Compose { text },
             ..
@@ -465,14 +476,38 @@ impl PromptNodeGraph {
     }
 
     pub fn auto_layout(&mut self) {
-        let mut layers = self
+        for page in [
+            PromptNodePage::OpenAiCompatible,
+            PromptNodePage::Hunyuan,
+        ] {
+            self.auto_layout_page(page);
+        }
+        self.layout_version = Self::CURRENT_LAYOUT_VERSION;
+    }
+
+    fn auto_layout_page(&mut self, page: PromptNodePage) {
+        let page_node_ids: HashSet<String> = self
             .nodes
             .iter()
-            .map(|node| (node.id.clone(), 0_usize))
+            .filter(|node| node.page == page || node.page == PromptNodePage::Shared)
+            .map(|node| node.id.clone())
+            .collect();
+
+        if page_node_ids.is_empty() {
+            return;
+        }
+
+        let mut layers = page_node_ids
+            .iter()
+            .map(|id| (id.clone(), 0_usize))
             .collect::<HashMap<_, _>>();
-        for _ in 0..self.nodes.len() {
+
+        for _ in 0..page_node_ids.len() {
             let mut changed = false;
             for link in &self.links {
+                if !page_node_ids.contains(&link.from) || !page_node_ids.contains(&link.to) {
+                    continue;
+                }
                 let Some(from_layer) = layers.get(&link.from).copied() else {
                     continue;
                 };
@@ -491,69 +526,30 @@ impl PromptNodeGraph {
         let max_layer = layers.values().copied().max().unwrap_or(0);
 
         for layer in 0..=max_layer {
-            let mut shared_ids = self
+            let mut ids = self
                 .nodes
                 .iter()
                 .filter(|node| {
-                    node.page == PromptNodePage::Shared && layers.get(&node.id) == Some(&layer)
+                    (node.page == page || node.page == PromptNodePage::Shared)
+                        && layers.get(&node.id) == Some(&layer)
                 })
                 .map(|node| node.id.clone())
                 .collect::<Vec<_>>();
 
-            // If layer == 0 (input layer), sort semantically so language variables are on top and context blocks are on bottom
             if layer == 0 {
-                shared_ids.sort_by_key(|id| {
+                ids.sort_by_key(|id| {
                     self.nodes
                         .iter()
                         .find(|n| n.id == *id)
                         .map(node_semantic_rank)
                         .unwrap_or((99, id.clone()))
                 });
-                position_column(&mut self.nodes, layer, &shared_ids, 40.0);
-                continue;
+            } else {
+                sort_layer_nodes(&mut ids, layer, &self.nodes, &self.links);
             }
 
-            // For layer >= 1: partition shared nodes by barycenter into top shared (< 500.0) and bottom shared (>= 500.0)
-            let mut top_shared = Vec::new();
-            let mut bottom_shared = Vec::new();
-            for id in shared_ids {
-                let bary = compute_node_barycenter(&id, &self.nodes, &self.links).unwrap_or(0.0);
-                if bary < 500.0 {
-                    top_shared.push(id);
-                } else {
-                    bottom_shared.push(id);
-                }
-            }
-            sort_layer_nodes(&mut top_shared, layer, &self.nodes, &self.links);
-            sort_layer_nodes(&mut bottom_shared, layer, &self.nodes, &self.links);
-
-            let top_bottom = position_column(&mut self.nodes, layer, &top_shared, 40.0);
-
-            // Provider nodes on each page (OpenAiCompatible, Hunyuan)
-            let mut max_provider_bottom = top_bottom;
-            for page in [PromptNodePage::OpenAiCompatible, PromptNodePage::Hunyuan] {
-                let mut provider_ids = self
-                    .nodes
-                    .iter()
-                    .filter(|node| node.page == page && layers.get(&node.id) == Some(&layer))
-                    .map(|node| node.id.clone())
-                    .collect::<Vec<_>>();
-                if provider_ids.is_empty() {
-                    continue;
-                }
-                sort_layer_nodes(&mut provider_ids, layer, &self.nodes, &self.links);
-                let prov_bottom =
-                    position_column(&mut self.nodes, layer, &provider_ids, top_bottom);
-                if prov_bottom > max_provider_bottom {
-                    max_provider_bottom = prov_bottom;
-                }
-            }
-
-            if !bottom_shared.is_empty() {
-                position_column(&mut self.nodes, layer, &bottom_shared, max_provider_bottom);
-            }
+            position_column(&mut self.nodes, layer, &ids, 40.0);
         }
-        self.layout_version = Self::CURRENT_LAYOUT_VERSION;
     }
 
     pub(crate) fn accepts_input(&self, id: &str, input: u8) -> bool {
@@ -768,7 +764,7 @@ mod tests {
     use super::*;
 
     #[test]
-    fn shared_nodes_feed_both_pages_but_provider_nodes_stay_on_their_page() {
+    fn provider_nodes_stay_on_their_page_and_shared_nodes_connect_to_both() {
         let mut graph = PromptNodeGraph::empty();
         let shared = graph.add_variable(
             PromptNodePage::Shared,
@@ -784,6 +780,24 @@ mod tests {
         assert!(graph.connect(&shared, &hunyuan, 0));
         assert!(!graph.connect(&openai, &hunyuan, 0));
         assert!(!graph.connect(&openai, &shared_target, 0));
+    }
+
+    #[test]
+    fn independent_translation_context_accepts_compose_and_input_nodes() {
+        let mut graph = PromptNodeGraph::builtin_default();
+        let custom_compose = graph.add_compose(
+            PromptNodePage::OpenAiCompatible,
+            "Custom context: {0}".into(),
+            [100.0, 100.0],
+        );
+        assert!(graph.connect(&custom_compose, "openai-reference-context", 0));
+
+        let hunyuan_compose = graph.add_compose(
+            PromptNodePage::Hunyuan,
+            "Hunyuan specific context: {0}".into(),
+            [200.0, 200.0],
+        );
+        assert!(graph.connect(&hunyuan_compose, "hunyuan-reference-context", 0));
     }
 
     #[test]
@@ -821,7 +835,7 @@ mod tests {
         let PromptNodeKind::Compose { text } = &mut changed
             .nodes
             .iter_mut()
-            .find(|node| node.id == "reference-explicit-rules")
+            .find(|node| node.id == "openai-reference-explicit-rules")
             .unwrap()
             .kind
         else {
@@ -892,8 +906,8 @@ mod tests {
     fn validation_rejects_a_compose_link_without_a_text_placeholder() {
         let mut graph = PromptNodeGraph::builtin_default();
         graph.links.push(PromptLink {
-            from: "current-input".into(),
-            to: "reference-explicit-rules".into(),
+            from: "openai-current-input".into(),
+            to: "openai-reference-explicit-rules".into(),
             input: 2,
         });
 

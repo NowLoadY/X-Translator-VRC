@@ -1,6 +1,10 @@
 mod canvas;
+mod history;
+mod navigation;
 mod runtime_preview;
 mod style;
+
+pub use history::PromptStudioHistory;
 
 use eframe::egui::{
     self, Align, Color32, CornerRadius, Frame, Layout, Margin, Pos2, Rect, RichText, Sense, Stroke,
@@ -25,11 +29,22 @@ pub struct PromptLinkKey {
     pub input: u8,
 }
 
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct NodeTitleEdit {
+    pub node_id: String,
+    pub text: String,
+}
+
 #[derive(Clone, Debug)]
 pub struct PromptStudioController {
     selected_id: String,
     draft: Option<PromptTemplateProfile>,
     dirty: bool,
+    history: PromptStudioHistory,
+    drag_start_profile: Option<PromptTemplateProfile>,
+    editing_title: Option<NodeTitleEdit>,
+    title_edit_start_profile: Option<PromptTemplateProfile>,
+    text_edit_start_profile: Option<PromptTemplateProfile>,
     wire_from: Option<String>,
     wire_from_input: Option<(String, u8)>,
     pan: Vec2,
@@ -45,6 +60,7 @@ pub struct PromptStudioController {
     add_node_center: Option<[f32; 2]>,
     active_provider: PromptProviderTarget,
     runtime_trace: Option<PromptExecutionTrace>,
+    wire_base_zoom: Option<f32>,
 }
 
 impl Default for PromptStudioController {
@@ -59,6 +75,11 @@ impl PromptStudioController {
             selected_id: String::new(),
             draft: None,
             dirty: false,
+            history: PromptStudioHistory::default(),
+            drag_start_profile: None,
+            editing_title: None,
+            title_edit_start_profile: None,
+            text_edit_start_profile: None,
             wire_from: None,
             wire_from_input: None,
             pan: Vec2::ZERO,
@@ -74,6 +95,7 @@ impl PromptStudioController {
             add_node_center: None,
             active_provider,
             runtime_trace: None,
+            wire_base_zoom: None,
         }
     }
 
@@ -107,12 +129,8 @@ impl PromptStudioController {
             self.draft = Some(selected.clone());
             self.dirty = false;
             self.fit_pending = true;
-            self.selected_nodes.clear();
-            self.selected_links.clear();
-            self.wire_from = None;
-            self.wire_from_input = None;
-            self.box_select_start = None;
-            self.box_select_current = None;
+            self.history.clear();
+            self.cleanup_transient_state();
         }
 
         PromptStudioSnapshot {
@@ -133,12 +151,8 @@ impl PromptStudioController {
             .iter()
             .find(|profile| profile.id == self.selected_id)
             .cloned();
-        self.wire_from = None;
-        self.wire_from_input = None;
-        self.selected_nodes.clear();
-        self.selected_links.clear();
-        self.box_select_start = None;
-        self.box_select_current = None;
+        self.history.clear();
+        self.cleanup_transient_state();
         self.fit_pending = true;
     }
 
@@ -147,12 +161,8 @@ impl PromptStudioController {
         self.draft = Some(profile);
         self.dirty = true;
         self.fit_pending = true;
-        self.wire_from = None;
-        self.wire_from_input = None;
-        self.selected_nodes.clear();
-        self.selected_links.clear();
-        self.box_select_start = None;
-        self.box_select_current = None;
+        self.history.clear();
+        self.cleanup_transient_state();
     }
 
     pub fn is_dirty(&self) -> bool {
@@ -161,6 +171,89 @@ impl PromptStudioController {
 
     pub fn set_runtime_trace(&mut self, trace: Option<PromptExecutionTrace>) {
         self.runtime_trace = trace;
+    }
+
+    pub fn push_history(&mut self, before: PromptTemplateProfile) {
+        self.history.push(before);
+        self.dirty = true;
+    }
+
+    pub fn can_undo(&self) -> bool {
+        let read_only = self.draft.as_ref().map_or(true, |d| d.read_only);
+        self.history.can_undo(read_only)
+    }
+
+    pub fn can_redo(&self) -> bool {
+        let read_only = self.draft.as_ref().map_or(true, |d| d.read_only);
+        self.history.can_redo(read_only)
+    }
+
+    pub fn undo(&mut self) {
+        let Some(current) = self.draft.clone() else {
+            return;
+        };
+        if let Some(previous) = self.history.undo(current) {
+            self.draft = Some(previous);
+            self.dirty = true;
+            self.cleanup_transient_state();
+        }
+    }
+
+    pub fn redo(&mut self) {
+        let Some(current) = self.draft.clone() else {
+            return;
+        };
+        if let Some(next) = self.history.redo(current) {
+            self.draft = Some(next);
+            self.dirty = true;
+            self.cleanup_transient_state();
+        }
+    }
+
+    pub fn start_editing_title(
+        &mut self,
+        node_id: String,
+        initial_text: String,
+        before: PromptTemplateProfile,
+    ) {
+        self.editing_title = Some(NodeTitleEdit {
+            node_id,
+            text: initial_text,
+        });
+        self.title_edit_start_profile = Some(before);
+    }
+
+    pub fn cancel_editing_title(&mut self) {
+        self.editing_title = None;
+        self.title_edit_start_profile = None;
+    }
+
+    pub fn cleanup_transient_state(&mut self) {
+        self.wire_from = None;
+        self.wire_from_input = None;
+        self.drag_node = None;
+        self.drag_origins.clear();
+        self.drag_start_profile = None;
+        self.editing_title = None;
+        self.title_edit_start_profile = None;
+        self.text_edit_start_profile = None;
+        self.box_select_start = None;
+        self.box_select_current = None;
+        self.wire_base_zoom = None;
+        if let Some(draft) = &self.draft {
+            let valid_node_ids: HashSet<&str> =
+                draft.graph.nodes.iter().map(|n| n.id.as_str()).collect();
+            self.selected_nodes
+                .retain(|id| valid_node_ids.contains(id.as_str()));
+            self.selected_links.retain(|key| {
+                draft.graph.links.iter().any(|l| {
+                    l.from == key.from && l.to == key.to && l.input == key.input
+                })
+            });
+        } else {
+            self.selected_nodes.clear();
+            self.selected_links.clear();
+        }
     }
 
     fn mark_dirty(&mut self) {
@@ -235,6 +328,8 @@ pub enum PromptStudioAction {
     SaveProfile(PromptTemplateProfile),
     ActivateProfile(PromptTemplateProfile),
     CloneProfile(PromptTemplateProfile),
+    ExportProfile(PromptTemplateProfile),
+    ImportProfile,
 }
 
 pub fn render(
@@ -318,6 +413,26 @@ fn render_header(
                     let profile = new_profile();
                     actions.push(PromptStudioAction::CreateProfile(profile.clone()));
                     controller.set_draft(profile);
+                }
+                if small_outline_button(
+                    ui,
+                    crate::i18n::tr(language, "IMPORT"),
+                    crate::i18n::tr(language, "Import graph project file"),
+                )
+                .clicked()
+                {
+                    actions.push(PromptStudioAction::ImportProfile);
+                }
+                if small_outline_button(
+                    ui,
+                    crate::i18n::tr(language, "EXPORT"),
+                    crate::i18n::tr(language, "Export graph project file"),
+                )
+                .clicked()
+                {
+                    if let Some(profile) = controller.draft.clone() {
+                        actions.push(PromptStudioAction::ExportProfile(profile));
+                    }
                 }
                 ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
                     if controller.is_dirty() {
@@ -595,7 +710,7 @@ mod tests {
     }
 
     #[test]
-    fn provider_tabs_show_shared_and_matching_nodes_only() {
+    fn provider_tabs_show_matching_provider_nodes_only() {
         let mut controller = PromptStudioController::default();
         let graph = PromptNodeGraph::builtin_default();
 
@@ -604,7 +719,16 @@ mod tests {
                 graph
                     .nodes
                     .iter()
-                    .find(|node| node.id == "reference-context")
+                    .find(|node| node.id == "openai-reference-context")
+                    .unwrap()
+            )
+        );
+        assert!(
+            !controller.node_is_visible(
+                graph
+                    .nodes
+                    .iter()
+                    .find(|node| node.id == "hunyuan-reference-context")
                     .unwrap()
             )
         );
@@ -630,11 +754,20 @@ mod tests {
         controller.select_provider(PromptProviderTarget::Hunyuan);
 
         assert!(
+            !controller.node_is_visible(
+                graph
+                    .nodes
+                    .iter()
+                    .find(|node| node.id == "openai-reference-context")
+                    .unwrap()
+            )
+        );
+        assert!(
             controller.node_is_visible(
                 graph
                     .nodes
                     .iter()
-                    .find(|node| node.id == "reference-context")
+                    .find(|node| node.id == "hunyuan-reference-context")
                     .unwrap()
             )
         );
@@ -668,5 +801,110 @@ mod tests {
             controller.active_provider,
             PromptProviderTarget::OpenAiCompatible
         );
+    }
+
+    #[test]
+    fn controller_undo_and_redo_tracks_draft_mutations() {
+        let mut controller = PromptStudioController::default();
+        let mut profile = new_profile();
+        profile.name = "Initial".to_string();
+        controller.set_draft(profile.clone());
+
+        assert!(!controller.can_undo());
+        assert!(!controller.can_redo());
+
+        // Simulate a mutation
+        let before = profile.clone();
+        let mut mutated = profile.clone();
+        mutated.name = "Renamed".to_string();
+        mutated.graph.add_variable(
+            PromptNodePage::OpenAiCompatible,
+            PromptVariable::CurrentInput,
+            [50.0, 50.0],
+        );
+        controller.draft = Some(mutated.clone());
+        controller.push_history(before.clone());
+
+        assert!(controller.can_undo());
+        assert!(!controller.can_redo());
+
+        // Undo
+        controller.undo();
+        assert_eq!(controller.draft.as_ref().unwrap().name, "Initial");
+        assert!(controller.can_redo());
+        assert!(!controller.can_undo());
+
+        // Redo
+        controller.redo();
+        assert_eq!(controller.draft.as_ref().unwrap().name, "Renamed");
+        assert!(controller.can_undo());
+        assert!(!controller.can_redo());
+    }
+
+    #[test]
+    fn controller_start_and_cancel_title_editing() {
+        let mut controller = PromptStudioController::default();
+        let profile = new_profile();
+        controller.set_draft(profile.clone());
+
+        controller.start_editing_title(
+            "node-1".to_string(),
+            "My Node".to_string(),
+            profile.clone(),
+        );
+        assert_eq!(
+            controller.editing_title,
+            Some(NodeTitleEdit {
+                node_id: "node-1".to_string(),
+                text: "My Node".to_string(),
+            })
+        );
+        assert_eq!(controller.title_edit_start_profile, Some(profile));
+
+        controller.cancel_editing_title();
+        assert!(controller.editing_title.is_none());
+        assert!(controller.title_edit_start_profile.is_none());
+    }
+
+    #[test]
+    fn adding_and_connecting_custom_compose_to_translation_context_succeeds() {
+        let mut profile = new_profile();
+        let compose_id = profile.graph.add_compose(
+            PromptNodePage::OpenAiCompatible,
+            "Write prompt text here: {0}".into(),
+            [150.0, 150.0],
+        );
+        assert!(profile.graph.connect(&compose_id, "openai-reference-context", 0));
+        assert!(profile
+            .graph
+            .links
+            .iter()
+            .any(|l| l.from == compose_id && l.to == "openai-reference-context" && l.input == 0));
+    }
+
+    #[test]
+    fn wire_dragging_near_edge_triggers_auto_pan_and_dynamic_zoom() {
+        let context = egui::Context::default();
+        let mut controller = PromptStudioController::default();
+        controller.zoom = 1.0;
+        controller.pan = Vec2::ZERO;
+
+        let canvas = Rect::from_min_size(Pos2::new(100.0, 100.0), Vec2::new(800.0, 600.0));
+
+        // When pointer is near right edge (e.g. x = 880, canvas right is 900)
+        let mut input = egui::RawInput::default();
+        input.screen_rect = Some(Rect::from_min_size(Pos2::ZERO, Vec2::new(1024.0, 768.0)));
+        input.predicted_dt = 1.0 / 60.0;
+        input.events.push(egui::Event::PointerMoved(Pos2::new(880.0, 300.0)));
+
+        let mut output = context.run_ui(input, |ui| {
+            navigation::update_wire_dragging_navigation(&mut controller, canvas, ui, true);
+        });
+        output.textures_delta.clear();
+
+        // Pan should have moved left (pan.x < 0) to reveal nodes to the right, and zoom out slightly
+        assert!(controller.pan.x < 0.0);
+        assert!(controller.zoom < 1.0);
+        assert_eq!(controller.wire_base_zoom, Some(1.0));
     }
 }

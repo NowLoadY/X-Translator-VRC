@@ -780,7 +780,7 @@ mod tests {
         let json = serde_json::to_string(&event).unwrap();
         let decoded: ServerEvent = serde_json::from_str(&json).unwrap();
         assert_eq!(decoded, event);
-        assert!(json.contains(r#""node_id":"current-input""#));
+        assert!(json.contains(r#""node_id":"hunyuan-current-input""#));
     }
 
     #[test]

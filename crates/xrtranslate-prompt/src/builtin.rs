@@ -26,185 +26,8 @@ pub(crate) const AUTO_REFERENCE_CONTEXT_INSTRUCTION: &str = concat!(
 impl PromptNodeGraph {
     pub fn builtin_default() -> Self {
         let mut builder = GraphBuilder::default();
-
-        builder.variable("source-language", PromptVariable::SourceLanguage);
-        builder.variable("target-language", PromptVariable::TargetLanguage);
-        builder.variable("current-input", PromptVariable::CurrentInput);
-
-        for (id, block) in [
-            (
-                "context-language-order",
-                TranslationPromptBlock::LanguageOrder,
-            ),
-            ("context-terminology", TranslationPromptBlock::Terminology),
-            (
-                "context-recent-turns",
-                TranslationPromptBlock::RecentTurns { limit: None },
-            ),
-            (
-                "context-previous-revision",
-                TranslationPromptBlock::PreviousRevision,
-            ),
-            (
-                "context-surrounding-source",
-                TranslationPromptBlock::SurroundingSource,
-            ),
-        ] {
-            builder.node(id, PromptNodeKind::Input { block });
-        }
-
-        builder.compose(
-            "reference-sections",
-            "ASSEMBLE CONTEXT SECTIONS",
-            "{0}\n\n{1}\n\n{2}\n\n{3}\n\n{4}",
-            &[
-                "context-language-order",
-                "context-terminology",
-                "context-recent-turns",
-                "context-previous-revision",
-                "context-surrounding-source",
-            ],
-        );
-        builder.compose(
-            "reference-context",
-            "TRANSLATION CONTEXT",
-            "# Translation Context\n\n{0}",
-            &["reference-sections"],
-        );
-        builder.compose(
-            "reference-explicit-rules",
-            "EXPLICIT REFERENCE RULES",
-            EXPLICIT_REFERENCE_CONTEXT_INSTRUCTION,
-            &["source-language", "target-language"],
-        );
-        builder.compose(
-            "reference-auto-rules",
-            "AUTO REFERENCE RULES",
-            AUTO_REFERENCE_CONTEXT_INSTRUCTION,
-            &["target-language"],
-        );
-        builder.switch(
-            "reference-handling-rules",
-            "SELECT REFERENCE RULES",
-            PromptCondition::SourceIsAuto,
-            "reference-explicit-rules",
-            "reference-auto-rules",
-        );
-
-        builder.compose(
-            "openai-explicit-instruction",
-            "EXPLICIT SOURCE INSTRUCTION",
-            "You are a real-time speech translator. If input is already {0}, output it unchanged. Otherwise translate it into natural, fluent {0}. Output only the translation.",
-            &["target-language"],
-        );
-        builder.compose(
-            "openai-auto-instruction",
-            "AUTO SOURCE INSTRUCTION",
-            "You are a real-time speech translator. The input language is one of the following: {0}. Translate it into the OTHER language from that list. Output only the translation.",
-            &["target-language"],
-        );
-        builder.switch(
-            "openai-instruction",
-            "SELECT SOURCE INSTRUCTION",
-            PromptCondition::SourceIsAuto,
-            "openai-explicit-instruction",
-            "openai-auto-instruction",
-        );
-
-        builder.compose(
-            "openai-system-with-context",
-            "SYSTEM PROMPT WITH CONTEXT",
-            "{0}\n\n{1}\n{2}",
-            &[
-                "openai-instruction",
-                "reference-handling-rules",
-                "reference-context",
-            ],
-        );
-        builder.switch(
-            "openai-system",
-            "SELECT SYSTEM PROMPT",
-            PromptCondition::HasReferenceContext,
-            "openai-instruction",
-            "openai-system-with-context",
-        );
-        builder.compose(
-            "openai-explicit-user",
-            "EXPLICIT SOURCE MESSAGE",
-            "Source language: {0}\nCurrent input:\n{1}",
-            &["source-language", "current-input"],
-        );
-        builder.compose(
-            "openai-auto-user",
-            "AUTO SOURCE MESSAGE",
-            "Current input:\n{0}",
-            &["current-input"],
-        );
-        builder.switch(
-            "openai-user",
-            "SELECT USER MESSAGE",
-            PromptCondition::SourceIsAuto,
-            "openai-explicit-user",
-            "openai-auto-user",
-        );
-        builder.output(
-            "openai-request",
-            PromptProviderTarget::OpenAiCompatible,
-            &[
-                (PromptMessageRole::System, "openai-system"),
-                (PromptMessageRole::User, "openai-user"),
-            ],
-        );
-
-        builder.compose(
-            "hunyuan-explicit-instruction",
-            "EXPLICIT SOURCE INSTRUCTION",
-            "Translate the following {0} text into natural {1}. Output only the translation, do not output the prompt; do not add explanations.",
-            &["source-language", "target-language"],
-        );
-        builder.compose(
-            "hunyuan-auto-instruction",
-            "AUTO SOURCE INSTRUCTION",
-            "Translate the following text into the other language among {0}. Output only the translation; do not add explanations.",
-            &["target-language"],
-        );
-        builder.switch(
-            "hunyuan-instruction",
-            "SELECT SOURCE INSTRUCTION",
-            PromptCondition::SourceIsAuto,
-            "hunyuan-explicit-instruction",
-            "hunyuan-auto-instruction",
-        );
-        builder.compose(
-            "hunyuan-with-context",
-            "USER PROMPT WITH CONTEXT",
-            "{0}\n\n{1}\n\n--- BEGIN REFERENCE CONTEXT ---\n{2}\n--- END REFERENCE CONTEXT ---\n\nCurrent input:\n{3}",
-            &[
-                "hunyuan-instruction",
-                "reference-handling-rules",
-                "reference-context",
-                "current-input",
-            ],
-        );
-        builder.compose(
-            "hunyuan-without-context",
-            "USER PROMPT WITHOUT CONTEXT",
-            "{0}\n\n{1}",
-            &["hunyuan-instruction", "current-input"],
-        );
-        builder.switch(
-            "hunyuan-user",
-            "SELECT USER PROMPT",
-            PromptCondition::HasReferenceContext,
-            "hunyuan-without-context",
-            "hunyuan-with-context",
-        );
-        builder.output(
-            "hunyuan-request",
-            PromptProviderTarget::Hunyuan,
-            &[(PromptMessageRole::User, "hunyuan-user")],
-        );
-
+        builder.build_openai_flow();
+        builder.build_hunyuan_flow();
         let mut graph = builder.finish();
         graph.auto_layout();
         graph
@@ -224,27 +47,310 @@ struct GraphBuilder {
 }
 
 impl GraphBuilder {
-    fn node(&mut self, id: &str, kind: PromptNodeKind) {
-        let label = crate::schema::default_node_label(&kind);
-        self.labeled_node(id, &label, kind);
+    fn build_openai_flow(&mut self) {
+        let page = PromptNodePage::OpenAiCompatible;
+        self.variable("openai-source-language", page, PromptVariable::SourceLanguage);
+        self.variable("openai-target-language", page, PromptVariable::TargetLanguage);
+        self.variable("openai-current-input", page, PromptVariable::CurrentInput);
+
+        for (id, block) in [
+            (
+                "openai-context-language-order",
+                TranslationPromptBlock::LanguageOrder,
+            ),
+            ("openai-context-terminology", TranslationPromptBlock::Terminology),
+            (
+                "openai-context-recent-turns",
+                TranslationPromptBlock::RecentTurns { limit: None },
+            ),
+            (
+                "openai-context-previous-revision",
+                TranslationPromptBlock::PreviousRevision,
+            ),
+            (
+                "openai-context-surrounding-source",
+                TranslationPromptBlock::SurroundingSource,
+            ),
+        ] {
+            self.node(id, page, PromptNodeKind::Input { block });
+        }
+
+        self.compose(
+            "openai-reference-sections",
+            page,
+            "ASSEMBLE CONTEXT SECTIONS",
+            "{0}\n\n{1}\n\n{2}\n\n{3}\n\n{4}",
+            &[
+                "openai-context-language-order",
+                "openai-context-terminology",
+                "openai-context-recent-turns",
+                "openai-context-previous-revision",
+                "openai-context-surrounding-source",
+            ],
+        );
+        self.compose(
+            "openai-reference-context",
+            page,
+            "TRANSLATION CONTEXT",
+            "# Translation Context\n\n{0}",
+            &["openai-reference-sections"],
+        );
+        self.compose(
+            "openai-reference-explicit-rules",
+            page,
+            "EXPLICIT REFERENCE RULES",
+            EXPLICIT_REFERENCE_CONTEXT_INSTRUCTION,
+            &["openai-source-language", "openai-target-language"],
+        );
+        self.compose(
+            "openai-reference-auto-rules",
+            page,
+            "AUTO REFERENCE RULES",
+            AUTO_REFERENCE_CONTEXT_INSTRUCTION,
+            &["openai-target-language"],
+        );
+        self.switch(
+            "openai-reference-handling-rules",
+            page,
+            "SELECT REFERENCE RULES",
+            PromptCondition::SourceIsAuto,
+            "openai-reference-explicit-rules",
+            "openai-reference-auto-rules",
+        );
+
+        self.compose(
+            "openai-explicit-instruction",
+            page,
+            "EXPLICIT SOURCE INSTRUCTION",
+            "You are a real-time speech translator. If input is already {0}, output it unchanged. Otherwise translate it into natural, fluent {0}. Output only the translation.",
+            &["openai-target-language"],
+        );
+        self.compose(
+            "openai-auto-instruction",
+            page,
+            "AUTO SOURCE INSTRUCTION",
+            "You are a real-time speech translator. The input language is one of the following: {0}. Translate it into the OTHER language from that list. Output only the translation.",
+            &["openai-target-language"],
+        );
+        self.switch(
+            "openai-instruction",
+            page,
+            "SELECT SOURCE INSTRUCTION",
+            PromptCondition::SourceIsAuto,
+            "openai-explicit-instruction",
+            "openai-auto-instruction",
+        );
+
+        self.compose(
+            "openai-system-with-context",
+            page,
+            "SYSTEM PROMPT WITH CONTEXT",
+            "{0}\n\n{1}\n{2}",
+            &[
+                "openai-instruction",
+                "openai-reference-handling-rules",
+                "openai-reference-context",
+            ],
+        );
+        self.switch(
+            "openai-system",
+            page,
+            "SELECT SYSTEM PROMPT",
+            PromptCondition::HasReferenceContext,
+            "openai-instruction",
+            "openai-system-with-context",
+        );
+        self.compose(
+            "openai-explicit-user",
+            page,
+            "EXPLICIT SOURCE MESSAGE",
+            "Source language: {0}\nCurrent input:\n{1}",
+            &["openai-source-language", "openai-current-input"],
+        );
+        self.compose(
+            "openai-auto-user",
+            page,
+            "AUTO SOURCE MESSAGE",
+            "Current input:\n{0}",
+            &["openai-current-input"],
+        );
+        self.switch(
+            "openai-user",
+            page,
+            "SELECT USER MESSAGE",
+            PromptCondition::SourceIsAuto,
+            "openai-explicit-user",
+            "openai-auto-user",
+        );
+        self.output(
+            "openai-request",
+            PromptProviderTarget::OpenAiCompatible,
+            &[
+                (PromptMessageRole::System, "openai-system"),
+                (PromptMessageRole::User, "openai-user"),
+            ],
+        );
     }
 
-    fn labeled_node(&mut self, id: &str, label: &str, kind: PromptNodeKind) {
+    fn build_hunyuan_flow(&mut self) {
+        let page = PromptNodePage::Hunyuan;
+        self.variable("hunyuan-source-language", page, PromptVariable::SourceLanguage);
+        self.variable("hunyuan-target-language", page, PromptVariable::TargetLanguage);
+        self.variable("hunyuan-current-input", page, PromptVariable::CurrentInput);
+
+        for (id, block) in [
+            (
+                "hunyuan-context-language-order",
+                TranslationPromptBlock::LanguageOrder,
+            ),
+            (
+                "hunyuan-context-terminology",
+                TranslationPromptBlock::Terminology,
+            ),
+            (
+                "hunyuan-context-recent-turns",
+                TranslationPromptBlock::RecentTurns { limit: None },
+            ),
+            (
+                "hunyuan-context-previous-revision",
+                TranslationPromptBlock::PreviousRevision,
+            ),
+            (
+                "hunyuan-context-surrounding-source",
+                TranslationPromptBlock::SurroundingSource,
+            ),
+        ] {
+            self.node(id, page, PromptNodeKind::Input { block });
+        }
+
+        self.compose(
+            "hunyuan-reference-sections",
+            page,
+            "ASSEMBLE CONTEXT SECTIONS",
+            "{0}\n\n{1}\n\n{2}\n\n{3}\n\n{4}",
+            &[
+                "hunyuan-context-language-order",
+                "hunyuan-context-terminology",
+                "hunyuan-context-recent-turns",
+                "hunyuan-context-previous-revision",
+                "hunyuan-context-surrounding-source",
+            ],
+        );
+        self.compose(
+            "hunyuan-reference-context",
+            page,
+            "TRANSLATION CONTEXT",
+            "# Translation Context\n\n{0}",
+            &["hunyuan-reference-sections"],
+        );
+        self.compose(
+            "hunyuan-reference-explicit-rules",
+            page,
+            "EXPLICIT REFERENCE RULES",
+            EXPLICIT_REFERENCE_CONTEXT_INSTRUCTION,
+            &["hunyuan-source-language", "hunyuan-target-language"],
+        );
+        self.compose(
+            "hunyuan-reference-auto-rules",
+            page,
+            "AUTO REFERENCE RULES",
+            AUTO_REFERENCE_CONTEXT_INSTRUCTION,
+            &["hunyuan-target-language"],
+        );
+        self.switch(
+            "hunyuan-reference-handling-rules",
+            page,
+            "SELECT REFERENCE RULES",
+            PromptCondition::SourceIsAuto,
+            "hunyuan-reference-explicit-rules",
+            "hunyuan-reference-auto-rules",
+        );
+
+        self.compose(
+            "hunyuan-explicit-instruction",
+            page,
+            "EXPLICIT SOURCE INSTRUCTION",
+            "Translate the following {0} text into natural {1}. Output only the translation, do not output the prompt; do not add explanations.",
+            &["hunyuan-source-language", "hunyuan-target-language"],
+        );
+        self.compose(
+            "hunyuan-auto-instruction",
+            page,
+            "AUTO SOURCE INSTRUCTION",
+            "Translate the following text into the other language among {0}. Output only the translation; do not add explanations.",
+            &["hunyuan-target-language"],
+        );
+        self.switch(
+            "hunyuan-instruction",
+            page,
+            "SELECT SOURCE INSTRUCTION",
+            PromptCondition::SourceIsAuto,
+            "hunyuan-explicit-instruction",
+            "hunyuan-auto-instruction",
+        );
+
+        self.compose(
+            "hunyuan-with-context",
+            page,
+            "USER PROMPT WITH CONTEXT",
+            "{0}\n\n{1}\n\n--- BEGIN REFERENCE CONTEXT ---\n{2}\n--- END REFERENCE CONTEXT ---\n\nCurrent input:\n{3}",
+            &[
+                "hunyuan-instruction",
+                "hunyuan-reference-handling-rules",
+                "hunyuan-reference-context",
+                "hunyuan-current-input",
+            ],
+        );
+        self.compose(
+            "hunyuan-without-context",
+            page,
+            "USER PROMPT WITHOUT CONTEXT",
+            "{0}\n\n{1}",
+            &["hunyuan-instruction", "hunyuan-current-input"],
+        );
+        self.switch(
+            "hunyuan-user",
+            page,
+            "SELECT USER PROMPT",
+            PromptCondition::HasReferenceContext,
+            "hunyuan-without-context",
+            "hunyuan-with-context",
+        );
+        self.output(
+            "hunyuan-request",
+            PromptProviderTarget::Hunyuan,
+            &[(PromptMessageRole::User, "hunyuan-user")],
+        );
+    }
+
+    fn node(&mut self, id: &str, page: PromptNodePage, kind: PromptNodeKind) {
+        let label = crate::schema::default_node_label(&kind);
+        self.labeled_node(id, page, &label, kind);
+    }
+
+    fn labeled_node(&mut self, id: &str, page: PromptNodePage, label: &str, kind: PromptNodeKind) {
         self.nodes.push(PromptNode {
             id: id.into(),
             label: label.into(),
-            page: node_page(id),
+            page,
             kind,
             position: [0.0, 0.0],
         });
     }
 
-    fn variable(&mut self, id: &str, variable: PromptVariable) {
-        self.node(id, PromptNodeKind::Variable { variable });
+    fn variable(&mut self, id: &str, page: PromptNodePage, variable: PromptVariable) {
+        self.node(id, page, PromptNodeKind::Variable { variable });
     }
 
-    fn compose(&mut self, id: &str, label: &str, text: &str, sources: &[&str]) {
-        self.labeled_node(id, label, PromptNodeKind::Compose { text: text.into() });
+    fn compose(
+        &mut self,
+        id: &str,
+        page: PromptNodePage,
+        label: &str,
+        text: &str,
+        sources: &[&str],
+    ) {
+        self.labeled_node(id, page, label, PromptNodeKind::Compose { text: text.into() });
         for (input, source) in sources.iter().enumerate() {
             self.link(source, id, input as u8);
         }
@@ -253,12 +359,13 @@ impl GraphBuilder {
     fn switch(
         &mut self,
         id: &str,
+        page: PromptNodePage,
         label: &str,
         condition: PromptCondition,
         false_source: &str,
         true_source: &str,
     ) {
-        self.labeled_node(id, label, PromptNodeKind::Switch { condition });
+        self.labeled_node(id, page, label, PromptNodeKind::Switch { condition });
         self.link(false_source, id, 0);
         self.link(true_source, id, 1);
     }
@@ -269,13 +376,19 @@ impl GraphBuilder {
         target: PromptProviderTarget,
         messages: &[(PromptMessageRole, &str)],
     ) {
-        self.node(
-            id,
-            PromptNodeKind::Request {
+        self.nodes.push(PromptNode {
+            id: id.into(),
+            label: crate::schema::default_node_label(&PromptNodeKind::Request {
+                target,
+                roles: messages.iter().map(|(role, _)| *role).collect(),
+            }),
+            page: PromptNodePage::for_target(target),
+            kind: PromptNodeKind::Request {
                 target,
                 roles: messages.iter().map(|(role, _)| *role).collect(),
             },
-        );
+            position: [0.0, 0.0],
+        });
         for (input, (_, source)) in messages.iter().enumerate() {
             self.link(source, id, input as u8);
         }
@@ -296,16 +409,6 @@ impl GraphBuilder {
             links: self.links,
             layout_version: 0,
         }
-    }
-}
-
-fn node_page(id: &str) -> PromptNodePage {
-    if id.starts_with("openai-") {
-        PromptNodePage::OpenAiCompatible
-    } else if id.starts_with("hunyuan-") {
-        PromptNodePage::Hunyuan
-    } else {
-        PromptNodePage::Shared
     }
 }
 
@@ -555,13 +658,13 @@ After current input: speaker-01 en / After it."
             .unwrap();
 
         assert_eq!(
-            execution.trace.node("current-input").unwrap().output,
+            execution.trace.node("hunyuan-current-input").unwrap().output,
             "Then when will you?"
         );
         assert!(
             execution
                 .trace
-                .node("context-recent-turns")
+                .node("hunyuan-context-recent-turns")
                 .unwrap()
                 .output
                 .contains("We changed the plan.")
@@ -601,7 +704,7 @@ After current input: speaker-01 en / After it."
     #[test]
     fn builtin_graph_uses_compose_nodes_instead_of_fragmented_text_nodes() {
         let graph = PromptNodeGraph::builtin_default();
-        assert!(graph.nodes.len() <= 30, "{} nodes", graph.nodes.len());
+        assert!(graph.nodes.len() <= 50, "{} nodes", graph.nodes.len());
         assert!(
             graph
                 .nodes
@@ -678,10 +781,10 @@ After current input: speaker-01 en / After it."
     fn builtin_composition_nodes_have_semantic_editor_labels() {
         let graph = PromptNodeGraph::builtin_default();
         for (id, label) in [
-            ("reference-context", "TRANSLATION CONTEXT"),
-            ("reference-explicit-rules", "EXPLICIT REFERENCE RULES"),
-            ("reference-auto-rules", "AUTO REFERENCE RULES"),
-            ("reference-handling-rules", "SELECT REFERENCE RULES"),
+            ("openai-reference-context", "TRANSLATION CONTEXT"),
+            ("openai-reference-explicit-rules", "EXPLICIT REFERENCE RULES"),
+            ("openai-reference-auto-rules", "AUTO REFERENCE RULES"),
+            ("openai-reference-handling-rules", "SELECT REFERENCE RULES"),
             ("openai-explicit-instruction", "EXPLICIT SOURCE INSTRUCTION"),
             ("openai-system", "SELECT SYSTEM PROMPT"),
             ("hunyuan-with-context", "USER PROMPT WITH CONTEXT"),
@@ -703,17 +806,17 @@ After current input: speaker-01 en / After it."
         let explicit_rules = graph
             .nodes
             .iter()
-            .find(|node| node.id == "reference-explicit-rules")
+            .find(|node| node.id == "openai-reference-explicit-rules")
             .unwrap();
         let auto_rules = graph
             .nodes
             .iter()
-            .find(|node| node.id == "reference-auto-rules")
+            .find(|node| node.id == "openai-reference-auto-rules")
             .unwrap();
         let switch_rules = graph
             .nodes
             .iter()
-            .find(|node| node.id == "reference-handling-rules")
+            .find(|node| node.id == "openai-reference-handling-rules")
             .unwrap();
         let openai = graph
             .nodes
@@ -817,7 +920,7 @@ After current input: speaker-01 en / After it."
         let explicit_rules = graph
             .nodes
             .iter()
-            .find(|node| node.id == "reference-explicit-rules")
+            .find(|node| node.id == "openai-reference-explicit-rules")
             .unwrap();
         match &explicit_rules.kind {
             PromptNodeKind::Compose { text } => {
@@ -830,13 +933,13 @@ After current input: speaker-01 en / After it."
                 ));
                 assert_eq!(text, EXPLICIT_REFERENCE_CONTEXT_INSTRUCTION);
             }
-            _ => panic!("reference-explicit-rules must be a Compose node"),
+            _ => panic!("openai-reference-explicit-rules must be a Compose node"),
         }
 
         let auto_rules = graph
             .nodes
             .iter()
-            .find(|node| node.id == "reference-auto-rules")
+            .find(|node| node.id == "openai-reference-auto-rules")
             .unwrap();
         match &auto_rules.kind {
             PromptNodeKind::Compose { text } => {
@@ -851,7 +954,7 @@ After current input: speaker-01 en / After it."
                 ));
                 assert_eq!(text, AUTO_REFERENCE_CONTEXT_INSTRUCTION);
             }
-            _ => panic!("reference-auto-rules must be a Compose node"),
+            _ => panic!("openai-reference-auto-rules must be a Compose node"),
         }
     }
 

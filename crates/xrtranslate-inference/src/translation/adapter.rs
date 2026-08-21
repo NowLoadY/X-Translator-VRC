@@ -156,7 +156,7 @@ mod tests {
         assert_eq!(
             result
                 .prompt_trace
-                .node("current-input")
+                .node("hunyuan-current-input")
                 .map(|node| node.output.as_str()),
             Some("hello")
         );

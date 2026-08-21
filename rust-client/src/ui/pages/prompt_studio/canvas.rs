@@ -220,6 +220,79 @@ pub(super) fn render_graph_editor(
         if editable {
             ui.separator();
             render_node_toolbar(&mut draft, controller, ui, language);
+            if small_outline_button(
+                ui,
+                crate::i18n::tr(language, "AUTO LAYOUT"),
+                crate::i18n::tr(language, "Automatically arrange nodes"),
+            )
+            .clicked()
+            {
+                let before = draft.clone();
+                draft.graph.auto_layout();
+                controller.fit_pending = true;
+                controller.push_history(before);
+            }
+            if small_outline_button(
+                ui,
+                crate::i18n::tr(language, "FIT"),
+                crate::i18n::tr(language, "Fit graph to canvas"),
+            )
+            .clicked()
+            {
+                controller.fit_pending = true;
+            }
+            if small_icon_button(ui, "-", crate::i18n::tr(language, "Zoom out")).clicked() {
+                controller.zoom = (controller.zoom - 0.1).clamp(0.25, 1.6);
+            }
+            if small_icon_button(ui, "+", crate::i18n::tr(language, "Zoom in")).clicked() {
+                controller.zoom = (controller.zoom + 0.1).clamp(0.25, 1.6);
+            }
+            ui.separator();
+            let undo_enabled = controller.can_undo();
+            let undo_btn = ui
+                .add_enabled(
+                    undo_enabled,
+                    egui::Button::new(
+                        RichText::new(crate::i18n::tr(language, "UNDO"))
+                            .font(egui::FontId::monospace(9.5))
+                            .color(if undo_enabled { style::INK } else { style::MUTED }),
+                    )
+                    .fill(Color32::TRANSPARENT)
+                    .stroke(Stroke::new(1.0, style::BAR_BORDER))
+                    .corner_radius(CornerRadius::same(1))
+                    .min_size(Vec2::new(52.0, 25.0)),
+                )
+                .on_hover_text(crate::i18n::tr(language, "Undo last action (Ctrl+Z)"));
+            if undo_btn.clicked() {
+                controller.undo();
+                if let Some(d) = &controller.draft {
+                    draft = d.clone();
+                }
+            }
+            let redo_enabled = controller.can_redo();
+            let redo_btn = ui
+                .add_enabled(
+                    redo_enabled,
+                    egui::Button::new(
+                        RichText::new(crate::i18n::tr(language, "REDO"))
+                            .font(egui::FontId::monospace(9.5))
+                            .color(if redo_enabled { style::INK } else { style::MUTED }),
+                    )
+                    .fill(Color32::TRANSPARENT)
+                    .stroke(Stroke::new(1.0, style::BAR_BORDER))
+                    .corner_radius(CornerRadius::same(1))
+                    .min_size(Vec2::new(52.0, 25.0)),
+                )
+                .on_hover_text(crate::i18n::tr(
+                    language,
+                    "Redo last action (Ctrl+Y / Ctrl+Shift+Z)",
+                ));
+            if redo_btn.clicked() {
+                controller.redo();
+                if let Some(d) = &controller.draft {
+                    draft = d.clone();
+                }
+            }
         }
         ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
             if editable {
@@ -231,6 +304,13 @@ pub(super) fn render_graph_editor(
                 .clicked()
                 {
                     actions.push(PromptStudioAction::DeleteProfile(draft.id.clone()));
+                }
+                if validation_error.is_none()
+                    && draft.id != snapshot.active_id
+                    && style::command_button(ui, crate::i18n::tr(language, "ACTIVATE"), true).clicked()
+                {
+                    actions.push(PromptStudioAction::ActivateProfile(draft.clone()));
+                    controller.dirty = false;
                 }
             } else if small_outline_button(
                 ui,
@@ -247,40 +327,23 @@ pub(super) fn render_graph_editor(
                 actions.push(PromptStudioAction::CloneProfile(copy.clone()));
                 controller.set_draft(copy);
             }
-            if validation_error.is_none()
-                && draft.id != snapshot.active_id
-                && style::command_button(ui, crate::i18n::tr(language, "ACTIVATE"), true).clicked()
+            if small_outline_button(
+                ui,
+                crate::i18n::tr(language, "EXPORT"),
+                crate::i18n::tr(language, "Export graph project file"),
+            )
+            .clicked()
             {
-                actions.push(PromptStudioAction::ActivateProfile(draft.clone()));
-                controller.dirty = false;
+                actions.push(PromptStudioAction::ExportProfile(draft.clone()));
             }
-            if editable
-                && small_outline_button(
-                    ui,
-                    crate::i18n::tr(language, "AUTO LAYOUT"),
-                    crate::i18n::tr(language, "Automatically arrange nodes"),
-                )
-                .clicked()
+            if small_outline_button(
+                ui,
+                crate::i18n::tr(language, "IMPORT"),
+                crate::i18n::tr(language, "Import graph project file"),
+            )
+            .clicked()
             {
-                draft.graph.auto_layout();
-                controller.fit_pending = true;
-                controller.mark_dirty();
-            }
-            if editable
-                && small_outline_button(
-                    ui,
-                    crate::i18n::tr(language, "FIT"),
-                    crate::i18n::tr(language, "Fit graph to canvas"),
-                )
-                .clicked()
-            {
-                controller.fit_pending = true;
-            }
-            if small_icon_button(ui, "-", crate::i18n::tr(language, "Zoom out")).clicked() {
-                controller.zoom = (controller.zoom - 0.1).clamp(0.25, 1.6);
-            }
-            if small_icon_button(ui, "+", crate::i18n::tr(language, "Zoom in")).clicked() {
-                controller.zoom = (controller.zoom + 0.1).clamp(0.25, 1.6);
+                actions.push(PromptStudioAction::ImportProfile);
             }
         });
     });
@@ -344,6 +407,8 @@ pub(super) fn render_graph_editor(
             let is_pulling_wire =
                 controller.wire_from.is_some() || controller.wire_from_input.is_some();
 
+            navigation::update_wire_dragging_navigation(controller, canvas, ui, is_pulling_wire);
+
             if editable && response.secondary_clicked() {
                 if is_pulling_wire {
                     controller.wire_from = None;
@@ -362,7 +427,7 @@ pub(super) fn render_graph_editor(
                 });
             }
             if controller.fit_pending {
-                fit_graph_to_canvas(&draft.graph, controller, canvas.size());
+                navigation::fit_graph_to_canvas(&draft.graph, controller, canvas.size());
                 controller.fit_pending = false;
             }
             let mut canvas_ui = canvas_viewport(ui, canvas);
@@ -468,33 +533,47 @@ pub(super) fn render_graph_editor(
                                     .contains(pointer)
                         });
                     if !over_runtime_preview {
-                        zoom_at_pointer(controller, canvas, pointer, scroll);
+                        navigation::zoom_at_pointer(controller, canvas, pointer, scroll);
                     }
                 }
             }
-            if editable
-                && !canvas_ui.ctx().egui_wants_keyboard_input()
-                && canvas_ui.input(|input| {
+            if editable && !canvas_ui.ctx().egui_wants_keyboard_input() {
+                let ctrl = canvas_ui.input(|i| i.modifiers.command || i.modifiers.ctrl);
+                let shift = canvas_ui.input(|i| i.modifiers.shift);
+                if ctrl && !shift && canvas_ui.input(|i| i.key_pressed(egui::Key::Z)) {
+                    controller.undo();
+                    if let Some(d) = &controller.draft {
+                        draft = d.clone();
+                    }
+                } else if (ctrl && shift && canvas_ui.input(|i| i.key_pressed(egui::Key::Z)))
+                    || (ctrl && canvas_ui.input(|i| i.key_pressed(egui::Key::Y)))
+                {
+                    controller.redo();
+                    if let Some(d) = &controller.draft {
+                        draft = d.clone();
+                    }
+                } else if canvas_ui.input(|input| {
                     input.key_pressed(egui::Key::Delete) || input.key_pressed(egui::Key::Backspace)
-                })
-            {
-                let mut modified = false;
-                let selected = controller.selected_nodes.drain().collect::<Vec<_>>();
-                for id in &selected {
-                    draft.graph.remove_node(&id);
-                    modified = true;
-                }
-                let selected_links = controller.selected_links.drain().collect::<Vec<_>>();
-                for link_key in &selected_links {
-                    draft.graph.links.retain(|link| {
-                        !(link.from == link_key.from
-                            && link.to == link_key.to
-                            && link.input == link_key.input)
-                    });
-                    modified = true;
-                }
-                if modified {
-                    controller.mark_dirty();
+                }) {
+                    let before = draft.clone();
+                    let mut modified = false;
+                    let selected = controller.selected_nodes.drain().collect::<Vec<_>>();
+                    for id in &selected {
+                        draft.graph.remove_node(&id);
+                        modified = true;
+                    }
+                    let selected_links = controller.selected_links.drain().collect::<Vec<_>>();
+                    for link_key in &selected_links {
+                        draft.graph.links.retain(|link| {
+                            !(link.from == link_key.from
+                                && link.to == link_key.to
+                                && link.input == link_key.input)
+                        });
+                        modified = true;
+                    }
+                    if modified {
+                        controller.push_history(before);
+                    }
                 }
             }
             if canvas_ui.input(|input| input.key_pressed(egui::Key::Escape)) {
@@ -503,6 +582,7 @@ pub(super) fn render_graph_editor(
                 controller.box_select_start = None;
                 controller.box_select_current = None;
                 controller.selected_links.clear();
+                controller.cancel_editing_title();
             }
             draw_canvas_background(&mut canvas_ui, canvas, controller);
             render_links(&mut canvas_ui, canvas, &mut draft, controller, editable);
@@ -518,7 +598,7 @@ pub(super) fn render_graph_editor(
             );
             render_wire_preview(&mut canvas_ui, canvas, &draft, controller);
             render_selection_box(&mut canvas_ui, controller);
-            render_canvas_navigation_hint(&canvas_ui, canvas, language);
+            navigation::render_canvas_navigation_hint(&canvas_ui, canvas, language);
         });
     controller.draft = Some(draft);
 }
@@ -576,8 +656,9 @@ fn render_node_menu(
         ] {
             if ui.button(crate::i18n::tr(language, label)).clicked() {
                 let position = node_add_position(controller, &draft.graph, preferred_center);
+                let before = draft.clone();
                 let id = draft.graph.add_variable(page, variable, position);
-                finish_node_add(draft, controller, id);
+                finish_node_add(draft, controller, before, id);
                 ui.close();
             }
         }
@@ -590,8 +671,9 @@ fn render_node_menu(
         for (label, block) in available_blocks() {
             if ui.button(crate::i18n::tr(language, label)).clicked() {
                 let position = node_add_position(controller, &draft.graph, preferred_center);
+                let before = draft.clone();
                 let id = draft.graph.add_input(page, block, position);
-                finish_node_add(draft, controller, id);
+                finish_node_add(draft, controller, before, id);
                 ui.close();
             }
         }
@@ -606,8 +688,9 @@ fn render_node_menu(
         ] {
             if ui.button(crate::i18n::tr(language, label)).clicked() {
                 let position = node_add_position(controller, &draft.graph, preferred_center);
+                let before = draft.clone();
                 let id = draft.graph.add_switch(page, condition, position);
-                finish_node_add(draft, controller, id);
+                finish_node_add(draft, controller, before, id);
                 ui.close();
             }
         }
@@ -622,10 +705,11 @@ fn render_node_menu(
             .clicked()
         {
             let position = node_add_position(controller, &draft.graph, preferred_center);
+            let before = draft.clone();
             let id = draft
                 .graph
                 .add_compose(page, "Write prompt text here: {0}".into(), position);
-            finish_node_add(draft, controller, id);
+            finish_node_add(draft, controller, before, id);
             ui.close();
         }
     });
@@ -649,8 +733,9 @@ fn render_node_menu(
             .clicked()
         {
             let position = node_add_position(controller, &draft.graph, preferred_center);
+            let before = draft.clone();
             let id = draft.graph.add_request(target, roles, position);
-            finish_node_add(draft, controller, id);
+            finish_node_add(draft, controller, before, id);
             ui.close();
         }
     });
@@ -670,12 +755,13 @@ fn node_add_position(
 fn finish_node_add(
     draft: &mut PromptTemplateProfile,
     controller: &mut PromptStudioController,
+    before: PromptTemplateProfile,
     id: String,
 ) {
     draft.graph.layout_version = 0;
     controller.selected_nodes.clear();
     controller.selected_nodes.insert(id);
-    controller.mark_dirty();
+    controller.push_history(before);
 }
 
 fn draw_canvas_background(ui: &egui::Ui, canvas: Rect, controller: &PromptStudioController) {
@@ -838,13 +924,14 @@ fn render_links(
     }
 
     if let Some(index) = remove_link {
+        let before = profile.clone();
         let removed = profile.graph.links.remove(index);
         controller.selected_links.remove(&PromptLinkKey {
             from: removed.from,
             to: removed.to,
             input: removed.input,
         });
-        controller.mark_dirty();
+        controller.push_history(before);
     }
 }
 
@@ -890,10 +977,22 @@ fn render_nodes(
                 "API REQUEST PREVIEW\n\n{}",
                 truncate_preview(&preview, 1200)
             ))
+        } else if editable {
+            response.on_hover_text(crate::i18n::tr(
+                language,
+                "Drag header to move · Double-click to rename",
+            ))
         } else {
             response
         };
-        if editable && response.clicked() {
+        if editable && response.double_clicked() {
+            let initial = if node.label.trim().is_empty() || node.label == "COMPOSE TEXT" {
+                node_display_label(&node)
+            } else {
+                node.label.clone()
+            };
+            controller.start_editing_title(node.id.clone(), initial, profile.clone());
+        } else if editable && response.clicked() {
             let extend = ui.input(|input| input.modifiers.shift || input.modifiers.ctrl);
             if extend {
                 if !controller.selected_nodes.insert(node.id.clone()) {
@@ -912,6 +1011,7 @@ fn render_nodes(
                 controller.selected_nodes.insert(node.id.clone());
             }
             controller.drag_node = Some(node.id.clone());
+            controller.drag_start_profile = Some(profile.clone());
         }
         if editable
             && response.dragged()
@@ -940,6 +1040,11 @@ fn render_nodes(
             }
             controller.drag_node = None;
             controller.drag_origins.clear();
+            if let Some(before) = controller.drag_start_profile.take() {
+                if before.graph.nodes != profile.graph.nodes {
+                    controller.push_history(before);
+                }
+            }
         }
         let scale = node_scale(rect, &node);
         let close_rect = Rect::from_center_size(
@@ -982,9 +1087,10 @@ fn render_nodes(
         );
     }
     if let Some(id) = remove_id {
+        let before = profile.clone();
         profile.graph.remove_node(&id);
         controller.selected_nodes.remove(&id);
-        controller.mark_dirty();
+        controller.push_history(before);
     }
 }
 
@@ -1044,37 +1150,70 @@ fn draw_node(
     let title_width =
         (rect.width() - 18.0 * scale - kind_width - close_width).max(title_font_size * 8.0);
     let title_chars = (title_width / (title_font_size * 0.62)).floor() as usize;
-    if editable && matches!(node.kind, PromptNodeKind::Compose { .. }) {
-        let mut edited_title = if node.label.trim().is_empty() || node.label == "COMPOSE TEXT" {
-            title
-        } else {
-            node.label.clone()
-        };
-        let title_rect = Rect::from_min_size(
-            Pos2::new(rect.left() + 7.0 * scale, rect.top() + 2.0 * scale),
-            Vec2::new(title_width, (header_height - 4.0 * scale).max(12.0)),
-        );
-        let changed = ui
-            .put(
+
+    let is_renaming = editable
+        && controller
+            .editing_title
+            .as_ref()
+            .is_some_and(|edit| edit.node_id == node.id);
+
+    if is_renaming {
+        let mut committed_text = None;
+        let mut cancelled = false;
+        if let Some(edit) = &mut controller.editing_title {
+            let title_rect = Rect::from_min_size(
+                Pos2::new(rect.left() + 7.0 * scale, rect.top() + 2.0 * scale),
+                Vec2::new(title_width, (header_height - 4.0 * scale).max(14.0)),
+            );
+            ui.painter().rect_filled(
+                title_rect.expand(1.0),
+                CornerRadius::same(1),
+                Color32::WHITE,
+            );
+            ui.painter().rect_stroke(
+                title_rect.expand(1.0),
+                CornerRadius::same(1),
+                Stroke::new(1.0, GRAPH_ACCENT),
+                egui::epaint::StrokeKind::Inside,
+            );
+            let edit_response = ui.put(
                 title_rect,
-                egui::TextEdit::singleline(&mut edited_title)
+                egui::TextEdit::singleline(&mut edit.text)
                     .font(egui::FontId::monospace(title_font_size))
                     .text_color(style::NODE_TEXT)
                     .desired_width(title_width)
                     .frame(egui::Frame::NONE),
-            )
-            .on_hover_text(crate::i18n::tr(language, "Rename this Compose node"))
-            .changed();
-        if changed {
+            );
+            edit_response.request_focus();
+
+            let enter_pressed = ui.input(|i| i.key_pressed(egui::Key::Enter));
+            let escape_pressed = ui.input(|i| i.key_pressed(egui::Key::Escape));
+            let lost_focus = edit_response.lost_focus();
+
+            if escape_pressed {
+                cancelled = true;
+            } else if enter_pressed || lost_focus {
+                committed_text = Some(edit.text.trim().to_string());
+            }
+        }
+        if cancelled {
+            controller.cancel_editing_title();
+        } else if let Some(new_text) = committed_text {
+            let before = controller.title_edit_start_profile.take();
             if let Some(actual) = profile
                 .graph
                 .nodes
                 .iter_mut()
                 .find(|actual| actual.id == node.id)
             {
-                actual.label = edited_title;
-                controller.mark_dirty();
+                if actual.label != new_text {
+                    actual.label = new_text;
+                    if let Some(before_profile) = before {
+                        controller.push_history(before_profile);
+                    }
+                }
             }
+            controller.editing_title = None;
         }
     } else {
         ui.painter().text(
@@ -1311,8 +1450,9 @@ fn render_node_sockets(
         }
         if editable && (output_response.clicked() || output_response.drag_stopped()) {
             if let Some((target_id, target_input)) = controller.wire_from_input.take() {
+                let before = profile.clone();
                 if profile.graph.connect(&node.id, &target_id, target_input) {
-                    controller.mark_dirty();
+                    controller.push_history(before);
                 }
             }
         }
@@ -1361,31 +1501,36 @@ fn render_node_sockets(
                 if controller.wire_from.is_some() {
                     if input_response.clicked() || input_response.drag_stopped() {
                         if let Some(from) = controller.finish_wire() {
+                            let before = profile.clone();
                             if profile.graph.connect(&from, &node.id, input) {
-                                controller.mark_dirty();
+                                controller.push_history(before);
                             }
                         }
                     }
                 } else if let Some(link) = connected_link.as_ref() {
                     if input_response.drag_started() {
                         let from_id = link.from.clone();
+                        let before = profile.clone();
                         profile
                             .graph
                             .links
                             .retain(|l| !(l.to == node.id && l.input == input));
                         controller.wire_from = Some(from_id);
-                        controller.mark_dirty();
+                        controller.push_history(before);
                     } else if input_response.secondary_clicked() {
+                        let before = profile.clone();
                         profile
                             .graph
                             .links
                             .retain(|l| !(l.to == node.id && l.input == input));
-                        controller.mark_dirty();
+                        controller.push_history(before);
                     }
                 } else {
                     if input_response.drag_started() {
                         controller.wire_from_input = Some((node.id.clone(), input));
                     } else if input_response.secondary_clicked() {
+                        let before = profile.clone();
+                        let mut removed = false;
                         if let Some(actual) = profile
                             .graph
                             .nodes
@@ -1394,9 +1539,12 @@ fn render_node_sockets(
                         {
                             if let PromptNodeKind::Compose { text } = &mut actual.kind {
                                 remove_compose_placeholder(text, input);
-                                profile.graph.layout_version = 0;
-                                controller.mark_dirty();
+                                removed = true;
                             }
+                        }
+                        if removed {
+                            profile.graph.layout_version = 0;
+                            controller.push_history(before);
                         }
                     }
                 }
@@ -1548,50 +1696,6 @@ fn render_selection_box(ui: &egui::Ui, controller: &PromptStudioController) {
     );
 }
 
-fn render_canvas_navigation_hint(ui: &egui::Ui, canvas: Rect, language: crate::i18n::UiLanguage) {
-    let font_id = egui::FontId::monospace(9.5);
-    let text_color = Color32::BLACK;
-
-    let items = [
-        (
-            "NAVIGATE",
-            "Space + Left Drag / Middle Drag to pan · Mouse Wheel to zoom",
-        ),
-        (
-            "SELECT",
-            "Left Drag on canvas to box select · Shift + Click to multi-select",
-        ),
-        (
-            "CONNECT",
-            "Drag socket to connect / unplug · Click empty space to cancel wire",
-        ),
-        (
-            "ACTIONS",
-            "Del / Backspace to delete · Right-Click socket to disconnect",
-        ),
-    ];
-
-    let line_height = 16.0;
-    let base_y = canvas.bottom() - 12.0;
-    let right_x = canvas.right() - 16.0;
-
-    for (index, (tag, detail)) in items.iter().rev().enumerate() {
-        let y = base_y - index as f32 * line_height;
-        let line_text = format!(
-            "{} · {}",
-            crate::i18n::tr(language, tag),
-            crate::i18n::tr(language, detail)
-        );
-        ui.painter().text(
-            Pos2::new(right_x, y),
-            egui::Align2::RIGHT_BOTTOM,
-            line_text,
-            font_id.clone(),
-            text_color,
-        );
-    }
-}
-
 fn rect_between(first: Pos2, second: Pos2) -> Rect {
     Rect::from_min_max(
         Pos2::new(first.x.min(second.x), first.y.min(second.y)),
@@ -1612,54 +1716,6 @@ fn graph_rect(
         ),
         size * controller.zoom,
     )
-}
-
-fn fit_graph_to_canvas(
-    graph: &PromptNodeGraph,
-    controller: &mut PromptStudioController,
-    available: Vec2,
-) {
-    if !graph
-        .nodes
-        .iter()
-        .any(|node| controller.node_is_visible(node))
-    {
-        return;
-    }
-    let min_x = graph
-        .nodes
-        .iter()
-        .filter(|node| controller.node_is_visible(node))
-        .map(|node| node.position[0])
-        .fold(f32::INFINITY, f32::min);
-    let max_x = graph
-        .nodes
-        .iter()
-        .filter(|node| controller.node_is_visible(node))
-        .map(|node| node.position[0] + node_size(node).x)
-        .fold(f32::NEG_INFINITY, f32::max);
-    let min_y = graph
-        .nodes
-        .iter()
-        .filter(|node| controller.node_is_visible(node))
-        .map(|node| node.position[1])
-        .fold(f32::INFINITY, f32::min);
-    let max_y = graph
-        .nodes
-        .iter()
-        .filter(|node| controller.node_is_visible(node))
-        .map(|node| node.position[1] + node_size(node).y)
-        .fold(f32::NEG_INFINITY, f32::max);
-    let graph_width = (max_x - min_x).max(NODE_WIDTH);
-    let graph_height = (max_y - min_y).max(84.0);
-    let viewport = (available - Vec2::splat(48.0)).max(Vec2::splat(1.0));
-    controller.zoom = (viewport.x / graph_width)
-        .min(viewport.y / graph_height)
-        .clamp(0.25, 1.0);
-    controller.pan = Vec2::new(
-        (available.x - graph_width * controller.zoom) * 0.5 - min_x * controller.zoom,
-        (available.y - graph_height * controller.zoom) * 0.5 - min_y * controller.zoom,
-    );
 }
 
 fn socket_position(
@@ -1702,24 +1758,6 @@ fn input_socket_indexes(graph: &PromptNodeGraph, node: &PromptNode) -> Vec<u8> {
         PromptNodeKind::Request { roles, .. } => (0..roles.len() as u8).collect(),
         _ => Vec::new(),
     }
-}
-
-fn zoom_at_pointer(
-    controller: &mut PromptStudioController,
-    canvas: Rect,
-    pointer: Pos2,
-    scroll: f32,
-) {
-    let old_zoom = controller.zoom;
-    let factor = (scroll * 0.0015).exp();
-    let new_zoom = (old_zoom * factor).clamp(0.25, 1.6);
-    if (new_zoom - old_zoom).abs() <= f32::EPSILON {
-        return;
-    }
-    let pointer_in_canvas = pointer - canvas.min;
-    let graph_position = (pointer_in_canvas - controller.pan) / old_zoom;
-    controller.zoom = new_zoom;
-    controller.pan = pointer_in_canvas - graph_position * new_zoom;
 }
 
 fn bezier_points(from: Pos2, to: Pos2) -> [Pos2; 4] {
@@ -1806,7 +1844,7 @@ mod tests {
         let canvas = Rect::from_min_size(Pos2::ZERO, available);
         let mut controller = PromptStudioController::default();
 
-        fit_graph_to_canvas(&graph, &mut controller, available);
+        navigation::fit_graph_to_canvas(&graph, &mut controller, available);
 
         for node in &graph.nodes {
             let rect = graph_rect(canvas, &controller, node.position, node_size(node));

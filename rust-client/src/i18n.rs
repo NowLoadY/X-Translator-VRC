@@ -105,6 +105,52 @@ pub fn tr_dynamic<'a>(language: UiLanguage, english: &'a str) -> Cow<'a, str> {
 
 /// Consolidated single-source-of-truth dictionary: `(English Key, Chinese (zh), Japanese (ja), Korean (ko), Russian (ru))`
 const DICTIONARY: &[(&str, &str, &str, &str, &str)] = &[
+    ("EXPORT", "导出工程", "エクスポート", "내보내기", "Экспорт"),
+    ("IMPORT", "导入工程", "インポート", "가져오기", "Импорт"),
+    (
+        "Export graph project file",
+        "导出当前提示词图工程文件 (.json)",
+        "プロンプトグラフプロジェクトファイルをエクスポート (.json)",
+        "프롬프트 그래프 프로젝트 파일 내보내기 (.json)",
+        "Экспорт файла проекта графа промптов (.json)",
+    ),
+    (
+        "Import graph project file",
+        "导入提示词图工程文件 (.json)",
+        "プロンプトグラフプロジェクトファイルをインポート (.json)",
+        "프롬프트 그래프 프로젝트 파일 가져오기 (.json)",
+        "Импорт файла проекта графа промптов (.json)",
+    ),
+    ("UNDO", "撤销", "元に戻す", "실행 취소", "Отменить"),
+    ("REDO", "重做", "やり直す", "다시 실행", "Повторить"),
+    (
+        "Undo last action (Ctrl+Z)",
+        "撤销上一步操作 (Ctrl+Z)",
+        "最後のアクションを元に戻す (Ctrl+Z)",
+        "마지막 작업 실행 취소 (Ctrl+Z)",
+        "Отменить последнее действие (Ctrl+Z)",
+    ),
+    (
+        "Redo last action (Ctrl+Y / Ctrl+Shift+Z)",
+        "重做操作 (Ctrl+Y / Ctrl+Shift+Z)",
+        "操作をやり直す (Ctrl+Y / Ctrl+Shift+Z)",
+        "작업 다시 실행 (Ctrl+Y / Ctrl+Shift+Z)",
+        "Повторить действие (Ctrl+Y / Ctrl+Shift+Z)",
+    ),
+    (
+        "Drag header to move · Double-click to rename",
+        "拖动标题移动 · 双击重命名",
+        "ヘッダーをドラッグして移動 · ダブルクリックで名前変更",
+        "헤더를 드래그하여 이동 · 더블 클릭하여 이름 바꾸기",
+        "Перетащите заголовок для перемещения · Двойной щелчок для переименования",
+    ),
+    (
+        "Double-click to rename",
+        "双击重命名",
+        "ダブルクリックで名前変更",
+        "더블 클릭하여 이름 바꾸기",
+        "Двойной щелчок для переименования",
+    ),
     ("Open", "打开", "開く", "열기", "Открыть"),
     ("Delete", "删除", "削除", "삭제", "Удалить"),
     ("Cancel", "取消", "キャンセル", "취소", "Отмена"),
