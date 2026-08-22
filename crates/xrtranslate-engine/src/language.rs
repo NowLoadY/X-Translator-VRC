@@ -12,6 +12,7 @@ pub enum Script {
     Cyrillic,
     Hangul,
     Thai,
+    Devanagari,
 }
 
 /// Identifies all Unicode scripts present in the text.
@@ -33,6 +34,10 @@ pub fn observed_scripts(text: &str) -> Vec<Script> {
                 Some(Script::Hangul)
             } else if ('\u{0e00}'..='\u{0e7f}').contains(&character) {
                 Some(Script::Thai)
+            } else if ('\u{0900}'..='\u{097f}').contains(&character)
+                || ('\u{a8e0}'..='\u{a8ff}').contains(&character)
+            {
+                Some(Script::Devanagari)
             } else {
                 None
             };
@@ -96,6 +101,9 @@ pub fn has_substantial_script_evidence(script: Script, text: &str) -> bool {
         Script::Thai => trimmed
             .chars()
             .any(|c| ('\u{0e00}'..='\u{0e7f}').contains(&c)),
+        Script::Devanagari => trimmed.chars().any(|c| {
+            ('\u{0900}'..='\u{097f}').contains(&c) || ('\u{a8e0}'..='\u{a8ff}').contains(&c)
+        }),
     }
 }
 
@@ -128,6 +136,14 @@ pub fn detect_text_language(text: &str) -> Option<&'static str> {
         .any(|c| ('\u{0e00}'..='\u{0e7f}').contains(&c))
     {
         return Some("th");
+    }
+
+    // Check for Devanagari (Hindi).
+    if trimmed
+        .chars()
+        .any(|c| ('\u{0900}'..='\u{097f}').contains(&c) || ('\u{a8e0}'..='\u{a8ff}').contains(&c))
+    {
+        return Some("hi");
     }
 
     // Check for Cyrillic (Russian).
@@ -193,6 +209,12 @@ fn is_language_code_match(detected: &str, code: &str) -> bool {
     if detected.eq_ignore_ascii_case(code) {
         return true;
     }
+    let primary = code.split(['-', '_']).next().unwrap_or(code);
+    if detected.eq_ignore_ascii_case(primary)
+        || (detected.eq_ignore_ascii_case("hi") && primary.eq_ignore_ascii_case("hin"))
+    {
+        return true;
+    }
     if detected == "zh" && (code.starts_with("zh") || code == "zh-tw" || code == "zh-cn") {
         return true;
     }
@@ -200,14 +222,20 @@ fn is_language_code_match(detected: &str, code: &str) -> bool {
 }
 
 fn static_code(code: &str) -> &'static str {
-    match code.to_ascii_lowercase().as_str() {
-        "zh" | "zh-cn" | "zh-hans" => "zh",
-        "zh-tw" | "zh-hant" | "zh-hk" => "zh-TW",
+    let normalized = code.trim().to_ascii_lowercase().replace('_', "-");
+    match normalized.as_str() {
+        "zh-tw" | "zh-hant" | "zh-hk" | "zh-mo" => return "zh-TW",
+        "zh" | "zh-cn" | "zh-hans" => return "zh",
+        _ => {}
+    }
+    let primary = normalized.split('-').next().unwrap_or_default();
+    match primary {
         "en" => "en",
         "ja" => "ja",
         "ko" => "ko",
         "ru" => "ru",
         "th" => "th",
+        "hi" | "hin" => "hi",
         "fr" => "fr",
         "de" => "de",
         "es" => "es",
@@ -235,6 +263,7 @@ mod tests {
         assert_eq!(detect_text_language("안녕하세요"), Some("ko"));
         assert_eq!(detect_text_language("Привет мир"), Some("ru"));
         assert_eq!(detect_text_language("สวัสดีชาวโลก"), Some("th"));
+        assert_eq!(detect_text_language("स्वागत है"), Some("hi"));
         assert_eq!(detect_text_language("12345"), None);
         assert_eq!(detect_text_language("   "), None);
         assert_eq!(detect_text_language("ok"), None); // Short acronym ignored as substantial
@@ -242,6 +271,9 @@ mod tests {
 
     #[test]
     fn test_auto_route_language_pair() {
+        assert_eq!(static_code("vi-VN"), "vi");
+        assert_eq!(static_code("hi_IN"), "hi");
+
         // When typing English on a zh -> en pair, it should flip to en -> zh
         assert_eq!(
             auto_route_language_pair("How are you today?", "zh", "en"),
@@ -256,6 +288,16 @@ mod tests {
 
         // When typing Chinese on a zh -> en pair, no change is needed
         assert_eq!(auto_route_language_pair("你好世界", "zh", "en"), None);
+
+        // Devanagari provides an unambiguous route for Hindi.
+        assert_eq!(
+            auto_route_language_pair("नमस्ते दुनिया", "en", "hi-IN"),
+            Some(("hi", "en"))
+        );
+        assert_eq!(
+            auto_route_language_pair("नमस्ते दुनिया", "en", "hin"),
+            Some(("hi", "en"))
+        );
 
         // When typing Japanese on a zh -> en pair, routes ja -> en
         assert_eq!(

@@ -49,8 +49,16 @@ struct GraphBuilder {
 impl GraphBuilder {
     fn build_openai_flow(&mut self) {
         let page = PromptNodePage::OpenAiCompatible;
-        self.variable("openai-source-language", page, PromptVariable::SourceLanguage);
-        self.variable("openai-target-language", page, PromptVariable::TargetLanguage);
+        self.variable(
+            "openai-source-language",
+            page,
+            PromptVariable::SourceLanguage,
+        );
+        self.variable(
+            "openai-target-language",
+            page,
+            PromptVariable::TargetLanguage,
+        );
         self.variable("openai-current-input", page, PromptVariable::CurrentInput);
 
         for (id, block) in [
@@ -58,7 +66,10 @@ impl GraphBuilder {
                 "openai-context-language-order",
                 TranslationPromptBlock::LanguageOrder,
             ),
-            ("openai-context-terminology", TranslationPromptBlock::Terminology),
+            (
+                "openai-context-terminology",
+                TranslationPromptBlock::Terminology,
+            ),
             (
                 "openai-context-recent-turns",
                 TranslationPromptBlock::RecentTurns { limit: None },
@@ -194,8 +205,16 @@ impl GraphBuilder {
 
     fn build_hunyuan_flow(&mut self) {
         let page = PromptNodePage::Hunyuan;
-        self.variable("hunyuan-source-language", page, PromptVariable::SourceLanguage);
-        self.variable("hunyuan-target-language", page, PromptVariable::TargetLanguage);
+        self.variable(
+            "hunyuan-source-language",
+            page,
+            PromptVariable::SourceLanguage,
+        );
+        self.variable(
+            "hunyuan-target-language",
+            page,
+            PromptVariable::TargetLanguage,
+        );
         self.variable("hunyuan-current-input", page, PromptVariable::CurrentInput);
 
         for (id, block) in [
@@ -350,7 +369,12 @@ impl GraphBuilder {
         text: &str,
         sources: &[&str],
     ) {
-        self.labeled_node(id, page, label, PromptNodeKind::Compose { text: text.into() });
+        self.labeled_node(
+            id,
+            page,
+            label,
+            PromptNodeKind::Compose { text: text.into() },
+        );
         for (input, source) in sources.iter().enumerate() {
             self.link(source, id, input as u8);
         }
@@ -658,7 +682,11 @@ After current input: speaker-01 en / After it."
             .unwrap();
 
         assert_eq!(
-            execution.trace.node("hunyuan-current-input").unwrap().output,
+            execution
+                .trace
+                .node("hunyuan-current-input")
+                .unwrap()
+                .output,
             "Then when will you?"
         );
         assert!(
@@ -782,7 +810,10 @@ After current input: speaker-01 en / After it."
         let graph = PromptNodeGraph::builtin_default();
         for (id, label) in [
             ("openai-reference-context", "TRANSLATION CONTEXT"),
-            ("openai-reference-explicit-rules", "EXPLICIT REFERENCE RULES"),
+            (
+                "openai-reference-explicit-rules",
+                "EXPLICIT REFERENCE RULES",
+            ),
             ("openai-reference-auto-rules", "AUTO REFERENCE RULES"),
             ("openai-reference-handling-rules", "SELECT REFERENCE RULES"),
             ("openai-explicit-instruction", "EXPLICIT SOURCE INSTRUCTION"),

@@ -38,9 +38,16 @@ struct ServiceCategory {
 pub(crate) struct OnboardingProviderState {
     pub selected: String,
     pub remote: bool,
-    pub choices: Vec<(String, bool)>,
+    pub choices: Vec<OnboardingProviderChoice>,
     pub model: String,
     pub api_key: String,
+}
+
+#[derive(Clone)]
+pub(crate) struct OnboardingProviderChoice {
+    pub name: String,
+    pub remote: bool,
+    pub model_asset: Option<String>,
 }
 
 /// Editable view of the ASR, translation, and TTS provider portions of `config.json`.
@@ -171,7 +178,11 @@ impl ServiceConfigEditor {
             choices: category
                 .providers
                 .iter()
-                .map(|provider| (provider.name.clone(), provider_is_remote(provider)))
+                .map(|provider| OnboardingProviderChoice {
+                    name: provider.name.clone(),
+                    remote: provider_is_remote(provider),
+                    model_asset: provider_model_asset(provider),
+                })
                 .collect(),
             model: field("model"),
             api_key: field("api_key"),
@@ -294,7 +305,7 @@ impl ServiceConfigEditor {
         live_tts_cuda_version: Option<&str>,
         project_root: &std::path::Path,
         language: crate::i18n::UiLanguage,
-    ) -> bool {
+    ) -> (bool, bool) {
         use crate::ui::components::{self, section};
         use eframe::egui;
 
@@ -314,6 +325,7 @@ impl ServiceConfigEditor {
 
         let runtime_requirements = self.runtime_requirements();
         let mut apply_runtime_config = false;
+        let mut delete_runtime_requested = false;
         let mut runtime_action = crate::ui::RuntimeUiAction::None;
         for cat_idx in 0..self.categories.len() {
             let category_title = crate::i18n::tr(language, self.categories[cat_idx].title);
@@ -460,6 +472,7 @@ impl ServiceConfigEditor {
                                         .filter(|field| {
                                             provider_field_is_visible(
                                                 field,
+                                                category_key,
                                                 &provider_name,
                                                 model_asset.is_some(),
                                             )
@@ -486,6 +499,7 @@ impl ServiceConfigEditor {
                                                 {
                                                     if !provider_field_is_visible(
                                                         field,
+                                                        category_key,
                                                         &provider_name,
                                                         model_asset.is_some(),
                                                     ) {
@@ -567,6 +581,7 @@ impl ServiceConfigEditor {
                             .filter(|field| {
                                 provider_field_is_visible(
                                     field,
+                                    category_key,
                                     &provider_name,
                                     model_asset.is_some(),
                                 )
@@ -587,6 +602,7 @@ impl ServiceConfigEditor {
                                     {
                                         if !provider_field_is_visible(
                                             field,
+                                            category_key,
                                             &provider_name,
                                             model_asset.is_some(),
                                         ) {
@@ -621,13 +637,16 @@ impl ServiceConfigEditor {
                         }
                     }
                 }
-                if category_key == "tts" && active_name == "audio8" && !self.dirty {
+                if category_key == "tts" && runtime_requirements.onnx_tts && !self.dirty {
                     ui.add_space(12.0);
+                    let can_delete_runtime =
+                        runtime_installer.managed_resources_are_present(project_root);
                     runtime_action = crate::ui::render_tts_runtime_status(
                         ui,
                         language,
                         runtime_installer,
                         runtime_requirements,
+                        can_delete_runtime,
                         live_tts_backend,
                         live_tts_cuda_version,
                     );
@@ -651,6 +670,16 @@ impl ServiceConfigEditor {
                 {
                     self.message = Some(error);
                 }
+            }
+            crate::ui::RuntimeUiAction::SwitchSource(use_mirror) => {
+                if let Err(error) =
+                    runtime_installer.switch_download_source(project_root.to_path_buf(), use_mirror)
+                {
+                    self.message = Some(error);
+                }
+            }
+            crate::ui::RuntimeUiAction::DeleteResources => {
+                delete_runtime_requested = true;
             }
         }
 
@@ -694,7 +723,7 @@ impl ServiceConfigEditor {
                     .size(12.0),
             );
         }
-        apply_runtime_config
+        (apply_runtime_config, delete_runtime_requested)
     }
 
     fn save(&mut self) -> Result<(), String> {
@@ -940,6 +969,18 @@ fn render_provider_model_action(
         .add_enabled(!busy, egui::Button::new(action_label))
         .on_hover_text(package.label)
         .clicked();
+    let previous_source = model_tasks.use_mirror();
+    let mut use_mirror = previous_source;
+    crate::ui::components::download_mirror_toggle(ui, request.language, &mut use_mirror);
+    if use_mirror != previous_source
+        && let Err(error) = model_tasks.switch_download_source(
+            request.project_root.to_path_buf(),
+            package.id,
+            use_mirror,
+        )
+    {
+        return Some(error);
+    }
     if clicked {
         return model_tasks
             .install(request.project_root.to_path_buf(), package.id)
@@ -1125,11 +1166,17 @@ fn provider_field_label(language: crate::i18n::UiLanguage, name: &str) -> String
     )
 }
 
-fn provider_field_is_visible(field: &ConfigField, provider_name: &str, native_model: bool) -> bool {
+fn provider_field_is_visible(
+    field: &ConfigField,
+    category_key: &str,
+    provider_name: &str,
+    native_model: bool,
+) -> bool {
     if provider_name == "openai" && matches!(field.name.as_str(), "transport" | "url") {
         return false;
     }
-    if provider_name == "audio8"
+    if category_key == "tts"
+        && native_model
         && matches!(
             field.name.as_str(),
             "device"
@@ -1141,7 +1188,10 @@ fn provider_field_is_visible(field: &ConfigField, provider_name: &str, native_mo
     {
         return true;
     }
-    if provider_name == "audio8" && matches!(field.name.as_str(), "transport" | "url" | "model") {
+    if category_key == "tts"
+        && native_model
+        && matches!(field.name.as_str(), "transport" | "url" | "model")
+    {
         return false;
     }
     provider_field_descriptor(&field.name).map_or(!native_model, |descriptor| {
@@ -1306,19 +1356,27 @@ mod tests {
             kind: JsonFieldKind::String,
         };
 
-        assert!(!provider_field_is_visible(&field("url"), "openai", false));
+        assert!(!provider_field_is_visible(
+            &field("url"),
+            "asr",
+            "openai",
+            false
+        ));
         assert!(!provider_field_is_visible(
             &field("transport"),
+            "asr",
             "openai",
             false
         ));
         assert!(provider_field_is_visible(
             &field("api_key"),
+            "asr",
             "openai",
             false
         ));
         assert!(provider_field_is_visible(
             &field("url"),
+            "asr",
             "openai-compatible",
             false
         ));

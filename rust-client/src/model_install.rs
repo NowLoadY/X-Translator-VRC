@@ -8,9 +8,11 @@ use crossbeam_channel::{Receiver, TryRecvError, unbounded};
 use std::{path::PathBuf, thread};
 use xrtranslate_assets::{
     DownloadProgress, ModelAssetId, ModelAssetsConfig, ModelCapability, ModelLevel,
-    NativeModelInstaller, ResolvedModelAssets, manifests_for_capability,
+    NativeModelInstaller, ResolvedModelAssets, clear_model_staging, manifests_for_capability,
+    remove_model_asset,
 };
 use xrtranslate_config::AppConfig;
+use xrtranslate_download::{DownloadCancellation, DownloadSource};
 
 #[derive(Clone, Debug)]
 pub enum NativeModelTaskState {
@@ -75,6 +77,7 @@ enum NativeModelTaskResult {
         asset_id: ModelAssetId,
         directory: PathBuf,
     },
+    Cancelled,
     Failed(String),
 }
 
@@ -85,7 +88,11 @@ pub struct NativeModelTaskManager {
     state: NativeModelTaskState,
     events: Option<Receiver<NativeModelTaskEvent>>,
     proxy_url: Option<String>,
+    use_mirror: bool,
     rediscover_after_current: bool,
+    cancellation: Option<DownloadCancellation>,
+    active_task: Option<(PathBuf, NativeModelTask)>,
+    restart_after_source_switch: bool,
 }
 
 impl Default for NativeModelTaskManager {
@@ -94,7 +101,11 @@ impl Default for NativeModelTaskManager {
             state: NativeModelTaskState::Idle,
             events: None,
             proxy_url: None,
+            use_mirror: false,
             rediscover_after_current: false,
+            cancellation: None,
+            active_task: None,
+            restart_after_source_switch: false,
         }
     }
 }
@@ -102,6 +113,35 @@ impl Default for NativeModelTaskManager {
 impl NativeModelTaskManager {
     pub fn set_proxy_url(&mut self, proxy_url: &str) {
         self.proxy_url = (!proxy_url.trim().is_empty()).then(|| proxy_url.trim().to_owned());
+    }
+
+    /// Switches the global model source. An active transfer is cooperatively
+    /// stopped, its package staging is removed after the worker releases it,
+    /// and the same package is restarted through the newly selected source.
+    pub fn switch_download_source(
+        &mut self,
+        project_root: PathBuf,
+        asset_id: ModelAssetId,
+        use_mirror: bool,
+    ) -> Result<(), String> {
+        if self.use_mirror == use_mirror {
+            return Ok(());
+        }
+        self.use_mirror = use_mirror;
+        if matches!(self.active_task, Some((_, NativeModelTask::Install(_)))) && self.is_busy() {
+            self.restart_after_source_switch = true;
+            if let Some(cancellation) = &self.cancellation {
+                cancellation.cancel();
+            }
+            return Ok(());
+        }
+        let assets = load_assets(&project_root)?;
+        clear_model_staging(&assets, asset_id).map_err(|error| error.to_string())
+    }
+
+    #[must_use]
+    pub const fn use_mirror(&self) -> bool {
+        self.use_mirror
     }
     #[must_use]
     pub fn state(&self) -> &NativeModelTaskState {
@@ -115,6 +155,22 @@ impl NativeModelTaskManager {
 
     pub fn install(&mut self, project_root: PathBuf, asset_id: ModelAssetId) -> Result<(), String> {
         self.start(project_root, NativeModelTask::Install(asset_id))
+    }
+
+    pub fn delete(
+        &mut self,
+        project_root: &std::path::Path,
+        asset_id: ModelAssetId,
+    ) -> Result<(), String> {
+        if self.is_busy() {
+            return Err("Wait for the current model task before deleting a model resource.".into());
+        }
+        let assets = load_assets(project_root)?;
+        remove_model_asset(&assets, asset_id).map_err(|error| error.to_string())?;
+        self.state = NativeModelTaskState::Idle;
+        self.events = None;
+        self.active_task = None;
+        Ok(())
     }
 
     /// Starts a one-time, background presence scan for the configured model
@@ -183,6 +239,7 @@ impl NativeModelTaskManager {
         };
 
         let mut finished = false;
+        let mut cancelled = false;
         loop {
             match events.try_recv() {
                 Ok(NativeModelTaskEvent::Progress(progress)) => {
@@ -205,6 +262,10 @@ impl NativeModelTaskManager {
                             asset_id,
                             directory,
                         },
+                        NativeModelTaskResult::Cancelled => {
+                            cancelled = true;
+                            NativeModelTaskState::Idle
+                        }
                         NativeModelTaskResult::Failed(error) => NativeModelTaskState::Failed(error),
                     };
                     finished = true;
@@ -222,6 +283,17 @@ impl NativeModelTaskManager {
         }
         if finished {
             self.events = None;
+            self.cancellation = None;
+            let active_task = self.active_task.take();
+            if cancelled && self.restart_after_source_switch {
+                self.restart_after_source_switch = false;
+                if let Some((project_root, task)) = active_task
+                    && let Err(error) = self.start(project_root, task)
+                {
+                    self.state = NativeModelTaskState::Failed(error);
+                }
+                return;
+            }
             if self.rediscover_after_current {
                 self.rediscover_after_current = false;
                 self.state = NativeModelTaskState::Idle;
@@ -236,9 +308,23 @@ impl NativeModelTaskManager {
 
         let (event_tx, event_rx) = unbounded();
         let proxy_url = self.proxy_url.clone();
+        let source = DownloadSource::from_mirror_enabled(self.use_mirror);
+        let cancellation =
+            matches!(task, NativeModelTask::Install(_)).then(DownloadCancellation::default);
+        let worker_cancellation = cancellation.clone();
+        let worker_root = project_root.clone();
         thread::Builder::new()
             .name("native-model-installer".into())
-            .spawn(move || run_task(project_root, task, event_tx, proxy_url))
+            .spawn(move || {
+                run_task(
+                    worker_root,
+                    task,
+                    event_tx,
+                    proxy_url,
+                    source,
+                    worker_cancellation,
+                )
+            })
             .map_err(|error| format!("Cannot start native model worker: {error}"))?;
         self.state = match task {
             NativeModelTask::Discover => NativeModelTaskState::Discovering,
@@ -250,6 +336,8 @@ impl NativeModelTaskManager {
             },
         };
         self.events = Some(event_rx);
+        self.cancellation = cancellation;
+        self.active_task = Some((project_root, task));
         Ok(())
     }
 }
@@ -259,12 +347,19 @@ fn run_task(
     task: NativeModelTask,
     event_tx: crossbeam_channel::Sender<NativeModelTaskEvent>,
     proxy_url: Option<String>,
+    source: DownloadSource,
+    cancellation: Option<DownloadCancellation>,
 ) {
     let result = match task {
         NativeModelTask::Discover => discover_models(project_root),
-        NativeModelTask::Install(asset_id) => {
-            install_model(project_root, asset_id, &event_tx, proxy_url.as_deref())
-        }
+        NativeModelTask::Install(asset_id) => install_model(
+            project_root,
+            asset_id,
+            &event_tx,
+            proxy_url.as_deref(),
+            source,
+            cancellation.expect("install tasks have a cancellation token"),
+        ),
     };
     let _ = event_tx.send(NativeModelTaskEvent::Finished(result));
 }
@@ -295,32 +390,83 @@ fn install_model(
     asset_id: ModelAssetId,
     event_tx: &crossbeam_channel::Sender<NativeModelTaskEvent>,
     proxy_url: Option<&str>,
+    source: DownloadSource,
+    cancellation: DownloadCancellation,
 ) -> NativeModelTaskResult {
-    let result = (|| -> Result<PathBuf, String> {
-        let assets = load_assets(&project_root)?;
-        let installer = NativeModelInstaller::with_proxy(assets, proxy_url)
-            .map_err(|error| error.to_string())?;
-        let runtime = tokio::runtime::Builder::new_current_thread()
-            .enable_all()
-            .build()
-            .map_err(|error| format!("Cannot initialize model installer runtime: {error}"))?;
-        let progress_tx = event_tx.clone();
-        runtime
-            .block_on(installer.install(asset_id, move |progress| {
-                let _ = progress_tx.send(NativeModelTaskEvent::Progress(progress));
-            }))
-            .map_err(|error| error.to_string())
-    })();
+    let cancellation_observer = cancellation.clone();
+    let assets = match load_assets(&project_root) {
+        Ok(assets) => assets,
+        Err(error) => return NativeModelTaskResult::Failed(error),
+    };
+    let installer = match NativeModelInstaller::with_download_source_and_cancellation(
+        assets,
+        proxy_url,
+        source,
+        cancellation,
+    ) {
+        Ok(installer) => installer,
+        Err(error) => return NativeModelTaskResult::Failed(error.to_string()),
+    };
+    let runtime = match tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()
+    {
+        Ok(runtime) => runtime,
+        Err(error) => {
+            return NativeModelTaskResult::Failed(format!(
+                "Cannot initialize model installer runtime: {error}"
+            ));
+        }
+    };
+    let progress_tx = event_tx.clone();
+    let result = runtime.block_on(installer.install(asset_id, move |progress| {
+        let _ = progress_tx.send(NativeModelTaskEvent::Progress(progress));
+    }));
 
     match result {
         Ok(directory) => NativeModelTaskResult::Installed {
             asset_id,
             directory,
         },
-        Err(error) => NativeModelTaskResult::Failed(error),
+        Err(error) if error.is_cancelled() || cancellation_observer.is_cancelled() => {
+            let cleanup = load_assets(&project_root).and_then(|assets| {
+                clear_model_staging(&assets, asset_id).map_err(|error| error.to_string())
+            });
+            match cleanup {
+                Ok(()) => NativeModelTaskResult::Cancelled,
+                Err(error) => NativeModelTaskResult::Failed(error),
+            }
+        }
+        Err(error) => NativeModelTaskResult::Failed(error.to_string()),
     }
 }
 
+/// Filesystem-backed startup preflight. Unlike the task manager's live UI
+/// state, this does not report every package missing before discovery runs.
+pub fn configured_models_are_present(project_root: &std::path::Path) -> Result<bool, String> {
+    let packages = configured_model_packages(project_root)?;
+    let assets = load_assets(project_root)?;
+    let presence = assets.check();
+    Ok(packages.iter().all(|package| {
+        !presence
+            .diagnostics()
+            .iter()
+            .any(|diagnostic| diagnostic.asset_id == package.id)
+    }))
+}
+
+pub fn model_asset_is_present(
+    project_root: &std::path::Path,
+    asset_id: ModelAssetId,
+) -> Result<bool, String> {
+    let assets = load_assets(project_root)?;
+    let target = assets.asset(asset_id);
+    Ok(target
+        .manifest()
+        .required_files
+        .iter()
+        .all(|file| target.directory().join(file.relative_path).is_file()))
+}
 
 fn load_assets(project_root: &std::path::Path) -> Result<ResolvedModelAssets, String> {
     let config = load_config(project_root)?;
@@ -343,6 +489,19 @@ pub fn configured_model_packages(
             Ok(package_from_manifest(manifest))
         })
         .collect()
+}
+
+/// Enumerates the complete manifest catalogue using the configured directory
+/// overrides. UI resource management can therefore expose installed packages
+/// that are no longer selected by a provider without naming model families.
+pub fn catalog_model_packages(
+    project_root: &std::path::Path,
+) -> Result<Vec<NativeModelPackage>, String> {
+    let assets = load_assets(project_root)?;
+    Ok(assets
+        .catalog_assets()
+        .map(|asset| package_from_manifest(asset.manifest()))
+        .collect())
 }
 
 /// Resolves one provider's declared `model_asset` without assuming that the
@@ -501,6 +660,65 @@ mod tests {
     }
 
     #[test]
+    fn startup_presence_reads_disk_before_background_discovery() {
+        let root = std::env::temp_dir().join(format!(
+            "xrtranslate-startup-model-presence-{}",
+            std::process::id()
+        ));
+        let _ = std::fs::remove_dir_all(&root);
+        std::fs::create_dir_all(&root).unwrap();
+        std::fs::write(root.join("config.json"), include_str!("../../config.json")).unwrap();
+
+        let assets = load_assets(&root).unwrap();
+        for asset in assets.active_assets() {
+            std::fs::create_dir_all(asset.directory()).unwrap();
+            for file in asset.manifest().required_files {
+                let path = asset.directory().join(file.relative_path);
+                std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+                std::fs::write(path, []).unwrap();
+            }
+        }
+
+        assert!(configured_models_are_present(&root).unwrap());
+        let manager = NativeModelTaskManager::default();
+        assert!(
+            configured_model_packages(&root)
+                .unwrap()
+                .iter()
+                .all(|package| !manager.is_model_present(package.id))
+        );
+
+        let mut packages = configured_model_packages(&root).unwrap();
+        let package = packages.remove(0);
+        let other_package = packages
+            .first()
+            .expect("default configuration has another model package")
+            .clone();
+        let target = assets.asset(package.id);
+        let staging = target
+            .directory()
+            .parent()
+            .unwrap()
+            .join(".xrtranslate-staging")
+            .join(format!(
+                "{}-{}",
+                package.id.as_str(),
+                target.manifest().source.revision
+            ));
+        std::fs::create_dir_all(&staging).unwrap();
+        std::fs::write(staging.join("artifact.part"), b"partial").unwrap();
+        let mut manager = NativeModelTaskManager::default();
+        manager
+            .switch_download_source(root.clone(), package.id, true)
+            .unwrap();
+        assert!(!staging.exists());
+        manager.delete(&root, package.id).unwrap();
+        assert!(!model_asset_is_present(&root, package.id).unwrap());
+        assert!(model_asset_is_present(&root, other_package.id).unwrap());
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
     fn detected_state_is_scoped_to_the_packages_that_were_discovered() {
         let manager = NativeModelTaskManager {
             state: NativeModelTaskState::Detected {
@@ -509,7 +727,11 @@ mod tests {
             },
             events: None,
             proxy_url: None,
+            use_mirror: false,
             rediscover_after_current: false,
+            cancellation: None,
+            active_task: None,
+            restart_after_source_switch: false,
         };
 
         assert!(manager.is_model_ready(ModelAssetId::Qwen3AsrGguf));
@@ -536,7 +758,11 @@ mod tests {
             state: NativeModelTaskState::Discovering,
             events: Some(receiver),
             proxy_url: None,
+            use_mirror: false,
             rediscover_after_current: false,
+            cancellation: None,
+            active_task: None,
+            restart_after_source_switch: false,
         };
         manager.invalidate_discovery();
         sender

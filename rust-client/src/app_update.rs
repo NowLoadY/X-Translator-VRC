@@ -950,12 +950,12 @@ mod tests {
     #[test]
     fn beta_catalogue_prefers_stable_over_prerelease_of_same_version() {
         let selected = release_asset_from_catalogue(
-            vec![release("v0.2.8-beta.3"), release("v0.2.8")],
+            vec![release("v99.0.0-beta.3"), release("v99.0.0")],
             UpdateChannel::Beta,
         )
         .unwrap()
         .unwrap();
-        assert_eq!(selected.version, "0.2.8");
+        assert_eq!(selected.version, "99.0.0");
     }
 
     #[test]

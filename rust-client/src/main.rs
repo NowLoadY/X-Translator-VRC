@@ -69,6 +69,7 @@ pub const LANGUAGE_OPTIONS: &[(&str, &str)] = &[
     ("ru", "Russian"),
     ("ko", "Korean"),
     ("th", "Thai"),
+    ("hi", "Hindi"),
     ("it", "Italian"),
     ("de", "German"),
     ("vi", "Vietnamese"),
@@ -129,6 +130,12 @@ fn meeting_source_name_to_capture(source: &str) -> CaptureSource {
         "both" => CaptureSource::Both,
         _ => CaptureSource::Microphone,
     }
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum PendingResourceDeletion {
+    Model(xrtranslate_assets::ModelAssetId),
+    Runtime,
 }
 
 struct XRTranslateApp {
@@ -193,6 +200,7 @@ struct XRTranslateApp {
     pub prompt_library: PromptTemplateLibrary,
     pub prompt_studio: ui::pages::prompt_studio::PromptStudioController,
     pub modal_dialog: ui::modal::ModalDialog,
+    pending_resource_deletion: Option<PendingResourceDeletion>,
     pub first_run: bool,
     pub onboarding_page: usize,
     pub ui_language: UiLanguage,
@@ -237,6 +245,22 @@ fn publish_host_output(subscribers: &[Box<dyn HostOutputSubscriber>], event: Hos
     for subscriber in subscribers {
         subscriber.on_host_output(event);
     }
+}
+
+/// Initializes output-side session dependencies before activating live input.
+///
+/// On Windows the session configuration can create the default-output TTS
+/// stream. WASAPI loopback must be opened after that output stream is ready;
+/// otherwise the first loopback client can remain silent until it is rebuilt
+/// by a device selection change.
+fn initialize_live_audio<Host, Dependencies>(
+    host: &mut Host,
+    initialize_dependencies: impl FnOnce(&mut Host) -> Dependencies,
+    activate_capture: impl FnOnce(&mut Host) -> Result<(), String>,
+) -> Result<Dependencies, String> {
+    let dependencies = initialize_dependencies(host);
+    activate_capture(host)?;
+    Ok(dependencies)
 }
 
 impl Default for XRTranslateApp {
@@ -772,6 +796,7 @@ impl Default for XRTranslateApp {
                 prompt_provider,
             ),
             modal_dialog: ui::modal::ModalDialog::default(),
+            pending_resource_deletion: None,
             first_run,
             onboarding_page,
             ui_language: settings.ui_language,
@@ -800,6 +825,60 @@ impl Default for XRTranslateApp {
 impl XRTranslateApp {
     pub fn project_root(&self) -> std::path::PathBuf {
         self.backend_manager.project_root()
+    }
+
+    fn request_model_resource_deletion(&mut self, asset_id: xrtranslate_assets::ModelAssetId) {
+        let label = xrtranslate_assets::manifest_for(asset_id).label;
+        self.pending_resource_deletion = Some(PendingResourceDeletion::Model(asset_id));
+        self.modal_dialog =
+            ui::modal::ModalDialog::confirm_resource_deletion(label, self.ui_language);
+    }
+
+    fn request_runtime_resource_deletion(&mut self) {
+        self.pending_resource_deletion = Some(PendingResourceDeletion::Runtime);
+        self.modal_dialog = ui::modal::ModalDialog::confirm_resource_deletion(
+            i18n::tr(
+                self.ui_language,
+                "Inference Runtime & Hardware Acceleration",
+            ),
+            self.ui_language,
+        );
+    }
+
+    fn confirm_pending_resource_deletion(&mut self) {
+        let Some(resource) = self.pending_resource_deletion.take() else {
+            return;
+        };
+        let project_root = self.project_root();
+        self.backend_manager.shutdown();
+        let result = match resource {
+            PendingResourceDeletion::Model(asset_id) => {
+                self.model_task_manager.delete(&project_root, asset_id)
+            }
+            PendingResourceDeletion::Runtime => self
+                .runtime_installer
+                .delete_managed_resources(&project_root),
+        };
+        match result {
+            Ok(()) => self.last_error = None,
+            Err(error) => self.last_error = Some(error),
+        }
+    }
+
+    fn render_modal_layer(&mut self, ctx: &egui::Context) {
+        self.modal_dialog.render(ctx, self.ui_language);
+        let modal_action = self.modal_dialog.take_action();
+        match modal_action {
+            Some(ui::modal::ModalAction::DownloadUpdate) => self.download_update(),
+            Some(ui::modal::ModalAction::InstallUpdate) => self.install_update_and_restart(),
+            Some(ui::modal::ModalAction::ConfirmResourceDeletion) => {
+                self.confirm_pending_resource_deletion()
+            }
+            None => {}
+        }
+        if !self.modal_dialog.open && modal_action.is_none() {
+            self.pending_resource_deletion = None;
+        }
     }
 
     pub(crate) fn plugin_enabled(&self, id: PluginId) -> bool {
@@ -963,8 +1042,14 @@ impl XRTranslateApp {
                     {
                         if let Ok(content) = std::fs::read_to_string(&path) {
                             let new_id = format!("custom-import-{}", uuid::Uuid::new_v4());
-                            if let Ok(mut imported) = xrtranslate_prompt::PromptTemplateProfile::import_project_json(&content, new_id) {
-                                if imported.name == "Imported Graph" || imported.name.trim().is_empty() {
+                            if let Ok(mut imported) =
+                                xrtranslate_prompt::PromptTemplateProfile::import_project_json(
+                                    &content, new_id,
+                                )
+                            {
+                                if imported.name == "Imported Graph"
+                                    || imported.name.trim().is_empty()
+                                {
                                     if let Some(stem) = path.file_stem().and_then(|s| s.to_str()) {
                                         let clean_stem = stem.trim();
                                         if !clean_stem.is_empty() {
@@ -1699,8 +1784,27 @@ impl XRTranslateApp {
                 }
             })
             .collect::<Vec<_>>();
-        match self.start_selected_capture(routes, &audio_txs) {
-            Ok(()) => {
+        let session_configs = initialize_live_audio(
+            self,
+            |app| {
+                routes
+                    .iter()
+                    .map(|source| {
+                        let recognition = app.recognition_settings(*source).clone();
+                        app.session_config(
+                            plugin_session.as_ref(),
+                            &recognition,
+                            *source,
+                            vad_threshold_for_background_noise(recognition.background_noise),
+                            ctx.clone(),
+                        )
+                    })
+                    .collect::<Vec<_>>()
+            },
+            |app| app.start_selected_capture(routes, &audio_txs),
+        );
+        match session_configs {
+            Ok(session_configs) => {
                 if !publish_to_host_outputs {
                     self.meeting_plugin.event_sink.begin_sessions(routes.len());
                 }
@@ -1713,16 +1817,8 @@ impl XRTranslateApp {
                 }
                 self.sessions = session_channels
                     .iter()
-                    .zip(routes.iter())
-                    .map(|((_, audio_rx), source)| {
-                        let recognition = self.recognition_settings(*source).clone();
-                        let config = self.session_config(
-                            plugin_session.as_ref(),
-                            &recognition,
-                            *source,
-                            vad_threshold_for_background_noise(recognition.background_noise),
-                            ctx.clone(),
-                        );
+                    .zip(session_configs)
+                    .map(|((_, audio_rx), config)| {
                         let session =
                             start_session(audio_rx.clone(), self.event_tx.clone(), config);
                         if crate::feature_access::is_available(
@@ -2667,6 +2763,7 @@ impl eframe::App for XRTranslateApp {
             .request_repaint_after(std::time::Duration::from_millis(100));
         if self.first_run {
             ui::render_onboarding_fullscreen(self, ui);
+            self.render_modal_layer(ui.ctx());
             return;
         }
 
@@ -2817,12 +2914,7 @@ impl eframe::App for XRTranslateApp {
                     });
             });
 
-        self.modal_dialog.render(ui.ctx(), self.ui_language);
-        match self.modal_dialog.take_action() {
-            Some(ui::modal::ModalAction::DownloadUpdate) => self.download_update(),
-            Some(ui::modal::ModalAction::InstallUpdate) => self.install_update_and_restart(),
-            None => {}
-        }
+        self.render_modal_layer(ui.ctx());
     }
 
     fn clear_color(&self, _visuals: &egui::Visuals) -> [f32; 4] {
@@ -2904,7 +2996,7 @@ fn main() -> eframe::Result<()> {
         options,
         Box::new(move |cc| {
             egui_extras::install_image_loaders(&cc.egui_ctx);
-            configure_cjk_fonts(&cc.egui_ctx);
+            ui::fonts::configure_multilingual_fonts(&cc.egui_ctx);
             ui::theme::apply_theme(&cc.egui_ctx);
             if let Some(state) = cc.wgpu_render_state.as_ref() {
                 log::info!("wgpu adapter: {:?}", state.adapter.get_info());
@@ -2946,51 +3038,9 @@ fn configure_transparent_wgpu(
     options
 }
 
-fn configure_cjk_fonts(ctx: &egui::Context) {
-    let mut definitions = egui::FontDefinitions::default();
-
-    // 1. Primary CJK Font (Microsoft YaHei)
-    let yahei_path = std::path::Path::new(r"C:\Windows\Fonts\msyh.ttc");
-    let has_yahei = if let Ok(font_bytes) = std::fs::read(yahei_path) {
-        definitions.font_data.insert(
-            "microsoft_yahei".into(),
-            std::sync::Arc::new(egui::FontData::from_owned(font_bytes)),
-        );
-        true
-    } else {
-        log::warn!("Chinese UI font not found: {}", yahei_path.display());
-        false
-    };
-
-    // 2. Korean Font (Malgun Gothic)
-    let malgun_path = std::path::Path::new(r"C:\Windows\Fonts\malgun.ttf");
-    let has_malgun = if let Ok(font_bytes) = std::fs::read(malgun_path) {
-        definitions.font_data.insert(
-            "malgun_gothic".into(),
-            std::sync::Arc::new(egui::FontData::from_owned(font_bytes)),
-        );
-        true
-    } else {
-        log::warn!("Korean UI font not found: {}", malgun_path.display());
-        false
-    };
-
-    for family in [egui::FontFamily::Proportional, egui::FontFamily::Monospace] {
-        let list = definitions.families.entry(family).or_default();
-        if has_yahei {
-            list.insert(0, "microsoft_yahei".into());
-        }
-        if has_malgun {
-            let pos = if has_yahei { 1 } else { 0 };
-            list.insert(pos, "malgun_gothic".into());
-        }
-    }
-    ctx.set_fonts(definitions);
-}
-
 #[cfg(test)]
 mod tests {
-    use super::vad_threshold_for_background_noise;
+    use super::{initialize_live_audio, vad_threshold_for_background_noise};
 
     #[test]
     fn noisier_environment_uses_a_stricter_vad_threshold() {
@@ -3000,5 +3050,44 @@ mod tests {
 
         assert!(quiet < medium);
         assert!(medium < noisy);
+    }
+
+    #[test]
+    fn live_audio_initializes_output_dependencies_before_capture() {
+        let mut events = Vec::new();
+
+        let dependencies = initialize_live_audio(
+            &mut events,
+            |events| {
+                events.push("output-ready");
+                "session-config"
+            },
+            |events| {
+                events.push("capture-active");
+                Ok(())
+            },
+        )
+        .unwrap();
+
+        assert_eq!(dependencies, "session-config");
+        assert_eq!(events, ["output-ready", "capture-active"]);
+    }
+
+    #[test]
+    fn live_audio_propagates_capture_activation_failure() {
+        let mut events = Vec::new();
+
+        let error = initialize_live_audio(
+            &mut events,
+            |events| events.push("output-ready"),
+            |events| {
+                events.push("capture-failed");
+                Err("device unavailable".into())
+            },
+        )
+        .unwrap_err();
+
+        assert_eq!(error, "device unavailable");
+        assert_eq!(events, ["output-ready", "capture-failed"]);
     }
 }

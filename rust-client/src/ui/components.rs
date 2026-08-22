@@ -1119,6 +1119,31 @@ pub fn toggle_with_label(ui: &mut Ui, checked: &mut bool, label: &str) -> egui::
     .inner
 }
 
+pub fn download_mirror_toggle(
+    ui: &mut Ui,
+    language: crate::i18n::UiLanguage,
+    checked: &mut bool,
+) -> egui::Response {
+    toggle_with_label(ui, checked, crate::i18n::tr(language, "Use mirror")).on_hover_text(
+        crate::i18n::tr(
+            language,
+            "Route supported GitHub and Hugging Face downloads through an alternate mirror.",
+        ),
+    )
+}
+
+pub fn resource_delete_button(ui: &mut Ui, language: crate::i18n::UiLanguage) -> egui::Response {
+    let icon = egui::Image::new(egui::include_image!("../../resources/icons/trash.svg"))
+        .fit_to_exact_size(egui::Vec2::splat(14.0))
+        .tint(Color32::from_rgb(185, 28, 28));
+    ui.add(
+        egui::Button::image(icon)
+            .frame(false)
+            .min_size(egui::Vec2::splat(22.0)),
+    )
+    .on_hover_text(crate::i18n::tr(language, "Delete"))
+}
+
 pub fn feature_checkbox(
     ui: &mut Ui,
     feature: crate::feature_access::Feature,
@@ -1661,6 +1686,8 @@ pub enum RuntimeUiAction {
     None,
     Install,
     Retry,
+    SwitchSource(bool),
+    DeleteResources,
 }
 
 pub fn render_runtime_task_state(
@@ -1692,11 +1719,15 @@ pub fn render_runtime_task_state(
             total,
         } => {
             ui.add_space(6.0);
-            ui.label(egui::RichText::new(asset).size(11.0).color(theme::text_weak()));
+            ui.label(
+                egui::RichText::new(asset)
+                    .size(11.0)
+                    .color(theme::text_weak()),
+            );
             if *total > 0 {
                 ui.add(
                     egui::ProgressBar::new(
-                        (*downloaded as f64 / *total as f64).clamp(0.0, 1.0) as f32,
+                        (*downloaded as f64 / *total as f64).clamp(0.0, 1.0) as f32
                     )
                     .text(format!(
                         "{} / {}",
@@ -1737,11 +1768,34 @@ pub fn render_runtime_task_state(
     }
 }
 
-pub fn render_tts_runtime_status(
+pub fn render_runtime_fallback_notice(
     ui: &mut egui::Ui,
     language: crate::i18n::UiLanguage,
     installer: &crate::runtime_install::RuntimeInstaller,
+) {
+    let Some(reason) = installer.fallback_reason() else {
+        return;
+    };
+    ui.add_space(6.0);
+    ui.label(
+        egui::RichText::new(reason)
+            .size(11.5)
+            .color(Color32::from_rgb(180, 83, 9)),
+    );
+    if reason.contains(crate::runtime_install::NVIDIA_APP_URL) {
+        ui.hyperlink_to(
+            crate::i18n::tr(language, "Open NVIDIA App driver download"),
+            crate::runtime_install::NVIDIA_APP_URL,
+        );
+    }
+}
+
+pub fn render_tts_runtime_status(
+    ui: &mut egui::Ui,
+    language: crate::i18n::UiLanguage,
+    installer: &mut crate::runtime_install::RuntimeInstaller,
     requirements: xrtranslate_config::RuntimeRequirements,
+    can_delete_resources: bool,
     live_backend: Option<&str>,
     live_cuda_version: Option<&str>,
 ) -> RuntimeUiAction {
@@ -1794,26 +1848,24 @@ pub fn render_tts_runtime_status(
                     .color(Color32::from_rgb(180, 83, 9)),
                 );
             }
-            if let Some(reason) = installer.fallback_reason() {
-                ui.add_space(6.0);
-                ui.label(
-                    egui::RichText::new(reason)
-                        .size(11.5)
-                        .color(Color32::from_rgb(180, 83, 9)),
-                );
-            }
+            render_runtime_fallback_notice(ui, language, installer);
 
             match &state {
                 RuntimeInstallState::Ready if plan_is_ready => {
                     ui.add_space(6.0);
-                    ui.label(
-                        egui::RichText::new(crate::i18n::tr(
-                            language,
-                            "Ready — no additional runtime download is required.",
-                        ))
-                        .size(12.0)
-                        .color(Color32::from_rgb(5, 150, 105)),
-                    );
+                    ui.horizontal(|ui| {
+                        ui.label(
+                            egui::RichText::new(crate::i18n::tr(
+                                language,
+                                "Ready — no additional runtime download is required.",
+                            ))
+                            .size(12.0)
+                            .color(Color32::from_rgb(5, 150, 105)),
+                        );
+                        if can_delete_resources && resource_delete_button(ui, language).clicked() {
+                            action = RuntimeUiAction::DeleteResources;
+                        }
+                    });
                 }
                 RuntimeInstallState::Ready => {
                     let label = download_size.map_or_else(
@@ -1828,23 +1880,40 @@ pub fn render_tts_runtime_status(
                         },
                     );
                     ui.add_space(8.0);
-                    if primary_button_enabled(
-                        ui,
-                        &label,
-                        download_size.is_some() && !installer.is_busy(),
-                    )
-                    .clicked()
-                    {
-                        action = RuntimeUiAction::Install;
-                    }
+                    ui.horizontal(|ui| {
+                        if primary_button_enabled(
+                            ui,
+                            &label,
+                            download_size.is_some() && !installer.is_busy(),
+                        )
+                        .clicked()
+                        {
+                            action = RuntimeUiAction::Install;
+                        }
+                    });
                 }
                 RuntimeInstallState::Failed(_) => {
                     ui.add_space(8.0);
-                    if animated_button(ui, crate::i18n::tr(language, "Retry")).clicked() {
-                        action = RuntimeUiAction::Retry;
-                    }
+                    ui.horizontal(|ui| {
+                        if animated_button(ui, crate::i18n::tr(language, "Retry")).clicked() {
+                            action = RuntimeUiAction::Retry;
+                        }
+                    });
                 }
                 _ => {}
+            }
+
+            if can_delete_resources
+                && !matches!(state, RuntimeInstallState::Ready if plan_is_ready)
+                && resource_delete_button(ui, language).clicked()
+            {
+                action = RuntimeUiAction::DeleteResources;
+            }
+
+            ui.add_space(8.0);
+            let mut use_mirror = installer.use_mirror();
+            if download_mirror_toggle(ui, language, &mut use_mirror).changed() {
+                action = RuntimeUiAction::SwitchSource(use_mirror);
             }
 
             render_runtime_task_state(

@@ -34,6 +34,7 @@ const LANGUAGES: &[LanguageSpec] = &[
     language!("ru", "Russian", Cyrillic),
     language!("ko", "Korean", Hangul),
     language!("th", "Thai", Thai),
+    language!("hi", "Hindi", Devanagari),
     language!("it", "Italian", Latin),
     language!("de", "German", Latin),
     language!("vi", "Vietnamese", Latin),
@@ -62,8 +63,17 @@ impl SupportedLanguage {
                 } else if code.eq_ignore_ascii_case("zh-hans") || code.eq_ignore_ascii_case("zh-cn")
                 {
                     LANGUAGES.iter().find(|l| l.code == "zh").map(Self)
+                } else if code.eq_ignore_ascii_case("hin")
+                    || code.eq_ignore_ascii_case("hi-in")
+                    || code.eq_ignore_ascii_case("hi_in")
+                {
+                    LANGUAGES.iter().find(|l| l.code == "hi").map(Self)
                 } else {
-                    None
+                    let primary = code.split(['-', '_']).next().unwrap_or(code);
+                    LANGUAGES
+                        .iter()
+                        .find(|language| language.code.eq_ignore_ascii_case(primary))
+                        .map(Self)
                 }
             })
     }
@@ -76,15 +86,17 @@ impl SupportedLanguage {
         {
             return LANGUAGES.iter().find(|l| l.code == "zh-TW").map(Self);
         }
-        LANGUAGES
-            .iter()
-            .find(|language| language.model_name.eq_ignore_ascii_case(label))
-            .map(Self)
-            .or_else(|| {
-                label
-                    .eq_ignore_ascii_case("Mandarin")
-                    .then(|| Self(&LANGUAGES[1]))
-            })
+        Self::from_code(label).or_else(|| {
+            LANGUAGES
+                .iter()
+                .find(|language| language.model_name.eq_ignore_ascii_case(label))
+                .map(Self)
+                .or_else(|| {
+                    label
+                        .eq_ignore_ascii_case("Mandarin")
+                        .then(|| Self(&LANGUAGES[1]))
+                })
+        })
     }
 
     pub(crate) const fn code(self) -> &'static str {
@@ -406,6 +418,18 @@ mod tests {
             SupportedLanguage::from_model_label("Traditional Chinese"),
             SupportedLanguage::from_code("zh-TW")
         );
+        assert_eq!(
+            SupportedLanguage::from_code("hi-IN"),
+            SupportedLanguage::from_code("hi")
+        );
+        assert_eq!(
+            SupportedLanguage::from_code("hin"),
+            SupportedLanguage::from_code("hi")
+        );
+        assert_eq!(
+            SupportedLanguage::from_code("vi-VN"),
+            SupportedLanguage::from_code("vi")
+        );
     }
 
     #[test]
@@ -457,6 +481,31 @@ mod tests {
             AutoDecision::Switched { route: LanguageRoute { source, .. }, .. } if source == language("ko")
         ));
         assert_eq!(route.active_targets(""), "ko,en");
+    }
+
+    #[test]
+    fn hindi_is_accepted_and_can_adapt_an_automatic_pair() {
+        let mut configured = AdaptiveLanguageRoute::default();
+        configured.configure("auto", "hi,en");
+        assert!(matches!(
+            configured.classify(Some("Hindi"), "नमस्ते दुनिया"),
+            AutoDecision::Accept(LanguageRoute { source, target })
+                if source == language("hi") && target == language("en")
+        ));
+
+        let mut adaptive = AdaptiveLanguageRoute::default();
+        adaptive.configure("auto", "ja,en");
+        assert!(matches!(
+            adaptive.classify(Some("Hindi"), "नमस्ते दुनिया"),
+            AutoDecision::Retry { candidate: Some(candidate), .. }
+                if candidate == language("hi")
+        ));
+        assert!(matches!(
+            adaptive.classify(Some("Hindi"), "आप कैसे हैं"),
+            AutoDecision::Switched { route: LanguageRoute { source, .. }, .. }
+                if source == language("hi")
+        ));
+        assert_eq!(adaptive.active_targets(""), "hi,en");
     }
 
     #[test]

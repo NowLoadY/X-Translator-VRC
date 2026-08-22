@@ -144,9 +144,7 @@ impl RuntimeLayout {
 
     #[must_use]
     pub fn cuda_runtime_directory(&self, cuda_version: &str) -> PathBuf {
-        self.runtime_root
-            .join("cuda")
-            .join(cuda_version)
+        self.runtime_root.join("cuda").join(cuda_version)
     }
 
     #[must_use]
@@ -1534,10 +1532,7 @@ mod tests {
         );
 
         let external_layout = RuntimeLayout::new(&root, Some("/mnt/ai/runtime"));
-        assert_eq!(
-            external_layout.runtime_root(),
-            Path::new("/mnt/ai/runtime")
-        );
+        assert_eq!(external_layout.runtime_root(), Path::new("/mnt/ai/runtime"));
         assert_eq!(
             external_layout.llama_cpp_directory(),
             PathBuf::from("/mnt/ai/runtime/llama.cpp")
@@ -1579,7 +1574,7 @@ mod tests {
         assert_eq!(config.translation.provider, "hunyuan");
         assert_eq!(config.tts.provider, "none");
         assert_eq!(config.model_manager.llama_cpp.release, "b10333");
-        assert_eq!(config.model_manager.llama_cpp.downloads.len(), 6);
+        assert_eq!(config.model_manager.llama_cpp.downloads.len(), 8);
         assert_eq!(config.model_manager.onnxruntime.release, "1.28.0");
         assert_eq!(config.model_manager.onnxruntime.downloads.len(), 2);
         assert_eq!(

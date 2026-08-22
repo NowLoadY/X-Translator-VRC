@@ -4,7 +4,6 @@
 //! API keys, and runtime binaries are in place before allowing access to the main session.
 
 use std::path::Path;
-use xrtranslate_assets::ModelCapability;
 
 use crate::{
     backend::BackendManager,
@@ -33,43 +32,16 @@ pub fn has_unmet_prerequisites(
         return true;
     }
 
-    // 2. Local ASR and MT model package requirements
-    if requirements.llama_cpp {
-        let packages = model_install::configured_model_packages(project_root)
-            .unwrap_or_default()
-            .into_iter()
-            .filter(|package| package.capability != ModelCapability::Tts)
-            .collect::<Vec<_>>();
-        if !packages
-            .iter()
-            .all(|package| model_task_manager.is_model_present(package.id))
-        {
-            return true;
-        }
+    // 2. Every selected provider-declared local model package.
+    let packages = model_install::configured_model_packages(project_root).unwrap_or_default();
+    if !packages
+        .iter()
+        .all(|package| model_task_manager.is_model_present(package.id))
+    {
+        return true;
     }
 
-    // 3. Optional TTS model package requirements
-    let tts_provider = service_config.onboarding_provider_state("tts");
-    let selected_audio8 = tts_provider
-        .as_ref()
-        .is_some_and(|state| state.selected == "audio8");
-    if selected_audio8 {
-        let package = model_install::model_package_for_provider_config_key(
-            project_root,
-            "audio8",
-            ModelCapability::Tts,
-            "audio8-tts-onnx-fp16",
-        )
-        .ok();
-        let installed = package
-            .as_ref()
-            .is_some_and(|package| model_task_manager.is_model_present(package.id));
-        if !installed {
-            return true;
-        }
-    }
-
-    // 4. Runtime binary and acceleration dependencies
+    // 3. Runtime binary and acceleration dependencies
     let llama_ready = !requirements.llama_cpp || backend_manager.llama_server_path_is_valid();
     let onnx_ready = !requirements.onnx_tts || runtime_installer.plan_is_ready();
     if !llama_ready || !onnx_ready {
@@ -111,41 +83,15 @@ pub fn evaluate_step_requirement(
             if requirements.missing_api_key {
                 return Some("Configure every required API key to continue.");
             }
-            if requirements.llama_cpp {
-                let packages: Vec<model_install::NativeModelPackage> =
-                    match model_install::configured_model_packages(project_root) {
-                        Ok(packages) => packages
-                            .into_iter()
-                            .filter(|package| package.capability != ModelCapability::Tts)
-                            .collect(),
-                        Err(_) => return Some("Download every required model package to continue."),
-                    };
-                if !packages
-                    .iter()
-                    .all(|package| model_task_manager.is_model_present(package.id))
-                {
-                    return Some("Download every required model package to continue.");
-                }
-            }
-
-            let provider = service_config.onboarding_provider_state("tts");
-            let selected_audio8 = provider
-                .as_ref()
-                .is_some_and(|state| state.selected == "audio8");
-            if selected_audio8 {
-                let package = model_install::model_package_for_provider_config_key(
-                    project_root,
-                    "audio8",
-                    ModelCapability::Tts,
-                    "audio8-tts-onnx-fp16",
-                )
-                .ok();
-                let installed = package
-                    .as_ref()
-                    .is_some_and(|package| model_task_manager.is_model_present(package.id));
-                if !installed {
-                    return Some("Download the TTS model package to continue, or choose Skip.");
-                }
+            let packages = match model_install::configured_model_packages(project_root) {
+                Ok(packages) => packages,
+                Err(_) => return Some("Download every required model package to continue."),
+            };
+            if !packages
+                .iter()
+                .all(|package| model_task_manager.is_model_present(package.id))
+            {
+                return Some("Download every required model package to continue.");
             }
 
             let llama_ready =
@@ -170,22 +116,51 @@ pub fn resolve_startup_onboarding_state(
     project_root: &Path,
     service_config: &ServiceConfigEditor,
     backend_manager: &BackendManager,
-    model_task_manager: &NativeModelTaskManager,
-    runtime_installer: &RuntimeInstaller,
+    _model_task_manager: &NativeModelTaskManager,
+    _runtime_installer: &RuntimeInstaller,
 ) -> (bool, usize) {
     if is_first_run
-        || has_unmet_prerequisites(
-            project_root,
-            service_config,
-            backend_manager,
-            model_task_manager,
-            runtime_installer,
-        )
+        || has_unmet_startup_prerequisites(project_root, service_config, backend_manager)
     {
         (true, 0)
     } else {
         (false, 0)
     }
+}
+
+/// Startup uses direct filesystem probes because both background managers are
+/// intentionally still `Idle` here. Reading their live state before discovery
+/// and runtime planning complete would make every local setup look missing.
+fn has_unmet_startup_prerequisites(
+    project_root: &Path,
+    service_config: &ServiceConfigEditor,
+    backend_manager: &BackendManager,
+) -> bool {
+    let requirements = service_config.runtime_requirements();
+    if requirements.missing_api_key {
+        return true;
+    }
+
+    if !model_install::configured_models_are_present(project_root).unwrap_or(false) {
+        return true;
+    }
+
+    if requirements.llama_cpp && !backend_manager.llama_server_path_is_valid() {
+        return true;
+    }
+    if requirements.onnx_tts {
+        let onnx_requirements = xrtranslate_config::RuntimeRequirements {
+            llama_cpp: false,
+            missing_api_key: false,
+            ..requirements
+        };
+        if !crate::runtime_install::configured_runtime_is_ready(project_root, onnx_requirements)
+            .unwrap_or(false)
+        {
+            return true;
+        }
+    }
+    false
 }
 
 #[cfg(test)]
@@ -194,7 +169,10 @@ mod tests {
 
     #[test]
     fn first_run_always_resolves_to_welcome_page() {
-        let root = std::env::temp_dir().join(format!("xrtranslate-onboarding-test-1-{}", std::process::id()));
+        let root = std::env::temp_dir().join(format!(
+            "xrtranslate-onboarding-test-1-{}",
+            std::process::id()
+        ));
         let backend_manager = BackendManager::load();
         let service_config = ServiceConfigEditor::load();
         let model_task_manager = NativeModelTaskManager::default();

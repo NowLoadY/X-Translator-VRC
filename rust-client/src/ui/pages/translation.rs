@@ -488,10 +488,12 @@ pub fn render(app: &mut crate::XRTranslateApp, ui: &mut egui::Ui) {
                     }
                 });
                 if !tts_configured {
-                    tts_response.response.on_disabled_hover_text(crate::i18n::tr(
-                        app.ui_language,
-                        "Configure a TTS provider in Settings to enable TTS playback.",
-                    ));
+                    tts_response
+                        .response
+                        .on_disabled_hover_text(crate::i18n::tr(
+                            app.ui_language,
+                            "Configure a TTS provider in Settings to enable TTS playback.",
+                        ));
                 }
 
                 ui.add_space(8.0);
@@ -514,18 +516,19 @@ pub fn render(app: &mut crate::XRTranslateApp, ui: &mut egui::Ui) {
                         .iter()
                         .map(|device| (device.id.clone(), device.name.clone())),
                 );
-                let output_selector = ui.add_enabled_ui(tts_configured && !app.is_translating, |ui| {
-                    if components::searchable_combobox(
-                        ui,
-                        "tts_output_device_selector",
-                        &current_output,
-                        &mut app.selected_tts_output_device_id,
-                        &output_options,
-                    ) {
-                        app.audio_system.clear_tts_playback();
-                        app.save_settings();
-                    }
-                });
+                let output_selector =
+                    ui.add_enabled_ui(tts_configured && !app.is_translating, |ui| {
+                        if components::searchable_combobox(
+                            ui,
+                            "tts_output_device_selector",
+                            &current_output,
+                            &mut app.selected_tts_output_device_id,
+                            &output_options,
+                        ) {
+                            app.audio_system.clear_tts_playback();
+                            app.save_settings();
+                        }
+                    });
                 if app.is_translating {
                     output_selector.response.on_hover_text(crate::i18n::tr(
                         app.ui_language,

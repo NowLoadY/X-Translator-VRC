@@ -476,10 +476,7 @@ impl PromptNodeGraph {
     }
 
     pub fn auto_layout(&mut self) {
-        for page in [
-            PromptNodePage::OpenAiCompatible,
-            PromptNodePage::Hunyuan,
-        ] {
+        for page in [PromptNodePage::OpenAiCompatible, PromptNodePage::Hunyuan] {
             self.auto_layout_page(page);
         }
         self.layout_version = Self::CURRENT_LAYOUT_VERSION;

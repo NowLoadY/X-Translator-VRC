@@ -5,7 +5,7 @@ use std::{
     time::{SystemTime, UNIX_EPOCH},
 };
 
-use xrtranslate_download::{DownloadClient, DownloadSpec};
+use xrtranslate_download::{DownloadClient, DownloadSource, DownloadSpec};
 
 use crate::{
     ModelAssetId, ModelAssetsPreflight, ModelAssetsPreflightError, ModelSource, RequiredModelFile,
@@ -140,9 +140,17 @@ pub struct DownloadProgress {
 pub enum ModelDownloadError {
     Download(xrtranslate_download::DownloadError),
     StagingDirectory { path: PathBuf, source: io::Error },
+    Removal { path: PathBuf, source: io::Error },
     Locked(PathBuf),
     Lock { path: PathBuf, source: io::Error },
     AtomicInstall(AtomicInstallError),
+}
+
+impl ModelDownloadError {
+    #[must_use]
+    pub fn is_cancelled(&self) -> bool {
+        matches!(self, Self::Download(error) if error.is_cancelled())
+    }
 }
 
 impl fmt::Display for ModelDownloadError {
@@ -153,6 +161,13 @@ impl fmt::Display for ModelDownloadError {
                 write!(
                     formatter,
                     "cannot create model staging directory {}: {source}",
+                    path.display()
+                )
+            }
+            Self::Removal { path, source } => {
+                write!(
+                    formatter,
+                    "cannot remove model resource {}: {source}",
                     path.display()
                 )
             }
@@ -177,7 +192,9 @@ impl Error for ModelDownloadError {
     fn source(&self) -> Option<&(dyn Error + 'static)> {
         match self {
             Self::Download(error) => Some(error),
-            Self::StagingDirectory { source, .. } | Self::Lock { source, .. } => Some(source),
+            Self::StagingDirectory { source, .. }
+            | Self::Removal { source, .. }
+            | Self::Lock { source, .. } => Some(source),
             Self::AtomicInstall(error) => Some(error),
             Self::Locked(_) => None,
         }
@@ -200,9 +217,34 @@ impl NativeModelInstaller {
         assets: ResolvedModelAssets,
         proxy_url: Option<&str>,
     ) -> Result<Self, ModelDownloadError> {
-        let client = DownloadClient::with_proxy(
+        Self::with_download_source(assets, proxy_url, DownloadSource::Official)
+    }
+
+    pub fn with_download_source(
+        assets: ResolvedModelAssets,
+        proxy_url: Option<&str>,
+        source: DownloadSource,
+    ) -> Result<Self, ModelDownloadError> {
+        let client = DownloadClient::with_proxy_and_source(
             concat!("xrtranslate-assets/", env!("CARGO_PKG_VERSION")),
             proxy_url,
+            source,
+        )
+        .map_err(ModelDownloadError::Download)?;
+        Ok(Self { assets, client })
+    }
+
+    pub fn with_download_source_and_cancellation(
+        assets: ResolvedModelAssets,
+        proxy_url: Option<&str>,
+        source: DownloadSource,
+        cancellation: xrtranslate_download::DownloadCancellation,
+    ) -> Result<Self, ModelDownloadError> {
+        let client = DownloadClient::with_proxy_source_and_cancellation(
+            concat!("xrtranslate-assets/", env!("CARGO_PKG_VERSION")),
+            proxy_url,
+            source,
+            cancellation,
         )
         .map_err(ModelDownloadError::Download)?;
         Ok(Self { assets, client })
@@ -296,6 +338,95 @@ impl NativeModelInstaller {
             .await
             .map_err(ModelDownloadError::Download)
     }
+}
+
+/// Removes only the resumable staging owned by one immutable model package.
+/// Callers must first stop the package's worker so no `.part` file is open.
+pub fn clear_model_staging(
+    assets: &ResolvedModelAssets,
+    id: ModelAssetId,
+) -> Result<(), ModelDownloadError> {
+    let staging = staging_directory(assets.asset(id));
+    match fs::remove_dir_all(&staging) {
+        Ok(()) => Ok(()),
+        Err(source) if source.kind() == io::ErrorKind::NotFound => Ok(()),
+        Err(source) => Err(ModelDownloadError::StagingDirectory {
+            path: staging,
+            source,
+        }),
+    }
+}
+
+/// Deletes exactly one model package and its resumable staging. Manifest files
+/// are removed individually so a custom package directory containing unrelated
+/// user data is never recursively erased.
+pub fn remove_model_asset(
+    assets: &ResolvedModelAssets,
+    id: ModelAssetId,
+) -> Result<(), ModelDownloadError> {
+    let target = assets.asset(id);
+    let staging = staging_directory(target);
+    let staging_parent = staging.parent().expect("staging directory has parent");
+    fs::create_dir_all(staging_parent).map_err(|source| ModelDownloadError::StagingDirectory {
+        path: staging_parent.to_path_buf(),
+        source,
+    })?;
+    let _lock = InstallLock::acquire(staging_parent, id)?;
+
+    clear_model_staging(assets, id)?;
+    for file in target.manifest().required_files {
+        let path = target.directory().join(file.relative_path);
+        match fs::remove_file(&path) {
+            Ok(()) => {}
+            Err(source) if source.kind() == io::ErrorKind::NotFound => {}
+            Err(source) => return Err(ModelDownloadError::Removal { path, source }),
+        }
+        remove_empty_parents(path.parent(), target.directory())?;
+    }
+    match fs::remove_dir(target.directory()) {
+        Ok(()) => Ok(()),
+        Err(source)
+            if matches!(
+                source.kind(),
+                io::ErrorKind::NotFound | io::ErrorKind::DirectoryNotEmpty
+            ) =>
+        {
+            Ok(())
+        }
+        Err(source) => Err(ModelDownloadError::Removal {
+            path: target.directory().to_path_buf(),
+            source,
+        }),
+    }
+}
+
+fn remove_empty_parents(
+    mut directory: Option<&Path>,
+    boundary: &Path,
+) -> Result<(), ModelDownloadError> {
+    while let Some(path) = directory {
+        if path == boundary {
+            break;
+        }
+        match fs::remove_dir(path) {
+            Ok(()) => directory = path.parent(),
+            Err(source)
+                if matches!(
+                    source.kind(),
+                    io::ErrorKind::NotFound | io::ErrorKind::DirectoryNotEmpty
+                ) =>
+            {
+                break;
+            }
+            Err(source) => {
+                return Err(ModelDownloadError::Removal {
+                    path: path.to_path_buf(),
+                    source,
+                });
+            }
+        }
+    }
+    Ok(())
 }
 
 fn staging_directory(target: &ResolvedModelAsset) -> PathBuf {

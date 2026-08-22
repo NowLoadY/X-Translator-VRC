@@ -116,6 +116,34 @@
           "url": "https://github.com/ggml-org/llama.cpp/releases/download/b10333/cudart-llama-bin-win-cuda-12.4-x64.zip"
         },
         {
+          "bytes": 145463676,
+          "cuda_version": "13.1",
+          "executable": "llama-server.exe",
+          "kind": "server-cuda",
+          "name": "llama-b8913-bin-win-cuda-13.1-x64.zip",
+          "required_files": [
+            "ggml.dll",
+            "ggml-cuda.dll"
+          ],
+          "sha256": "16cb6fb46efe3923833dc08eaeb7ab29c6251e29a11d9ae32581e226172e2af0",
+          "target": "windows-x86_64",
+          "url": "https://github.com/ggml-org/llama.cpp/releases/download/b8913/llama-b8913-bin-win-cuda-13.1-x64.zip"
+        },
+        {
+          "bytes": 402582216,
+          "cuda_version": "13.1",
+          "kind": "cuda-runtime",
+          "name": "cudart-llama-bin-win-cuda-13.1-x64.zip",
+          "required_file_prefixes": [
+            "cudart64_",
+            "cublasLt64_",
+            "cublas64_"
+          ],
+          "sha256": "f96935e7e385e3b2d0189239077c10fe8fd7e95690fea4afec455b1b6c7e3f18",
+          "target": "windows-x86_64",
+          "url": "https://github.com/ggml-org/llama.cpp/releases/download/b8913/cudart-llama-bin-win-cuda-13.1-x64.zip"
+        },
+        {
           "bytes": 146654145,
           "cuda_version": "13.3",
           "executable": "llama-server.exe",

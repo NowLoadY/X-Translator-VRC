@@ -112,11 +112,15 @@ impl AnimationSystem {
         let global_id = Id::new("onboarding_page_flip_transition_state");
 
         let (direction, start_time) = ui.ctx().memory_mut(|m| {
-            let state = m.data.get_temp_mut_or_insert_with(global_id, || {
-                (page_index, current_time, 0.0f32)
-            });
+            let state = m
+                .data
+                .get_temp_mut_or_insert_with(global_id, || (page_index, current_time, 0.0f32));
             if state.0 != page_index {
-                let dir = if page_index > state.0 { 1.0f32 } else { -1.0f32 };
+                let dir = if page_index > state.0 {
+                    1.0f32
+                } else {
+                    -1.0f32
+                };
                 state.0 = page_index;
                 state.1 = current_time;
                 state.2 = dir;

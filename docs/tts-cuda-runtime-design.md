@@ -56,10 +56,11 @@ host recomputes the plan and reuses any newly installed matching assets.
 
 Selection uses the highest declared CUDA ABI that is supported by both the
 driver and GPU compute capability. CUDA 13 is selected only when both are
-compatible; otherwise a compatible CUDA 12 package is selected. Blackwell (50-Series,
-CC 12.0+) architecture explicitly requires CUDA 13.3+ precompiled assets and cannot
-run CUDA 12.4. If Blackwell is detected on an older driver (< 13.3), the user is prompted
-to update their NVIDIA graphics driver rather than attempting an incompatible CUDA 12 install.
+compatible; otherwise a compatible CUDA 12 package is selected. Blackwell
+(50-Series, CC 12.0+) requires CUDA 12.8 or newer precompiled assets and cannot
+run the declared CUDA 12.4 package. Drivers reporting CUDA 13.1/13.2 select the
+declared CUDA 13.1 llama.cpp bundle; CUDA 13.3-capable drivers prefer the newer
+13.3 bundle. The UI retains an NVIDIA App upgrade prompt while using 13.1.
 An absent NVIDIA GPU selects CPU without downloading CUDA files. A detected but
 incompatible or incomplete NVIDIA installation produces an actionable diagnostic instead
 of silently claiming that CUDA is active.
@@ -75,7 +76,8 @@ Runtime resources remain split by role:
 1. llama.cpp executable and backend-specific libraries;
 2. a compact ONNX Runtime CPU core included in the native application (`runtime/onnxruntime/cpu/`);
 3. CUDA-version-specific ONNX cores and execution-provider pairs under dedicated directories (`runtime/onnxruntime/cuda-13/`, `runtime/onnxruntime/cuda-12/`);
-4. CUDA redistributable dependencies shared by compatible consumers (`runtime/cuda/13.3/`, `runtime/cuda/12.4/`).
+4. CUDA redistributable dependencies shared by compatible consumers
+   (`runtime/cuda/13.3/`, `runtime/cuda/13.1/`, `runtime/cuda/12.4/`).
 
 Only the roles required by active local providers are installed. A CPU-only
 host never downloads CUDA, CUDA providers, or cuDNN. Installing TTS does not duplicate CUDA
@@ -155,7 +157,9 @@ Required automated coverage:
 - no NVIDIA device selects CPU and no CUDA assets;
 - CUDA 12-only driver selects the compatible CUDA 12 plan;
 - CUDA 13-capable Turing-or-newer hardware selects the CUDA 13 plan;
-- Blackwell (50-Series) selects CUDA 13.3+ and falls back to CPU with prompt if driver < 13.3;
+- Blackwell (50-Series) selects CUDA 13.1 for drivers reporting 13.1/13.2,
+  prefers CUDA 13.3 when supported, never selects CUDA 12.4, and falls back to
+  CPU with an upgrade prompt when no complete compatible bundle exists;
 - unsupported compute capability cannot select an incompatible package;
 - llama.cpp and TTS requirements reuse identical runtime assets;
 - missing required DLLs produce `RepairRequired`;

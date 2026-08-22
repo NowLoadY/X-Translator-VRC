@@ -18,11 +18,12 @@ use xrtranslate_config::{
     NativeRuntimeBackend, NativeRuntimeSelection, OnnxRuntimeConfig, RuntimeLayout,
     RuntimeRequirements,
 };
-use xrtranslate_download::{DownloadClient, DownloadSpec};
+use xrtranslate_download::{DownloadCancellation, DownloadClient, DownloadSource, DownloadSpec};
 
 const MIN_CUDA_COMPUTE_CAPABILITY: (u16, u16) = (6, 0);
 const TURING_COMPUTE_CAPABILITY: (u16, u16) = (7, 5);
 const BLACKWELL_MINIMUM_CUDA: (u16, u16) = (12, 8);
+pub(crate) const NVIDIA_APP_URL: &str = "https://www.nvidia.com/en-us/software/nvidia-app/";
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 enum RuntimeBackend {
@@ -119,6 +120,7 @@ enum Event {
         total: u64,
     },
     Extracting,
+    Cancelled,
     Finished(Result<PathBuf, String>),
 }
 
@@ -128,6 +130,10 @@ pub struct RuntimeInstaller {
     events: Option<Receiver<Event>>,
     selection: Option<RuntimePlan>,
     proxy_url: Option<String>,
+    use_mirror: bool,
+    cancellation: Option<DownloadCancellation>,
+    active_project_root: Option<PathBuf>,
+    restart_after_source_switch: bool,
 }
 
 impl Default for RuntimeInstaller {
@@ -137,6 +143,10 @@ impl Default for RuntimeInstaller {
             events: None,
             selection: None,
             proxy_url: None,
+            use_mirror: false,
+            cancellation: None,
+            active_project_root: None,
+            restart_after_source_switch: false,
         }
     }
 }
@@ -144,6 +154,33 @@ impl Default for RuntimeInstaller {
 impl RuntimeInstaller {
     pub fn set_proxy_url(&mut self, proxy_url: &str) {
         self.proxy_url = (!proxy_url.trim().is_empty()).then(|| proxy_url.trim().to_owned());
+    }
+
+    /// Switches the runtime transfer source without mixing partial archives
+    /// from two channels. In-flight downloads stop cooperatively, staging is
+    /// cleared after file handles close, then the selected plan restarts.
+    pub fn switch_download_source(
+        &mut self,
+        project_root: PathBuf,
+        use_mirror: bool,
+    ) -> Result<(), String> {
+        if self.use_mirror == use_mirror {
+            return Ok(());
+        }
+        self.use_mirror = use_mirror;
+        if self.cancellation.is_some() && self.is_busy() {
+            self.restart_after_source_switch = true;
+            if let Some(cancellation) = &self.cancellation {
+                cancellation.cancel();
+            }
+            return Ok(());
+        }
+        clear_runtime_staging(&project_root)
+    }
+
+    #[must_use]
+    pub const fn use_mirror(&self) -> bool {
+        self.use_mirror
     }
     #[must_use]
     pub fn state(&self) -> &RuntimeInstallState {
@@ -246,6 +283,10 @@ impl RuntimeInstaller {
         })?;
         let (sender, receiver) = unbounded();
         let proxy_url = self.proxy_url.clone();
+        let source = DownloadSource::from_mirror_enabled(self.use_mirror);
+        let cancellation = DownloadCancellation::default();
+        let worker_cancellation = cancellation.clone();
+        let worker_root = project_root.clone();
         thread::Builder::new()
             .name("llama-cpp-installer".into())
             .spawn(move || {
@@ -256,15 +297,25 @@ impl RuntimeInstaller {
                     .and_then(|runtime| {
                         runtime.block_on(async {
                             install_runtime_plan(
-                                project_root,
+                                worker_root.clone(),
                                 selection,
                                 sender.clone(),
                                 proxy_url.as_deref(),
+                                source,
+                                worker_cancellation.clone(),
                             )
                             .await
                         })
                     });
-                let _ = sender.send(Event::Finished(result));
+                if worker_cancellation.is_cancelled() {
+                    let cleanup = clear_runtime_staging(&worker_root);
+                    let _ = match cleanup {
+                        Ok(()) => sender.send(Event::Cancelled),
+                        Err(error) => sender.send(Event::Finished(Err(error))),
+                    };
+                } else {
+                    let _ = sender.send(Event::Finished(result));
+                }
             })
             .map_err(|error| format!("Cannot start llama.cpp installer: {error}"))?;
         self.state = RuntimeInstallState::Downloading {
@@ -273,6 +324,88 @@ impl RuntimeInstaller {
             total: self.download_size_bytes().unwrap_or(0),
         };
         self.events = Some(receiver);
+        self.cancellation = Some(cancellation);
+        self.active_project_root = Some(project_root);
+        Ok(())
+    }
+
+    #[must_use]
+    pub fn managed_resources_are_present(&self, project_root: &Path) -> bool {
+        let Ok(config) = load_app_config(project_root) else {
+            return false;
+        };
+        let layout = config.runtime_layout(project_root);
+        if !paths_refer_to_same_location(
+            layout.runtime_root(),
+            &project_root.join(RuntimeLayout::DEFAULT_RUNTIME_DIRECTORY),
+        ) {
+            return false;
+        }
+        layout.llama_cpp_directory().is_dir()
+            || config
+                .model_manager
+                .llama_cpp
+                .downloads
+                .iter()
+                .filter_map(|asset| asset.cuda_version.as_deref())
+                .any(|version| layout.cuda_runtime_directory(version).is_dir())
+            || config
+                .model_manager
+                .onnxruntime
+                .downloads
+                .iter()
+                .any(|asset| layout.onnx_runtime_directory(&asset.cuda_version).is_dir())
+    }
+
+    /// Removes every runtime component managed by the download catalogue while
+    /// preserving the packaged CPU ONNX core and any user-selected external
+    /// runtime directory.
+    pub fn delete_managed_resources(&mut self, project_root: &Path) -> Result<(), String> {
+        if self.is_busy() {
+            return Err("Wait for runtime preparation before deleting runtime resources.".into());
+        }
+        let config = load_app_config(project_root)?;
+        let layout = config.runtime_layout(project_root);
+        let managed_root = project_root.join(RuntimeLayout::DEFAULT_RUNTIME_DIRECTORY);
+        if !paths_refer_to_same_location(layout.runtime_root(), &managed_root) {
+            return Err(
+                "The selected runtime directory is external and will not be deleted automatically."
+                    .into(),
+            );
+        }
+
+        remove_managed_directory(&layout.llama_cpp_directory())?;
+        let cuda_versions = config
+            .model_manager
+            .llama_cpp
+            .downloads
+            .iter()
+            .filter_map(|asset| asset.cuda_version.as_deref())
+            .collect::<HashSet<_>>();
+        for version in cuda_versions {
+            remove_managed_directory(&layout.cuda_runtime_directory(version))?;
+        }
+        let onnx_versions = config
+            .model_manager
+            .onnxruntime
+            .downloads
+            .iter()
+            .map(|asset| asset.cuda_version.as_str())
+            .collect::<HashSet<_>>();
+        for version in onnx_versions {
+            remove_managed_directory(&layout.onnx_runtime_directory(version))?;
+        }
+        match fs::remove_file(layout.native_runtime_selection_file()) {
+            Ok(()) => {}
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+            Err(error) => return Err(format!("Cannot remove native runtime marker: {error}")),
+        }
+        clear_runtime_staging(project_root)?;
+        self.state = RuntimeInstallState::Idle;
+        self.events = None;
+        self.selection = None;
+        self.cancellation = None;
+        self.active_project_root = None;
         Ok(())
     }
 
@@ -281,6 +414,7 @@ impl RuntimeInstaller {
             return;
         };
         let mut finished = false;
+        let mut cancelled = false;
         loop {
             match events.try_recv() {
                 Ok(Event::Prepared(result)) => {
@@ -306,7 +440,18 @@ impl RuntimeInstaller {
                     };
                 }
                 Ok(Event::Extracting) => self.state = RuntimeInstallState::Extracting,
+                Ok(Event::Cancelled) => {
+                    self.state = RuntimeInstallState::Idle;
+                    cancelled = true;
+                    finished = true;
+                    break;
+                }
                 Ok(Event::Finished(result)) => {
+                    if result.is_ok()
+                        && let Some(selection) = self.selection.as_mut()
+                    {
+                        selection.download_bytes = 0;
+                    }
                     self.state = match result {
                         Ok(path) => RuntimeInstallState::Installed(path),
                         Err(error) => RuntimeInstallState::Failed(error),
@@ -326,7 +471,34 @@ impl RuntimeInstaller {
         }
         if finished {
             self.events = None;
+            self.cancellation = None;
+            let project_root = self.active_project_root.take();
+            if cancelled && self.restart_after_source_switch {
+                self.restart_after_source_switch = false;
+                if let Some(project_root) = project_root
+                    && let Err(error) = self.install_recommended(project_root)
+                {
+                    self.state = RuntimeInstallState::Failed(error);
+                }
+            }
         }
+    }
+}
+
+fn paths_refer_to_same_location(left: &Path, right: &Path) -> bool {
+    let left = std::path::absolute(left).unwrap_or_else(|_| left.to_path_buf());
+    let right = std::path::absolute(right).unwrap_or_else(|_| right.to_path_buf());
+    left == right
+}
+
+fn remove_managed_directory(path: &Path) -> Result<(), String> {
+    match fs::remove_dir_all(path) {
+        Ok(()) => Ok(()),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(()),
+        Err(error) => Err(format!(
+            "Cannot remove managed runtime resource {}: {error}",
+            path.display()
+        )),
     }
 }
 
@@ -363,6 +535,8 @@ async fn install_onnx_runtime(
     selection: OnnxRuntimeSelection,
     sender: crossbeam_channel::Sender<Event>,
     proxy_url: Option<&str>,
+    source: DownloadSource,
+    cancellation: DownloadCancellation,
     progress_base: u64,
     progress_total: u64,
 ) -> Result<PathBuf, String> {
@@ -427,8 +601,13 @@ async fn install_onnx_runtime(
     }
     fs::create_dir_all(&payload)
         .map_err(|error| format!("Cannot create ONNX runtime extraction folder: {error}"))?;
-    let client = DownloadClient::with_proxy("XRTranslate ONNX runtime installer", proxy_url)
-        .map_err(|error| error.to_string())?;
+    let client = DownloadClient::with_proxy_source_and_cancellation(
+        "XRTranslate ONNX runtime installer",
+        proxy_url,
+        source,
+        cancellation,
+    )
+    .map_err(|error| error.to_string())?;
     let mut completed = 0_u64;
 
     if !cuda_ready {
@@ -564,6 +743,8 @@ async fn install_runtime_plan(
     plan: RuntimePlan,
     sender: crossbeam_channel::Sender<Event>,
     proxy_url: Option<&str>,
+    source: DownloadSource,
+    cancellation: DownloadCancellation,
 ) -> Result<PathBuf, String> {
     let progress_total =
         missing_runtime_bytes(&project_root, plan.llama_cpp.as_ref(), plan.onnx.as_ref());
@@ -577,6 +758,8 @@ async fn install_runtime_plan(
                 selection,
                 sender.clone(),
                 proxy_url,
+                source,
+                cancellation.clone(),
                 0,
                 progress_total,
             )
@@ -590,6 +773,8 @@ async fn install_runtime_plan(
                 selection,
                 sender,
                 proxy_url,
+                source,
+                cancellation,
                 llama_bytes,
                 progress_total,
             )
@@ -606,6 +791,8 @@ async fn install(
     selection: RuntimeSelection,
     sender: crossbeam_channel::Sender<Event>,
     proxy_url: Option<&str>,
+    source: DownloadSource,
+    cancellation: DownloadCancellation,
     progress_base: u64,
     progress_total: u64,
 ) -> Result<PathBuf, String> {
@@ -667,8 +854,13 @@ async fn install(
         ));
     }
 
-    let client = DownloadClient::with_proxy("XRTranslate runtime installer", proxy_url)
-        .map_err(|error| error.to_string())?;
+    let client = DownloadClient::with_proxy_source_and_cancellation(
+        "XRTranslate runtime installer",
+        proxy_url,
+        source,
+        cancellation,
+    )
+    .map_err(|error| error.to_string())?;
     let release = load_runtime_config(&project_root)?.release;
     let runtime_root = layout.runtime_root().to_path_buf();
     let staging = runtime_root.join(format!(".llama.cpp-{release}-staging"));
@@ -1219,6 +1411,45 @@ fn load_app_config(project_root: &Path) -> Result<AppConfig, String> {
     })
 }
 
+/// Removes only resumable runtime staging for the releases declared by the
+/// active configuration. Final runtime directories are never touched.
+fn clear_runtime_staging(project_root: &Path) -> Result<(), String> {
+    let config = load_app_config(project_root)?;
+    let layout = load_runtime_layout(project_root);
+    let paths = [
+        layout.runtime_root().join(format!(
+            ".llama.cpp-{}-staging",
+            config.model_manager.llama_cpp.release
+        )),
+        layout.runtime_root().join(format!(
+            ".onnxruntime-{}-staging",
+            config.model_manager.onnxruntime.release
+        )),
+    ];
+    for path in paths {
+        match fs::remove_dir_all(&path) {
+            Ok(()) => {}
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+            Err(error) => {
+                return Err(format!(
+                    "Cannot clear runtime staging {}: {error}",
+                    path.display()
+                ));
+            }
+        }
+    }
+    Ok(())
+}
+
+/// Filesystem-backed startup preflight. This avoids treating the installer's
+/// empty, not-yet-planned UI state as proof that the runtime is missing.
+pub fn configured_runtime_is_ready(
+    project_root: &Path,
+    requirements: RuntimeRequirements,
+) -> Result<bool, String> {
+    configured_runtime_plan(project_root, requirements).map(|plan| plan.download_bytes == 0)
+}
+
 fn configured_runtime_plan(
     project_root: &Path,
     requirements: RuntimeRequirements,
@@ -1419,7 +1650,9 @@ pub(crate) fn migrate_legacy_directory(layout: &RuntimeLayout, source_dir: &Path
 
         // 2. ONNX runtime DLL migration if found in legacy mixed folder
         if lower.starts_with("onnxruntime") && lower.ends_with(".dll") {
-            let cuda_version = if layout.cuda_runtime_directory("13.3").is_dir() || lower.contains("cuda13") {
+            let cuda_version = if layout.cuda_runtime_directory("13.3").is_dir()
+                || lower.contains("cuda13")
+            {
                 "13"
             } else if layout.cuda_runtime_directory("12.4").is_dir() || lower.contains("cuda12") {
                 "12"
@@ -1720,12 +1953,21 @@ fn select_assets_for_hardware(
                     .filter(|asset| asset.kind == LlamaCppAssetKind::ServerCuda)
                     .filter_map(|asset| asset.cuda_version.as_deref())
                     .filter_map(parse_version)
-                    .max()
+                    .filter(|version| {
+                        *version >= minimum
+                            && cuda_supports_compute_capability(*version, nvidia.compute_capability)
+                            && assets.iter().any(|asset| {
+                                asset.kind == LlamaCppAssetKind::CudaRuntime
+                                    && asset.cuda_version.as_deref().and_then(parse_version)
+                                        == Some(*version)
+                            })
+                    })
+                    .min()
                     .map(format_version)
-                    .unwrap_or_else(|| "13.3".into());
+                    .unwrap_or_else(|| format_version(minimum));
                 format!(
-                    "This RTX 50-series GPU needs a CUDA {package_cuda}-capable NVIDIA driver to use the packaged llama.cpp runtime. The installed driver only reports CUDA {}; using the CPU runtime.",
-                    nvidia.driver_cuda
+                    "This RTX 50-series GPU needs a CUDA {package_cuda}-capable NVIDIA driver to use the packaged llama.cpp runtime. The installed driver only reports CUDA {}; using the CPU runtime. Update the graphics driver with NVIDIA App: {NVIDIA_APP_URL}",
+                    nvidia.driver_cuda,
                 )
             } else {
                 format!(
@@ -1756,11 +1998,29 @@ fn select_assets_for_hardware(
             )));
         };
         let executable = runtime.executable.clone();
+        let selected_version = parse_version(cuda_version)
+            .ok_or_else(|| "selected CUDA asset has an invalid CUDA version".to_owned())?;
+        let newer_version = assets
+            .iter()
+            .filter(|asset| asset.kind == LlamaCppAssetKind::ServerCuda)
+            .filter_map(|asset| asset.cuda_version.as_deref())
+            .filter_map(parse_version)
+            .filter(|version| *version > selected_version)
+            .max();
+        let fallback_reason = (nvidia.compute_capability.0 >= 10)
+            .then_some(newer_version)
+            .flatten()
+            .map(|newer| {
+                format!(
+                    "Using the compatible CUDA {cuda_version} llama.cpp runtime for this RTX 50-series GPU. Update the graphics driver with NVIDIA App to enable the newer CUDA {} runtime: {NVIDIA_APP_URL}",
+                    format_version(newer),
+                )
+            });
         return Ok(RuntimeSelection {
             assets: vec![runtime, cudart],
             backend: RuntimeBackend::Cuda,
             executable,
-            fallback_reason: None,
+            fallback_reason,
         });
     }
     cpu_selection(None)
@@ -1989,7 +2249,9 @@ fn run_nvidia_smi(args: &[&str]) -> Result<Option<(PathBuf, std::process::Output
     }
 
     if windows_reports_nvidia_adapter() {
-        Err("Windows reports an NVIDIA display adapter, but nvidia-smi could not be found. Reinstall or update the NVIDIA driver; the installer will not silently substitute a CPU runtime.".into())
+        Err(format!(
+            "Windows reports an NVIDIA display adapter, but nvidia-smi could not be found. Reinstall or update the NVIDIA driver with NVIDIA App ({NVIDIA_APP_URL}); the installer will not silently substitute a CPU runtime."
+        ))
     } else {
         Ok(None)
     }
@@ -2129,6 +2391,7 @@ mod tests {
             cuda_version: name
                 .contains("cuda-12.4")
                 .then(|| "12.4".into())
+                .or_else(|| name.contains("cuda-13.1").then(|| "13.1".into()))
                 .or_else(|| name.contains("cuda-13.3").then(|| "13.3".into())),
             executable: "llama-server.exe".into(),
             required_files: vec!["ggml.dll".into()],
@@ -2144,7 +2407,7 @@ mod tests {
     fn automatic_installer_uses_the_configured_download_urls() {
         let config = AppConfig::from_json_str(include_str!("../../config.json")).unwrap();
         let assets = release_assets_from_config(&config.model_manager.llama_cpp).unwrap();
-        assert_eq!(assets.len(), 6);
+        assert_eq!(assets.len(), 8);
         assert_eq!(config.model_manager.llama_cpp.release, "b10333");
         assert!(
             !config
@@ -2171,6 +2434,37 @@ mod tests {
         assert_eq!(
             cuda_runtime.required_file_prefixes,
             ["cudart64_", "cublasLt64_", "cublas64_"]
+        );
+        let blackwell_compatible = release_assets_from_config(&config.model_manager.llama_cpp)
+            .unwrap()
+            .into_iter()
+            .filter(|asset| asset.cuda_version.as_deref() == Some("13.1"))
+            .collect::<Vec<_>>();
+        assert_eq!(blackwell_compatible.len(), 2);
+        assert!(blackwell_compatible.iter().all(|asset| {
+            asset
+                .browser_download_url
+                .contains("/releases/download/b8913/")
+                && asset.sha256.len() == 64
+                && asset.size > 0
+        }));
+        let server_13_1 = blackwell_compatible
+            .iter()
+            .find(|asset| asset.kind == LlamaCppAssetKind::ServerCuda)
+            .unwrap();
+        assert_eq!(server_13_1.size, 145_463_676);
+        assert_eq!(
+            server_13_1.sha256,
+            "16cb6fb46efe3923833dc08eaeb7ab29c6251e29a11d9ae32581e226172e2af0"
+        );
+        let cudart_13_1 = blackwell_compatible
+            .iter()
+            .find(|asset| asset.kind == LlamaCppAssetKind::CudaRuntime)
+            .unwrap();
+        assert_eq!(cudart_13_1.size, 402_582_216);
+        assert_eq!(
+            cudart_13_1.sha256,
+            "f96935e7e385e3b2d0189239077c10fe8fd7e95690fea4afec455b1b6c7e3f18"
         );
         let linux = release_assets_from_config(&config.model_manager.llama_cpp)
             .unwrap()
@@ -2234,10 +2528,11 @@ mod tests {
     fn onnx_and_llama_choose_the_same_cuda_major() {
         let cuda_runtimes = vec![
             asset("cudart-llama-bin-win-cuda-12.4-x64.zip"),
+            asset("cudart-llama-bin-win-cuda-13.1-x64.zip"),
             asset("cudart-llama-bin-win-cuda-13.3-x64.zip"),
         ];
         let providers = vec![onnx_asset("12"), onnx_asset("13")];
-        for (driver, expected) in [("12.9", "12.4"), ("13.3", "13.3")] {
+        for (driver, expected) in [("12.9", "12.4"), ("13.2", "13.1"), ("13.3", "13.3")] {
             let selection = select_onnx_assets_for_hardware(
                 &providers,
                 &cuda_runtimes,
@@ -2405,6 +2700,8 @@ mod tests {
                 },
                 sender,
                 None,
+                DownloadSource::Official,
+                DownloadCancellation::default(),
                 0,
                 0,
             ))
@@ -2516,11 +2813,13 @@ mod tests {
     }
 
     #[test]
-    fn blackwell_falls_back_to_cpu_when_the_driver_cannot_load_the_gpu_package() {
+    fn blackwell_selects_cuda_13_1_when_the_driver_cannot_load_cuda_13_3() {
         let assets = vec![
             asset("llama-b1-bin-win-cpu-x64.zip"),
             asset("llama-b1-bin-win-cuda-12.4-x64.zip"),
             asset("cudart-llama-bin-win-cuda-12.4-x64.zip"),
+            asset("llama-b1-bin-win-cuda-13.1-x64.zip"),
+            asset("cudart-llama-bin-win-cuda-13.1-x64.zip"),
             asset("llama-b1-bin-win-cuda-13.3-x64.zip"),
             asset("cudart-llama-bin-win-cuda-13.3-x64.zip"),
         ];
@@ -2530,14 +2829,38 @@ mod tests {
             driver_cuda: "13.2".into(),
         };
         let selected = select_assets_for_hardware(&assets, Some(&nvidia)).unwrap();
+        assert_eq!(selected.backend, RuntimeBackend::Cuda);
+        assert_eq!(selected.assets[0].cuda_version.as_deref(), Some("13.1"));
+        let notice = selected.fallback_reason.unwrap();
+        assert!(notice.contains("NVIDIA App"));
+        assert!(notice.contains(NVIDIA_APP_URL));
+    }
+
+    #[test]
+    fn blackwell_driver_below_13_1_reports_the_minimum_complete_gpu_package() {
+        let assets = vec![
+            asset("llama-b1-bin-win-cpu-x64.zip"),
+            asset("llama-b1-bin-win-cuda-12.4-x64.zip"),
+            asset("cudart-llama-bin-win-cuda-12.4-x64.zip"),
+            asset("llama-b1-bin-win-cuda-13.1-x64.zip"),
+            asset("cudart-llama-bin-win-cuda-13.1-x64.zip"),
+            asset("llama-b1-bin-win-cuda-13.3-x64.zip"),
+            asset("cudart-llama-bin-win-cuda-13.3-x64.zip"),
+        ];
+        let selected = select_assets_for_hardware(
+            &assets,
+            Some(&NvidiaCuda {
+                gpu: "NVIDIA GeForce RTX 5080".into(),
+                compute_capability: (12, 0),
+                driver_cuda: "13.0".into(),
+            }),
+        )
+        .unwrap();
         assert_eq!(selected.backend, RuntimeBackend::Cpu);
-        assert_eq!(selected.assets[0].kind, LlamaCppAssetKind::ServerCpu);
-        assert!(
-            selected
-                .fallback_reason
-                .unwrap()
-                .contains("using the CPU runtime")
-        );
+        let notice = selected.fallback_reason.unwrap();
+        assert!(notice.contains("CUDA 13.1-capable"));
+        assert!(!notice.contains("needs a CUDA 13.3-capable"));
+        assert!(notice.contains(NVIDIA_APP_URL));
     }
 
     #[test]
@@ -2630,6 +2953,74 @@ mod tests {
     }
 
     #[test]
+    fn source_switch_cleanup_removes_only_declared_runtime_staging() {
+        let root = std::env::temp_dir().join(format!(
+            "xrtranslate-runtime-source-switch-{}",
+            std::process::id()
+        ));
+        let _ = std::fs::remove_dir_all(&root);
+        std::fs::create_dir_all(&root).unwrap();
+        std::fs::write(root.join("config.json"), include_str!("../../config.json")).unwrap();
+        let config = load_app_config(&root).unwrap();
+        let layout = load_runtime_layout(&root);
+        let llama_staging = layout.runtime_root().join(format!(
+            ".llama.cpp-{}-staging",
+            config.model_manager.llama_cpp.release
+        ));
+        let onnx_staging = layout.runtime_root().join(format!(
+            ".onnxruntime-{}-staging",
+            config.model_manager.onnxruntime.release
+        ));
+        let installed = layout.llama_cpp_directory();
+        std::fs::create_dir_all(&llama_staging).unwrap();
+        std::fs::create_dir_all(&onnx_staging).unwrap();
+        std::fs::create_dir_all(&installed).unwrap();
+
+        clear_runtime_staging(&root).unwrap();
+
+        assert!(!llama_staging.exists());
+        assert!(!onnx_staging.exists());
+        assert!(installed.exists());
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn deleting_managed_runtime_keeps_the_packaged_cpu_core() {
+        let root =
+            std::env::temp_dir().join(format!("xrtranslate-runtime-delete-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&root);
+        std::fs::create_dir_all(&root).unwrap();
+        std::fs::write(root.join("config.json"), include_str!("../../config.json")).unwrap();
+        let config = load_app_config(&root).unwrap();
+        let layout = load_runtime_layout(&root);
+        std::fs::create_dir_all(layout.llama_cpp_directory()).unwrap();
+        for version in config
+            .model_manager
+            .llama_cpp
+            .downloads
+            .iter()
+            .filter_map(|asset| asset.cuda_version.as_deref())
+        {
+            std::fs::create_dir_all(layout.cuda_runtime_directory(version)).unwrap();
+        }
+        for asset in &config.model_manager.onnxruntime.downloads {
+            std::fs::create_dir_all(layout.onnx_runtime_directory(&asset.cuda_version)).unwrap();
+        }
+        let cpu_core = layout.onnx_cpu_core_library();
+        std::fs::create_dir_all(cpu_core.parent().unwrap()).unwrap();
+        std::fs::write(&cpu_core, b"packaged").unwrap();
+        std::fs::write(layout.native_runtime_selection_file(), b"{}").unwrap();
+
+        let mut installer = RuntimeInstaller::default();
+        installer.delete_managed_resources(&root).unwrap();
+
+        assert!(!layout.llama_cpp_directory().exists());
+        assert!(!layout.native_runtime_selection_file().exists());
+        assert!(cpu_core.is_file());
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
     fn reads_current_nvidia_smi_cuda_umd_output() {
         let output = "| NVIDIA-SMI 610.47  CUDA UMD Version: 13.3 |";
         assert_eq!(
@@ -2640,7 +3031,8 @@ mod tests {
 
     #[test]
     fn legacy_cuda_13_dlls_are_migrated_to_shared_cuda_13_directory() {
-        let root = std::env::temp_dir().join(format!("xrtranslate-legacy-cuda13-{}", std::process::id()));
+        let root =
+            std::env::temp_dir().join(format!("xrtranslate-legacy-cuda13-{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&root);
         let layout = RuntimeLayout::new(&root, Some(Path::new("runtime")));
         let llama_dir = layout.llama_cpp_directory();
@@ -2662,7 +3054,8 @@ mod tests {
 
     #[test]
     fn legacy_cuda_12_dlls_are_migrated_to_shared_cuda_12_directory() {
-        let root = std::env::temp_dir().join(format!("xrtranslate-legacy-cuda12-{}", std::process::id()));
+        let root =
+            std::env::temp_dir().join(format!("xrtranslate-legacy-cuda12-{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&root);
         let layout = RuntimeLayout::new(&root, Some(Path::new("runtime")));
         let llama_dir = layout.llama_cpp_directory();
@@ -2684,7 +3077,8 @@ mod tests {
 
     #[test]
     fn legacy_cpu_runtime_does_not_create_cuda_directories() {
-        let root = std::env::temp_dir().join(format!("xrtranslate-legacy-cpu-{}", std::process::id()));
+        let root =
+            std::env::temp_dir().join(format!("xrtranslate-legacy-cpu-{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&root);
         let layout = RuntimeLayout::new(&root, Some(Path::new("runtime")));
         let llama_dir = layout.llama_cpp_directory();

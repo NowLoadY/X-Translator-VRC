@@ -7,6 +7,10 @@
 
 #![forbid(unsafe_code)]
 
+mod source;
+
+pub use source::DownloadSource;
+
 use reqwest::{
     StatusCode,
     header::{ACCEPT_ENCODING, CONTENT_RANGE, RANGE, RETRY_AFTER},
@@ -17,6 +21,10 @@ use std::{
     fmt, fs,
     io::{self, Read},
     path::{Path, PathBuf},
+    sync::{
+        Arc,
+        atomic::{AtomicBool, Ordering},
+    },
     time::Duration,
 };
 use tokio::io::AsyncWriteExt;
@@ -25,6 +33,24 @@ use tokio::io::AsyncWriteExt;
 pub struct DownloadProgress {
     pub downloaded_bytes: u64,
     pub total_bytes: u64,
+}
+
+/// Cooperative cancellation shared by a UI-owned download worker and the
+/// control that replaces its source. Cancellation is checked between network
+/// chunks and retry delays so the worker releases its `.part` file before the
+/// owning installer removes staging.
+#[derive(Clone, Debug, Default)]
+pub struct DownloadCancellation(Arc<AtomicBool>);
+
+impl DownloadCancellation {
+    pub fn cancel(&self) {
+        self.0.store(true, Ordering::Release);
+    }
+
+    #[must_use]
+    pub fn is_cancelled(&self) -> bool {
+        self.0.load(Ordering::Acquire)
+    }
 }
 
 #[derive(Clone, Copy, Debug)]
@@ -90,6 +116,8 @@ impl Default for DownloadPolicy {
 pub struct DownloadClient {
     client: reqwest::Client,
     policy: DownloadPolicy,
+    source: DownloadSource,
+    cancellation: Option<DownloadCancellation>,
 }
 
 impl DownloadClient {
@@ -102,13 +130,41 @@ impl DownloadClient {
     }
 
     pub fn with_proxy(user_agent: &str, proxy_url: Option<&str>) -> Result<Self, DownloadError> {
-        Self::with_policy_and_proxy(user_agent, DownloadPolicy::default(), proxy_url)
+        Self::with_proxy_and_source(user_agent, proxy_url, DownloadSource::Official)
+    }
+
+    pub fn with_proxy_and_source(
+        user_agent: &str,
+        proxy_url: Option<&str>,
+        source: DownloadSource,
+    ) -> Result<Self, DownloadError> {
+        Self::with_policy_proxy_and_source(user_agent, DownloadPolicy::default(), proxy_url, source)
+    }
+
+    pub fn with_proxy_source_and_cancellation(
+        user_agent: &str,
+        proxy_url: Option<&str>,
+        source: DownloadSource,
+        cancellation: DownloadCancellation,
+    ) -> Result<Self, DownloadError> {
+        let mut client = Self::with_proxy_and_source(user_agent, proxy_url, source)?;
+        client.cancellation = Some(cancellation);
+        Ok(client)
     }
 
     fn with_policy_and_proxy(
         user_agent: &str,
         policy: DownloadPolicy,
         proxy_url: Option<&str>,
+    ) -> Result<Self, DownloadError> {
+        Self::with_policy_proxy_and_source(user_agent, policy, proxy_url, DownloadSource::Official)
+    }
+
+    fn with_policy_proxy_and_source(
+        user_agent: &str,
+        policy: DownloadPolicy,
+        proxy_url: Option<&str>,
+        source: DownloadSource,
     ) -> Result<Self, DownloadError> {
         if policy.max_attempts == 0 {
             return Err(DownloadError::InvalidSpec(
@@ -128,7 +184,12 @@ impl DownloadClient {
         let client = builder
             .build()
             .map_err(|error| DownloadError::Client(error.to_string()))?;
-        Ok(Self { client, policy })
+        Ok(Self {
+            client,
+            policy,
+            source,
+            cancellation: None,
+        })
     }
 
     /// Downloads beside `complete` using a deterministic `.part` sibling.
@@ -191,6 +252,7 @@ impl DownloadClient {
         }
 
         for attempt in 1..=self.policy.max_attempts {
+            self.ensure_not_cancelled(spec.label)?;
             match self.transfer_once(spec, partial, &mut on_progress).await {
                 Ok(()) => {
                     if let Err(error) = verify_file(partial, spec) {
@@ -203,7 +265,7 @@ impl DownloadClient {
                             let Some(delay) = self.retry_delay(&error, attempt) else {
                                 return Err(error);
                             };
-                            tokio::time::sleep(delay).await;
+                            self.sleep_or_cancel(delay, spec.label).await?;
                             continue;
                         }
                         return Err(error);
@@ -220,7 +282,7 @@ impl DownloadClient {
                     let Some(delay) = self.retry_delay(&error, attempt) else {
                         return Err(error.with_attempts(attempt));
                     };
-                    tokio::time::sleep(delay).await;
+                    self.sleep_or_cancel(delay, spec.label).await?;
                 }
                 Err(error) => return Err(error.with_attempts(attempt)),
             }
@@ -234,6 +296,32 @@ impl DownloadClient {
             self.policy.retry_delay.saturating_mul(multiplier)
         });
         (delay <= self.policy.max_automatic_retry_delay).then_some(delay)
+    }
+
+    fn ensure_not_cancelled(&self, label: &str) -> Result<(), DownloadError> {
+        if self
+            .cancellation
+            .as_ref()
+            .is_some_and(DownloadCancellation::is_cancelled)
+        {
+            Err(DownloadError::Cancelled {
+                label: label.to_owned(),
+            })
+        } else {
+            Ok(())
+        }
+    }
+
+    async fn sleep_or_cancel(&self, delay: Duration, label: &str) -> Result<(), DownloadError> {
+        let mut remaining = delay;
+        let quantum = Duration::from_millis(100);
+        while !remaining.is_zero() {
+            self.ensure_not_cancelled(label)?;
+            let current = remaining.min(quantum);
+            tokio::time::sleep(current).await;
+            remaining = remaining.saturating_sub(current);
+        }
+        self.ensure_not_cancelled(label)
     }
 
     async fn transfer_once(
@@ -256,9 +344,10 @@ impl DownloadClient {
             return Ok(());
         }
 
+        let resolved_url = self.source.resolve(spec.url);
         let mut request = self
             .client
-            .get(spec.url)
+            .get(resolved_url.as_ref())
             .header(ACCEPT_ENCODING, "identity");
         if existing > 0 {
             request = request.header(RANGE, format!("bytes={existing}-"));
@@ -321,6 +410,7 @@ impl DownloadClient {
         });
 
         loop {
+            self.ensure_not_cancelled(spec.label)?;
             let chunk = match response.chunk().await {
                 Ok(chunk) => chunk,
                 Err(error) => {
@@ -428,9 +518,17 @@ pub enum DownloadError {
         expected: String,
         actual: String,
     },
+    Cancelled {
+        label: String,
+    },
 }
 
 impl DownloadError {
+    #[must_use]
+    pub const fn is_cancelled(&self) -> bool {
+        matches!(self, Self::Cancelled { .. })
+    }
+
     fn is_retryable(&self) -> bool {
         match self {
             Self::Transfer { .. } | Self::Incomplete { .. } => true,
@@ -550,6 +648,7 @@ impl fmt::Display for DownloadError {
                 "downloaded file {} has SHA-256 {actual}; expected {expected}",
                 path.display()
             ),
+            Self::Cancelled { label } => write!(formatter, "download {label} was cancelled"),
         }
     }
 }
@@ -734,6 +833,8 @@ mod tests {
         let client = DownloadClient {
             client: reqwest::Client::new(),
             policy: DownloadPolicy::default(),
+            source: DownloadSource::Official,
+            cancellation: None,
         };
         let excessive = DownloadError::HttpStatus {
             label: "artifact".into(),
@@ -742,6 +843,38 @@ mod tests {
             attempts: 0,
         };
         assert_eq!(client.retry_delay(&excessive, 1), None);
+    }
+
+    #[test]
+    fn cancelled_transfer_stops_before_opening_a_partial_file() {
+        let cancellation = DownloadCancellation::default();
+        cancellation.cancel();
+        let client = DownloadClient::with_proxy_source_and_cancellation(
+            "xrtranslate-download-test",
+            None,
+            DownloadSource::Official,
+            cancellation,
+        )
+        .unwrap();
+        let root = std::env::temp_dir().join(format!(
+            "xrtranslate-download-cancelled-{}",
+            std::process::id()
+        ));
+        let complete = root.join("artifact.bin");
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap();
+        let error = runtime
+            .block_on(client.download_to(
+                DownloadSpec::size_only("artifact", "https://example.invalid/artifact", 1),
+                &complete,
+                |_| {},
+            ))
+            .unwrap_err();
+
+        assert!(error.is_cancelled());
+        assert!(!complete.with_file_name("artifact.bin.part").exists());
     }
 
     #[test]

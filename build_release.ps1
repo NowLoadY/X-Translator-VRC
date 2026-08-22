@@ -21,7 +21,28 @@ $corporaDirectory = Join-Path $projectRoot 'XR-Corpus\corpora'
 $cargoPath = Join-Path $env:USERPROFILE '.cargo\bin\cargo.exe'
 
 if ([string]::IsNullOrWhiteSpace($OnnxRuntimeCpu)) {
-    throw 'Pass -OnnxRuntimeCpu <onnxruntime.dll>. Expected ORT 1.28.0 CUDA13 archive core: 16,277,856 bytes, SHA-256 2462fe2d64ce063babefda3d9b1998380ffa74e99acf5d24d520ee67daa9e0f1. This compact CPU-capable core is the only inference runtime bundled in the release.'
+    if (-not (Test-Path -LiteralPath $configPath -PathType Leaf)) {
+        throw "Release configuration was not found: $configPath"
+    }
+    $releaseConfig = Get-Content -LiteralPath $configPath -Raw | ConvertFrom-Json
+    $onnxRuntimeDownload = $releaseConfig.model_manager.onnxruntime.downloads |
+        Where-Object { [string]$_.cuda_version -eq '13' } |
+        Select-Object -First 1
+    if ($null -eq $onnxRuntimeDownload) {
+        throw 'config.json does not declare a CUDA 13 ONNX Runtime package whose core can be bundled as the CPU fallback.'
+    }
+
+    $archiveDirectory = ([string]$onnxRuntimeDownload.archive_directory).Replace('/', '\')
+    $coreSuffix = Join-Path $archiveDirectory 'onnxruntime.dll'
+    $runtimeAssetCache = Join-Path $projectRoot '.temp\runtime-assets'
+    $cachedCore = Get-ChildItem -LiteralPath $runtimeAssetCache -Filter 'onnxruntime.dll' -File -Recurse -ErrorAction SilentlyContinue |
+        Where-Object { $_.FullName.EndsWith($coreSuffix, [System.StringComparison]::OrdinalIgnoreCase) } |
+        Select-Object -First 1
+    if ($null -eq $cachedCore) {
+        throw "The configured ONNX Runtime package is not extracted under $runtimeAssetCache. Pass -OnnxRuntimeCpu <onnxruntime.dll> from the official $($onnxRuntimeDownload.name) package."
+    }
+    $OnnxRuntimeCpu = $cachedCore.FullName
+    Write-Host "Using configured ONNX Runtime core: $OnnxRuntimeCpu"
 }
 $OnnxRuntimeCpu = [System.IO.Path]::GetFullPath($OnnxRuntimeCpu)
 if (-not (Test-Path -LiteralPath $OnnxRuntimeCpu -PathType Leaf)) {

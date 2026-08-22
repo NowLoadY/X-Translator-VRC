@@ -539,6 +539,8 @@ mod tests {
 
         // Multi-script full stops (Devanagari, Arabic, Armenian, Ethiopic, Myanmar, Tibetan)
         assert_eq!(sanitize_chatbox_segment("नमस्ते।"), "नमस्ते");
+        assert_eq!(sanitize_chatbox_segment("आप कैसे हैं?"), "आप कैसे हैं?");
+        assert_eq!(sanitize_chatbox_segment("Tiếng Việt!"), "Tiếng Việt!");
         assert_eq!(sanitize_chatbox_segment("مرحبا۔"), "مرحبا");
         assert_eq!(sanitize_chatbox_segment("Բարև։"), "Բարև");
         assert_eq!(sanitize_chatbox_segment("ሰላም።"), "ሰላም");

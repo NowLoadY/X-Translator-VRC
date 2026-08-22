@@ -65,7 +65,7 @@ pub fn render(app: &mut crate::XRTranslateApp, ui: &mut egui::Ui) {
                                 let project_root = app.project_root();
                                 let live_tts_backend = app.tts_runtime_backend.clone();
                                 let live_tts_cuda_version = app.tts_runtime_cuda_version.clone();
-                                let apply = app.service_config.render(
+                                let (apply, delete_runtime) = app.service_config.render(
                                     ui,
                                     &mut app.backend_manager,
                                     &mut app.model_task_manager,
@@ -77,6 +77,9 @@ pub fn render(app: &mut crate::XRTranslateApp, ui: &mut egui::Ui) {
                                 );
                                 if apply {
                                     app.apply_service_configuration(Some(ui.ctx().clone()));
+                                }
+                                if delete_runtime {
+                                    app.request_runtime_resource_deletion();
                                 }
                             }
                             SettingsSection::Plugins => {
@@ -382,7 +385,10 @@ fn render_update_controls(app: &mut crate::XRTranslateApp, ui: &mut egui::Ui) {
 fn render_server_section(app: &mut crate::XRTranslateApp, ui: &mut egui::Ui) {
     section(ui, crate::i18n::tr(app.ui_language, "Backend"), |ui| {
         ui.horizontal(|ui| {
-            ui.label(format!("{}:", crate::i18n::tr(app.ui_language, "Runtime Directory")));
+            ui.label(format!(
+                "{}:",
+                crate::i18n::tr(app.ui_language, "Runtime Directory")
+            ));
             let dir_changed = components::directory_path_input(
                 ui,
                 &mut app.backend_manager.runtime_directory,

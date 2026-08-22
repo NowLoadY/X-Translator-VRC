@@ -246,9 +246,11 @@ impl PromptStudioController {
             self.selected_nodes
                 .retain(|id| valid_node_ids.contains(id.as_str()));
             self.selected_links.retain(|key| {
-                draft.graph.links.iter().any(|l| {
-                    l.from == key.from && l.to == key.to && l.input == key.input
-                })
+                draft
+                    .graph
+                    .links
+                    .iter()
+                    .any(|l| l.from == key.from && l.to == key.to && l.input == key.input)
             });
         } else {
             self.selected_nodes.clear();
@@ -874,12 +876,16 @@ mod tests {
             "Write prompt text here: {0}".into(),
             [150.0, 150.0],
         );
-        assert!(profile.graph.connect(&compose_id, "openai-reference-context", 0));
-        assert!(profile
-            .graph
-            .links
-            .iter()
-            .any(|l| l.from == compose_id && l.to == "openai-reference-context" && l.input == 0));
+        assert!(
+            profile
+                .graph
+                .connect(&compose_id, "openai-reference-context", 0)
+        );
+        assert!(
+            profile.graph.links.iter().any(|l| l.from == compose_id
+                && l.to == "openai-reference-context"
+                && l.input == 0)
+        );
     }
 
     #[test]
@@ -895,7 +901,9 @@ mod tests {
         let mut input = egui::RawInput::default();
         input.screen_rect = Some(Rect::from_min_size(Pos2::ZERO, Vec2::new(1024.0, 768.0)));
         input.predicted_dt = 1.0 / 60.0;
-        input.events.push(egui::Event::PointerMoved(Pos2::new(880.0, 300.0)));
+        input
+            .events
+            .push(egui::Event::PointerMoved(Pos2::new(880.0, 300.0)));
 
         let mut output = context.run_ui(input, |ui| {
             navigation::update_wire_dragging_navigation(&mut controller, canvas, ui, true);

@@ -1288,7 +1288,10 @@ fn translation_route(source_language: &str, target_language: &str) -> Translatio
 }
 
 fn normalized_code(value: &str) -> String {
-    value.trim().to_ascii_lowercase()
+    let normalized = value.trim().to_ascii_lowercase().replace('_', "-");
+    SupportedLanguage::from_code(&normalized)
+        .map(|language| language.code().to_owned())
+        .unwrap_or(normalized)
 }
 
 fn language_name(code: &str) -> &str {
@@ -1358,6 +1361,16 @@ mod tests {
                 target: "English".into(),
                 source_code: "ja".into(),
                 target_code: "en".into(),
+            }
+        );
+        assert_eq!(asr_language("hi-IN"), Some("Hindi".into()));
+        assert_eq!(
+            translation_route("hi-IN", "vi-VN"),
+            super::TranslationRoute {
+                source: "Hindi".into(),
+                target: "Vietnamese".into(),
+                source_code: "hi".into(),
+                target_code: "vi".into(),
             }
         );
     }

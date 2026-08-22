@@ -160,10 +160,8 @@ impl BackendManager {
         if self.llama_server_path.trim().is_empty()
             || is_managed_llama_server_path(&layout, Path::new(&self.llama_server_path))
         {
-            let candidate = layout.managed_llama_server(format!(
-                "llama-server{}",
-                std::env::consts::EXE_SUFFIX
-            ));
+            let candidate = layout
+                .managed_llama_server(format!("llama-server{}", std::env::consts::EXE_SUFFIX));
             self.llama_server_path = candidate.display().to_string();
         }
         Ok(())
@@ -214,7 +212,6 @@ impl BackendManager {
         Ok(())
     }
 
-
     pub(crate) fn persist_llama_server_path(
         project_root: &std::path::Path,
         path: &std::path::Path,
@@ -240,9 +237,7 @@ impl BackendManager {
                 path.display()
             ));
         }
-        let value = config_path_value(
-            &layout.config_path_for(&path),
-        );
+        let value = config_path_value(&layout.config_path_for(&path));
         Self::write_llama_server_path(layout.project_root(), &value)?;
         Ok(path)
     }
@@ -907,8 +902,8 @@ fn preferred_llama_server_path(layout: &RuntimeLayout, configured: &str) -> Stri
         }
     }
 
-    let installed = layout
-        .managed_llama_server(format!("llama-server{}", std::env::consts::EXE_SUFFIX));
+    let installed =
+        layout.managed_llama_server(format!("llama-server{}", std::env::consts::EXE_SUFFIX));
     let installed = std::path::absolute(&installed).unwrap_or(installed);
     if installed.is_file() {
         installed.display().to_string()

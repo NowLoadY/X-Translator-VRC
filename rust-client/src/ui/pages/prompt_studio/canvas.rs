@@ -255,7 +255,11 @@ pub(super) fn render_graph_editor(
                     egui::Button::new(
                         RichText::new(crate::i18n::tr(language, "UNDO"))
                             .font(egui::FontId::monospace(9.5))
-                            .color(if undo_enabled { style::INK } else { style::MUTED }),
+                            .color(if undo_enabled {
+                                style::INK
+                            } else {
+                                style::MUTED
+                            }),
                     )
                     .fill(Color32::TRANSPARENT)
                     .stroke(Stroke::new(1.0, style::BAR_BORDER))
@@ -276,7 +280,11 @@ pub(super) fn render_graph_editor(
                     egui::Button::new(
                         RichText::new(crate::i18n::tr(language, "REDO"))
                             .font(egui::FontId::monospace(9.5))
-                            .color(if redo_enabled { style::INK } else { style::MUTED }),
+                            .color(if redo_enabled {
+                                style::INK
+                            } else {
+                                style::MUTED
+                            }),
                     )
                     .fill(Color32::TRANSPARENT)
                     .stroke(Stroke::new(1.0, style::BAR_BORDER))
@@ -307,7 +315,8 @@ pub(super) fn render_graph_editor(
                 }
                 if validation_error.is_none()
                     && draft.id != snapshot.active_id
-                    && style::command_button(ui, crate::i18n::tr(language, "ACTIVATE"), true).clicked()
+                    && style::command_button(ui, crate::i18n::tr(language, "ACTIVATE"), true)
+                        .clicked()
                 {
                     actions.push(PromptStudioAction::ActivateProfile(draft.clone()));
                     controller.dirty = false;

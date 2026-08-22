@@ -13,7 +13,9 @@
 | 设备加速包 | `xrtranslate-config` | `<runtime_root>/cuda/<version>` | 仅兼容 NVIDIA 设备按需下载 | CUDA ABI 与驱动能力匹配；llama.cpp 和 ONNX 共享同一份 |
 
 所有网络传输统一经过 `xrtranslate-download`，因此模型和运行时共用断点续传、
-代理、重试、进度、大小与 SHA-256 校验。后端不下载资源；默认 release 不包含
+代理、重试、进度、大小与 SHA-256 校验。模型与 runtime installer 只传递中立的
+`DownloadSource`；GitHub/Hugging Face 官方地址到镜像地址的转换由下载 crate 的
+单一镜像路由负责。后端不下载资源；默认 release 不包含
 TTS、ASR 或翻译大模型，也没有 Python 环境。兼容的离线打包选项只能显式加入
 已校验的 ASR/翻译 GGUF，Audio8 TTS 始终由用户按需下载。
 
@@ -21,7 +23,7 @@ TTS、ASR 或翻译大模型，也没有 Python 环境。兼容的离线打包�
 
 | 功能 / provider | 模型资源 | 推理资源 | GPU 策略 | 缺失时行为 |
 | --- | --- | --- | --- | --- |
-| ASR `qwen3-gguf` | Qwen3-ASR Q4 GGUF + mmproj，合计 1,924,209,664 B | llama.cpp server | 匹配 CUDA 13.3 或 12.4；否则 CPU server | 欢迎页下载/修复；未就绪不启动本地 ASR |
+| ASR `qwen3-gguf` | Qwen3-ASR Q4 GGUF + mmproj，合计 1,924,209,664 B | llama.cpp server | 匹配 CUDA 13.3、13.1 或 12.4；否则 CPU server | 欢迎页下载/修复；未就绪不启动本地 ASR |
 | 翻译 `hunyuan` 普通 | Hy-MT2 1.8B Q4 GGUF，1,133,080,448 B | 与 ASR 共用 llama.cpp | 与 ASR 共用同一 server/runtime 选择 | 欢迎页下载/修复 |
 | 翻译 `hunyuan` 大 | Hy-MT2 7B Q4 GGUF，4,624,648,896 B | 与 ASR 共用 llama.cpp | 同上 | 欢迎页下载/修复 |
 | TTS `audio8` | Audio8 FP16 ONNX 完整包，2,171,728,005 B | ONNX Runtime 1.28 | Auto/CUDA 优先，失败原子回退 CPU；不使用 Vulkan/DirectML | TTS 是可选功能，可跳过；启用时下载/修复 |
@@ -36,15 +38,15 @@ TTS、ASR 或翻译大模型，也没有 Python 环境。兼容的离线打包�
 | --- | --- | --- | --- |
 | 无 NVIDIA GPU，或显式选择 CPU | release 内 `runtime/onnxruntime/cpu/onnxruntime.dll` | CPU server（仅本地 ASR/翻译需要） | 不下载任何 CUDA/provider/cuDNN |
 | NVIDIA + 驱动支持 CUDA 12 | ORT 1.28 CUDA12 同源核心/provider | CUDA 12.4 server | CUDA 12.4 共享包只下载一次 |
-| NVIDIA + 驱动/GPU 支持 CUDA 13 | ORT 1.28 CUDA13 同源核心/provider | CUDA 13.3 server | CUDA 13.3 共享包只下载一次 |
-| NVIDIA Blackwell (50 系, CC 12.0+) | ORT 1.28 CUDA13（需驱动 >= 13.3） | CUDA 13.3 server（需驱动 >= 13.3） | 不支持 CUDA 12.4；驱动不足时提示更新驱动并回退 CPU |
+| NVIDIA + 驱动/GPU 支持 CUDA 13 | ORT 1.28 CUDA13 同源核心/provider | 驱动支持时优先 CUDA 13.3，否则选择 CUDA 13.1 | 匹配版本的共享包只下载一次 |
+| NVIDIA Blackwell (50 系, CC 12.0+) | ORT 1.28 CUDA13 同源核心/provider | 驱动 13.1/13.2 选择 b8913 CUDA 13.1；驱动 >= 13.3 优先 CUDA 13.3 | 最低 CUDA 12.8，绝不选 12.4；使用 13.1 时仍提示通过 NVIDIA App 升级驱动 |
 | NVIDIA 存在但无完整兼容归档 | CPU core | CPU server | 计划仍成功，记录明确 fallback reason |
 
 CPU ONNX 核心为 16,277,856 B，取自官方
 `onnxruntime-win-x64-gpu_cuda13-1.28.0.zip` 的 `onnxruntime.dll`；该核心本身可独立
 执行 CPU session，随 release 提供并由 packager 校验 SHA-256。
 CUDA12 provider 归档为 455,344,532 B，CUDA13 为 365,825,268 B；它们只在
-TTS 请求 CUDA 时下载。共享 CUDA 12.4/13.3 归档约 391 MB，使用资源并集去重，
+TTS 请求 CUDA 时下载。共享 CUDA 12.4/13.1/13.3 归档按所选版本使用资源并集去重，
 不会因同时启用 llama.cpp 与 TTS 下载两次。
 
 ## ONNX 与 Runtime 目录隔离与兼容性迁移
@@ -69,6 +71,10 @@ runtime/cuda/
 │  ├─ cudart64_12.dll
 │  ├─ cublasLt64_12.dll
 │  └─ cublas64_12.dll
+├─ 13.1/
+│  ├─ cudart64_13.dll
+│  ├─ cublasLt64_13.dll
+│  └─ cublas64_13.dll
 └─ 13.3/
    ├─ cudart64_13.dll
    ├─ cublasLt64_13.dll

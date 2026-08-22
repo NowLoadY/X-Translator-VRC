@@ -181,7 +181,11 @@ pub(super) fn update_wire_dragging_navigation(
         let zoom_out_ratio = (max_edge_intensity / 1.5).clamp(0.0, 1.0);
         let target_zoom = (base_zoom * (1.0 - zoom_out_ratio * 0.22)).clamp(0.20, 1.6);
 
-        let zoom_change_rate = if target_zoom < controller.zoom { 7.0 } else { 5.0 };
+        let zoom_change_rate = if target_zoom < controller.zoom {
+            7.0
+        } else {
+            5.0
+        };
         let zoom_step = 1.0 - (-dt * zoom_change_rate).exp();
         let new_zoom = controller.zoom + (target_zoom - controller.zoom) * zoom_step;
 

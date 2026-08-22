@@ -41,12 +41,14 @@ pub struct ModalDialog {
     pub cancel_label: String,
     action: Option<ModalAction>,
     ok_action: Option<ModalAction>,
+    destructive_ok: bool,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum ModalAction {
     DownloadUpdate,
     InstallUpdate,
+    ConfirmResourceDeletion,
 }
 
 impl Default for ModalDialog {
@@ -61,6 +63,7 @@ impl Default for ModalDialog {
             cancel_label: "Cancel".into(),
             action: None,
             ok_action: None,
+            destructive_ok: false,
         }
     }
 }
@@ -84,6 +87,7 @@ impl ModalDialog {
             cancel_label: crate::i18n::tr(language, "Later").into(),
             action: None,
             ok_action: Some(ModalAction::DownloadUpdate),
+            destructive_ok: false,
         }
     }
 
@@ -111,6 +115,34 @@ impl ModalDialog {
             cancel_label: crate::i18n::tr(language, "Later").into(),
             action: None,
             ok_action: Some(ModalAction::InstallUpdate),
+            destructive_ok: false,
+        }
+    }
+
+    pub fn confirm_resource_deletion(
+        resource_label: &str,
+        language: crate::i18n::UiLanguage,
+    ) -> Self {
+        Self {
+            open: true,
+            pages: vec![ModalPage::new(
+                crate::i18n::tr(language, "Delete downloaded resource?"),
+                format!(
+                    "{resource_label}\n\n{}",
+                    crate::i18n::tr(
+                        language,
+                        "Only this resource will be removed. You can download it again later."
+                    )
+                ),
+            )],
+            current_page: 0,
+            show_ok_button: true,
+            ok_label: crate::i18n::tr(language, "Delete").into(),
+            show_cancel_button: true,
+            cancel_label: crate::i18n::tr(language, "Cancel").into(),
+            action: None,
+            ok_action: Some(ModalAction::ConfirmResourceDeletion),
+            destructive_ok: true,
         }
     }
 
@@ -141,6 +173,7 @@ impl ModalDialog {
             cancel_label: "Close".into(),
             action: None,
             ok_action: None,
+            destructive_ok: false,
         }
     }
 
@@ -155,6 +188,7 @@ impl ModalDialog {
             cancel_label: "Close".into(),
             action: None,
             ok_action: None,
+            destructive_ok: false,
         }
     }
 
@@ -334,7 +368,12 @@ impl ModalDialog {
                                     } else {
                                         &self.ok_label
                                     };
-                                if crate::ui::components::primary_button(ui, ok_text).clicked() {
+                                let confirmed = if self.destructive_ok {
+                                    crate::ui::components::danger_button(ui, ok_text).clicked()
+                                } else {
+                                    crate::ui::components::primary_button(ui, ok_text).clicked()
+                                };
+                                if confirmed {
                                     self.action = self.ok_action;
                                     close_dialog = true;
                                 }
@@ -373,5 +412,18 @@ mod tests {
         assert_eq!(modal.ok_label, "安装");
         assert_eq!(modal.cancel_label, "稍后");
         assert_eq!(modal.ok_action, Some(ModalAction::InstallUpdate));
+    }
+
+    #[test]
+    fn resource_deletion_modal_is_explicit_and_destructive() {
+        let modal =
+            ModalDialog::confirm_resource_deletion("Audio model", crate::i18n::UiLanguage::Chinese);
+
+        assert_eq!(modal.pages[0].title, "删除已下载的资源？");
+        assert!(modal.pages[0].content.contains("Audio model"));
+        assert_eq!(modal.ok_label, "删除");
+        assert_eq!(modal.cancel_label, "取消");
+        assert!(modal.destructive_ok);
+        assert_eq!(modal.ok_action, Some(ModalAction::ConfirmResourceDeletion));
     }
 }

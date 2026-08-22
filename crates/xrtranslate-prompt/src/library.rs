@@ -70,19 +70,20 @@ impl PromptTemplateProfile {
         content: &str,
         new_id: impl Into<String>,
     ) -> Result<PromptTemplateProfile, String> {
-        let (name, description, mut graph) =
-            if let Ok(project) = serde_json::from_str::<PromptGraphProjectFile>(content) {
-                (project.name, project.description, project.graph)
-            } else if let Ok(profile) = serde_json::from_str::<PromptTemplateProfile>(content) {
-                (profile.name, profile.description, profile.graph)
-            } else if let Ok(raw_graph) = serde_json::from_str::<PromptNodeGraph>(content) {
-                ("Imported Graph".to_string(), String::new(), raw_graph)
-            } else {
-                return Err(
+        let (name, description, mut graph) = if let Ok(project) =
+            serde_json::from_str::<PromptGraphProjectFile>(content)
+        {
+            (project.name, project.description, project.graph)
+        } else if let Ok(profile) = serde_json::from_str::<PromptTemplateProfile>(content) {
+            (profile.name, profile.description, profile.graph)
+        } else if let Ok(raw_graph) = serde_json::from_str::<PromptNodeGraph>(content) {
+            ("Imported Graph".to_string(), String::new(), raw_graph)
+        } else {
+            return Err(
                     "Failed to parse prompt graph JSON. Please ensure it follows the Prompt Graph schema."
                         .into(),
                 );
-            };
+        };
 
         if graph.nodes.is_empty() {
             return Err("Imported prompt graph contains no nodes.".into());
@@ -369,7 +370,8 @@ mod tests {
         assert!(exported.contains("\"openai-request\""));
         assert!(exported.contains("\"hunyuan-request\""));
 
-        let imported = PromptTemplateProfile::import_project_json(&exported, "imported-test-id").unwrap();
+        let imported =
+            PromptTemplateProfile::import_project_json(&exported, "imported-test-id").unwrap();
         assert_eq!(imported.id, "imported-test-id");
         assert_eq!(imported.name, "Built-in Default");
         assert!(!imported.read_only);

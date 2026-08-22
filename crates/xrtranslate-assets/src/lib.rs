@@ -15,7 +15,10 @@ pub use catalog::{
     ModelAssetManifest, ModelCapability, ModelFileRole, ModelFileSource, ModelLevel, ModelSource,
     QWEN3_ASR_GGUF, RequiredModelFile, manifest_for, manifests_for_capability,
 };
-pub use install::{AtomicInstallError, DownloadProgress, ModelDownloadError, NativeModelInstaller};
+pub use install::{
+    AtomicInstallError, DownloadProgress, ModelDownloadError, NativeModelInstaller,
+    clear_model_staging, remove_model_asset,
+};
 pub use preflight::{
     ModelAssetDiagnostic, ModelAssetProblem, ModelAssetsPreflight, ModelAssetsPreflightError,
 };

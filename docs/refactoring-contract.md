@@ -60,6 +60,17 @@ shared domain/runtime/UI capability
   must not implement their own HTTP chunk loop, range-resume, retry, proxy, or
   checksum policy. SHA-256 verification is the default; size-only verification
   is an explicit fallback only when a trusted source publishes no digest.
+  Source switching must use cooperative cancellation. Staging cleanup remains
+  with the artifact owner and happens only after the shared transfer releases
+  its file handle; UI code must not delete `.part` files directly.
+- Provider/model selection is data-driven through the shared configuration and
+  asset manifest catalogue. Main application and onboarding code may branch on
+  neutral capabilities, but must not name a concrete provider, model, revision,
+  or resource path. Delete controls pass an asset identity to its owner and
+  never construct or recursively remove resource paths in UI code. Every
+  user-initiated resource deletion requires a shared confirmation dialog that
+  names the target; cancellation clears the pending identity without invoking
+  the owner.
 - UI rendering should consume a snapshot/controller and emit typed actions.
   Rendering code must not acquire unrelated runtime or persistence ownership.
 - Treat model package metadata, prompt composition, and provider delivery as

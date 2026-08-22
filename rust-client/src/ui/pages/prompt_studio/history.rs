@@ -131,7 +131,9 @@ mod tests {
         assert_eq!(history.redo_count(), 1);
 
         // Undo from 2 -> should restore 1
-        let restored_p1 = history.undo(restored_p2.clone()).expect("Undo should succeed");
+        let restored_p1 = history
+            .undo(restored_p2.clone())
+            .expect("Undo should succeed");
         assert_eq!(restored_p1, p1);
         assert!(!history.can_undo(false));
         assert_eq!(history.redo_count(), 2);
