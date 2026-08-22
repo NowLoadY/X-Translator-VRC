@@ -1186,18 +1186,13 @@ fn render_runtime_installation_section(
 
             components::render_runtime_fallback_notice(ui, language, &app.runtime_installer);
 
-            if let Some(path) = components::render_runtime_task_state(
+            components::render_runtime_task_state(
                 ui,
                 language,
                 &state,
                 "Extracting native runtime...",
                 "The native runtime is installed and ready.",
-            ) {
-                app.backend_manager.runtime_directory = path.to_string_lossy().to_string();
-                if let Err(error) = app.backend_manager.save_runtime_directory() {
-                    app.last_error = Some(error);
-                }
-            }
+            );
         });
 
     ui.add_space(12.0);

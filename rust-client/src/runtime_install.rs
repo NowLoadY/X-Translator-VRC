@@ -97,7 +97,7 @@ pub enum RuntimeInstallState {
         total: u64,
     },
     Extracting,
-    Installed(PathBuf),
+    Installed,
     Failed(String),
 }
 
@@ -409,12 +409,13 @@ impl RuntimeInstaller {
         Ok(())
     }
 
-    pub fn poll(&mut self) {
+    pub fn poll(&mut self) -> Option<PathBuf> {
         let Some(events) = &self.events else {
-            return;
+            return None;
         };
         let mut finished = false;
         let mut cancelled = false;
+        let mut installed_executable = None;
         loop {
             match events.try_recv() {
                 Ok(Event::Prepared(result)) => {
@@ -453,7 +454,10 @@ impl RuntimeInstaller {
                         selection.download_bytes = 0;
                     }
                     self.state = match result {
-                        Ok(path) => RuntimeInstallState::Installed(path),
+                        Ok(path) => {
+                            installed_executable = Some(path);
+                            RuntimeInstallState::Installed
+                        }
                         Err(error) => RuntimeInstallState::Failed(error),
                     };
                     finished = true;
@@ -482,6 +486,7 @@ impl RuntimeInstaller {
                 }
             }
         }
+        installed_executable
     }
 }
 
@@ -2371,6 +2376,23 @@ fn directory_contains_file_prefix(directory: &Path, prefix: &str) -> Result<bool
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn poll_returns_the_installed_executable_to_host_coordination() {
+        let executable = PathBuf::from("runtime/llama.cpp/llama-server.exe");
+        let (sender, receiver) = unbounded();
+        sender
+            .send(Event::Finished(Ok(executable.clone())))
+            .unwrap();
+        let mut installer = RuntimeInstaller {
+            events: Some(receiver),
+            ..RuntimeInstaller::default()
+        };
+
+        assert_eq!(installer.poll(), Some(executable));
+        assert!(matches!(installer.state(), RuntimeInstallState::Installed));
+        assert!(installer.events.is_none());
+    }
 
     fn asset(name: &str) -> ReleaseAsset {
         let is_cuda_runtime = name.contains("cudart");

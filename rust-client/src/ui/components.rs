@@ -1696,11 +1696,11 @@ pub fn render_runtime_task_state(
     state: &crate::runtime_install::RuntimeInstallState,
     extracting_text: &'static str,
     installed_text: &'static str,
-) -> Option<std::path::PathBuf> {
+) {
     use crate::runtime_install::RuntimeInstallState;
 
     match state {
-        RuntimeInstallState::Idle | RuntimeInstallState::Ready => None,
+        RuntimeInstallState::Idle | RuntimeInstallState::Ready => {}
         RuntimeInstallState::Detecting => {
             ui.add_space(6.0);
             ui.label(
@@ -1711,7 +1711,6 @@ pub fn render_runtime_task_state(
                 .size(12.0)
                 .color(theme::text_weak()),
             );
-            None
         }
         RuntimeInstallState::Downloading {
             asset,
@@ -1736,7 +1735,6 @@ pub fn render_runtime_task_state(
                     )),
                 );
             }
-            None
         }
         RuntimeInstallState::Extracting => {
             ui.add_space(6.0);
@@ -1745,16 +1743,14 @@ pub fn render_runtime_task_state(
                     .size(12.0)
                     .color(theme::text_weak()),
             );
-            None
         }
-        RuntimeInstallState::Installed(path) => {
+        RuntimeInstallState::Installed => {
             ui.add_space(6.0);
             ui.label(
                 egui::RichText::new(crate::i18n::tr(language, installed_text))
                     .size(12.0)
                     .color(Color32::from_rgb(5, 150, 105)),
             );
-            Some(path.clone())
         }
         RuntimeInstallState::Failed(error) => {
             ui.add_space(6.0);
@@ -1763,7 +1759,6 @@ pub fn render_runtime_task_state(
                     .size(12.0)
                     .color(Color32::from_rgb(220, 38, 38)),
             );
-            None
         }
     }
 }

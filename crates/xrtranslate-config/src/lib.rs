@@ -107,7 +107,7 @@ impl RuntimeLayout {
         let project_root = project_root.as_ref().to_path_buf();
         let runtime_root = match runtime_directory {
             Some(dir) => {
-                let dir = dir.as_ref();
+                let dir = normalized_runtime_root(dir.as_ref());
                 if dir.is_absolute() {
                     dir.to_path_buf()
                 } else {
@@ -250,6 +250,24 @@ impl RuntimeLayout {
             .unwrap_or_else(|| project_root.as_ref().join("runtime"))
             .join("XRTranslate")
             .join("user-config.json")
+    }
+}
+
+/// Older welcome builds accidentally persisted the managed llama-server
+/// executable as `runtime_directory`. Keep those user configs usable without
+/// treating the executable as a directory or requiring a manual reset.
+fn normalized_runtime_root(path: &Path) -> &Path {
+    let is_llama_server = path.file_stem().is_some_and(|name| name == "llama-server")
+        && path
+            .extension()
+            .is_none_or(|extension| extension.eq_ignore_ascii_case("exe"));
+    let managed_directory = path
+        .parent()
+        .filter(|parent| parent.file_name().is_some_and(|name| name == "llama.cpp"));
+    if is_llama_server && let Some(runtime_root) = managed_directory.and_then(Path::parent) {
+        runtime_root
+    } else {
+        path
     }
 }
 
@@ -1496,6 +1514,28 @@ mod tests {
         assert_eq!(
             layout.config_path_for(&configured),
             PathBuf::from("runtime/llama.cpp/llama-server")
+        );
+    }
+
+    #[test]
+    fn runtime_layout_recovers_executable_persisted_as_runtime_directory() {
+        let root = PathBuf::from("/tmp/xrtranslate-release");
+        let relative = RuntimeLayout::new(&root, Some("runtime/llama.cpp/llama-server.exe"));
+        assert_eq!(relative.runtime_root(), root.join("runtime"));
+        assert_eq!(
+            relative.onnx_cpu_core_library(),
+            root.join("runtime/onnxruntime/cpu/onnxruntime.dll")
+        );
+
+        let custom_root = std::env::temp_dir().join("xrtranslate-custom-runtime");
+        let absolute =
+            RuntimeLayout::new(&root, Some(custom_root.join("llama.cpp/llama-server.exe")));
+        assert_eq!(absolute.runtime_root(), custom_root);
+
+        let unrelated = RuntimeLayout::new(&root, Some("custom/llama-server.exe"));
+        assert_eq!(
+            unrelated.runtime_root(),
+            root.join("custom/llama-server.exe")
         );
     }
 

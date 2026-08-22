@@ -2736,7 +2736,9 @@ impl XRTranslateApp {
 impl eframe::App for XRTranslateApp {
     fn ui(&mut self, ui: &mut egui::Ui, _frame: &mut eframe::Frame) {
         self.model_task_manager.poll();
-        self.runtime_installer.poll();
+        if let Some(path) = self.runtime_installer.poll() {
+            self.backend_manager.use_installed_llama_server(&path);
+        }
         let runtime_requirements = self.service_config.runtime_requirements();
         if !self.runtime_installer.is_busy()
             && !self.runtime_installer.plan_matches(runtime_requirements)

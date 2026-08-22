@@ -2972,8 +2972,13 @@ fn outbound_is_current(
 }
 
 async fn shutdown_signal() {
-    let _ = tokio::signal::ctrl_c().await;
-    info!("shutdown signal received");
+    match tokio::signal::ctrl_c().await {
+        Ok(()) => info!("shutdown signal received"),
+        Err(error) => {
+            warn!(%error, "Ctrl+C listener is unavailable; keeping backend running");
+            std::future::pending::<()>().await;
+        }
+    }
 }
 
 #[cfg(test)]

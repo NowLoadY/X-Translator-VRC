@@ -137,6 +137,10 @@ impl BackendManager {
         !value.is_empty() && configured_llama_server_path(&self.runtime_layout(), value).is_file()
     }
 
+    pub(crate) fn use_installed_llama_server(&mut self, path: &std::path::Path) {
+        self.llama_server_path = path.display().to_string();
+    }
+
     pub fn save_runtime_directory(&mut self) -> Result<(), String> {
         let requested = self.runtime_directory.trim();
         let value = if requested.is_empty() {
